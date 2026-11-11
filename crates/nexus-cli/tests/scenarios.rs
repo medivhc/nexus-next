@@ -321,3 +321,167 @@ fn sim_is_deterministic_per_seed_and_varies_across_seeds() {
     let distinct: std::collections::HashSet<u64> = (1..=5).map(run).collect();
     assert_eq!(distinct.len(), 5);
 }
+
+// ---------------------------------------------------------------- M1.3 结构化执行
+
+const EXEC_KEYS: [&str; 10] = [
+    "duration_ms", "exit_code", "schema", "signal", "stderr", "stderr_base64", "stdout", "stdout_base64", "timed_out", "truncated",
+];
+
+scenario! {
+    name: exec_returns_output_and_exit_code,
+    covers: "R09, R19",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let script = "echo out; echo err >&2; exit 3";
+        // When 直接执行
+        let out = w.cli("laptop", &["exec", "home", "--", "sh", "-c", script]).await;
+        // Then 输出分开到达，退出码透传
+        assert_eq!(out.code, 3, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+        // When 要求 JSON
+        let out = w.cli("laptop", &["exec", "home", "--json", "--", "sh", "-c", script]).await;
+        assert_eq!(out.code, 3);
+        let v = json(&out.stdout);
+        assert_eq!(keys(&v), EXEC_KEYS);
+        assert_eq!(v["exit_code"], 3);
+        assert_eq!(v["stdout"], "out\n");
+        assert_eq!(v["stderr"], "err\n");
+        assert_eq!(v["timed_out"], false);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["stdout_base64"], Value::Null);
+        assert!(v["duration_ms"].is_u64());
+        // And 成功的命令退出码为 0
+        let ok = w.cli("laptop", &["exec", "home", "--", "echo", "hello", "world"]).await;
+        assert_eq!((ok.code, ok.stdout.as_str()), (0, "hello world\n"));
+    },
+}
+
+scenario! {
+    name: exec_streams_stdin,
+    covers: "R09",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        // 足够大，必然被拆成很多块传输
+        let input: Vec<u8> = (0..300_000u32).map(|i| b'a' + (i % 26) as u8).chain(*b"\nend\n").collect();
+        let out = w.cli_with_stdin("laptop", &["exec", "home", "--", "cat"], &input).await;
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout_raw.len(), input.len());
+        assert!(out.stdout_raw == input, "输出与输入不一致");
+    },
+}
+
+scenario! {
+    name: exec_passes_arbitrary_bytes_and_large_output,
+    covers: "R09",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        // 不是合法 UTF-8 的字节
+        let out = w.cli("laptop", &["exec", "home", "--", "printf", "\\377\\000x"]).await;
+        assert_eq!(out.stdout_raw, [0xff, 0x00, b'x']);
+        let v = json(&w.cli("laptop", &["exec", "home", "--json", "--", "printf", "\\377\\000x"]).await.stdout);
+        assert_eq!(v["stdout"], Value::Null);
+        assert_eq!(v["stdout_base64"], "/wB4");
+        // 几 MB 的输出完整到达
+        let big = w.cli("laptop", &["exec", "home", "--", "head", "-c", "3000000", "/dev/zero"]).await;
+        assert_eq!(big.code, 0, "stderr: {}", big.stderr);
+        assert_eq!(big.stdout_raw.len(), 3_000_000);
+        assert!(big.stdout_raw.iter().all(|b| *b == 0));
+    },
+}
+
+scenario! {
+    name: exec_honours_cwd_and_env,
+    covers: "R09",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let out = w.cli("laptop", &["exec", "home", "--cwd", "/tmp", "--env", "FOO=bar", "--", "sh", "-c", "pwd; printenv FOO"]).await;
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "/tmp\nbar\n");
+        let bad = w.cli("laptop", &["exec", "home", "--env", "NOEQUALS", "--", "true"]).await;
+        assert_eq!(bad.code, 102);
+    },
+}
+
+scenario! {
+    name: exec_timeout_is_reported,
+    covers: "R10",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let out = w.cli("laptop", &["exec", "home", "--timeout", "1", "--json", "--", "sleep", "30"]).await;
+        assert_eq!(out.code, 124, "stderr: {}", out.stderr);
+        let v = json(&out.stdout);
+        assert_eq!(v["timed_out"], true);
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["exit_code"], Value::Null);
+        let ms = v["duration_ms"].as_u64().unwrap();
+        assert!((1000..5000).contains(&ms), "应当在 1 秒左右被终止，实际 {ms} 毫秒");
+        // 直接输出时，标准错误说明原因
+        let human = w.cli("laptop", &["exec", "home", "--timeout", "0.5", "--", "sleep", "30"]).await;
+        assert_eq!(human.code, 124);
+        assert_eq!(error_kind(&human.stderr), "timed_out");
+    },
+}
+
+scenario! {
+    name: exec_output_limit_is_reported,
+    covers: "R10",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let out = w.cli("laptop", &["exec", "home", "--max-output", "1000", "--", "head", "-c", "100000", "/dev/zero"]).await;
+        assert_eq!(out.code, 125, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout_raw.len(), 1000, "应当恰好收到上限那么多");
+        assert_eq!(error_kind(&out.stderr), "truncated");
+        let v = json(&w.cli("laptop", &["exec", "home", "--max-output", "1000", "--json", "--", "head", "-c", "100000", "/dev/zero"]).await.stdout);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["timed_out"], false);
+        assert_eq!(v["stdout"].as_str().unwrap().len(), 1000);
+    },
+}
+
+scenario! {
+    name: exec_errors_are_clear,
+    covers: "R10",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        // 尚未加入网络
+        let out = w.cli("laptop", &["exec", "home", "--", "true"]).await;
+        assert_eq!(out.code, 106);
+        w.network("laptop", &["home"]).await;
+        // 命令不存在
+        let out = w.cli("laptop", &["exec", "home", "--", "no-such-program-nexus"]).await;
+        assert_eq!(out.code, 127, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "");
+        assert_eq!(error_kind(&out.stderr), "spawn_failed");
+        // 节点不在名册里
+        assert_eq!(w.cli("laptop", &["exec", "nosuch", "--", "true"]).await.code, 103);
+        // 没有给出命令
+        assert_eq!(w.cli("laptop", &["exec", "home"]).await.code, 102);
+    },
+}
+
+scenario! {
+    name: exec_on_the_local_node,
+    covers: "R09",
+    nodes: ["laptop"],
+    real: yes,
+    run: |w: World| async move {
+        w.cli_ok("laptop", &["init", "--name", "laptop"]).await;
+        let out = w.cli("laptop", &["exec", "laptop", "--", "echo", "hi"]).await;
+        assert_eq!((out.code, out.stdout.as_str()), (0, "hi\n"), "stderr: {}", out.stderr);
+    },
+}

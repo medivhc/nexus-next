@@ -11,11 +11,12 @@ use nexus_core_proto::authz::{self, Action, Context, Outcome, Principal};
 use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
-use nexus_fabric::{read_msg, write_msg, Connection, Proto, Transport};
-use nexus_sys::System;
+use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
+use nexus_sys::{Cmd, Proc, ProcEvent, System};
 use nexus_wire::{
     hex_encode, AddrHints, CtlRequest, CtlResponse, ErrorCode, InitReport, JoinCode, ListEntry,
     MembershipReport, Request, RequestHeader, Response, StatusReport, WireError, WIRE_VERSION,
+    ExecEvent, ExecResult, ExecSpec, Input,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -25,11 +26,43 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
-/// 一次本机控制调用：请求，以及回传结果的通道。
-pub type CtlCall = (CtlRequest, oneshot::Sender<CtlResponse>);
+/// 常驻程序一侧的控制会话：向命令行发送回应，接收命令行的输入。
+pub struct CtlServer {
+    pub tx: mpsc::Sender<CtlResponse>,
+    pub rx: mpsc::Receiver<Input>,
+}
+
+/// 命令行一侧的控制会话。
+pub struct CtlClient {
+    pub tx: mpsc::Sender<Input>,
+    pub rx: mpsc::Receiver<CtlResponse>,
+}
+
+/// 一次本机控制调用：请求，以及这次会话常驻程序一侧的通道。
+pub type CtlCall = (CtlRequest, CtlServer);
+
+/// 建立一对控制会话通道。通道有界：命令行读得慢时，输出会一路反压到远端进程。
+pub fn ctl_session(req: CtlRequest) -> (CtlCall, CtlClient) {
+    let (resp_tx, resp_rx) = mpsc::channel(16);
+    let (in_tx, in_rx) = mpsc::channel(16);
+    ((req, CtlServer { tx: resp_tx, rx: in_rx }), CtlClient { tx: in_tx, rx: resp_rx })
+}
+
+/// 收到请求后怎么处理：直接回应，或者进入流式的执行。
+enum Dispatch {
+    Reply(Response),
+    Exec(ExecSpec),
+}
+
+/// 打开远端执行失败的原因。
+enum OpenError {
+    StaleRoster,
+    Remote(WireError),
+    Io(io::Error),
+}
 
 /// 等待对端响应的上限。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -208,22 +241,21 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut accept = Box::pin(self.transport.accept());
         loop {
             tokio::select! {
+                biased;
+                Some(()) = tasks.next(), if !tasks.is_empty() => {}
                 conn = &mut accept => {
                     let (conn, proto) = conn?;
                     accept = Box::pin(self.transport.accept());
                     tasks.push(Box::pin(self.serve_conn(conn, proto)));
                 }
-                Some((req, reply)) = ctl.recv() => {
-                    tasks.push(Box::pin(async move {
-                        let _ = reply.send(self.handle_ctl(req).await);
-                    }));
+                Some((req, server)) = ctl.recv() => {
+                    tasks.push(Box::pin(self.handle_ctl(req, server)));
                 }
                 Some(peer) = pushes.recv() => {
                     tasks.push(Box::pin(async move {
                         let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.push_roster(peer)).await;
                     }));
                 }
-                Some(()) = tasks.next(), if !tasks.is_empty() => {}
             }
         }
     }
@@ -231,12 +263,19 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn serve_conn(&self, conn: T::Conn, proto: Proto) {
         let peer = conn.remote();
         while let Ok(Some(mut stream)) = conn.accept_bi().await {
-            let response = match read_msg::<_, RequestHeader>(&mut stream).await {
+            let dispatch = match read_msg::<_, RequestHeader>(&mut stream).await {
                 Ok(header) => match proto {
                     Proto::Rpc => self.handle_rpc(peer, header),
-                    Proto::Join => self.handle_join(header),
+                    Proto::Join => Dispatch::Reply(self.handle_join(header)),
                 },
                 Err(_) => return,
+            };
+            let response = match dispatch {
+                Dispatch::Reply(r) => r,
+                Dispatch::Exec(spec) => {
+                    self.serve_exec(stream, spec).await;
+                    continue;
+                }
             };
             if write_msg(&mut stream, &response).await.is_err() {
                 return;
@@ -246,59 +285,61 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    fn handle_rpc(&self, peer: NodeId, header: RequestHeader) -> Response {
+    fn handle_rpc(&self, peer: NodeId, header: RequestHeader) -> Dispatch {
         if header.version != WIRE_VERSION {
-            return Response::Error(err(ErrorCode::UnsupportedVersion, format!("不支持的协议版本 {}", header.version)));
+            return Dispatch::Reply(Response::Error(err(ErrorCode::UnsupportedVersion, format!("不支持的协议版本 {}", header.version))));
         }
         // 名册推送只靠签名证明自己，不要求发送方已经在本机的旧名册里。
         if let Request::RosterPush { roster, addrs } = &header.body {
-            return match self.adopt_roster(roster) {
+            return Dispatch::Reply(match self.adopt_roster(roster) {
                 Ok(()) => {
                     let _ = self.learn_hints(addrs);
                     Response::Ok
                 }
                 Err(e) if matches!(e.code, ErrorCode::InvalidInput) => Response::Ok, // 不比本机新：无需更新
                 Err(e) => Response::Error(e),
-            };
+            });
         }
         let mine = self.roster_version();
         if header.roster_version > mine {
-            return Response::Error(err(ErrorCode::StaleRoster, format!("本机名册版本 {mine} 较旧")));
+            return Dispatch::Reply(Response::Error(err(ErrorCode::StaleRoster, format!("本机名册版本 {mine} 较旧"))));
         }
         let Some(roster) = self.roster() else {
-            return Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络"));
+            return Dispatch::Reply(Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络")));
         };
         let me = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
         let capability = match header.body {
             Request::NodeInfo => "node.info",
             Request::RosterSync => "roster.sync",
+            Request::Exec(_) => "term.exec",
             Request::RosterPush { .. } | Request::JoinOffer { .. } => {
-                return Response::Error(err(ErrorCode::InvalidInput, "这个请求不能在此协议上使用"))
+                return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这个请求不能在此协议上使用")))
             }
         };
         let action = Action {
             capability: Capability::parse(capability).expect("内置能力名合法"),
             resource: match ResourcePath::parse(&me) {
                 Ok(r) => r,
-                Err(_) => return Response::Error(err(ErrorCode::Internal, "本机不在名册里")),
+                Err(_) => return Dispatch::Reply(Response::Error(err(ErrorCode::Internal, "本机不在名册里")),)
             },
         };
         let ctx = Context { roster: &roster, me: self.me(), now: self.system.now() };
         let verdict = authz::decide(&ctx, peer, &Principal::Device, &action);
         if let Outcome::Deny(reason) = verdict.outcome {
-            return Response::Error(err(ErrorCode::Denied, format!("访问被拒绝：{reason:?}")));
+            return Dispatch::Reply(Response::Error(err(ErrorCode::Denied, format!("访问被拒绝：{reason:?}"))));
         }
         if mine > header.roster_version {
             // 对方的名册旧了，稍后在后台推过去。
             let _ = self.push_tx.send(peer);
         }
-        match header.body {
+        Dispatch::Reply(match header.body {
             Request::NodeInfo => Response::NodeInfo(self.info()),
+            Request::Exec(spec) => return Dispatch::Exec(spec),
             _ => Response::Roster {
                 roster: (mine > header.roster_version).then(|| self.trust.borrow().roster.clone()).flatten(),
                 addrs: self.addr_hints(),
             },
-        }
+        })
     }
 
     /// 处理加入协议上的邀请。邀请方不在本机名册里（本机还没有名册），
@@ -408,8 +449,9 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 处理一次本机控制调用。
-    pub async fn handle_ctl(&self, req: CtlRequest) -> CtlResponse {
+    pub async fn handle_ctl(&self, req: CtlRequest, server: CtlServer) {
         let result = match req {
+            CtlRequest::Exec { node, spec } => return self.exec(&node, spec, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node).await.map(CtlResponse::Status),
             CtlRequest::Init { name } => self.init(name).map(CtlResponse::Init),
@@ -418,7 +460,208 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
             CtlRequest::List => Ok(CtlResponse::List(self.list().await)),
         };
-        result.unwrap_or_else(CtlResponse::Error)
+        let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
+    }
+
+    /// 命令行请求在某个节点上执行命令：打开执行，然后在命令行和执行之间转发。
+    async fn exec(&self, node: &str, spec: ExecSpec, server: CtlServer) {
+        let device = match self.resolve(node) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = server.tx.send(CtlResponse::Error(e)).await;
+                return;
+            }
+        };
+        if device.node_id == self.me() {
+            // 在本机执行：用内存管道连接两端，走和远端完全相同的代码。
+            let (near, far) = tokio::io::duplex(256 * 1024);
+            let client = async {
+                let mut near = near;
+                match read_msg::<_, Response>(&mut near).await {
+                    Ok(Response::Ok) => self.pump_exec(near, server).await,
+                    Ok(Response::Error(e)) => {
+                        let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    }
+                    other => {
+                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                    }
+                }
+            };
+            futures_util::future::join(self.serve_exec(far, spec), client).await;
+            return;
+        }
+        for attempt in 0..2 {
+            let failure = match self.open_exec(device.node_id, &spec).await {
+                Ok(stream) => return self.pump_exec(stream, server).await,
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                    continue;
+                }
+                Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
+                Err(OpenError::Remote(e)) => e,
+                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+            };
+            let _ = server.tx.send(CtlResponse::Error(failure)).await;
+            return;
+        }
+    }
+
+    /// 向远端发出执行请求，对方接受后返回这条流。
+    async fn open_exec(
+        &self,
+        to: NodeId,
+        spec: &ExecSpec,
+    ) -> Result<<T::Conn as Connection>::Stream, OpenError> {
+        let open = async {
+            let conn = self.transport.connect(to, Proto::Rpc).await?;
+            let mut stream = conn.open_bi().await?;
+            let header = RequestHeader {
+                version: WIRE_VERSION,
+                roster_version: self.roster_version(),
+                body: Request::Exec(spec.clone()),
+            };
+            write_msg(&mut stream, &header).await?;
+            let resp: Response = read_msg(&mut stream).await?;
+            Ok::<_, io::Error>((stream, resp))
+        };
+        let (stream, resp) = tokio::time::timeout(REQUEST_TIMEOUT, open)
+            .await
+            .map_err(|_| OpenError::Io(io::Error::new(io::ErrorKind::TimedOut, "超时")))?
+            .map_err(OpenError::Io)?;
+        match resp {
+            Response::Ok => Ok(stream),
+            Response::Error(e) if e.code == ErrorCode::StaleRoster => Err(OpenError::StaleRoster),
+            Response::Error(e) => Err(OpenError::Remote(e)),
+            other => Err(OpenError::Remote(internal(format!("对方的回应无法理解：{other:?}")))),
+        }
+    }
+
+    /// 调用方一侧：把命令行的输入送到执行端，把执行事件送回命令行，直到命令结束。
+    async fn pump_exec<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = FrameReader::new(rd);
+        let mut input_open = true;
+        loop {
+            // 先转发输出、再发送输入：两边都在等对方读的时候不会互相卡住。
+            tokio::select! {
+                biased;
+                event = reader.next::<ExecEvent>() => match event {
+                    Ok(Some(event)) => {
+                        let done = matches!(event, ExecEvent::Exit(_));
+                        if server.tx.send(CtlResponse::Exec(event)).await.is_err() && input_open {
+                            input_open = false;
+                            let _ = write_msg(&mut wr, &Input::Cancel).await;
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let lost = err(ErrorCode::Unreachable, "执行过程中连接中断，命令可能仍在运行或已被终止");
+                        let _ = server.tx.send(CtlResponse::Error(lost)).await;
+                        break;
+                    }
+                },
+                input = server.rx.recv(), if input_open => {
+                    // 命令行已经离开时，请对方终止命令，然后继续等它结束。
+                    let input = input.unwrap_or(Input::Cancel);
+                    input_open = !matches!(input, Input::Cancel);
+                    if write_msg(&mut wr, &input).await.is_err() {
+                        input_open = false;
+                    }
+                }
+            }
+        }
+        let _ = wr.shutdown().await;
+        reader.drain().await;
+    }
+
+    /// 执行端：启动进程，转发输入和输出，执行超时与输出上限，最后报告结果。
+    async fn serve_exec<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, spec: ExecSpec) {
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = FrameReader::new(rd);
+        let cmd = Cmd { program: spec.program.clone(), args: spec.args.clone(), cwd: spec.cwd.clone(), env: spec.env.clone() };
+        let mut proc = match self.system.spawn(cmd) {
+            Ok(p) => p,
+            Err(e) => {
+                let failure = err(ErrorCode::SpawnFailed, format!("无法启动 {}：{e}", spec.program));
+                let _ = write_msg(&mut wr, &Response::Error(failure)).await;
+                let _ = wr.shutdown().await;
+                reader.drain().await;
+                return;
+            }
+        };
+        if write_msg(&mut wr, &Response::Ok).await.is_err() {
+            proc.kill();
+        }
+        let started = self.system.now();
+        let limit = spec.timeout_ms.map(Duration::from_millis);
+        let deadline = tokio::time::sleep(limit.unwrap_or(Duration::from_secs(100 * 365 * 24 * 3600)));
+        tokio::pin!(deadline);
+        let mut sent: u64 = 0;
+        let (mut timed_out, mut truncated, mut input_open, mut caller_gone) = (false, false, true, false);
+        loop {
+            tokio::select! {
+                biased;
+                // 计时器放在最前：命令不停地输出时，超时也必须能生效。
+                _ = &mut deadline, if limit.is_some() && !timed_out => {
+                    timed_out = true;
+                    proc.kill();
+                }
+                event = proc.next_event() => match event {
+                    ProcEvent::Exited(status) => {
+                        let result = ExecResult {
+                            exit_code: status.code,
+                            signal: status.signal,
+                            timed_out,
+                            truncated,
+                            duration_ms: self.system.now().millis_since(started),
+                        };
+                        if !caller_gone {
+                            let _ = write_msg(&mut wr, &ExecEvent::Exit(result)).await;
+                        }
+                        break;
+                    }
+                    ProcEvent::Stdout(bytes) | ProcEvent::Stderr(bytes) if truncated || caller_gone => drop(bytes),
+                    event => {
+                        let (is_err, mut bytes) = match event {
+                            ProcEvent::Stdout(b) => (false, b),
+                            ProcEvent::Stderr(b) => (true, b),
+                            ProcEvent::Exited(_) => unreachable!(),
+                        };
+                        let room = spec.max_output.saturating_sub(sent);
+                        if bytes.len() as u64 > room {
+                            bytes.truncate(room as usize);
+                            truncated = true;
+                            proc.kill();
+                        }
+                        if !bytes.is_empty() {
+                            sent += bytes.len() as u64;
+                            let event = if is_err { ExecEvent::Stderr(bytes) } else { ExecEvent::Stdout(bytes) };
+                            if write_msg(&mut wr, &event).await.is_err() {
+                                caller_gone = true;
+                                proc.kill();
+                            }
+                        }
+                    }
+                },
+                input = reader.next::<Input>(), if input_open => match input {
+                    Ok(Some(Input::Stdin(bytes))) => proc.write_stdin(bytes),
+                    Ok(Some(Input::CloseStdin)) => proc.close_stdin(),
+                    Ok(None) => {
+                        input_open = false;
+                        proc.close_stdin();
+                    }
+                    Ok(Some(Input::Cancel)) | Err(_) => {
+                        input_open = false;
+                        caller_gone = true;
+                        proc.kill();
+                    }
+                },
+            }
+        }
+        let _ = wr.shutdown().await;
+        reader.drain().await;
     }
 
     fn local_status(&self) -> StatusReport {

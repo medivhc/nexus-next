@@ -8,11 +8,11 @@
 
 pub use nexus_cli::Output;
 
-use nexus_cli::{parse, run_client, Ctl};
+use nexus_cli::{parse, run_client, Captured, Ctl};
 use nexus_fabric_sim::SimTransport;
-use nexus_runtime::{load_or_create_device_key, CtlCall, Node};
+use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_sim::{SimClock, SimDisk, SimSystem};
-use nexus_wire::{CtlRequest, CtlResponse};
+use nexus_wire::CtlRequest;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// 场景运行时所在的世界。
 pub struct World {
@@ -38,15 +38,25 @@ enum Inner {
 impl World {
     /// 在某个节点上执行一条 `nexus` 命令。
     pub async fn cli(&self, node: &str, args: &[&str]) -> Output {
+        self.cli_with_stdin(node, args, b"").await
+    }
+
+    /// 执行一条命令，并把 `stdin` 作为它的标准输入。
+    pub async fn cli_with_stdin(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         let out = match &self.inner {
             Inner::Sim { nodes, .. } => {
                 let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
-                match parse(args.iter().copied()) {
-                    Err(out) => out,
-                    Ok(cli) => run_client(&cli.cmd, &ChanCtl(tx.clone())).await,
-                }
+                let mut sink = Captured::default();
+                let code = match parse(args.iter().copied(), &mut sink) {
+                    Err(code) => code,
+                    Ok(cli) => {
+                        let mut input = std::io::Cursor::new(stdin.to_vec());
+                        run_client(&cli.cmd, &ChanCtl(tx.clone()), &mut input, &mut sink).await
+                    }
+                };
+                Output::from_captured(code, sink)
             }
-            Inner::Real(real) => real.cli(node, args),
+            Inner::Real(real) => real.cli(node, args, stdin),
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
         self.trace
@@ -127,11 +137,13 @@ impl World {
 struct ChanCtl(mpsc::Sender<CtlCall>);
 
 impl Ctl for ChanCtl {
-    async fn call(&self, req: CtlRequest) -> io::Result<CtlResponse> {
-        let gone = || io::Error::new(io::ErrorKind::ConnectionRefused, "常驻程序没有在运行");
-        let (tx, rx) = oneshot::channel();
-        self.0.send((req, tx)).await.map_err(|_| gone())?;
-        rx.await.map_err(|_| gone())
+    async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
+        let (call, client) = ctl_session(req);
+        self.0
+            .send(call)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::ConnectionRefused, "常驻程序没有在运行"))?;
+        Ok(client)
     }
 }
 
@@ -273,19 +285,27 @@ impl RealWorld {
         }
     }
 
-    fn cli(&self, node: &str, args: &[&str]) -> Output {
+    fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
+        use std::io::Write;
         let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
-        let out = Command::new(&self.bin)
+        // 标准输入是管道而不是终端：任何交互提示都会让命令失败。
+        let mut child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
-            .stdin(Stdio::null()) // 没有终端：任何交互提示都会让命令失败
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("无法执行 nexus");
-        Output {
-            code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        }
+        let mut pipe = child.stdin.take().unwrap();
+        let data = stdin.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = pipe.write_all(&data);
+        });
+        let out = child.wait_with_output().expect("无法等待 nexus");
+        let _ = writer.join();
+        let code = out.status.code().unwrap_or(-1);
+        Output::from_captured(code, Captured { stdout: out.stdout, stderr: out.stderr })
     }
 }
 

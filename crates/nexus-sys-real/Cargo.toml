@@ -8,3 +8,5 @@ license.workspace = true
 nexus-core-proto.workspace = true
 nexus-sys.workspace = true
 getrandom.workspace = true
+tokio.workspace = true
+nix.workspace = true

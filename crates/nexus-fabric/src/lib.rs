@@ -81,3 +81,48 @@ pub async fn read_msg<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> i
 fn invalid(e: nexus_wire::FrameError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
+
+/// 可以安全地放进 `select!` 的帧读取器：被取消时不会丢掉已经读到一半的帧。
+pub struct FrameReader<R> {
+    inner: R,
+    decoder: nexus_wire::FrameDecoder,
+    buf: Vec<u8>,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, decoder: nexus_wire::FrameDecoder::default(), buf: vec![0; 64 * 1024], eof: false }
+    }
+
+    /// 下一帧。对方正常结束且没有残留数据时返回 `Ok(None)`。
+    pub async fn next<T: DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+        loop {
+            if let Some(msg) = self.decoder.next_frame().map_err(invalid)? {
+                return Ok(Some(msg));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            let n = self.inner.read(&mut self.buf).await?;
+            if n == 0 {
+                self.eof = true;
+            } else {
+                self.decoder.push(&self.buf[..n]);
+            }
+        }
+    }
+
+    /// 读到对方的结束标记为止，最多等两秒。
+    pub async fn drain(&mut self) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !self.eof {
+                match self.inner.read(&mut self.buf).await {
+                    Ok(0) | Err(_) => self.eof = true,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+    }
+}

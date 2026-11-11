@@ -8,3 +8,4 @@ license.workspace = true
 nexus-core-proto.workspace = true
 nexus-sys.workspace = true
 turmoil.workspace = true
+tokio.workspace = true

@@ -1,38 +1,57 @@
-use nexus_cli::{parse, run_client, Cli, Cmd, Ctl, Output, EXIT_INTERNAL};
-use nexus_fabric::{read_msg, write_msg};
+use nexus_cli::{parse, run_client, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL};
+use nexus_fabric::{read_msg, write_msg, FrameReader};
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
-use nexus_runtime::{load_or_create_device_key, CtlCall, Node};
+use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_real::RealSystem;
-use nexus_wire::{CtlRequest, CtlResponse};
-use std::io;
+use nexus_wire::{CtlRequest, CtlResponse, Input};
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+
+/// 写到真实终端，每段都立即刷新，长时间运行的命令也能实时看到输出。
+struct Terminal;
+
+impl Sink for Terminal {
+    fn out(&mut self, bytes: &[u8]) {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(bytes);
+        let _ = out.flush();
+    }
+    fn err(&mut self, bytes: &[u8]) {
+        let mut err = io::stderr().lock();
+        let _ = err.write_all(bytes);
+        let _ = err.flush();
+    }
+}
 
 fn main() {
-    let cli = match parse(std::env::args_os().skip(1)) {
+    let cli = match parse(std::env::args_os().skip(1), &mut Terminal) {
         Ok(cli) => cli,
-        Err(out) => finish(out),
+        Err(code) => std::process::exit(code),
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
     let data_dir = data_dir(&cli);
-    let out = rt.block_on(async {
+    let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery } => match daemon(&data_dir, name.clone(), transport_config(*local_only, relay, *no_discovery)).await {
-                Ok(()) => Output { code: 0, stdout: String::new(), stderr: String::new() },
-                Err(e) => Output { code: EXIT_INTERNAL, stdout: String::new(), stderr: format!("nexus daemon: {e}\n") },
-            },
-            cmd => run_client(cmd, &UnixCtl { socket: data_dir.join("ctl.sock") }).await,
+            Cmd::Daemon { name, local_only, relay, no_discovery } => {
+                match daemon(&data_dir, name.clone(), transport_config(*local_only, relay, *no_discovery)).await {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        Terminal.err(format!("nexus daemon: {e}\n").as_bytes());
+                        EXIT_INTERNAL
+                    }
+                }
+            }
+            cmd => {
+                let ctl = UnixCtl { socket: data_dir.join("ctl.sock") };
+                run_client(cmd, &ctl, &mut tokio::io::stdin(), &mut Terminal).await
+            }
         }
     });
-    finish(out)
-}
-
-fn finish(out: Output) -> ! {
-    print!("{}", out.stdout);
-    eprint!("{}", out.stderr);
-    std::process::exit(out.code)
+    std::process::exit(code)
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {
@@ -46,15 +65,35 @@ fn data_dir(cli: &Cli) -> PathBuf {
     home.join(".local/share/nexus")
 }
 
+/// 命令行一侧：通过 Unix 套接字连接常驻程序，把套接字两个方向接到会话通道上。
 struct UnixCtl {
     socket: PathBuf,
 }
 
 impl Ctl for UnixCtl {
-    async fn call(&self, req: CtlRequest) -> io::Result<CtlResponse> {
+    async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
         let mut stream = UnixStream::connect(&self.socket).await?;
         write_msg(&mut stream, &req).await?;
-        read_msg(&mut stream).await
+        let (rd, mut wr) = stream.into_split();
+        let (in_tx, mut in_rx) = mpsc::channel::<Input>(16);
+        let (resp_tx, resp_rx) = mpsc::channel::<CtlResponse>(16);
+        tokio::spawn(async move {
+            while let Some(input) = in_rx.recv().await {
+                if write_msg(&mut wr, &input).await.is_err() {
+                    break;
+                }
+            }
+            let _ = wr.shutdown().await;
+        });
+        tokio::spawn(async move {
+            let mut reader = FrameReader::new(rd);
+            while let Ok(Some(resp)) = reader.next::<CtlResponse>().await {
+                if resp_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(CtlClient { tx: in_tx, rx: resp_rx })
     }
 }
 
@@ -106,18 +145,38 @@ async fn daemon(data_dir: &Path, name: Option<String>, config: Config) -> io::Re
 async fn terminate() {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
-        Ok(mut s) => { s.recv().await; }
+        Ok(mut s) => {
+            s.recv().await;
+        }
         Err(_) => std::future::pending().await,
     }
 }
 
+/// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
 async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>) {
     let Ok(req) = read_msg::<_, CtlRequest>(&mut stream).await else { return };
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if tx.send((req, reply_tx)).await.is_err() {
+    let ((req, server), mut client) = ctl_session(req);
+    if tx.send((req, server)).await.is_err() {
         return;
     }
-    if let Ok(resp) = reply_rx.await {
-        let _ = write_msg(&mut stream, &resp).await;
-    }
+    let (rd, mut wr) = stream.into_split();
+    let inputs = client.tx;
+    let forward_inputs = async move {
+        let mut reader = FrameReader::new(rd);
+        while let Ok(Some(input)) = reader.next::<Input>().await {
+            if inputs.send(input).await.is_err() {
+                return;
+            }
+        }
+        // 命令行断开：通道随 `inputs` 一起关闭，节点会把它当作取消。
+    };
+    let forward_responses = async move {
+        while let Some(resp) = client.rx.recv().await {
+            if write_msg(&mut wr, &resp).await.is_err() {
+                break;
+            }
+        }
+        let _ = wr.shutdown().await;
+    };
+    tokio::join!(forward_inputs, forward_responses);
 }

@@ -34,6 +34,54 @@ pub enum Request {
     RosterPush { roster: SignedRoster, addrs: AddrHints },
     /// 管理设备向正在等待加入的设备发出的邀请（只在加入协议上使用）。
     JoinOffer { nonce: [u8; 16], roster: SignedRoster, addrs: AddrHints },
+    /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
+    /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
+    Exec(ExecSpec),
+}
+
+/// 要执行的命令。不经过 shell：`program` 直接作为可执行文件启动。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    /// 工作目录；`None` 时使用常驻程序所在用户的主目录。
+    pub cwd: Option<String>,
+    /// 追加的环境变量。
+    pub env: Vec<(String, String)>,
+    /// 超过这个时长就终止命令；`None` 表示不限。
+    pub timeout_ms: Option<u64>,
+    /// 标准输出与标准错误合计的上限，超过就终止命令。
+    pub max_output: u64,
+}
+
+/// 调用方在一次执行中发出的消息。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Input {
+    Stdin(Vec<u8>),
+    /// 标准输入结束。
+    CloseStdin,
+    /// 调用方不再需要结果，终止命令。
+    Cancel,
+}
+
+/// 执行过程中产生的事件。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(ExecResult),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecResult {
+    /// 正常退出时的退出码；被信号终止时为 `None`。
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    /// 因超时被终止。
+    pub timed_out: bool,
+    /// 因输出超过上限被终止；已经送出的输出恰好是上限那么多。
+    pub truncated: bool,
+    pub duration_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +105,8 @@ pub enum ErrorCode {
     /// 当前状态不允许这个操作，例如尚未初始化、已经加入、不是管理设备。
     InvalidState,
     InvalidInput,
+    /// 命令无法启动，例如可执行文件不存在。
+    SpawnFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +138,8 @@ pub enum CtlRequest {
     Revoke { name: String },
     /// 列出名册里的所有设备。
     List,
+    /// 在某个节点上执行命令。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Exec`。
+    Exec { node: String, spec: ExecSpec },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +149,7 @@ pub enum CtlResponse {
     JoinCode { code: String, expires_at: Timestamp },
     Membership(MembershipReport),
     List(Vec<ListEntry>),
+    Exec(ExecEvent),
     Error(WireError),
 }
 
