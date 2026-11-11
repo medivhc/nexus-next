@@ -8,11 +8,23 @@ use core::fmt;
 use core::str::FromStr;
 use serde::{Deserialize, Serialize};
 
-/// 节点标识。阶段 1 起它等于设备公钥；M0 中是一段随机字节。
+pub mod authz;
+pub mod crypto;
+pub mod path;
+pub mod roster;
+
+pub use crypto::{PublicKey, SecretKey, Signature};
+
+/// 节点标识，就是设备的 Ed25519 公钥。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub [u8; 32]);
 
 impl NodeId {
+    /// 作为公钥使用。
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey(self.0)
+    }
+
     /// 用于展示的短形式（前 8 个十六进制字符）。
     pub fn short(&self) -> String {
         self.to_string()[..8].to_string()

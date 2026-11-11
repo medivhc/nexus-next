@@ -1,0 +1,231 @@
+//! 名册：由根密钥签名的「谁是我的设备」清单，是判断对端是否可信的唯一依据。
+
+use crate::crypto::{canonical, PublicKey, Purpose, SecretKey, Signature};
+use crate::path::valid_segment;
+use crate::{NodeId, Timestamp};
+use core::fmt;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceRole {
+    /// 持有根密钥，可以批准设备、签发 agent 证书。
+    Admin,
+    Member,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub node_id: NodeId,
+    /// 同时用作资源路径的第一段，所以必须是合法的路径段。
+    pub name: String,
+    pub role: DeviceRole,
+    pub added_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedAgent {
+    pub agent: PublicKey,
+    pub revoked_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Roster {
+    pub root: PublicKey,
+    /// 单调递增。新名册的版本号必须严格大于旧的。
+    pub version: u64,
+    pub devices: Vec<Device>,
+    pub revoked_agents: Vec<RevokedAgent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRoster {
+    pub roster: Roster,
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterError {
+    /// 名册声明的根与本机信任的根不同。
+    WrongRoot,
+    BadSignature,
+    DuplicateDevice(NodeId),
+    DuplicateName(String),
+    InvalidName(String),
+    /// 版本号没有前进。
+    NotNewer { current: u64, candidate: u64 },
+}
+
+impl fmt::Display for RosterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RosterError::WrongRoot => f.write_str("名册不属于本机信任的根"),
+            RosterError::BadSignature => f.write_str("名册签名无效"),
+            RosterError::DuplicateDevice(id) => write!(f, "名册中设备 {} 重复", id.short()),
+            RosterError::DuplicateName(n) => write!(f, "名册中设备名 {n} 重复"),
+            RosterError::InvalidName(n) => write!(f, "名册中设备名 {n:?} 不合法"),
+            RosterError::NotNewer { current, candidate } => {
+                write!(f, "名册版本 {candidate} 不比当前的 {current} 新")
+            }
+        }
+    }
+}
+
+impl Roster {
+    pub fn sign(self, root: &SecretKey) -> SignedRoster {
+        let signature = root.sign(Purpose::Roster, &canonical(&self));
+        SignedRoster { roster: self, signature }
+    }
+
+    pub fn device(&self, id: NodeId) -> Option<&Device> {
+        self.devices.iter().find(|d| d.node_id == id)
+    }
+
+    pub fn device_by_name(&self, name: &str) -> Option<&Device> {
+        self.devices.iter().find(|d| d.name == name)
+    }
+
+    pub fn is_agent_revoked(&self, agent: &PublicKey) -> bool {
+        self.revoked_agents.iter().any(|r| r.agent == *agent)
+    }
+
+    /// 内容是否自洽：设备标识和名字都不重复，名字都合法。
+    pub fn validate(&self) -> Result<(), RosterError> {
+        for (i, d) in self.devices.iter().enumerate() {
+            if !valid_segment(&d.name) {
+                return Err(RosterError::InvalidName(d.name.clone()));
+            }
+            let earlier = &self.devices[..i];
+            if earlier.iter().any(|e| e.node_id == d.node_id) {
+                return Err(RosterError::DuplicateDevice(d.node_id));
+            }
+            if earlier.iter().any(|e| e.name == d.name) {
+                return Err(RosterError::DuplicateName(d.name.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SignedRoster {
+    /// 校验根、签名和内容，成功后返回名册本身。
+    pub fn verify(&self, trusted_root: &PublicKey) -> Result<&Roster, RosterError> {
+        if self.roster.root != *trusted_root {
+            return Err(RosterError::WrongRoot);
+        }
+        if !trusted_root.verify(Purpose::Roster, &canonical(&self.roster), &self.signature) {
+            return Err(RosterError::BadSignature);
+        }
+        self.roster.validate()?;
+        Ok(&self.roster)
+    }
+}
+
+/// 是否应当用 `candidate` 替换 `current`。
+pub fn accept_update(
+    current: Option<&SignedRoster>,
+    candidate: &SignedRoster,
+    trusted_root: &PublicKey,
+) -> Result<(), RosterError> {
+    let new = candidate.verify(trusted_root)?;
+    match current {
+        Some(cur) if new.version <= cur.roster.version => {
+            Err(RosterError::NotNewer { current: cur.roster.version, candidate: new.version })
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> SecretKey {
+        SecretKey::from_seed([1; 32])
+    }
+
+    fn dev(n: u8, name: &str) -> Device {
+        Device { node_id: NodeId([n; 32]), name: name.into(), role: DeviceRole::Member, added_at: Timestamp(0) }
+    }
+
+    fn roster(version: u64, devices: Vec<Device>) -> Roster {
+        Roster { root: root().public(), version, devices, revoked_agents: vec![] }
+    }
+
+    #[test]
+    fn signed_roster_verifies_under_its_root() {
+        // covers: R02
+        let s = roster(1, vec![dev(1, "laptop")]).sign(&root());
+        assert_eq!(s.verify(&root().public()).map(|r| r.version), Ok(1));
+    }
+
+    #[test]
+    fn roster_from_another_root_is_rejected() {
+        // covers: R02
+        let other = SecretKey::from_seed([2; 32]);
+        // 声明了别的根
+        let mut r = roster(1, vec![]);
+        r.root = other.public();
+        assert_eq!(r.sign(&other).verify(&root().public()), Err(RosterError::WrongRoot));
+        // 声明了本机的根，但由别的密钥签名
+        let forged = roster(1, vec![]).sign(&other);
+        assert_eq!(forged.verify(&root().public()), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn tampering_after_signing_is_detected() {
+        // covers: R02, R18
+        let mut s = roster(1, vec![dev(1, "laptop")]).sign(&root());
+        s.roster.devices.push(dev(9, "intruder"));
+        assert_eq!(s.verify(&root().public()), Err(RosterError::BadSignature));
+
+        let mut s = roster(1, vec![dev(1, "laptop")]).sign(&root());
+        s.roster.version = 99;
+        assert_eq!(s.verify(&root().public()), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn inconsistent_content_is_rejected_even_when_signed() {
+        let r = root().public();
+        let dup_id = roster(1, vec![dev(1, "a"), dev(1, "b")]).sign(&root());
+        assert_eq!(dup_id.verify(&r), Err(RosterError::DuplicateDevice(NodeId([1; 32]))));
+        let dup_name = roster(1, vec![dev(1, "a"), dev(2, "a")]).sign(&root());
+        assert_eq!(dup_name.verify(&r), Err(RosterError::DuplicateName("a".into())));
+        let bad_name = roster(1, vec![dev(1, "my laptop")]).sign(&root());
+        assert_eq!(bad_name.verify(&r), Err(RosterError::InvalidName("my laptop".into())));
+    }
+
+    #[test]
+    fn only_strictly_newer_rosters_are_accepted() {
+        // covers: R02, R18
+        let r = root().public();
+        let v1 = roster(1, vec![dev(1, "laptop")]).sign(&root());
+        let v2 = roster(2, vec![dev(1, "laptop"), dev(2, "home")]).sign(&root());
+        assert_eq!(accept_update(None, &v1, &r), Ok(()));
+        assert_eq!(accept_update(Some(&v1), &v2, &r), Ok(()));
+        assert_eq!(accept_update(Some(&v2), &v1, &r), Err(RosterError::NotNewer { current: 2, candidate: 1 }));
+        assert_eq!(accept_update(Some(&v2), &v2, &r), Err(RosterError::NotNewer { current: 2, candidate: 2 }));
+        let forged = roster(3, vec![]).sign(&SecretKey::from_seed([2; 32]));
+        assert_eq!(accept_update(Some(&v2), &forged, &r), Err(RosterError::BadSignature));
+    }
+
+    #[test]
+    fn errors_explain_themselves() {
+        let msg = RosterError::NotNewer { current: 4, candidate: 3 }.to_string();
+        assert!(msg.contains('3') && msg.contains('4'), "{msg}");
+        assert!(RosterError::DuplicateName("home".into()).to_string().contains("home"));
+        assert!(!RosterError::BadSignature.to_string().is_empty());
+    }
+
+    #[test]
+    fn lookups() {
+        let mut r = roster(1, vec![dev(1, "laptop"), dev(2, "home")]);
+        let agent = SecretKey::from_seed([7; 32]).public();
+        r.revoked_agents.push(RevokedAgent { agent, revoked_at: Timestamp(5) });
+        assert_eq!(r.device(NodeId([2; 32])).map(|d| d.name.as_str()), Some("home"));
+        assert_eq!(r.device(NodeId([3; 32])), None);
+        assert_eq!(r.device_by_name("laptop").map(|d| d.node_id), Some(NodeId([1; 32])));
+        assert!(r.device_by_name("office").is_none());
+        assert!(r.is_agent_revoked(&agent));
+        assert!(!r.is_agent_revoked(&SecretKey::from_seed([8; 32]).public()));
+    }
+}

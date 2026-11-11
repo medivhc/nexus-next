@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+postcard.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
