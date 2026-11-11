@@ -1,0 +1,17 @@
+[package]
+name = "nexus-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nexus-core-proto.workspace = true
+nexus-wire.workspace = true
+nexus-sys.workspace = true
+nexus-sys-sim.workspace = true
+nexus-fabric-sim.workspace = true
+nexus-runtime.workspace = true
+nexus-cli.workspace = true
+tokio.workspace = true
+turmoil.workspace = true
+tempfile.workspace = true

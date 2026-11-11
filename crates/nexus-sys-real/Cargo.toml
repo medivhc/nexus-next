@@ -1,0 +1,10 @@
+[package]
+name = "nexus-sys-real"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nexus-core-proto.workspace = true
+nexus-sys.workspace = true
+getrandom.workspace = true

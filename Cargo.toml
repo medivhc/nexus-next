@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+nexus-core-proto = { path = "crates/nexus-core-proto" }
+nexus-wire = { path = "crates/nexus-wire" }
+nexus-sys = { path = "crates/nexus-sys" }
+nexus-sys-real = { path = "crates/nexus-sys-real" }
+nexus-sys-sim = { path = "crates/nexus-sys-sim" }
+nexus-fabric = { path = "crates/nexus-fabric" }
+nexus-fabric-sim = { path = "crates/nexus-fabric-sim" }
+nexus-runtime = { path = "crates/nexus-runtime" }
+nexus-cli = { path = "crates/nexus-cli" }
+nexus-testkit = { path = "crates/nexus-testkit" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "sync", "net", "process", "signal"] }
+futures-util = "0.3"
+turmoil = "0.7"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+tempfile = "3"
