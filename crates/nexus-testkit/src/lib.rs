@@ -9,9 +9,8 @@
 pub use nexus_cli::Output;
 
 use nexus_cli::{parse, run_client, Ctl};
-use nexus_core_proto::PeerBook;
-use nexus_fabric_sim::{SimDirectory, SimTransport};
-use nexus_runtime::{load_or_create_node_id, save_peers, CtlCall, Node};
+use nexus_fabric_sim::SimTransport;
+use nexus_runtime::{load_or_create_device_key, CtlCall, Node};
 use nexus_sys_sim::{SimClock, SimDisk, SimSystem};
 use nexus_wire::{CtlRequest, CtlResponse};
 use std::cell::RefCell;
@@ -79,6 +78,50 @@ impl World {
     pub fn is_sim(&self) -> bool {
         matches!(self.inner, Inner::Sim { .. })
     }
+
+    /// 执行一条命令，要求成功，返回解析后的 JSON 输出。命令里会自动加上 `--json`。
+    pub async fn cli_ok(&self, node: &str, args: &[&str]) -> serde_json::Value {
+        let mut full: Vec<&str> = args.to_vec();
+        full.push("--json");
+        let out = self.cli(node, &full).await;
+        assert_eq!(out.code, 0, "{node}: nexus {} 失败：{}", full.join(" "), out.stderr);
+        serde_json::from_str(&out.stdout)
+            .unwrap_or_else(|e| panic!("{node}: nexus {} 的输出不是 JSON（{e}）：{:?}", full.join(" "), out.stdout))
+    }
+
+    /// 用户的操作流程：在 `admin` 上建立网络，再把 `members` 逐个加入。
+    pub async fn network(&self, admin: &str, members: &[&str]) {
+        self.cli_ok(admin, &["init", "--name", admin]).await;
+        for m in members {
+            let code = self.cli_ok(m, &["join"]).await;
+            let code = code["code"].as_str().expect("join 应当输出加入码").to_string();
+            self.cli_ok(admin, &["device", "approve", &code, "--name", m]).await;
+        }
+    }
+
+    /// 让一个节点从网络上消失。仿真里切断它与所有节点的网络；真实后端里杀掉它的进程。
+    pub fn take_offline(&self, node: &str) {
+        match &self.inner {
+            Inner::Sim { nodes, .. } => {
+                for other in nodes.keys().filter(|n| n.as_str() != node) {
+                    turmoil::partition(node, other.as_str());
+                }
+            }
+            Inner::Real(real) => real.kill(node),
+        }
+    }
+
+    /// 恢复 [`World::take_offline`] 切断的网络。只在仿真后端可用。
+    pub fn bring_online(&self, node: &str) {
+        match &self.inner {
+            Inner::Sim { nodes, .. } => {
+                for other in nodes.keys().filter(|n| n.as_str() != node) {
+                    turmoil::repair(node, other.as_str());
+                }
+            }
+            Inner::Real(_) => panic!("真实后端无法让被杀掉的节点原样恢复"),
+        }
+    }
 }
 
 struct ChanCtl(mpsc::Sender<CtlCall>);
@@ -132,34 +175,22 @@ where
         .simulation_duration(Duration::from_secs(30 * 24 * 3600));
     let mut sim = builder.build();
 
-    // 先确定每个节点的标识，并让它们互相知道。M1.2 起这一步由加入流程代替。
+    // 每个节点从零开始：没有名册，互不认识，和刚装好的设备一样。
     let clock = SimClock::default();
-    let directory = SimDirectory::default();
-    let mut disks = Vec::new();
-    let mut book = PeerBook::default();
-    for (i, name) in nodes.iter().enumerate() {
-        let disk = SimDisk::default();
-        let id = load_or_create_node_id(&SimSystem::new(disk.clone(), node_seed(seed, i), clock.clone()))
-            .expect("内存存储不会失败");
-        directory.register(id, name);
-        book.peers.push((name.to_string(), id));
-        disks.push(disk);
-    }
-
     let mut ctl = HashMap::new();
     for (i, name) in nodes.iter().enumerate() {
-        save_peers(&SimSystem::new(disks[i].clone(), 0, clock.clone()), &book).expect("内存存储不会失败");
+        let disk = SimDisk::default();
         let (tx, rx) = mpsc::channel::<CtlCall>(64);
         ctl.insert(name.to_string(), tx);
         let rx = Rc::new(tokio::sync::Mutex::new(rx));
-        let (disk, directory, name, clock) = (disks[i].clone(), directory.clone(), name.to_string(), clock.clone());
+        let (name, clock) = (name.to_string(), clock.clone());
         sim.host(name.clone(), move || {
-            let (disk, directory, name, rx, clock) = (disk.clone(), directory.clone(), name.clone(), rx.clone(), clock.clone());
+            let (disk, name, rx, clock) = (disk.clone(), name.clone(), rx.clone(), clock.clone());
             async move {
-                let system = SimSystem::new(disk, node_seed(seed, i) ^ 0x5eed, clock);
-                let id = load_or_create_node_id(&system)?;
-                let transport = SimTransport::bind(id, directory).await?;
-                let node = Node::new(transport, system, &name);
+                let system = SimSystem::new(disk, node_seed(seed, i), clock);
+                let key = load_or_create_device_key(&system)?;
+                let transport = SimTransport::bind(nexus_core_proto::NodeId(key.public().0), &name).await?;
+                let node = Node::new(transport, system, &name)?;
                 let mut rx = rx.lock().await;
                 node.run(&mut rx).await?;
                 Ok(())
@@ -200,36 +231,46 @@ impl Drop for SeedHint {
 struct RealWorld {
     bin: PathBuf,
     dirs: HashMap<String, PathBuf>,
-    children: Vec<Child>,
+    children: RefCell<HashMap<String, Child>>,
     _tmp: tempfile::TempDir,
 }
 
 impl RealWorld {
     fn start(nodes: &[&str], bin: &str) -> Self {
         let tmp = tempfile::tempdir().expect("无法创建临时目录");
-        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: Vec::new(), _tmp: tmp };
+        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), _tmp: tmp };
         for name in nodes {
             let dir = world._tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
             let child = Command::new(&world.bin)
-                .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+                .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name, "--local-only"])
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
                 .spawn()
                 .expect("无法启动 nexus daemon");
-            world.children.push(child);
+            world.children.borrow_mut().insert(name.to_string(), child);
             world.dirs.insert(name.to_string(), dir);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         for (name, dir) in &world.dirs {
             while !dir.join("ctl.sock").exists() {
-                assert!(Instant::now() < deadline, "节点 {name} 在 5 秒内没有就绪");
+                if Instant::now() >= deadline {
+                    let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+                    panic!("节点 {name} 在 10 秒内没有就绪。日志：\n{log}");
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
         world
+    }
+
+    fn kill(&self, node: &str) {
+        if let Some(mut child) = self.children.borrow_mut().remove(node) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn cli(&self, node: &str, args: &[&str]) -> Output {
@@ -250,7 +291,7 @@ impl RealWorld {
 
 impl Drop for RealWorld {
     fn drop(&mut self) {
-        for child in &mut self.children {
+        for child in self.children.borrow_mut().values_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }

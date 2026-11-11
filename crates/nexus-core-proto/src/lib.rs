@@ -94,6 +94,8 @@ pub struct NodeInfo {
     pub started_at: Timestamp,
     /// 该节点生成这份自述时，它自己的时钟。
     pub now: Timestamp,
+    /// 该节点持有的名册版本；尚未加入任何网络时为 `None`。
+    pub roster_version: Option<u64>,
 }
 
 /// 到对端的路径类型。
@@ -101,23 +103,6 @@ pub struct NodeInfo {
 pub enum PathKind {
     Direct,
     Relay,
-}
-
-/// 在 M0 中代替名册的「已知节点」表：名字到节点标识。M1.2 起由名册取代。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerBook {
-    pub peers: Vec<(String, NodeId)>,
-}
-
-impl PeerBook {
-    /// 按名字或完整的十六进制标识查找。
-    pub fn resolve(&self, name_or_id: &str) -> Option<NodeId> {
-        if let Some((_, id)) = self.peers.iter().find(|(n, _)| n == name_or_id) {
-            return Some(*id);
-        }
-        let id: NodeId = name_or_id.parse().ok()?;
-        self.peers.iter().any(|(_, p)| *p == id).then_some(id)
-    }
 }
 
 #[cfg(test)]
@@ -140,16 +125,5 @@ mod tests {
     fn node_id_rejects_bad_text() {
         assert!("abc".parse::<NodeId>().is_err());
         assert!("zz".repeat(32).parse::<NodeId>().is_err());
-    }
-
-    #[test]
-    fn peer_book_resolves_name_and_id_but_not_strangers() {
-        let a = NodeId([1; 32]);
-        let stranger = NodeId([9; 32]);
-        let book = PeerBook { peers: vec![("home".into(), a)] };
-        assert_eq!(book.resolve("home"), Some(a));
-        assert_eq!(book.resolve(&a.to_string()), Some(a));
-        assert_eq!(book.resolve("office"), None);
-        assert_eq!(book.resolve(&stranger.to_string()), None);
     }
 }

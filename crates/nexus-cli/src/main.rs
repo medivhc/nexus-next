@@ -1,6 +1,7 @@
 use nexus_cli::{parse, run_client, Cli, Cmd, Ctl, Output, EXIT_INTERNAL};
-use nexus_fabric::{read_msg, write_msg, OfflineTransport};
-use nexus_runtime::{load_or_create_node_id, CtlCall, Node};
+use nexus_fabric::{read_msg, write_msg};
+use nexus_fabric_iroh::{Config, IrohTransport, Relay};
+use nexus_runtime::{load_or_create_device_key, CtlCall, Node};
 use nexus_sys_real::RealSystem;
 use nexus_wire::{CtlRequest, CtlResponse};
 use std::io;
@@ -18,7 +19,7 @@ fn main() {
     let data_dir = data_dir(&cli);
     let out = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name } => match daemon(&data_dir, name.clone()).await {
+            Cmd::Daemon { name, local_only, relay, no_discovery } => match daemon(&data_dir, name.clone(), transport_config(*local_only, relay, *no_discovery)).await {
                 Ok(()) => Output { code: 0, stdout: String::new(), stderr: String::new() },
                 Err(e) => Output { code: EXIT_INTERNAL, stdout: String::new(), stderr: format!("nexus daemon: {e}\n") },
             },
@@ -57,14 +58,29 @@ impl Ctl for UnixCtl {
     }
 }
 
-async fn daemon(data_dir: &Path, name: Option<String>) -> io::Result<()> {
+fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config {
+    if local_only {
+        return Config::local_only();
+    }
+    let relay = match relay {
+        "default" => Relay::Default,
+        "disabled" => Relay::Disabled,
+        url => Relay::Custom(url.to_string()),
+    };
+    Config { relay, discovery: !no_discovery, bind: None }
+}
+
+async fn daemon(data_dir: &Path, name: Option<String>, config: Config) -> io::Result<()> {
     let system = RealSystem::new(data_dir)?;
-    let node_id = load_or_create_node_id(&system)?;
+    let key = load_or_create_device_key(&system)?;
     let name = name
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "node".to_string());
-    let node = Node::new(OfflineTransport { node_id }, system, &name);
+    let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+    let name = if name.is_empty() { "node".to_string() } else { name };
+    let transport = IrohTransport::bind(key.to_seed(), config).await?;
+    let node = Node::new(transport, system, &name)?;
 
     let socket = data_dir.join("ctl.sock");
     let _ = std::fs::remove_file(&socket);

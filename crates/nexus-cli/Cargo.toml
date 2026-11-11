@@ -9,6 +9,7 @@ nexus-core-proto.workspace = true
 nexus-wire.workspace = true
 nexus-sys-real.workspace = true
 nexus-fabric.workspace = true
+nexus-fabric-iroh.workspace = true
 nexus-runtime.workspace = true
 tokio.workspace = true
 clap.workspace = true
@@ -21,5 +22,6 @@ path = "src/main.rs"
 
 [dev-dependencies]
 nexus-testkit.workspace = true
+nexus-wire.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

@@ -3,30 +3,44 @@
 //! 帧 = 4 字节小端长度 + postcard 编码的消息。本 crate 只做编解码，不做 IO。
 #![forbid(unsafe_code)]
 
-use nexus_core_proto::{NodeInfo, PathKind};
+use nexus_core_proto::roster::{DeviceRole, SignedRoster};
+use nexus_core_proto::{NodeId, NodeInfo, PathKind, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_VERSION: u16 = 2;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
+
+/// 已知的节点地址提示：节点标识与传输层自己解释的一段文本。
+pub type AddrHints = Vec<(NodeId, String)>;
 
 /// 节点间请求。每条双向流承载一次调用。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestHeader {
     pub version: u16,
+    /// 发送方持有的名册版本，没有名册时为 0。双方据此发现谁的名册更旧。
+    pub roster_version: u64,
     pub body: Request,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     NodeInfo,
+    /// 请求对方在名册比我新时把名册发过来。
+    RosterSync,
+    /// 把一份名册推给对方。
+    RosterPush { roster: SignedRoster, addrs: AddrHints },
+    /// 管理设备向正在等待加入的设备发出的邀请（只在加入协议上使用）。
+    JoinOffer { nonce: [u8; 16], roster: SignedRoster, addrs: AddrHints },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     NodeInfo(NodeInfo),
+    Roster { roster: Option<SignedRoster>, addrs: AddrHints },
+    Ok,
     Error(WireError),
 }
 
@@ -36,12 +50,25 @@ pub enum ErrorCode {
     UnknownNode,
     Unreachable,
     Internal,
+    /// 对方拒绝了这次访问。
+    Denied,
+    /// 对方的名册比请求方旧；请求方应先把名册推过去再重试。
+    StaleRoster,
+    /// 当前状态不允许这个操作，例如尚未初始化、已经加入、不是管理设备。
+    InvalidState,
+    InvalidInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireError {
     pub code: ErrorCode,
     pub message: String,
+}
+
+impl WireError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
 }
 
 /// 本机控制通道：命令行发给常驻程序的请求。
@@ -51,11 +78,25 @@ pub enum CtlRequest {
     Status,
     /// 另一个节点的状态，按名字或标识指定。
     RemoteStatus { node: String },
+    /// 在第一台设备上建立网络。
+    Init { name: Option<String> },
+    /// 准备加入一个网络，返回加入码。
+    JoinStart,
+    /// 批准一台设备加入。
+    Approve { code: String, name: Option<String> },
+    /// 把一台设备移出名册。
+    Revoke { name: String },
+    /// 列出名册里的所有设备。
+    List,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtlResponse {
     Status(StatusReport),
+    Init(InitReport),
+    JoinCode { code: String, expires_at: Timestamp },
+    Membership(MembershipReport),
+    List(Vec<ListEntry>),
     Error(WireError),
 }
 
@@ -63,11 +104,79 @@ pub enum CtlResponse {
 pub struct StatusReport {
     /// 在线时是对端的自述；离线时只有本机已知的名字和标识。
     pub name: String,
-    pub node_id: nexus_core_proto::NodeId,
+    pub node_id: NodeId,
     pub info: Option<NodeInfo>,
     pub online: bool,
     pub rtt_ms: Option<u64>,
     pub path: Option<PathKind>,
+    /// 这台设备在本机名册中的角色；不在名册中时为 `None`。
+    pub role: Option<DeviceRole>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListEntry {
+    pub report: StatusReport,
+    pub is_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitReport {
+    pub name: String,
+    pub node_id: NodeId,
+    pub root: nexus_core_proto::PublicKey,
+    /// 根密钥本身，用于在所有设备都丢失后恢复。只显示这一次。
+    pub recovery_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipReport {
+    pub name: String,
+    pub node_id: NodeId,
+    pub roster_version: u64,
+    /// 新名册已经送达的其他设备数。
+    pub pushed: u32,
+    /// 暂时没能送达的设备名；它们会在下次与任一已更新的设备通信时得到新名册。
+    pub unreachable: Vec<String>,
+}
+
+/// 加入码：新设备显示，管理设备输入。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinCode {
+    pub node_id: NodeId,
+    /// 一次性随机数。只有看到加入码的人才能让这台设备接受邀请。
+    pub nonce: [u8; 16],
+    /// 新设备建议的名字。
+    pub name: String,
+    /// 新设备的地址提示。
+    pub addr: String,
+}
+
+const JOIN_CODE_PREFIX: &str = "nxj1-";
+
+impl JoinCode {
+    pub fn encode(&self) -> String {
+        let bytes = postcard::to_allocvec(self).expect("内存中的值总能编码");
+        format!("{JOIN_CODE_PREFIX}{}", hex_encode(&bytes))
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let body = s.trim().strip_prefix(JOIN_CODE_PREFIX)?;
+        postcard::from_bytes(&hex_decode(body)?).ok()
+    }
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -151,6 +260,7 @@ mod tests {
             version: "0.0.1".into(),
             started_at: Timestamp(1_700_000_000_000),
             now: Timestamp(1_700_000_000_500),
+            roster_version: Some(3),
         })
     }
 
@@ -166,7 +276,7 @@ mod tests {
     #[test]
     fn decoder_handles_byte_at_a_time_and_back_to_back_frames() {
         let mut bytes = encode(&sample()).unwrap();
-        bytes.extend(encode(&RequestHeader { version: WIRE_VERSION, body: Request::NodeInfo }).unwrap());
+        bytes.extend(encode(&RequestHeader { version: WIRE_VERSION, roster_version: 0, body: Request::NodeInfo }).unwrap());
         let mut dec = FrameDecoder::default();
         let mut got_first = false;
         let mut got_second = false;
@@ -179,6 +289,26 @@ mod tests {
             }
         }
         assert!(got_first && got_second);
+    }
+
+    #[test]
+    fn join_code_round_trip_and_rejects_garbage() {
+        let code = JoinCode { node_id: NodeId([5; 32]), nonce: [6; 16], name: "home".into(), addr: "x".into() };
+        let text = code.encode();
+        assert!(text.starts_with("nxj1-"));
+        assert_eq!(JoinCode::decode(&text), Some(code.clone()));
+        assert_eq!(JoinCode::decode(&format!("  {text}\n")), Some(code));
+        for bad in ["", "nxj1-", "nxj1-zz", "nxj1-abc", "xxxx-00", &text[..text.len() - 2]] {
+            assert_eq!(JoinCode::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        let data: Vec<u8> = (0..=255).collect();
+        assert_eq!(hex_decode(&hex_encode(&data)), Some(data));
+        assert_eq!(hex_decode("0"), None);
+        assert_eq!(hex_decode("g0"), None);
     }
 
     #[test]

@@ -1,74 +1,89 @@
 //! 驱动：基于 turmoil 虚拟网络的仿真传输。
 //!
-//! 简化：每条双向流是一条独立的虚拟 TCP 连接，开头由发起方写入自己的节点标识。
+//! 每条双向流是一条独立的虚拟 TCP 连接，开头由发起方写入自己的节点标识和协议。
 //! 仿真里信任这个声明；真实传输里对端身份由握手的公钥保证。
+//!
+//! 地址提示就是虚拟主机名。和真实传输一样，节点只能拨通它拿到过提示的节点。
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::{NodeId, PathKind};
-use nexus_fabric::{Connection, Transport};
+use nexus_fabric::{Connection, Proto, Transport};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use turmoil::net::{TcpListener, TcpStream};
 
 const PORT: u16 = 7000;
 
-/// 节点标识到虚拟主机名的对应表，代替真实世界里的地址发现。
-#[derive(Clone, Default)]
-pub struct SimDirectory(Rc<RefCell<HashMap<NodeId, String>>>);
-
-impl SimDirectory {
-    pub fn register(&self, id: NodeId, host: &str) {
-        self.0.borrow_mut().insert(id, host.to_string());
-    }
-    fn host_of(&self, id: NodeId) -> Option<String> {
-        self.0.borrow().get(&id).cloned()
-    }
-}
-
 pub struct SimTransport {
     me: NodeId,
-    dir: SimDirectory,
+    host: String,
+    hints: RefCell<HashMap<NodeId, String>>,
     listener: TcpListener,
 }
 
 impl SimTransport {
-    /// 必须在 turmoil 的主机上下文里调用。
-    pub async fn bind(me: NodeId, dir: SimDirectory) -> io::Result<Self> {
+    /// 必须在 turmoil 的主机上下文里调用，`host` 是本主机的名字。
+    pub async fn bind(me: NodeId, host: &str) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
-        Ok(Self { me, dir, listener })
+        Ok(Self { me, host: host.to_string(), hints: RefCell::default(), listener })
     }
 }
 
 pub enum SimConn {
-    Outgoing { me: NodeId, remote: NodeId, host: String },
+    Outgoing { me: NodeId, remote: NodeId, host: String, proto: Proto },
     Incoming { remote: NodeId, stream: RefCell<Option<TcpStream>> },
+}
+
+fn proto_byte(p: Proto) -> u8 {
+    match p {
+        Proto::Rpc => 1,
+        Proto::Join => 2,
+    }
 }
 
 impl Transport for SimTransport {
     type Conn = SimConn;
 
-    fn node_id(&self) -> NodeId { self.me }
-
-    async fn connect(&self, to: NodeId) -> io::Result<SimConn> {
-        let host = self
-            .dir
-            .host_of(to)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "找不到该节点的地址"))?;
-        Ok(SimConn::Outgoing { me: self.me, remote: to, host })
+    fn node_id(&self) -> NodeId {
+        self.me
     }
 
-    async fn accept(&self) -> io::Result<SimConn> {
-        let (mut stream, _) = self.listener.accept().await?;
-        let mut id = [0u8; 32];
-        stream.read_exact(&mut id).await?;
-        Ok(SimConn::Incoming { remote: NodeId(id), stream: RefCell::new(Some(stream)) })
+    fn local_hint(&self) -> String {
+        self.host.clone()
     }
 
-    fn path_kind(&self, to: NodeId) -> Option<PathKind> {
-        self.dir.host_of(to).map(|_| PathKind::Direct)
+    fn add_hint(&self, node: NodeId, hint: &str) {
+        if node != self.me && !hint.is_empty() {
+            self.hints.borrow_mut().insert(node, hint.to_string());
+        }
+    }
+
+    async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<SimConn> {
+        let host = self.hints.borrow().get(&to).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("不知道节点 {} 的地址", to.short()))
+        })?;
+        Ok(SimConn::Outgoing { me: self.me, remote: to, host, proto })
+    }
+
+    async fn accept(&self) -> io::Result<(SimConn, Proto)> {
+        loop {
+            let (mut stream, _) = self.listener.accept().await?;
+            let mut head = [0u8; 33];
+            if stream.read_exact(&mut head).await.is_err() {
+                continue;
+            }
+            let proto = match head[32] {
+                1 => Proto::Rpc,
+                2 => Proto::Join,
+                _ => continue,
+            };
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&head[..32]);
+            let conn = SimConn::Incoming { remote: NodeId(id), stream: RefCell::new(Some(stream)) };
+            return Ok((conn, proto));
+        }
     }
 }
 
@@ -81,17 +96,23 @@ impl Connection for SimConn {
         }
     }
 
+    fn path_kind(&self) -> Option<PathKind> {
+        Some(PathKind::Direct)
+    }
+
     async fn open_bi(&self) -> io::Result<TcpStream> {
         match self {
-            SimConn::Outgoing { me, host, .. } => {
+            SimConn::Outgoing { me, host, proto, .. } => {
                 let mut s = TcpStream::connect((turmoil::lookup(host.as_str()), PORT)).await?;
-                s.write_all(&me.0).await?;
+                let mut head = [0u8; 33];
+                head[..32].copy_from_slice(&me.0);
+                head[32] = proto_byte(*proto);
+                s.write_all(&head).await?;
                 Ok(s)
             }
-            SimConn::Incoming { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "仿真传输只支持由发起方开流",
-            )),
+            SimConn::Incoming { .. } => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "仿真传输只支持由发起方开流"))
+            }
         }
     }
 

@@ -52,6 +52,13 @@ FORBIDDEN_DEPS = {
 ALLOWED_LICENSES = {
     "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
     "ISC", "Unicode-3.0", "Unicode-DFS-2016", "Zlib", "Unlicense", "CC0-1.0", "BSL-1.0", "0BSD",
+    # 根证书数据使用的宽松数据许可证
+    "CDLA-Permissive-2.0",
+}
+
+# 逐个批准的例外：crate 名 -> (许可证, 理由)。新增例外需要写明理由。
+LICENSE_EXCEPTIONS = {
+    "attohttpc": ("MPL-2.0", "iroh 端口映射功能的依赖；未修改使用，MPL 的约束限于该 crate 自身的文件"),
 }
 
 
@@ -152,6 +159,9 @@ def check_licenses(root):
     errors = []
     for pkg in json.loads(out.stdout)["packages"]:
         lic = pkg.get("license")
+        exception = LICENSE_EXCEPTIONS.get(pkg["name"])
+        if exception and lic == exception[0]:
+            continue
         if not lic or not license_ok(lic):
             errors.append(f"依赖 {pkg['name']} {pkg['version']} 的许可证不在允许清单内：{lic}")
     return errors

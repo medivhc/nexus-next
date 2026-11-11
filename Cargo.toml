@@ -16,6 +16,7 @@ nexus-sys-real = { path = "crates/nexus-sys-real" }
 nexus-sys-sim = { path = "crates/nexus-sys-sim" }
 nexus-fabric = { path = "crates/nexus-fabric" }
 nexus-fabric-sim = { path = "crates/nexus-fabric-sim" }
+nexus-fabric-iroh = { path = "crates/nexus-fabric-iroh" }
 nexus-runtime = { path = "crates/nexus-runtime" }
 nexus-cli = { path = "crates/nexus-cli" }
 nexus-testkit = { path = "crates/nexus-testkit" }
@@ -30,6 +31,7 @@ getrandom = "0.3"
 tempfile = "3"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 proptest = "1"
+iroh = "1.4"
 
 # 依赖在开发构建里也做优化：签名校验在未优化时慢一个数量级，会拖慢授权矩阵。
 [profile.dev.package."*"]
