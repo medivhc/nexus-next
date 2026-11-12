@@ -16,3 +16,6 @@ tokio.workspace = true
 turmoil.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+nexus-term-proto.workspace = true
+vt100.workspace = true
+nix.workspace = true

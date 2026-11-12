@@ -1,0 +1,13 @@
+[package]
+name = "nexus-term-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+vt100.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+vt100.workspace = true

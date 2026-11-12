@@ -11,6 +11,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 nexus-core-proto = { path = "crates/nexus-core-proto" }
 nexus-wire = { path = "crates/nexus-wire" }
+nexus-term-proto = { path = "crates/nexus-term-proto" }
 nexus-sys = { path = "crates/nexus-sys" }
 nexus-sys-real = { path = "crates/nexus-sys-real" }
 nexus-sys-sim = { path = "crates/nexus-sys-sim" }
@@ -32,8 +33,14 @@ tempfile = "3"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 proptest = "1"
 iroh = "1.4"
+vt100 = "0.18"
+portable-pty = "0.9"
+crossterm = "0.29"
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 # 依赖在开发构建里也做优化：签名校验在未优化时慢一个数量级，会拖慢授权矩阵。
 [profile.dev.package."*"]
 opt-level = 2
+# 场景测试要在仿真里搬运几 MB 的终端输出，本仓库的代码也做基本优化。
+[profile.dev]
+opt-level = 1

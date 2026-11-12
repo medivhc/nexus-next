@@ -8,12 +8,20 @@ use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
 use nexus_core_proto::PathKind;
 use nexus_runtime::CtlClient;
-use nexus_wire::{CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, StatusReport};
+use nexus_wire::{
+    ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, Size,
+    StatusReport, WireError,
+};
 use serde_json::{json, Value};
 use std::future::Future;
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// `--json` 输出的结构版本。结构发生不兼容变化时递增。
 pub const JSON_SCHEMA: u32 = 2;
@@ -26,6 +34,7 @@ pub const EXIT_DENIED: i32 = 105;
 pub const EXIT_INVALID_STATE: i32 = 106;
 pub const EXIT_INVALID_INPUT: i32 = 107;
 pub const EXIT_UNREACHABLE: i32 = 108;
+pub const EXIT_NOT_FOUND: i32 = 109;
 /// `nexus exec` 的命令因超时被终止（与 timeout(1) 一致）。
 pub const EXIT_TIMED_OUT: i32 = 124;
 /// `nexus exec` 的命令因输出超过上限被终止。
@@ -112,6 +121,25 @@ pub enum Cmd {
         #[arg(last = true, required = true, value_name = "命令")]
         command: Vec<String>,
     },
+    /// 进入一台设备上的常驻终端会话（按 Ctrl-] 断开，会话继续运行）
+    ///
+    /// 会话不存在时自动创建。断开后重新连上，看到的屏幕和没断开时一样。
+    /// 网络中断时自动重连。会话里的 shell 退出时，以它的退出码退出。
+    Ssh {
+        /// 节点的名字或标识
+        node: String,
+        /// 会话的名字
+        #[arg(long, default_value = "main")]
+        session: String,
+        /// 标准输入不是终端时使用的终端尺寸，如 80x24
+        #[arg(long, value_name = "列x行")]
+        size: Option<String>,
+    },
+    /// 查看和结束终端会话
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
     /// 查看本机或另一个节点的状态
     Status {
         /// 节点的名字或标识；省略时为本机
@@ -137,6 +165,23 @@ pub enum DeviceCmd {
     /// 把一台设备移出名册，它将无法再访问其他设备
     Revoke {
         name: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCmd {
+    /// 列出一台设备上的终端会话
+    Ls {
+        node: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 结束一个终端会话，连着它的客户端随之退出
+    Kill {
+        node: String,
+        session: String,
         #[arg(long)]
         json: bool,
     },
@@ -205,6 +250,7 @@ fn fail_wire<K: Sink>(sink: &mut K, e: &nexus_wire::WireError) -> i32 {
         ErrorCode::InvalidInput => (EXIT_INVALID_INPUT, "invalid_input"),
         ErrorCode::Unreachable => (EXIT_UNREACHABLE, "unreachable"),
         ErrorCode::SpawnFailed => (EXIT_SPAWN_FAILED, "spawn_failed"),
+        ErrorCode::NotFound => (EXIT_NOT_FOUND, "not_found"),
         _ => (EXIT_INTERNAL, "internal"),
     };
     fail(sink, code, kind, &e.message)
@@ -275,6 +321,23 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         Cmd::Device { cmd: DeviceCmd::Revoke { name, json } } => (CtlRequest::Revoke { name: name.clone() }, *json),
         Cmd::Ls { json } => (CtlRequest::List, *json),
+        Cmd::Ssh { .. } => {
+            let args = match ssh_args(cmd) {
+                Ok(a) => a,
+                Err(msg) => return fail(sink, EXIT_USAGE, "usage", &msg),
+            };
+            let (_, mut no_resizes) = mpsc::channel(1);
+            let mut out = SinkWriter(sink);
+            let result = ssh(ctl, &args, stdin, &mut out, &mut no_resizes).await;
+            return match result {
+                Ok(code) => code,
+                Err(e) => ssh_fail(sink, &e),
+            };
+        }
+        Cmd::Session { cmd: SessionCmd::Ls { node, json } } => (CtlRequest::SessionList { node: node.clone() }, *json),
+        Cmd::Session { cmd: SessionCmd::Kill { node, session, json } } => {
+            (CtlRequest::SessionKill { node: node.clone(), session: session.clone() }, *json)
+        }
     };
     let resp = match call(ctl, req).await {
         Err(e) => {
@@ -284,7 +347,20 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     };
     let text = match resp {
         CtlResponse::Error(e) => return fail_wire(sink, &e),
-        CtlResponse::Exec(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
+        CtlResponse::Exec(_) | CtlResponse::Session(_) => {
+            return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
+        }
+        CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },
+        CtlResponse::Ok => match cmd {
+            Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "killed": session }))
+                } else {
+                    format!("已结束会话 {session}\n")
+                }
+            }
+            _ => String::new(),
+        },
         CtlResponse::Status(r) => if json { doc(status_json(&r)) } else { status_text(&r) },
         CtlResponse::List(entries) => if json { list_json(&entries) } else { list_text(&entries) },
         CtlResponse::Init(r) => {
@@ -333,6 +409,196 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     0
 }
 
+fn sessions_json(list: &[SessionInfo]) -> String {
+    let sessions: Vec<Value> = list
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "clients": s.clients,
+                "created_at_ms": s.created_at.0,
+                "cols": s.size.cols,
+                "rows": s.size.rows,
+            })
+        })
+        .collect();
+    doc(json!({ "schema": JSON_SCHEMA, "sessions": sessions }))
+}
+
+fn sessions_text(list: &[SessionInfo]) -> String {
+    if list.is_empty() {
+        return "没有会话\n".to_string();
+    }
+    list.iter()
+        .map(|s| format!("{:<16} {} 个客户端  {}x{}\n", s.name, s.clients, s.size.cols, s.size.rows))
+        .collect()
+}
+
+/// `nexus ssh` 的参数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshArgs {
+    pub node: String,
+    pub session: String,
+    /// 初始的终端尺寸。
+    pub size: Size,
+    /// 命令行上是否明确给出了尺寸。
+    pub size_given: bool,
+}
+
+/// 从解析好的命令里取出 `nexus ssh` 的参数。
+pub fn ssh_args(cmd: &Cmd) -> Result<SshArgs, String> {
+    let Cmd::Ssh { node, session, size } = cmd else { return Err("不是 ssh 命令".into()) };
+    let parsed = match size {
+        None => None,
+        Some(text) => {
+            let parse = || {
+                let (c, r) = text.split_once(['x', 'X'])?;
+                let size = Size { cols: c.trim().parse().ok()?, rows: r.trim().parse().ok()? };
+                (size.cols > 0 && size.rows > 0).then_some(size)
+            };
+            Some(parse().ok_or_else(|| format!("--size 的格式应为 列x行，例如 80x24：{text}"))?)
+        }
+    };
+    Ok(SshArgs { node: node.clone(), session: session.clone(), size: parsed.unwrap_or(Size::DEFAULT), size_given: parsed.is_some() })
+}
+
+/// `nexus ssh` 失败的原因。
+#[derive(Debug)]
+pub enum SshError {
+    /// 连不上本机的常驻程序。
+    Daemon(io::Error),
+    Remote(WireError),
+}
+
+/// 按 [`SshError`] 输出一行结构化的错误，返回退出码。
+pub fn ssh_fail<K: Sink>(sink: &mut K, e: &SshError) -> i32 {
+    match e {
+        SshError::Daemon(e) => {
+            fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"))
+        }
+        SshError::Remote(e) => fail_wire(sink, e),
+    }
+}
+
+/// 断开会话的按键：Ctrl-]。
+pub const DETACH_KEY: u8 = 0x1d;
+/// 连接中断后持续重连这么久，仍连不上才放弃。
+pub const RECONNECT_FOR: Duration = Duration::from_secs(30);
+
+/// 把 [`Sink`] 当作异步输出使用。
+struct SinkWriter<'a, K: Sink>(&'a mut K);
+
+impl<K: Sink> AsyncWrite for SinkWriter<'_, K> {
+    fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.0.out(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// `nexus ssh`：连上会话，在本机终端和会话之间转发，直到断开或会话结束。
+///
+/// 每段输出写出之后才确认，所以本机终端处理不过来时，会话会把这个客户端标记为落后，
+/// 而不是越积越多。返回会话结束时 shell 的退出码；主动断开时返回 0。
+pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    ctl: &C,
+    args: &SshArgs,
+    input: &mut R,
+    output: &mut W,
+    resizes: &mut mpsc::Receiver<Size>,
+) -> Result<i32, SshError> {
+    let mut size = args.size;
+    let mut resizes_open = true;
+    let mut connected_once = false;
+    let mut lost_since: Option<tokio::time::Instant> = None;
+    let mut buf = vec![0u8; 16 * 1024];
+    let note = format!("\r\n[已断开，会话 {} 仍在运行]\r\n", args.session);
+    loop {
+        let req = CtlRequest::Attach { node: args.node.clone(), session: args.session.clone(), size };
+        let mut session = ctl.open(req).await.map_err(SshError::Daemon)?;
+        // 发给常驻程序的消息先进本地队列，有空位时再发：这里从不因为发送而停下，
+        // 总能继续读常驻程序的回应，两边不会互相等待。确认可以合并。
+        let mut outbox: VecDeque<Input> = VecDeque::new();
+        // 连上之后才读输入：连接失败时不能让输入结束被当成断开。
+        let mut attached = false;
+        let mut leaving = false;
+        let lost = loop {
+            if leaving && outbox.is_empty() {
+                let _ = output.write_all(note.as_bytes()).await;
+                let _ = output.flush().await;
+                return Ok(0);
+            }
+            tokio::select! {
+                biased;
+                resp = session.rx.recv() => match resp {
+                    Some(CtlResponse::Session(msg)) => {
+                        attached = true;
+                        connected_once = true;
+                        lost_since = None;
+                        let bytes = match msg {
+                            ClientMsg::Exit(code) => {
+                                let _ = output.flush().await;
+                                return Ok(code.unwrap_or(0));
+                            }
+                            ClientMsg::Restore(b) | ClientMsg::Output(b) => b,
+                        };
+                        if output.write_all(&bytes).await.is_err() || output.flush().await.is_err() {
+                            leaving = true;
+                            outbox.push_back(Input::Detach);
+                            continue;
+                        }
+                        match outbox.back_mut() {
+                            Some(Input::Ack(n)) => *n += bytes.len() as u64,
+                            _ => outbox.push_back(Input::Ack(bytes.len() as u64)),
+                        }
+                    }
+                    Some(CtlResponse::Error(e)) if e.code == ErrorCode::Unreachable && connected_once => break e,
+                    Some(CtlResponse::Error(e)) => return Err(SshError::Remote(e)),
+                    Some(_) => return Err(SshError::Remote(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解"))),
+                    None => return Err(SshError::Remote(WireError::new(ErrorCode::Internal, "常驻程序提前结束了会话"))),
+                },
+                permit = session.tx.reserve(), if !outbox.is_empty() => match permit {
+                    Ok(permit) => permit.send(outbox.pop_front().expect("队列非空")),
+                    Err(_) => return Err(SshError::Remote(WireError::new(ErrorCode::Internal, "常驻程序提前结束了会话"))),
+                },
+                s = resizes.recv(), if resizes_open => match s {
+                    Some(s) => {
+                        size = s;
+                        outbox.push_back(Input::Resize(s));
+                    }
+                    None => resizes_open = false,
+                },
+                n = input.read(&mut buf), if attached && !leaving && outbox.len() < 64 => {
+                    let n = n.unwrap_or(0);
+                    let data = &buf[..n];
+                    let cut = data.iter().position(|&b| b == DETACH_KEY);
+                    let typed = &data[..cut.unwrap_or(n)];
+                    if !typed.is_empty() {
+                        outbox.push_back(Input::Stdin(typed.to_vec()));
+                    }
+                    if n == 0 || cut.is_some() {
+                        leaving = true;
+                        outbox.push_back(Input::Detach);
+                    }
+                }
+            }
+        };
+        // 连接中断：会话还在对方那里，过一会儿重新连上。
+        let since = *lost_since.get_or_insert_with(tokio::time::Instant::now);
+        if since.elapsed() >= RECONNECT_FOR {
+            return Err(SshError::Remote(lost));
+        }
+        let _ = output.write_all("\r\n[连接中断，正在重连…]\r\n".as_bytes()).await;
+        let _ = output.flush().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// `nexus exec`：把本机标准输入送过去，把输出实时写出（或在 `--json` 时最后一次性输出）。
 async fn exec<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, req: CtlRequest, json: bool, stdin: &mut R, sink: &mut K) -> i32 {
     let mut session = match ctl.open(req).await {
@@ -344,6 +610,7 @@ async fn exec<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, req: CtlRequest, j
     let mut collected = Captured::default();
     let mut buf = vec![0u8; 64 * 1024];
     let mut stdin_open = true;
+    let mut pending: Option<Input> = None;
     let result: ExecResult = loop {
         tokio::select! {
             biased;
@@ -355,17 +622,22 @@ async fn exec<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, req: CtlRequest, j
                 Some(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
                 None => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序提前结束了会话"),
             },
-            n = stdin.read(&mut buf), if stdin_open => {
-                let input = match n {
+            // 有空位才发：从不因为发送而停下，总能继续读输出，两边不会互相等待。
+            permit = session.tx.reserve(), if pending.is_some() => match permit {
+                Ok(permit) => permit.send(pending.take().expect("有待发的输入")),
+                Err(_) => {
+                    pending = None;
+                    stdin_open = false;
+                }
+            },
+            n = stdin.read(&mut buf), if stdin_open && pending.is_none() => {
+                pending = Some(match n {
                     Ok(0) | Err(_) => {
                         stdin_open = false;
                         Input::CloseStdin
                     }
                     Ok(n) => Input::Stdin(buf[..n].to_vec()),
-                };
-                if session.tx.send(input).await.is_err() {
-                    stdin_open = false;
-                }
+                });
             }
         }
     };

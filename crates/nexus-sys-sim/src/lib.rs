@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::Timestamp;
-use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, System};
+use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -53,6 +53,20 @@ impl SimSystem {
 
 impl System for SimSystem {
     type Proc = SimProc;
+    type Pty = SimPty;
+
+    fn spawn_pty(&self, size: Size) -> io::Result<SimPty> {
+        Ok(SimPty {
+            size,
+            line: Vec::new(),
+            lines: VecDeque::new(),
+            running: VecDeque::new(),
+            out: b"$ ".to_vec(),
+            killed: false,
+            sleep_until: None,
+            notify: Notify::new(),
+        })
+    }
 
     fn spawn(&self, cmd: Cmd) -> io::Result<SimProc> {
         let ctx = ShellCtx { cwd: cmd.cwd.clone().unwrap_or_else(|| "/home/sim".into()), env: cmd.env.clone() };
@@ -241,7 +255,20 @@ fn run_command(argv: &[String], ctx: &ShellCtx) -> Option<(Vec<Step>, i32)> {
         "true" => (vec![], 0),
         "false" => (vec![], 1),
         "echo" => (vec![emit(format!("{}\n", args.join(" ")).into_bytes())], 0),
-        "printf" => (vec![emit(unescape(args.first().map(String::as_str).unwrap_or("")))], 0),
+        "printf" => (vec![emit(printf(args.first().map(String::as_str).unwrap_or(""), &args[1.min(args.len())..]))], 0),
+        "seq" => {
+            let (first, last): (u64, u64) = match args {
+                [last] => (1, last.parse().ok()?),
+                [first, last] => (first.parse().ok()?, last.parse().ok()?),
+                _ => return None,
+            };
+            let mut out = String::new();
+            for i in first..=last {
+                out.push_str(&i.to_string());
+                out.push('\n');
+            }
+            (vec![emit(out.into_bytes())], 0)
+        }
         "pwd" => (vec![emit(format!("{}\n", ctx.cwd).into_bytes())], 0),
         "printenv" => match args.first().and_then(|name| ctx.env.iter().find(|(k, _)| k == name)) {
             Some((_, v)) => (vec![emit(format!("{v}\n").into_bytes())], 0),
@@ -293,6 +320,38 @@ fn tokenize(s: &str) -> Vec<String> {
     words
 }
 
+/// printf：格式串里的 `%s` 依次换成参数；参数比 `%s` 多时重复使用格式串，和真实的 printf 一致。
+fn printf(fmt: &str, args: &[String]) -> Vec<u8> {
+    let fmt = unescape(fmt);
+    let mut out = Vec::new();
+    let mut next = 0;
+    loop {
+        let mut i = 0;
+        let mut used = false;
+        while i < fmt.len() {
+            match (fmt[i], fmt.get(i + 1)) {
+                (b'%', Some(b's')) => {
+                    out.extend_from_slice(args.get(next).map(String::as_bytes).unwrap_or_default());
+                    next += 1;
+                    used = true;
+                    i += 2;
+                }
+                (b'%', Some(b'%')) => {
+                    out.push(b'%');
+                    i += 2;
+                }
+                (b, _) => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        if !used || next >= args.len() {
+            return out;
+        }
+    }
+}
+
 /// printf 格式串里的转义：\n、\t、\\ 和最多三位的八进制 \NNN。
 fn unescape(fmt: &str) -> Vec<u8> {
     let b = fmt.as_bytes();
@@ -325,6 +384,165 @@ fn unescape(fmt: &str) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------------- 仿真的终端
+
+/// 一个仿真的交互式 shell：回显输入，按行执行，输出提示符 `$ `。
+///
+/// 和真实终端一样，回车回显为 `\r\n`，程序输出里的 `\n` 变成 `\r\n`。
+/// 命令执行期间的输入照常回显，排队等命令结束后执行。Ctrl-C 中止正在执行的命令。
+/// 除了 [`run_command`] 认识的命令，还认识 `exit [码]` 和 `stty size`。
+pub struct SimPty {
+    size: Size,
+    /// 正在输入的一行。
+    line: Vec<u8>,
+    /// 已经回车、等待执行的行。
+    lines: VecDeque<String>,
+    /// 正在执行的命令剩下的步骤。
+    running: VecDeque<Step>,
+    /// 待输出的字节（回显、提示符）。
+    out: Vec<u8>,
+    killed: bool,
+    sleep_until: Option<tokio::time::Instant>,
+    notify: Notify,
+}
+
+const PROMPT: &[u8] = b"$ ";
+
+/// 终端的输出处理：`\n` 输出为 `\r\n`。
+fn onlcr(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 8);
+    for &b in bytes {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
+impl SimPty {
+    /// 把一行编译成步骤，最后输出提示符。`exit` 让 shell 退出。
+    fn compile(&self, line: &str) -> VecDeque<Step> {
+        let ctx = ShellCtx { cwd: "/home/sim".into(), env: vec![] };
+        let mut steps = VecDeque::new();
+        let mut status = 0;
+        for stmt in line.split(';') {
+            let words = tokenize(stmt);
+            match words.first().map(String::as_str) {
+                None => continue,
+                Some("exit") => {
+                    let code = words.get(1).and_then(|w| w.parse().ok()).unwrap_or(status);
+                    steps.push_back(Step::Exit(code));
+                    return steps;
+                }
+                Some("stty") if words.get(1).map(String::as_str) == Some("size") => {
+                    steps.push_back(Step::Out(format!("{} {}\n", self.size.rows, self.size.cols).into_bytes()));
+                    status = 0;
+                }
+                Some(_) => match run_command(&words, &ctx) {
+                    Some((s, st)) => {
+                        steps.extend(s.into_iter().filter(|s| !matches!(s, Step::Cat)));
+                        status = st;
+                    }
+                    None => {
+                        steps.push_back(Step::Err(format!("sh: {}: not found\n", words[0]).into_bytes()));
+                        status = 127;
+                    }
+                },
+            }
+        }
+        steps.push_back(Step::Out(PROMPT.to_vec()));
+        steps
+    }
+}
+
+impl Pty for SimPty {
+    async fn next_event(&mut self) -> PtyEvent {
+        loop {
+            if self.killed {
+                return PtyEvent::Exited(ExitStatus { code: None, signal: Some(9) });
+            }
+            if !self.out.is_empty() {
+                return PtyEvent::Output(std::mem::take(&mut self.out));
+            }
+            match self.running.front_mut() {
+                Some(Step::Exit(code)) => return PtyEvent::Exited(ExitStatus { code: Some(*code), signal: None }),
+                Some(Step::Out(bytes)) | Some(Step::Err(bytes)) => {
+                    let rest = bytes.split_off(bytes.len().min(CHUNK));
+                    let chunk = std::mem::replace(bytes, rest);
+                    if bytes.is_empty() {
+                        self.running.pop_front();
+                    }
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    return PtyEvent::Output(onlcr(&chunk));
+                }
+                Some(Step::Sleep(d)) => {
+                    let d = *d;
+                    let until = *self.sleep_until.get_or_insert_with(|| tokio::time::Instant::now() + d);
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(until) => {
+                            self.sleep_until = None;
+                            self.running.pop_front();
+                        }
+                        // 有输入：先把回显送出去，再继续等。
+                        _ = self.notify.notified() => {}
+                    }
+                }
+                Some(Step::Cat) => {
+                    self.running.pop_front();
+                }
+                None => match self.lines.pop_front() {
+                    Some(line) => self.running = self.compile(&line),
+                    None => self.notify.notified().await,
+                },
+            }
+        }
+    }
+
+    fn write(&mut self, data: Vec<u8>) {
+        for b in data {
+            match b {
+                // Ctrl-C：中止正在执行的命令，丢掉还没执行的输入。
+                0x03 => {
+                    self.running.clear();
+                    self.sleep_until = None;
+                    self.lines.clear();
+                    self.line.clear();
+                    self.out.extend_from_slice(b"^C\r\n");
+                    self.out.extend_from_slice(PROMPT);
+                }
+                b'\r' | b'\n' => {
+                    self.out.extend_from_slice(b"\r\n");
+                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned();
+                    self.lines.push_back(line);
+                }
+                0x7f | 0x08 => {
+                    if self.line.pop().is_some() {
+                        self.out.extend_from_slice(b"\x08 \x08");
+                    }
+                }
+                b => {
+                    self.line.push(b);
+                    self.out.push(b);
+                }
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    fn resize(&mut self, size: Size) {
+        self.size = size;
+    }
+
+    fn kill(&mut self) {
+        self.killed = true;
+        self.notify.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +552,11 @@ mod tests {
         assert_eq!(tokenize(" echo  'a b' \"c\" d "), ["echo", "a b", "c", "d"]);
         assert_eq!(tokenize("echo err >&2"), ["echo", "err", ">&2"]);
         assert_eq!(unescape("\\377\\000x"), [0xff, 0x00, b'x']);
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(printf("%s%s\\n", &args(&["ab", "cd"])), b"abcd\n");
+        assert_eq!(printf("<%s>", &args(&["a", "b"])), b"<a><b>");
+        assert_eq!(printf("100%%", &[]), b"100%");
+        assert_eq!(printf("x%sy", &[]), b"xy");
         assert_eq!(unescape("a\\nb\\\\"), b"a\nb\\");
     }
 }

@@ -10,3 +10,4 @@ nexus-sys.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
 nix.workspace = true
+portable-pty.workspace = true

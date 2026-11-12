@@ -1,10 +1,10 @@
-use nexus_cli::{parse, run_client, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL};
+use nexus_cli::{parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL, EXIT_USAGE};
 use nexus_fabric::{read_msg, write_msg, FrameReader};
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_real::RealSystem;
 use nexus_wire::{CtlRequest, CtlResponse, Input};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -45,6 +45,10 @@ fn main() {
                     }
                 }
             }
+            cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
+                let ctl = UnixCtl { socket: data_dir.join("ctl.sock") };
+                interactive_ssh(cmd, &ctl).await
+            }
             cmd => {
                 let ctl = UnixCtl { socket: data_dir.join("ctl.sock") };
                 run_client(cmd, &ctl, &mut tokio::io::stdin(), &mut Terminal).await
@@ -52,6 +56,47 @@ fn main() {
         }
     });
     std::process::exit(code)
+}
+
+/// 在真实终端里运行 `nexus ssh`：原始模式，尺寸取自终端并跟随窗口变化。
+async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
+    let mut args = match ssh_args(cmd) {
+        Ok(a) => a,
+        Err(msg) => {
+            Terminal.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+            return EXIT_USAGE;
+        }
+    };
+    let current = || crossterm::terminal::size().ok().map(|(cols, rows)| nexus_wire::Size { cols, rows });
+    if !args.size_given {
+        if let Some(size) = current() {
+            args.size = size;
+        }
+    }
+    let (tx, mut resizes) = mpsc::channel(4);
+    if !args.size_given {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut winch) = signal(SignalKind::window_change()) else { return };
+            while winch.recv().await.is_some() {
+                if let Some(size) = current() {
+                    if tx.send(size).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        Terminal.err("nexus ssh: 无法把终端切换到原始模式\n".as_bytes());
+        return EXIT_INTERNAL;
+    }
+    let result = ssh(ctl, &args, &mut tokio::io::stdin(), &mut tokio::io::stdout(), &mut resizes).await;
+    let _ = crossterm::terminal::disable_raw_mode();
+    match result {
+        Ok(code) => code,
+        Err(e) => ssh_fail(&mut Terminal, &e),
+    }
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {

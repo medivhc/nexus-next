@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::Timestamp;
-use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, System};
+use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System};
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -32,6 +32,11 @@ impl RealSystem {
 
 impl System for RealSystem {
     type Proc = RealProc;
+    type Pty = RealPty;
+
+    fn spawn_pty(&self, size: Size) -> io::Result<RealPty> {
+        RealPty::spawn(size)
+    }
 
     fn spawn(&self, cmd: Cmd) -> io::Result<RealProc> {
         let mut c = tokio::process::Command::new(&cmd.program);
@@ -156,5 +161,129 @@ impl Proc for RealProc {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGKILL);
         }
         let _ = self.child.start_kill();
+    }
+}
+
+// ---------------------------------------------------------------- 伪终端
+
+fn pty_size(size: Size) -> portable_pty::PtySize {
+    portable_pty::PtySize { rows: size.rows.max(1), cols: size.cols.max(1), pixel_width: 0, pixel_height: 0 }
+}
+
+enum PtyMsg {
+    Output(Vec<u8>),
+    /// 读到了终端的结束：程序和它派生的进程都已关闭终端。
+    Eof,
+    Exited(ExitStatus),
+}
+
+/// 程序退出后，最多再等这么久把剩下的输出读完（后台进程可能一直占着终端）。
+const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+pub struct RealPty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    pid: Option<u32>,
+    events: mpsc::UnboundedReceiver<PtyMsg>,
+    input: std::sync::mpsc::Sender<Vec<u8>>,
+    eof: bool,
+    status: Option<ExitStatus>,
+}
+
+impl RealPty {
+    fn spawn(size: Size) -> io::Result<Self> {
+        fn other(e: impl std::fmt::Display) -> io::Error {
+            io::Error::other(e.to_string())
+        }
+        let pair = portable_pty::native_pty_system().openpty(pty_size(size)).map_err(other)?;
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+        let mut cmd = portable_pty::CommandBuilder::new(shell);
+        cmd.env("TERM", "xterm-256color");
+        cmd.cwd(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
+        let mut child = pair.slave.spawn_command(cmd).map_err(other)?;
+        drop(pair.slave);
+        let pid = child.process_id();
+        let killer = child.clone_killer();
+        let mut reader = pair.master.try_clone_reader().map_err(other)?;
+        let mut writer = pair.master.take_writer().map_err(other)?;
+
+        let (tx, events) = mpsc::unbounded_channel();
+        // 读写终端都是阻塞调用，各用一个线程。
+        let out = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if out.send(PtyMsg::Output(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = out.send(PtyMsg::Eof);
+        });
+        std::thread::spawn(move || {
+            let status = match child.wait() {
+                Ok(s) => {
+                    let signal = s.signal().map(|_| 0);
+                    ExitStatus { code: if signal.is_some() { None } else { Some(s.exit_code() as i32) }, signal }
+                }
+                Err(_) => ExitStatus { code: None, signal: None },
+            };
+            let _ = tx.send(PtyMsg::Exited(status));
+        });
+        let (input, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while let Ok(chunk) = input_rx.recv() {
+                if writer.write_all(&chunk).and_then(|_| writer.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Self { master: pair.master, killer, pid, events, input, eof: false, status: None })
+    }
+}
+
+impl Pty for RealPty {
+    async fn next_event(&mut self) -> PtyEvent {
+        loop {
+            if let (true, Some(status)) = (self.eof, self.status) {
+                return PtyEvent::Exited(status);
+            }
+            let msg = match self.status {
+                // 程序已经退出：剩下的输出限时读完。
+                Some(status) => match tokio::time::timeout(DRAIN_AFTER_EXIT, self.events.recv()).await {
+                    Ok(m) => m,
+                    Err(_) => return PtyEvent::Exited(status),
+                },
+                None => self.events.recv().await,
+            };
+            match msg {
+                Some(PtyMsg::Output(b)) => return PtyEvent::Output(b),
+                Some(PtyMsg::Eof) => self.eof = true,
+                Some(PtyMsg::Exited(s)) => self.status = Some(s),
+                None => return PtyEvent::Exited(self.status.unwrap_or(ExitStatus { code: None, signal: None })),
+            }
+        }
+    }
+
+    fn write(&mut self, data: Vec<u8>) {
+        let _ = self.input.send(data);
+    }
+
+    fn resize(&mut self, size: Size) {
+        let _ = self.master.resize(pty_size(size));
+    }
+
+    fn kill(&mut self) {
+        // shell 是它自己的会话和进程组的首进程：连同它派生的进程一起终止。
+        if let Some(pid) = self.pid {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = self.killer.kill();
     }
 }

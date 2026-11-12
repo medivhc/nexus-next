@@ -12,19 +12,21 @@ use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
 use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
-use nexus_sys::{Cmd, Proc, ProcEvent, System};
+use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
+use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
-    hex_encode, AddrHints, CtlRequest, CtlResponse, ErrorCode, InitReport, JoinCode, ListEntry,
-    MembershipReport, Request, RequestHeader, Response, StatusReport, WireError, WIRE_VERSION,
-    ExecEvent, ExecResult, ExecSpec, Input,
+    hex_encode, AddrHints, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
+    Input, JoinCode, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
+    WireError, WIRE_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -51,11 +53,87 @@ pub fn ctl_session(req: CtlRequest) -> (CtlCall, CtlClient) {
     ((req, CtlServer { tx: resp_tx, rx: in_rx }), CtlClient { tx: in_tx, rx: resp_rx })
 }
 
-/// 收到请求后怎么处理：直接回应，或者进入流式的执行。
+/// 收到请求后怎么处理：直接回应，或者进入流式的执行或终端会话。
 enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
+    Session { name: String, create: bool, size: Size },
 }
+
+/// 发给一个终端会话任务的命令。
+enum SessCmd {
+    Attach { client: ClientId, size: Size, tx: mpsc::UnboundedSender<ClientMsg> },
+    Event(TermEvent),
+    Kill,
+}
+
+/// 节点上一个终端会话的句柄。会话本身由一个独立的任务驱动。
+struct SessionHandle {
+    cmd: mpsc::UnboundedSender<SessCmd>,
+    created_at: Timestamp,
+    clients: Rc<Cell<u32>>,
+    size: Rc<Cell<Size>>,
+}
+
+/// 请 `run` 启动的一个新会话任务。
+struct NewSession<P> {
+    name: String,
+    pty: P,
+    size: Size,
+    cmds: mpsc::UnboundedReceiver<SessCmd>,
+    clients: Rc<Cell<u32>>,
+    current_size: Rc<Cell<Size>>,
+}
+
+/// 一个运行中的会话：状态机，以及连着它的客户端。
+struct LiveSession {
+    term: TermSession,
+    clients: BTreeMap<ClientId, mpsc::UnboundedSender<ClientMsg>>,
+    client_count: Rc<Cell<u32>>,
+    current_size: Rc<Cell<Size>>,
+}
+
+impl LiveSession {
+    /// 把事件交给状态机，执行它给出的动作。发不出去的客户端视为已经离开。
+    fn apply<P: Pty>(&mut self, pty: &mut P, event: TermEvent) {
+        let mut queue = vec![event];
+        while let Some(event) = queue.pop() {
+            for action in self.term.handle(event) {
+                match action {
+                    TermAction::Send { client, msg } => {
+                        let gone = self.clients.get(&client).is_none_or(|tx| tx.send(msg).is_err());
+                        if gone && self.clients.remove(&client).is_some() {
+                            queue.push(TermEvent::Detach { client });
+                        }
+                    }
+                    TermAction::WritePty(bytes) => pty.write(bytes),
+                    TermAction::ResizePty(size) => pty.resize(size),
+                }
+            }
+        }
+        self.client_count.set(self.term.client_count() as u32);
+        self.current_size.set(self.term.size());
+    }
+
+    fn command<P: Pty>(&mut self, pty: &mut P, cmd: SessCmd) {
+        match cmd {
+            SessCmd::Attach { client, size, tx } => {
+                self.clients.insert(client, tx);
+                self.apply(pty, TermEvent::Attach { client, size });
+            }
+            SessCmd::Event(event) => {
+                if let TermEvent::Detach { client } = &event {
+                    self.clients.remove(client);
+                }
+                self.apply(pty, event);
+            }
+            SessCmd::Kill => pty.kill(),
+        }
+    }
+}
+
+/// 会话里的程序结束后，等落后的客户端追上最终屏幕的最长时间。
+const SESSION_LINGER: Duration = Duration::from_secs(10);
 
 /// 打开远端执行失败的原因。
 enum OpenError {
@@ -135,7 +213,7 @@ struct PendingJoin {
 
 type Task<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
-pub struct Node<T, S> {
+pub struct Node<T, S: System> {
     transport: T,
     system: S,
     /// 尚未加入网络时使用的名字，也是加入时建议的名字。
@@ -146,6 +224,10 @@ pub struct Node<T, S> {
     /// 需要在后台把名册推过去的节点。
     push_tx: mpsc::UnboundedSender<NodeId>,
     push_rx: RefCell<Option<mpsc::UnboundedReceiver<NodeId>>>,
+    sessions: RefCell<BTreeMap<String, SessionHandle>>,
+    next_client: Cell<ClientId>,
+    spawn_tx: mpsc::UnboundedSender<NewSession<S::Pty>>,
+    spawn_rx: RefCell<Option<mpsc::UnboundedReceiver<NewSession<S::Pty>>>>,
 }
 
 impl<T: Transport, S: System> Node<T, S> {
@@ -160,7 +242,12 @@ impl<T: Transport, S: System> Node<T, S> {
             transport.add_hint(*node, hint);
         }
         let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         Ok(Self {
+            sessions: RefCell::default(),
+            next_client: Cell::new(1),
+            spawn_tx,
+            spawn_rx: RefCell::new(Some(spawn_rx)),
             started_at: system.now(),
             transport,
             system,
@@ -236,6 +323,7 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 驱动整个节点：接受连接、处理请求、处理本机控制调用。正常情况下不返回。
     pub async fn run(&self, ctl: &mut mpsc::Receiver<CtlCall>) -> io::Result<()> {
         let mut pushes = self.push_rx.borrow_mut().take().expect("run 只能调用一次");
+        let mut spawns = self.spawn_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
         // accept 不保证可以安全取消，所以让同一个 future 跨循环存活。
         let mut accept = Box::pin(self.transport.accept());
@@ -256,33 +344,52 @@ impl<T: Transport, S: System> Node<T, S> {
                         let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.push_roster(peer)).await;
                     }));
                 }
+                Some(new) = spawns.recv() => {
+                    tasks.push(Box::pin(self.run_session(new)));
+                }
             }
         }
     }
 
+    /// 一个连接上的请求并发处理：终端会话这样的长流不会挡住同一连接上的其他请求。
     async fn serve_conn(&self, conn: T::Conn, proto: Proto) {
         let peer = conn.remote();
-        while let Ok(Some(mut stream)) = conn.accept_bi().await {
-            let dispatch = match read_msg::<_, RequestHeader>(&mut stream).await {
-                Ok(header) => match proto {
-                    Proto::Rpc => self.handle_rpc(peer, header),
-                    Proto::Join => Dispatch::Reply(self.handle_join(header)),
+        let mut streams: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
+        let mut accept = Box::pin(conn.accept_bi());
+        loop {
+            tokio::select! {
+                biased;
+                Some(()) = streams.next(), if !streams.is_empty() => {}
+                stream = &mut accept => match stream {
+                    Ok(Some(stream)) => {
+                        streams.push(Box::pin(self.serve_stream(peer, proto, stream)));
+                        accept = Box::pin(conn.accept_bi());
+                    }
+                    _ => break,
                 },
-                Err(_) => return,
-            };
-            let response = match dispatch {
-                Dispatch::Reply(r) => r,
-                Dispatch::Exec(spec) => {
-                    self.serve_exec(stream, spec).await;
-                    continue;
-                }
-            };
-            if write_msg(&mut stream, &response).await.is_err() {
-                return;
             }
-            let _ = stream.shutdown().await;
-            drain(&mut stream).await;
         }
+        while streams.next().await.is_some() {}
+    }
+
+    async fn serve_stream(&self, peer: NodeId, proto: Proto, mut stream: <T::Conn as Connection>::Stream) {
+        let dispatch = match read_msg::<_, RequestHeader>(&mut stream).await {
+            Ok(header) => match proto {
+                Proto::Rpc => self.handle_rpc(peer, header),
+                Proto::Join => Dispatch::Reply(self.handle_join(header)),
+            },
+            Err(_) => return,
+        };
+        let response = match dispatch {
+            Dispatch::Reply(r) => r,
+            Dispatch::Exec(spec) => return self.serve_exec(stream, spec).await,
+            Dispatch::Session { name, create, size } => return self.serve_session(stream, &name, create, size).await,
+        };
+        if write_msg(&mut stream, &response).await.is_err() {
+            return;
+        }
+        let _ = stream.shutdown().await;
+        drain(&mut stream).await;
     }
 
     fn handle_rpc(&self, peer: NodeId, header: RequestHeader) -> Dispatch {
@@ -308,17 +415,33 @@ impl<T: Transport, S: System> Node<T, S> {
             return Dispatch::Reply(Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络")));
         };
         let me = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
+        let session_name = match &header.body {
+            Request::SessionAttach { name, .. } | Request::SessionKill { name } => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(name) = &session_name {
+            if !valid_segment(name) {
+                return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _"))));
+            }
+        }
+        let resource = match &session_name {
+            Some(name) => format!("{me}/session/{name}"),
+            None => me.clone(),
+        };
         let capability = match header.body {
             Request::NodeInfo => "node.info",
             Request::RosterSync => "roster.sync",
             Request::Exec(_) => "term.exec",
+            Request::SessionAttach { .. } => "term.session.attach",
+            Request::SessionList => "term.session.list",
+            Request::SessionKill { .. } => "term.session.kill",
             Request::RosterPush { .. } | Request::JoinOffer { .. } => {
                 return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这个请求不能在此协议上使用")))
             }
         };
         let action = Action {
             capability: Capability::parse(capability).expect("内置能力名合法"),
-            resource: match ResourcePath::parse(&me) {
+            resource: match ResourcePath::parse(&resource) {
                 Ok(r) => r,
                 Err(_) => return Dispatch::Reply(Response::Error(err(ErrorCode::Internal, "本机不在名册里")),)
             },
@@ -335,6 +458,12 @@ impl<T: Transport, S: System> Node<T, S> {
         Dispatch::Reply(match header.body {
             Request::NodeInfo => Response::NodeInfo(self.info()),
             Request::Exec(spec) => return Dispatch::Exec(spec),
+            Request::SessionAttach { name, create, size } => return Dispatch::Session { name, create, size },
+            Request::SessionList => Response::Sessions(self.session_list()),
+            Request::SessionKill { name } => match self.session_kill(&name) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error(e),
+            },
             _ => Response::Roster {
                 roster: (mine > header.roster_version).then(|| self.trust.borrow().roster.clone()).flatten(),
                 addrs: self.addr_hints(),
@@ -459,6 +588,11 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Approve { code, name } => self.approve(&code, name).await.map(CtlResponse::Membership),
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
             CtlRequest::List => Ok(CtlResponse::List(self.list().await)),
+            CtlRequest::Attach { node, session, size } => return self.attach(&node, session, size, server).await,
+            CtlRequest::SessionList { node } => self.remote_session_list(&node).await.map(CtlResponse::Sessions),
+            CtlRequest::SessionKill { node, session } => {
+                self.remote_session_kill(&node, &session).await.map(|()| CtlResponse::Ok)
+            }
         };
         let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
     }
@@ -491,7 +625,7 @@ impl<T: Transport, S: System> Node<T, S> {
             return;
         }
         for attempt in 0..2 {
-            let failure = match self.open_exec(device.node_id, &spec).await {
+            let failure = match self.open_stream(device.node_id, Request::Exec(spec.clone())).await {
                 Ok(stream) => return self.pump_exec(stream, server).await,
                 Err(OpenError::StaleRoster) if attempt == 0 => {
                     let _ = self.push_roster(device.node_id).await;
@@ -506,20 +640,12 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    /// 向远端发出执行请求，对方接受后返回这条流。
-    async fn open_exec(
-        &self,
-        to: NodeId,
-        spec: &ExecSpec,
-    ) -> Result<<T::Conn as Connection>::Stream, OpenError> {
+    /// 向远端发出一个流式请求（执行、终端会话），对方接受后返回这条流。
+    async fn open_stream(&self, to: NodeId, body: Request) -> Result<<T::Conn as Connection>::Stream, OpenError> {
         let open = async {
             let conn = self.transport.connect(to, Proto::Rpc).await?;
             let mut stream = conn.open_bi().await?;
-            let header = RequestHeader {
-                version: WIRE_VERSION,
-                roster_version: self.roster_version(),
-                body: Request::Exec(spec.clone()),
-            };
+            let header = RequestHeader { version: WIRE_VERSION, roster_version: self.roster_version(), body };
             write_msg(&mut stream, &header).await?;
             let resp: Response = read_msg(&mut stream).await?;
             Ok::<_, io::Error>((stream, resp))
@@ -652,7 +778,9 @@ impl<T: Transport, S: System> Node<T, S> {
                         input_open = false;
                         proc.close_stdin();
                     }
-                    Ok(Some(Input::Cancel)) | Err(_) => {
+                    // 终端会话的消息对执行没有意义。
+                    Ok(Some(Input::Resize(_) | Input::Ack(_))) => {}
+                    Ok(Some(Input::Cancel | Input::Detach)) | Err(_) => {
                         input_open = false;
                         caller_gone = true;
                         proc.kill();
@@ -662,6 +790,270 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let _ = wr.shutdown().await;
         reader.drain().await;
+    }
+
+    // ------------------------------------------------------------ 终端会话
+
+    /// 命令行请求连上某个节点上的会话：打开会话流，然后在命令行和会话之间转发。
+    async fn attach(&self, node: &str, name: String, size: Size, server: CtlServer) {
+        let device = match self.resolve(node) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = server.tx.send(CtlResponse::Error(e)).await;
+                return;
+            }
+        };
+        if device.node_id == self.me() {
+            if !valid_segment(&name) {
+                let e = err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _"));
+                let _ = server.tx.send(CtlResponse::Error(e)).await;
+                return;
+            }
+            let (near, far) = tokio::io::duplex(256 * 1024);
+            let client = async {
+                let mut near = near;
+                match read_msg::<_, Response>(&mut near).await {
+                    Ok(Response::Ok) => self.pump_session(near, server).await,
+                    Ok(Response::Error(e)) => {
+                        let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    }
+                    other => {
+                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                    }
+                }
+            };
+            futures_util::future::join(self.serve_session(far, &name, true, size), client).await;
+            return;
+        }
+        let body = Request::SessionAttach { name, create: true, size };
+        for attempt in 0..2 {
+            let failure = match self.open_stream(device.node_id, body.clone()).await {
+                Ok(stream) => return self.pump_session(stream, server).await,
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                    continue;
+                }
+                Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
+                Err(OpenError::Remote(e)) => e,
+                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+            };
+            let _ = server.tx.send(CtlResponse::Error(failure)).await;
+            return;
+        }
+    }
+
+    /// 客户端一侧：把命令行的输入、尺寸变化和确认送到会话，把会话的输出送回命令行。
+    /// 连接中断时告诉命令行，由它决定是否重连；命令行离开时告诉会话。
+    async fn pump_session<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = FrameReader::new(rd);
+        let mut input_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                msg = reader.next::<ClientMsg>() => match msg {
+                    Ok(Some(msg)) => {
+                        let done = matches!(msg, ClientMsg::Exit(_));
+                        if server.tx.send(CtlResponse::Session(msg)).await.is_err() && input_open {
+                            input_open = false;
+                            let _ = write_msg(&mut wr, &Input::Detach).await;
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let lost = err(ErrorCode::Unreachable, "与会话的连接中断");
+                        let _ = server.tx.send(CtlResponse::Error(lost)).await;
+                        break;
+                    }
+                },
+                input = server.rx.recv(), if input_open => {
+                    let input = input.unwrap_or(Input::Detach);
+                    let leaving = matches!(input, Input::Detach | Input::Cancel);
+                    if write_msg(&mut wr, &input).await.is_err() || leaving {
+                        input_open = false;
+                        if leaving {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = wr.shutdown().await;
+        reader.drain().await;
+    }
+
+    /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
+    async fn serve_session<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, name: &str, create: bool, size: Size) {
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = FrameReader::new(rd);
+        let cmd = match self.open_session(name, create, size) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let _ = write_msg(&mut wr, &Response::Error(e)).await;
+                let _ = wr.shutdown().await;
+                reader.drain().await;
+                return;
+            }
+        };
+        let client = self.next_client.get();
+        self.next_client.set(client + 1);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_msg(&mut wr, &Response::Ok).await.is_err() {
+            let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
+            return;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                msg = out.recv() => match msg {
+                    Some(msg) => {
+                        let done = matches!(msg, ClientMsg::Exit(_));
+                        if write_msg(&mut wr, &msg).await.is_err() || done {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                input = reader.next::<Input>() => {
+                    let event = match input {
+                        Ok(Some(Input::Stdin(bytes))) => TermEvent::Input { client, bytes },
+                        Ok(Some(Input::Resize(size))) => TermEvent::Resize { client, size },
+                        Ok(Some(Input::Ack(bytes))) => TermEvent::Ack { client, bytes },
+                        Ok(Some(Input::CloseStdin)) => continue,
+                        Ok(Some(Input::Detach | Input::Cancel)) | Ok(None) | Err(_) => break,
+                    };
+                    if cmd.send(SessCmd::Event(event)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
+        let _ = wr.shutdown().await;
+        reader.drain().await;
+    }
+
+    /// 找到名为 `name` 的会话；不存在且 `create` 时启动一个新的。
+    fn open_session(&self, name: &str, create: bool, size: Size) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
+        if let Some(h) = self.sessions.borrow().get(name) {
+            return Ok(h.cmd.clone());
+        }
+        if !create {
+            return Err(err(ErrorCode::NotFound, format!("没有会话 {name}")));
+        }
+        if !valid_segment(name) {
+            return Err(err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+        }
+        let size = size.clamped();
+        let pty = self.system.spawn_pty(size).map_err(|e| err(ErrorCode::SpawnFailed, format!("无法启动终端：{e}")))?;
+        let (cmd, cmds) = mpsc::unbounded_channel();
+        let clients = Rc::new(Cell::new(0));
+        let current_size = Rc::new(Cell::new(size));
+        self.sessions.borrow_mut().insert(
+            name.to_string(),
+            SessionHandle { cmd: cmd.clone(), created_at: self.system.now(), clients: clients.clone(), size: current_size.clone() },
+        );
+        let new = NewSession { name: name.to_string(), pty, size, cmds, clients, current_size };
+        if self.spawn_tx.send(new).is_err() {
+            self.sessions.borrow_mut().remove(name);
+            return Err(internal("节点正在关闭"));
+        }
+        Ok(cmd)
+    }
+
+    /// 驱动一个会话：终端程序的输出交给状态机，状态机的动作发给客户端和终端。
+    async fn run_session(&self, new: NewSession<S::Pty>) {
+        let NewSession { name, mut pty, size, mut cmds, clients, current_size } = new;
+        let mut live = LiveSession {
+            term: TermSession::new(size, DEFAULT_WINDOW),
+            clients: BTreeMap::new(),
+            client_count: clients,
+            current_size,
+        };
+        loop {
+            // 先处理客户端的命令（输入、确认都很小），再处理终端输出：
+            // 终端不停输出时，确认也能及时生效。
+            tokio::select! {
+                biased;
+                cmd = cmds.recv() => match cmd {
+                    Some(cmd) => live.command(&mut pty, cmd),
+                    None => pty.kill(),
+                },
+                event = pty.next_event() => match event {
+                    PtyEvent::Output(bytes) => live.apply(&mut pty, TermEvent::PtyOutput(bytes)),
+                    PtyEvent::Exited(status) => {
+                        live.apply(&mut pty, TermEvent::PtyExited { code: status.code });
+                        break;
+                    }
+                },
+            }
+        }
+        // 程序已经结束：不再接受新的客户端，等落后的客户端拿到最终屏幕和退出码。
+        self.sessions.borrow_mut().remove(&name);
+        let linger = tokio::time::sleep(SESSION_LINGER);
+        tokio::pin!(linger);
+        while !live.clients.is_empty() {
+            tokio::select! {
+                biased;
+                cmd = cmds.recv() => match cmd {
+                    Some(cmd) => live.command(&mut pty, cmd),
+                    None => break,
+                },
+                _ = &mut linger => break,
+            }
+        }
+    }
+
+    fn session_list(&self) -> Vec<SessionInfo> {
+        self.sessions
+            .borrow()
+            .iter()
+            .map(|(name, h)| SessionInfo { name: name.clone(), clients: h.clients.get(), created_at: h.created_at, size: h.size.get() })
+            .collect()
+    }
+
+    fn session_kill(&self, name: &str) -> Result<(), WireError> {
+        match self.sessions.borrow().get(name) {
+            Some(h) => {
+                let _ = h.cmd.send(SessCmd::Kill);
+                Ok(())
+            }
+            None => Err(err(ErrorCode::NotFound, format!("没有会话 {name}"))),
+        }
+    }
+
+    /// 对一个节点发出一次普通请求，限时完成。
+    async fn call_node(&self, device: &Device, body: Request) -> Result<Response, WireError> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.request(device.node_id, body)).await {
+            Ok(Ok((Response::Error(e), _))) => Err(e),
+            Ok(Ok((resp, _))) => Ok(resp),
+            Ok(Err(e)) => Err(err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name))),
+            Err(_) => Err(err(ErrorCode::Unreachable, format!("连接 {} 超时", device.name))),
+        }
+    }
+
+    async fn remote_session_list(&self, node: &str) -> Result<Vec<SessionInfo>, WireError> {
+        let device = self.resolve(node)?;
+        if device.node_id == self.me() {
+            return Ok(self.session_list());
+        }
+        match self.call_node(&device, Request::SessionList).await? {
+            Response::Sessions(list) => Ok(list),
+            other => Err(internal(format!("对方的回应无法理解：{other:?}"))),
+        }
+    }
+
+    async fn remote_session_kill(&self, node: &str, name: &str) -> Result<(), WireError> {
+        let device = self.resolve(node)?;
+        if device.node_id == self.me() {
+            return self.session_kill(name);
+        }
+        match self.call_node(&device, Request::SessionKill { name: name.to_string() }).await? {
+            Response::Ok => Ok(()),
+            other => Err(internal(format!("对方的回应无法理解：{other:?}"))),
+        }
     }
 
     fn local_status(&self) -> StatusReport {

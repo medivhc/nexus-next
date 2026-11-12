@@ -24,7 +24,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # 纯逻辑层：crate 名 -> 允许的依赖
 PURE = {
     "nexus-core-proto": {"serde", "postcard", "ed25519-dalek"},
-    "nexus-wire": {"nexus-core-proto", "serde", "postcard"},
+    "nexus-wire": {"nexus-core-proto", "nexus-term-proto", "serde", "postcard"},
+    "nexus-term-proto": {"serde", "vt100"},
 }
 PURE_DEV_EXTRA = {"proptest"}
 

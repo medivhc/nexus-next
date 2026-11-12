@@ -5,11 +5,12 @@
 
 use nexus_core_proto::roster::{DeviceRole, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PathKind, Timestamp};
+pub use nexus_term_proto::{ClientMsg, Size};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 2;
+pub const WIRE_VERSION: u16 = 3;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -37,6 +38,22 @@ pub enum Request {
     /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
     /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
     Exec(ExecSpec),
+    /// 连上一个终端会话，不存在且 `create` 时创建。对方先回 `Response::Ok` 或 `Response::Error`；
+    /// 之后调用方发送 [`Input`]（`Stdin`、`Resize`、`Ack`、`Detach`），对方发送 [`ClientMsg`]。
+    SessionAttach { name: String, create: bool, size: Size },
+    /// 列出对方的终端会话。
+    SessionList,
+    /// 结束对方的一个终端会话。
+    SessionKill { name: String },
+}
+
+/// 一个终端会话的概况。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    pub clients: u32,
+    pub created_at: Timestamp,
+    pub size: Size,
 }
 
 /// 要执行的命令。不经过 shell：`program` 直接作为可执行文件启动。
@@ -62,6 +79,12 @@ pub enum Input {
     CloseStdin,
     /// 调用方不再需要结果，终止命令。
     Cancel,
+    /// 终端会话：客户端的终端尺寸变了。
+    Resize(Size),
+    /// 终端会话：客户端已经处理完这么多字节的输出。
+    Ack(u64),
+    /// 终端会话：客户端离开，会话继续运行。
+    Detach,
 }
 
 /// 执行过程中产生的事件。
@@ -89,6 +112,7 @@ pub enum Response {
     NodeInfo(NodeInfo),
     Roster { roster: Option<SignedRoster>, addrs: AddrHints },
     Ok,
+    Sessions(Vec<SessionInfo>),
     Error(WireError),
 }
 
@@ -107,6 +131,8 @@ pub enum ErrorCode {
     InvalidInput,
     /// 命令无法启动，例如可执行文件不存在。
     SpawnFailed,
+    /// 要操作的对象不存在，例如没有这个名字的会话。
+    NotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +166,10 @@ pub enum CtlRequest {
     List,
     /// 在某个节点上执行命令。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Exec`。
     Exec { node: String, spec: ExecSpec },
+    /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
+    Attach { node: String, session: String, size: Size },
+    SessionList { node: String },
+    SessionKill { node: String, session: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +180,9 @@ pub enum CtlResponse {
     Membership(MembershipReport),
     List(Vec<ListEntry>),
     Exec(ExecEvent),
+    Session(ClientMsg),
+    Sessions(Vec<SessionInfo>),
+    Ok,
     Error(WireError),
 }
 

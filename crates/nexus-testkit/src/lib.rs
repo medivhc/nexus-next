@@ -8,7 +8,7 @@
 
 pub use nexus_cli::Output;
 
-use nexus_cli::{parse, run_client, Captured, Ctl};
+use nexus_cli::{parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, SshArgs};
 use nexus_fabric_sim::SimTransport;
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_sim::{SimClock, SimDisk, SimSystem};
@@ -21,7 +21,10 @@ use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// 场景运行时所在的世界。
@@ -131,6 +134,262 @@ impl World {
             }
             Inner::Real(_) => panic!("真实后端无法让被杀掉的节点原样恢复"),
         }
+    }
+}
+
+impl World {
+    /// 在某个节点上启动一个交互式命令（`nexus ssh ...`），返回一个模拟的终端。
+    ///
+    /// 没有给出 `--size` 时使用 80x24。
+    pub async fn term(&self, node: &str, args: &[&str]) -> Term {
+        let mut full: Vec<&str> = args.to_vec();
+        if !full.contains(&"--size") {
+            full.extend(["--size", "80x24"]);
+        }
+        let mut ignored = Captured::default();
+        let cli = parse(full.iter().copied(), &mut ignored).unwrap_or_else(|_| panic!("参数不对：{full:?}"));
+        let ssh = ssh_args(&cli.cmd).unwrap_or_else(|e| panic!("{e}"));
+        let state = Arc::new(TermState::new(ssh.size));
+        let label = format!("{node}$ nexus {}", args.join(" "));
+        self.trace.borrow_mut().push(format!("term {label}"));
+        let io = match &self.inner {
+            Inner::Sim { nodes, .. } => {
+                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
+                TermIo::Sim(sim_term(tx, ssh, state.clone()))
+            }
+            Inner::Real(real) => TermIo::Real(real.term(node, &full, state.clone())),
+        };
+        Term { io, state, label }
+    }
+
+    /// 让 `a` 和 `b` 之间的网络中断一段时间，然后恢复。
+    ///
+    /// 期间两者之间的数据都送不到，恢复后连接上重传的数据照常送达（就像 QUIC 和 TCP 的重传）。
+    /// 仿真里把两者之间的消息全部扣住，到时放行；真实后端里把 `b` 的常驻程序暂停（SIGSTOP）这么久。
+    pub async fn interrupt(&self, a: &str, b: &str, d: Duration) {
+        match &self.inner {
+            Inner::Sim { .. } => {
+                turmoil::hold(a, b);
+                tokio::time::sleep(d).await;
+                turmoil::release(a, b);
+            }
+            Inner::Real(real) => {
+                real.signal(b, nix::sys::signal::Signal::SIGSTOP);
+                tokio::time::sleep(d).await;
+                real.signal(b, nix::sys::signal::Signal::SIGCONT);
+            }
+        }
+    }
+}
+
+/// 场景里的一个终端：把命令的输出喂给一个内存终端，可以输入、暂停读取、等待屏幕上出现内容。
+pub struct Term {
+    io: TermIo,
+    state: Arc<TermState>,
+    label: String,
+}
+
+enum TermIo {
+    Sim(SimTerm),
+    Real(RealTerm),
+}
+
+struct TermState {
+    screen: Mutex<Screen>,
+    paused: AtomicBool,
+    exit: Mutex<Option<i32>>,
+}
+
+struct Screen {
+    parser: vt100::Parser,
+    /// 还没凑成完整字符或转义序列的输出尾巴。
+    pending: Vec<u8>,
+}
+
+impl TermState {
+    fn new(size: nexus_wire::Size) -> Self {
+        let rows = std::num::NonZeroU16::new(size.rows).unwrap();
+        let cols = std::num::NonZeroU16::new(size.cols).unwrap();
+        Self {
+            screen: Mutex::new(Screen { parser: vt100::Parser::new(rows, cols, 0), pending: Vec::new() }),
+            paused: AtomicBool::new(false),
+            exit: Mutex::new(None),
+        }
+    }
+
+    fn feed(&self, bytes: &[u8]) {
+        let mut s = self.screen.lock().unwrap();
+        s.pending.extend_from_slice(bytes);
+        // 只在完整的字符和转义序列之间切分，终端模拟库对半个字符的处理有缺陷。
+        let cut = nexus_term_proto::safe_prefix(&s.pending);
+        let ready: Vec<u8> = s.pending.drain(..cut).collect();
+        s.parser.process(&ready);
+    }
+}
+
+/// 等待屏幕满足条件的默认时限。
+const EXPECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+impl Term {
+    /// 输入一段文字（`\r` 是回车）。
+    pub async fn send(&self, text: &str) {
+        match &self.io {
+            TermIo::Sim(t) => {
+                let mut w = t.input.lock().await;
+                if let Some(w) = w.as_mut() {
+                    let _ = w.write_all(text.as_bytes()).await;
+                }
+            }
+            TermIo::Real(t) => t.write(text.as_bytes()),
+        }
+    }
+
+    /// 当前屏幕的文字。
+    pub fn screen(&self) -> String {
+        self.state.screen.lock().unwrap().parser.screen().contents()
+    }
+
+    /// 等到屏幕满足 `pred`，超时则带着屏幕内容失败。
+    pub async fn wait_until(&self, what: &str, pred: impl Fn(&vt100::Screen) -> bool) {
+        self.wait_until_within(what, EXPECT_TIMEOUT, pred).await
+    }
+
+    async fn wait_until_within(&self, what: &str, limit: Duration, pred: impl Fn(&vt100::Screen) -> bool) {
+        let start = tokio::time::Instant::now();
+        loop {
+            if pred(self.state.screen.lock().unwrap().parser.screen()) {
+                return;
+            }
+            if start.elapsed() >= limit {
+                panic!("{}：{limit:?} 内没有等到{what}。屏幕：\n{}\n", self.label, self.screen());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 等到屏幕上出现内容恰好是 `text` 的一行。
+    pub async fn expect_line(&self, text: &str) {
+        self.expect_line_within(text, EXPECT_TIMEOUT).await
+    }
+
+    pub async fn expect_line_within(&self, text: &str, limit: Duration) {
+        self.wait_until_within(&format!("一行 {text:?}"), limit, |s| s.contents().lines().any(|l| l.trim_end() == text)).await
+    }
+
+    /// 等到屏幕上出现 `text`。
+    pub async fn expect_contains(&self, text: &str) {
+        self.wait_until(&format!("{text:?}"), |s| s.contents().contains(text)).await
+    }
+
+    /// 等到 shell 的提示符 `$ ` 出现：之前输入的内容可能在提示符之前回显，打乱屏幕。
+    pub async fn expect_prompt(&self) {
+        self.expect_contains("$ ").await
+    }
+
+    /// 停止读取输出，像一个卡住的终端。
+    pub fn pause(&self) {
+        self.state.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.state.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// 按 Ctrl-] 断开，返回命令的退出码。
+    pub async fn detach(&self) -> i32 {
+        self.send("\x1d").await;
+        self.wait_exit().await
+    }
+
+    /// 等命令结束，返回它的退出码。
+    pub async fn wait_exit(&self) -> i32 {
+        let start = tokio::time::Instant::now();
+        loop {
+            if let TermIo::Real(t) = &self.io {
+                t.poll_exit(&self.state);
+            }
+            if let Some(code) = *self.state.exit.lock().unwrap() {
+                return code;
+            }
+            if start.elapsed() >= EXPECT_TIMEOUT {
+                panic!("{}：{EXPECT_TIMEOUT:?} 内没有结束。屏幕：\n{}\n", self.label, self.screen());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+// 仿真：在场景所在的任务里直接运行 `nexus ssh` 的客户端代码，用内存管道代替终端。
+struct SimTerm {
+    input: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
+}
+
+fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, state: Arc<TermState>) -> SimTerm {
+    let (input, mut stdin) = tokio::io::duplex(4096);
+    // 输出管道很小：暂停读取时，客户端很快就写不进去，不再确认输出。
+    let (mut stdout, mut out_rd) = tokio::io::duplex(16 * 1024);
+    let st = state.clone();
+    tokio::task::spawn_local(async move {
+        let ctl = ChanCtl(tx);
+        let (_keep, mut resizes) = mpsc::channel(1);
+        let code = match ssh(&ctl, &args, &mut stdin, &mut stdout, &mut resizes).await {
+            Ok(code) => code,
+            Err(e) => ssh_fail(&mut Captured::default(), &e),
+        };
+        drop(stdout);
+        *st.exit.lock().unwrap() = Some(code);
+    });
+    tokio::task::spawn_local(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            if state.paused.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            match out_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => state.feed(&buf[..n]),
+            }
+        }
+    });
+    SimTerm { input: tokio::sync::Mutex::new(Some(input)) }
+}
+
+// 真实后端：真正的 `nexus ssh` 进程，标准输入和输出都是管道。
+struct RealTerm {
+    child: RefCell<Child>,
+    stdin: RefCell<Option<std::process::ChildStdin>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+impl RealTerm {
+    fn write(&self, bytes: &[u8]) {
+        use std::io::Write;
+        if let Some(w) = self.stdin.borrow_mut().as_mut() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
+    }
+
+    fn poll_exit(&self, state: &TermState) {
+        if let Ok(Some(status)) = self.child.borrow_mut().try_wait() {
+            let mut exit = state.exit.lock().unwrap();
+            if exit.is_none() {
+                let code = status.code().unwrap_or(-1);
+                if (100..120).contains(&code) {
+                    eprintln!("nexus ssh 的错误输出：{}", String::from_utf8_lossy(&self.stderr.lock().unwrap()));
+                }
+                *exit = Some(code);
+            }
+        }
+    }
+}
+
+impl Drop for RealTerm {
+    fn drop(&mut self) {
+        let mut child = self.child.borrow_mut();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -257,6 +516,10 @@ impl RealWorld {
             let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
             let child = Command::new(&world.bin)
                 .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name, "--local-only"])
+                // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
+                .env("SHELL", "/bin/sh")
+                .env("PS1", "$ ")
+                .env_remove("ENV")
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
                 .stderr(log)
@@ -283,6 +546,50 @@ impl RealWorld {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    fn signal(&self, node: &str, sig: nix::sys::signal::Signal) {
+        let children = self.children.borrow();
+        let child = children.get(node).unwrap_or_else(|| panic!("节点 {node} 没有在运行"));
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        nix::sys::signal::kill(pid, sig).expect("无法向常驻程序发送信号");
+    }
+
+    fn term(&self, node: &str, args: &[&str], state: Arc<TermState>) -> RealTerm {
+        use std::io::Read;
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let mut child = Command::new(&self.bin)
+            .args(["--data-dir", dir.to_str().unwrap()])
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("无法执行 nexus");
+        let mut out = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                // 暂停时不读：管道很快写满，客户端就不再确认输出。
+                while state.paused.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                match out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => state.feed(&buf[..n]),
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut err = child.stderr.take().unwrap();
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf);
+            sink.lock().unwrap().extend(buf);
+        });
+        let stdin = child.stdin.take();
+        RealTerm { child: RefCell::new(child), stdin: RefCell::new(stdin), stderr }
     }
 
     fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
