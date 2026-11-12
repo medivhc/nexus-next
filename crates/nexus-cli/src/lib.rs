@@ -162,6 +162,16 @@ pub enum Cmd {
     /// 提供工具 nexus_ls、nexus_status、nexus_exec、nexus_session_ls。
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
+    /// 输出一段 ~/.ssh/config 配置，让系统自带的 ssh、scp、git 能用 <设备名>.nexus 访问设备
+    ///
+    /// 用法：nexus ssh-config >> ~/.ssh/config，之后 ssh home.nexus、scp f home.nexus:/tmp/、
+    /// git clone home.nexus:/path/repo 都能用，不需要任何密钥。交互式登录进入常驻会话 main。
+    SshConfig,
+    /// 供 ssh 的 ProxyCommand 调用：在标准输入输出上充当 SSH 服务端（一般不直接运行）
+    SshProxy {
+        /// ssh 传入的主机名，形如 home.nexus
+        host: String,
+    },
     /// 查看本机或另一个节点的状态
     Status {
         /// 节点的名字或标识；省略时为本机
@@ -424,6 +434,9 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
         }
         Cmd::Mcp => return mcp(ctl, stdin, sink).await,
+        Cmd::SshConfig | Cmd::SshProxy { .. } => {
+            return fail(sink, EXIT_USAGE, "usage", "这条命令只能由 nexus 程序直接运行")
+        }
         Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {
             let Some(ttl_ms) = parse_ttl(ttl) else {
                 return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 4h：{ttl}"));
@@ -446,7 +459,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     };
     let text = match resp {
         CtlResponse::Error(e) => return fail_wire(sink, &e),
-        CtlResponse::Exec(_) | CtlResponse::Session(_) => {
+        CtlResponse::Exec(_) | CtlResponse::Session(_) | CtlResponse::SshHostKey(_) => {
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
         CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },

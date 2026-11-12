@@ -11,6 +11,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+mod ssh_proxy;
+
 /// 写到真实终端，每段都立即刷新，长时间运行的命令也能实时看到输出。
 struct Terminal;
 
@@ -51,6 +53,25 @@ fn main() {
                         EXIT_INTERNAL
                     }
                 }
+            }
+            Cmd::SshProxy { host } => {
+                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
+                ssh_proxy::run(ctl, host).await
+            }
+            Cmd::SshConfig => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| "nexus".into());
+                let dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir.clone());
+                print!(
+                    "\n# Nexus：ssh <设备名>.nexus（由 nexus ssh-config 生成）\n\
+                     Host *.nexus\n\
+                     \x20   ProxyCommand \"{exe}\" --data-dir \"{dir}\" ssh-proxy %h\n\
+                     \x20   UserKnownHostsFile \"{dir}/ssh_known_hosts\"\n\
+                     \x20   StrictHostKeyChecking accept-new\n\
+                     \x20   LogLevel ERROR\n",
+                    exe = exe.display(),
+                    dir = dir.display(),
+                );
+                0
             }
             cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
                 let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
@@ -118,7 +139,7 @@ fn data_dir(cli: &Cli) -> PathBuf {
 }
 
 /// 命令行一侧：通过 Unix 套接字连接常驻程序，把套接字两个方向接到会话通道上。
-struct UnixCtl {
+pub(crate) struct UnixCtl {
     socket: PathBuf,
     agent: Option<AgentCredential>,
 }

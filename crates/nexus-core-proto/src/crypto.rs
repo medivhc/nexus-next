@@ -10,6 +10,8 @@ pub enum Purpose {
     Roster,
     AgentCert,
     AgentAssertion,
+    /// 派生 SSH 呈现层的主机密钥。这类签名从不发布，只作为确定性的密钥材料。
+    SshHostKey,
 }
 
 impl Purpose {
@@ -18,6 +20,7 @@ impl Purpose {
             Purpose::Roster => b"nexus/v1/roster\0",
             Purpose::AgentCert => b"nexus/v1/agent-cert\0",
             Purpose::AgentAssertion => b"nexus/v1/agent-assertion\0",
+            Purpose::SshHostKey => b"nexus/v1/ssh-host-key\0",
         }
     }
 }
@@ -47,7 +50,7 @@ impl Signature {
         Self { r, s }
     }
 
-    fn to_bytes(self) -> [u8; 64] {
+    pub fn to_bytes(self) -> [u8; 64] {
         let mut b = [0u8; 64];
         b[..32].copy_from_slice(&self.r);
         b[32..].copy_from_slice(&self.s);

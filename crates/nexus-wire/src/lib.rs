@@ -176,6 +176,8 @@ pub enum CtlRequest {
     AgentList,
     /// 本机的审计记录，最新的在后。
     Audit { limit: Option<u32> },
+    /// 本机 SSH 呈现层为某个设备使用的主机密钥（种子）。对同一台目标设备总是相同。
+    SshHostKey { node: String },
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -196,6 +198,7 @@ pub enum CtlResponse {
     AgentRevoked(MembershipReport),
     Agents(Vec<AgentInfo>),
     Audit(Vec<AuditRecord>),
+    SshHostKey([u8; 32]),
     Ok,
     Error(WireError),
 }

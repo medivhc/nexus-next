@@ -700,6 +700,7 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::AgentRevoke { agent } => self.agent_revoke(&agent).await.map(CtlResponse::AgentRevoked),
             CtlRequest::AgentList => self.agent_list().map(CtlResponse::Agents),
             CtlRequest::Audit { limit } => self.read_audit(limit).map(CtlResponse::Audit),
+            CtlRequest::SshHostKey { node } => self.ssh_host_key(&node, agent_ref).map(CtlResponse::SshHostKey),
         };
         let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
     }
@@ -750,6 +751,18 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     // ------------------------------------------------------------ agent 管理
+
+    /// SSH 呈现层的主机密钥：由本机设备密钥对目标设备标识签名派生，因此稳定、不需要存储，
+    /// 也不会和其他设备的密钥相同。SSH 只在本机两个进程之间运行，这把密钥只用来让 ssh 的主机校验稳定。
+    fn ssh_host_key(&self, node: &str, agent: Option<&AgentCredential>) -> Result<[u8; 32], WireError> {
+        let device = self.resolve_for(node, agent)?;
+        let key = load_or_create_device_key(&self.system).map_err(internal)?;
+        let msg = device.node_id.0;
+        let sig = key.sign(nexus_core_proto::crypto::Purpose::SshHostKey, &msg).to_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&sig[32..]);
+        Ok(seed)
+    }
 
     fn load_agents(&self) -> Result<Vec<AgentInfo>, WireError> {
         load(&self.system, KEY_AGENTS).map(Option::unwrap_or_default).map_err(internal)

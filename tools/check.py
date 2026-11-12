@@ -212,12 +212,10 @@ def self_test():
            append("crates/nexus-runtime/Cargo.toml", 'turmoil = "0.7"\n'),
            check_arch, "不允许直接依赖 turmoil")
 
-    def mark_implemented(tmp):
+    def add_untested(tmp):
         p = tmp / "FEATURES.md"
-        text = p.read_text(encoding="utf-8")
-        head, sep, tail = text.partition("### R27")
-        p.write_text(head + sep + tail.replace("待实现", "已实现", 1), encoding="utf-8")
-    expect("已实现的需求没有测试", mark_implemented, check_trace, "R27 标为已实现")
+        p.write_text(p.read_text(encoding="utf-8") + "\n### R98 自检用的需求\n- 状态：已实现（自检）\n- 没有任何测试覆盖它。\n", encoding="utf-8")
+    expect("已实现的需求没有测试", add_untested, check_trace, "R98 标为已实现")
     expect("测试引用不存在的需求",
            append("crates/nexus-cli/tests/scenarios.rs", "\n// covers" + ": R" + "99\n"),
            check_trace, "不存在的需求 R" + "99")

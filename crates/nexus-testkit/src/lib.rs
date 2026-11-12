@@ -188,6 +188,24 @@ impl World {
     }
 }
 
+impl World {
+    /// 在某个节点所在的「机器」上运行一个普通程序（例如系统自带的 ssh、scp、git），只用于真实后端。
+    ///
+    /// 环境：`PATH` 最前面是 nexus 所在的目录，`NEXUS_DATA_DIR` 指向这个节点，
+    /// `HOME` 是这个节点专用的空目录（没有任何 SSH 密钥和配置）。
+    pub async fn host(&self, node: &str, argv: &[&str], stdin: &[u8]) -> Output {
+        let Inner::Real(real) = &self.inner else { panic!("host 只能用于真实后端") };
+        self.trace.borrow_mut().push(format!("host {node}$ {}", argv.join(" ")));
+        real.host(node, argv, stdin)
+    }
+
+    /// 某个节点的 `HOME`（见 [`World::host`]），只用于真实后端。
+    pub fn home_dir(&self, node: &str) -> PathBuf {
+        let Inner::Real(real) = &self.inner else { panic!("home_dir 只能用于真实后端") };
+        real.home(node)
+    }
+}
+
 /// 场景里的一个终端：把命令的输出喂给一个内存终端，可以输入、暂停读取、等待屏幕上出现内容。
 pub struct Term {
     io: TermIo,
@@ -554,6 +572,45 @@ impl RealWorld {
         }
     }
 
+    fn home(&self, node: &str) -> PathBuf {
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).join("home");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn host(&self, node: &str, argv: &[&str], stdin: &[u8]) -> Output {
+        use std::io::Write;
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let bin_dir = self.bin.parent().unwrap();
+        let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let mut child = Command::new(argv[0])
+            .args(&argv[1..])
+            .env("PATH", path)
+            .env("HOME", self.home(node))
+            .env("NEXUS_DATA_DIR", dir)
+            .env_remove("NEXUS_AGENT")
+            .env_remove("SSH_AUTH_SOCK")
+            .current_dir(self.home(node))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("无法运行 {}：{e}", argv[0]));
+        let mut input = child.stdin.take().unwrap();
+        let data = stdin.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = input.write_all(&data);
+        });
+        let out = child.wait_with_output().expect("等待程序结束失败");
+        let _ = writer.join();
+        Output {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout_raw: out.stdout,
+        }
+    }
+
     fn signal(&self, node: &str, sig: nix::sys::signal::Signal) {
         let children = self.children.borrow();
         let child = children.get(node).unwrap_or_else(|| panic!("节点 {node} 没有在运行"));
@@ -651,6 +708,19 @@ where
 /// `real: yes` 表示也在真实后端上运行；`real: (pending "原因")` 表示真实后端暂时无法运行。
 #[macro_export]
 macro_rules! scenario {
+    // 只适用于真实后端的场景（例如需要系统自带的程序）：仿真版本标为忽略并写明原因。
+    (name: $name:ident, covers: $covers:literal, nodes: [$($node:literal),+], sim: (pending $why:literal), real: yes, run: $body:expr $(,)?) => {
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+
+            #[test]
+            #[ignore = $why]
+            fn sim() {}
+
+            $crate::__real_test!(yes, [$($node),+], $body);
+        }
+    };
     (name: $name:ident, covers: $covers:literal, nodes: [$($node:literal),+], real: $real:tt, run: $body:expr $(,)?) => {
         mod $name {
             #[allow(unused_imports)]

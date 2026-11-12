@@ -36,6 +36,7 @@ iroh = "1.4"
 vt100 = "0.18"
 portable-pty = "0.9"
 crossterm = "0.29"
+russh = { version = "0.65", default-features = false, features = ["ring"] }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 # 依赖在开发构建里也做优化：签名校验在未优化时慢一个数量级，会拖慢授权矩阵。
