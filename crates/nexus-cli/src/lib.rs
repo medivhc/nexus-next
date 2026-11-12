@@ -9,7 +9,7 @@ use nexus_core_proto::roster::DeviceRole;
 use nexus_core_proto::PathKind;
 use nexus_runtime::CtlClient;
 use nexus_wire::{
-    ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, Size,
+    AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, Size,
     StatusReport, WireError,
 };
 use serde_json::{json, Value};
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// `--json` 输出的结构版本。结构发生不兼容变化时递增。
@@ -51,6 +51,10 @@ pub struct Cli {
     /// 本节点的数据目录（默认 $NEXUS_DATA_DIR 或 ~/.local/share/nexus）
     #[arg(long, global = true, value_name = "目录")]
     pub data_dir: Option<PathBuf>,
+    /// 以 agent 的身份执行：凭据文本（nxa1- 开头）或凭据文件的路径。也可以用环境变量 NEXUS_AGENT 给出。
+    /// agent 只能看到和做凭据里授权的事，不能做管理操作
+    #[arg(long, global = true, env = "NEXUS_AGENT", value_name = "凭据或文件", hide_env_values = true)]
+    pub agent: Option<String>,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -140,6 +144,24 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// 签发、撤销和列出 agent 凭据（只能在管理设备上）
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
+    /// 查看本机的审计记录：经过本机的每次访问，包括被拒绝的
+    Audit {
+        /// 只显示最近的这么多条
+        #[arg(long, value_name = "条数")]
+        limit: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 以 MCP 服务器的方式运行（标准输入输出），供 agent 框架调用
+    ///
+    /// 提供工具 nexus_ls、nexus_status、nexus_exec、nexus_session_ls。
+    /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
+    Mcp,
     /// 查看本机或另一个节点的状态
     Status {
         /// 节点的名字或标识；省略时为本机
@@ -185,6 +207,73 @@ pub enum SessionCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCmd {
+    /// 签发一份 agent 凭据
+    ///
+    /// 例：nexus agent issue --label builder --grant term.exec@home --grant 'term.session.*@home/session/build' --ttl 4h
+    ///
+    /// 能力：node.info、term.exec、term.session.attach、term.session.list、term.session.kill，
+    /// 末尾的星号匹配一组能力（term.session.*）。资源：设备名，或 设备名/session/会话名；
+    /// 一段写成星号时匹配任意一段，末尾的两个星号匹配其下的一切。
+    ///
+    /// 输出的凭据含 agent 的私钥，请像密码一样保管；agent 用 --agent 或 NEXUS_AGENT 使用它。
+    Issue {
+        /// agent 的名字
+        #[arg(long)]
+        label: String,
+        /// 授权条目，格式 能力@资源，例如 term.exec@home；可重复
+        #[arg(long = "grant", value_name = "能力@资源", required = true)]
+        grants: Vec<String>,
+        /// 有效期，例如 30m、4h、7d
+        #[arg(long, value_name = "时长")]
+        ttl: String,
+        /// 把凭据写进这个文件（权限 600），而不是打印出来
+        #[arg(long, value_name = "文件")]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 撤销一个 agent（按名字或标识），新名册推送到各设备后它的请求一律被拒绝
+    Revoke {
+        /// agent 的名字或标识
+        #[arg(value_name = "AGENT")]
+        who: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出签发过的 agent
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// 读取凭据：凭据文本本身，或凭据文件的路径。
+pub fn load_agent(text: &str) -> Result<AgentCredential, String> {
+    let content = if AgentCredential::looks_like(text) {
+        text.to_string()
+    } else {
+        std::fs::read_to_string(text).map_err(|e| format!("读不了凭据文件 {text}：{e}"))?
+    };
+    AgentCredential::decode(&content).ok_or_else(|| "凭据格式不对：应当是 nexus agent issue 输出的 nxa1- 开头的文本".to_string())
+}
+
+/// 解析 `30s`、`15m`、`4h`、`7d` 形式的时长，返回毫秒。
+pub fn parse_ttl(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (num, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = num.parse().ok()?;
+    let ms = match unit {
+        "s" => 1000,
+        "m" => 60 * 1000,
+        "h" => 3600 * 1000,
+        "d" => 24 * 3600 * 1000,
+        _ => return None,
+    };
+    n.checked_mul(ms).filter(|&v| v > 0)
 }
 
 /// 到本机常驻程序的控制通道。每次调用打开一个会话。
@@ -334,6 +423,16 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Err(e) => ssh_fail(sink, &e),
             };
         }
+        Cmd::Mcp => return mcp(ctl, stdin, sink).await,
+        Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {
+            let Some(ttl_ms) = parse_ttl(ttl) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 4h：{ttl}"));
+            };
+            (CtlRequest::AgentIssue { label: label.clone(), grants: grants.clone(), ttl_ms }, *json)
+        }
+        Cmd::Agent { cmd: AgentCmd::Revoke { who, json } } => (CtlRequest::AgentRevoke { agent: who.clone() }, *json),
+        Cmd::Agent { cmd: AgentCmd::Ls { json } } => (CtlRequest::AgentList, *json),
+        Cmd::Audit { limit, json } => (CtlRequest::Audit { limit: *limit }, *json),
         Cmd::Session { cmd: SessionCmd::Ls { node, json } } => (CtlRequest::SessionList { node: node.clone() }, *json),
         Cmd::Session { cmd: SessionCmd::Kill { node, session, json } } => {
             (CtlRequest::SessionKill { node: node.clone(), session: session.clone() }, *json)
@@ -351,6 +450,57 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
         CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },
+        CtlResponse::AgentIssued(r) => {
+            let out = match cmd {
+                Cmd::Agent { cmd: AgentCmd::Issue { out, .. } } => out.clone(),
+                _ => None,
+            };
+            if let Some(path) = &out {
+                if let Err(e) = write_private(path, &r.credential) {
+                    return fail(sink, EXIT_INTERNAL, "internal", &format!("写不了凭据文件 {}：{e}", path.display()));
+                }
+            }
+            let agent_id = nexus_core_proto::NodeId(r.agent_id.0).to_string();
+            if json {
+                let mut v = json!({
+                    "schema": JSON_SCHEMA,
+                    "agent_id": agent_id,
+                    "label": r.label,
+                    "not_after_ms": r.not_after.0,
+                });
+                match &out {
+                    Some(path) => v["credential_file"] = json!(path.display().to_string()),
+                    None => v["credential"] = json!(r.credential),
+                }
+                doc(v)
+            } else {
+                let how = match &out {
+                    Some(path) => format!("凭据已写入 {}。\n使用：NEXUS_AGENT={} nexus <命令>\n", path.display(), path.display()),
+                    None => format!("凭据（含私钥，请像密码一样保管）：\n\n{}\n\n使用：NEXUS_AGENT=<凭据> nexus <命令>，或 nexus --agent <凭据> <命令>\n", r.credential),
+                };
+                format!("已签发 agent {}（{}），有效期至 {} 毫秒时间戳。\n{how}", r.label, &agent_id[..8], r.not_after.0)
+            }
+        }
+        CtlResponse::AgentRevoked(m) => {
+            if json {
+                doc(json!({
+                    "schema": JSON_SCHEMA,
+                    "label": m.name,
+                    "agent_id": m.node_id.to_string(),
+                    "roster_version": m.roster_version,
+                    "pushed": m.pushed,
+                    "unreachable": m.unreachable,
+                }))
+            } else {
+                let mut s = format!("已撤销 agent {}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed);
+                if !m.unreachable.is_empty() {
+                    s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
+                }
+                s
+            }
+        }
+        CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
         CtlResponse::Ok => match cmd {
             Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
                 if json {
@@ -407,6 +557,111 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     };
     sink.out(text.as_bytes());
     0
+}
+
+/// 只有当前用户能读写的文件。
+fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(text.as_bytes())?;
+    f.write_all(b"\n")
+}
+
+fn agents_json(list: &[AgentInfo]) -> String {
+    let agents: Vec<Value> = list
+        .iter()
+        .map(|a| {
+            json!({
+                "agent_id": nexus_core_proto::NodeId(a.agent_id.0).to_string(),
+                "label": a.label,
+                "issued_at_ms": a.issued_at.0,
+                "not_after_ms": a.not_after.0,
+                "grants": a.grants,
+                "revoked": a.revoked,
+            })
+        })
+        .collect();
+    doc(json!({ "schema": JSON_SCHEMA, "agents": agents }))
+}
+
+fn agents_text(list: &[AgentInfo]) -> String {
+    if list.is_empty() {
+        return "还没有签发过 agent\n".to_string();
+    }
+    list.iter()
+        .map(|a| {
+            let state = if a.revoked { "已撤销" } else { "有效" };
+            format!("{:<16} {}  {}  {}\n", a.label, &nexus_core_proto::NodeId(a.agent_id.0).to_string()[..8], state, a.grants.join(" "))
+        })
+        .collect()
+}
+
+fn deny_kind(r: &nexus_core_proto::authz::DenyReason) -> &'static str {
+    use nexus_core_proto::authz::DenyReason::*;
+    match r {
+        PeerNotInRoster => "peer_not_in_roster",
+        CertBadSignature => "cert_bad_signature",
+        CertNotYetValid => "cert_not_yet_valid",
+        CertExpired => "cert_expired",
+        AgentRevoked => "agent_revoked",
+        AssertionBadSignature => "assertion_bad_signature",
+        WrongTarget => "wrong_target",
+        ActionMismatch => "action_mismatch",
+        Stale => "stale",
+        NoMatchingGrant => "no_matching_grant",
+        Replayed => "replayed",
+    }
+}
+
+fn audit_json(records: &[AuditRecord]) -> String {
+    use nexus_core_proto::authz::{Outcome, PrincipalRef};
+    let events: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            let e = &r.event;
+            let principal = match &e.principal {
+                PrincipalRef::Device(_) => json!({ "device": r.peer_name }),
+                PrincipalRef::Agent { id, label } => json!({ "agent_id": nexus_core_proto::NodeId(id.0).to_string(), "label": label }),
+            };
+            let (outcome, reason) = match &e.outcome {
+                Outcome::Allow => ("allow", None),
+                Outcome::Deny(r) => ("deny", Some(deny_kind(r))),
+            };
+            json!({
+                "at_ms": e.at.0,
+                "peer": r.peer_name,
+                "principal": principal,
+                "capability": e.capability,
+                "resource": e.resource,
+                "outcome": outcome,
+                "reason": reason,
+            })
+        })
+        .collect();
+    doc(json!({ "schema": JSON_SCHEMA, "events": events }))
+}
+
+fn audit_text(records: &[AuditRecord]) -> String {
+    use nexus_core_proto::authz::{Outcome, PrincipalRef};
+    if records.is_empty() {
+        return "没有审计记录\n".to_string();
+    }
+    records
+        .iter()
+        .map(|r| {
+            let e = &r.event;
+            let who = match &e.principal {
+                PrincipalRef::Device(_) => r.peer_name.clone(),
+                PrincipalRef::Agent { label, .. } => format!("agent {label}（经由 {}）", r.peer_name),
+            };
+            let outcome = match &e.outcome {
+                Outcome::Allow => "允许".to_string(),
+                Outcome::Deny(reason) => format!("拒绝：{}", deny_kind(reason)),
+            };
+            format!("{}  {}  {} {}  {}\n", e.at.0, who, e.capability, e.resource, outcome)
+        })
+        .collect()
 }
 
 fn sessions_json(list: &[SessionInfo]) -> String {
@@ -597,6 +852,140 @@ pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let _ = output.flush().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+// ---------------------------------------------------------------- MCP
+
+const MCP_PROTOCOL: &str = "2025-06-18";
+
+fn mcp_tools() -> Value {
+    let node = json!({ "type": "string", "description": "设备的名字或标识" });
+    json!([
+        {
+            "name": "nexus_ls",
+            "description": "列出你的所有设备及其状态（是否在线、直连还是中继、往返时间）。",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "nexus_status",
+            "description": "查看一台设备的状态；不给 node 时为本机。",
+            "inputSchema": { "type": "object", "properties": { "node": node } },
+        },
+        {
+            "name": "nexus_exec",
+            "description": "在一台设备上执行命令（不经过 shell），返回退出码、标准输出和标准错误。需要 shell 特性时写 [\"sh\", \"-c\", \"...\"]。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": node,
+                    "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "程序及其参数" },
+                    "cwd": { "type": "string", "description": "工作目录（默认是远端用户的主目录）" },
+                    "timeout_s": { "type": "number", "description": "超过这么多秒就终止命令（默认 300）" },
+                },
+                "required": ["node", "command"],
+            },
+        },
+        {
+            "name": "nexus_session_ls",
+            "description": "列出一台设备上的常驻终端会话。",
+            "inputSchema": { "type": "object", "properties": { "node": node }, "required": ["node"] },
+        },
+    ])
+}
+
+/// 把一次工具调用翻译成命令，执行，得到 (结构化结果, 是否出错)。
+async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
+    let cmd = match name {
+        "nexus_ls" => Cmd::Ls { json: true },
+        "nexus_status" => Cmd::Status { node: text("node"), json: true },
+        "nexus_session_ls" => match text("node") {
+            Some(node) => Cmd::Session { cmd: SessionCmd::Ls { node, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 node" }), true),
+        },
+        "nexus_exec" => {
+            let command: Option<Vec<String>> = args
+                .get("command")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect());
+            match (text("node"), command) {
+                (Some(node), Some(command)) if !command.is_empty() => Cmd::Exec {
+                    node,
+                    timeout: Some(args.get("timeout_s").and_then(Value::as_f64).unwrap_or(300.0)),
+                    max_output: DEFAULT_MAX_OUTPUT,
+                    cwd: text("cwd"),
+                    env: vec![],
+                    json: true,
+                    command,
+                },
+                _ => return (json!({ "error": "usage", "message": "需要 node 和非空的 command 数组" }), true),
+            }
+        }
+        _ => return (json!({ "error": "usage", "message": format!("没有工具 {name}") }), true),
+    };
+    let mut sink = Captured::default();
+    // run_client 里也会调用到这里（nexus mcp），装箱以打断异步函数的递归。
+    let mut empty = tokio::io::empty();
+    let code = Box::pin(run_client(&cmd, ctl, &mut empty, &mut sink)).await;
+    let out = String::from_utf8_lossy(&sink.stdout);
+    match serde_json::from_str::<Value>(out.trim()) {
+        // 执行类命令即使远端命令失败也有完整的结果；那不是工具出错。
+        Ok(v) if v.get("schema").is_some() => (v, false),
+        _ => {
+            let err = String::from_utf8_lossy(&sink.stderr);
+            let v = err.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| {
+                json!({ "error": "internal", "message": err.trim(), "exit_code": code })
+            });
+            (v, true)
+        }
+    }
+}
+
+/// `nexus mcp`：在标准输入输出上按行读写 JSON-RPC。
+async fn mcp<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, stdin: &mut R, sink: &mut K) -> i32 {
+    let mut lines = tokio::io::BufReader::new(stdin).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = match serde_json::from_str::<Value>(&line) {
+            Err(e) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } })),
+            Ok(req) => {
+                let id = req.get("id").cloned();
+                let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let result: Result<Value, (i64, String)> = match method {
+                    "initialize" => Ok(json!({
+                        "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or(MCP_PROTOCOL),
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "nexus", "version": env!("CARGO_PKG_VERSION") },
+                    })),
+                    "ping" => Ok(json!({})),
+                    "tools/list" => Ok(json!({ "tools": mcp_tools() })),
+                    "tools/call" => {
+                        let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+                        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        let (value, is_error) = mcp_call(ctl, name, &args).await;
+                        Ok(json!({
+                            "content": [{ "type": "text", "text": value.to_string() }],
+                            "structuredContent": value,
+                            "isError": is_error,
+                        }))
+                    }
+                    other => Err((-32601, format!("不支持的方法 {other}"))),
+                };
+                // 通知（没有 id）不回应。
+                id.map(|id| match result {
+                    Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+                    Err((code, message)) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+                })
+            }
+        };
+        if let Some(reply) = reply {
+            sink.out(format!("{reply}\n").as_bytes());
+        }
+    }
+    0
 }
 
 /// `nexus exec`：把本机标准输入送过去，把输出实时写出（或在 `--json` 时最后一次性输出）。

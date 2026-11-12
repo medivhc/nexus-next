@@ -76,6 +76,10 @@ pub trait System {
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
     /// 原子地写入一个小的持久化值。
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()>;
+    /// 在一份只追加的日志末尾写一条记录（审计用）。记录本身由调用方编码。
+    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()>;
+    /// 读出一份日志的全部内容；不存在时为空。
+    fn read_log(&self, name: &str) -> io::Result<Vec<u8>>;
     /// 启动一个进程，标准输入、输出、错误都通过管道连接。
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc>;
     /// 在一个新的伪终端里启动当前用户的登录 shell。
@@ -89,6 +93,8 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
+    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> { (**self).append_log(name, record) }
+    fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }
     fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty> { (**self).spawn_pty(size) }
 }

@@ -8,11 +8,11 @@
 
 pub use nexus_cli::Output;
 
-use nexus_cli::{parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, SshArgs};
+use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
 use nexus_fabric_sim::SimTransport;
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_sim::{SimClock, SimDisk, SimSystem};
-use nexus_wire::CtlRequest;
+use nexus_wire::{AgentCredential, CtlRequest};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -52,10 +52,16 @@ impl World {
                 let mut sink = Captured::default();
                 let code = match parse(args.iter().copied(), &mut sink) {
                     Err(code) => code,
-                    Ok(cli) => {
-                        let mut input = std::io::Cursor::new(stdin.to_vec());
-                        run_client(&cli.cmd, &ChanCtl(tx.clone()), &mut input, &mut sink).await
-                    }
+                    Ok(cli) => match cli.agent.as_deref().map(load_agent).transpose() {
+                        Err(msg) => {
+                            sink.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+                            EXIT_USAGE
+                        }
+                        Ok(agent) => {
+                            let mut input = std::io::Cursor::new(stdin.to_vec());
+                            run_client(&cli.cmd, &ChanCtl(tx.clone(), agent), &mut input, &mut sink).await
+                        }
+                    },
                 };
                 Output::from_captured(code, sink)
             }
@@ -330,7 +336,7 @@ fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, state: Arc<TermState>) -> 
     let (mut stdout, mut out_rd) = tokio::io::duplex(16 * 1024);
     let st = state.clone();
     tokio::task::spawn_local(async move {
-        let ctl = ChanCtl(tx);
+        let ctl = ChanCtl(tx, None);
         let (_keep, mut resizes) = mpsc::channel(1);
         let code = match ssh(&ctl, &args, &mut stdin, &mut stdout, &mut resizes).await {
             Ok(code) => code,
@@ -393,11 +399,11 @@ impl Drop for RealTerm {
     }
 }
 
-struct ChanCtl(mpsc::Sender<CtlCall>);
+struct ChanCtl(mpsc::Sender<CtlCall>, Option<AgentCredential>);
 
 impl Ctl for ChanCtl {
     async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
-        let (call, client) = ctl_session(req);
+        let (call, client) = ctl_session(req, self.1.clone());
         self.0
             .send(call)
             .await

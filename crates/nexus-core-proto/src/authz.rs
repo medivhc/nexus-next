@@ -108,6 +108,8 @@ pub enum DenyReason {
     /// 签署时间离当前时间太远。
     Stale,
     NoMatchingGrant,
+    /// 同一个签过名的请求已经用过一次。由运行时的 [`ReplayGuard`] 发现。
+    Replayed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +144,39 @@ pub struct Verdict {
 impl Verdict {
     pub fn allowed(&self) -> bool {
         self.outcome == Outcome::Allow
+    }
+}
+
+/// 记住近期见过的 agent 请求，拒绝重复使用。
+///
+/// 只需要记住签署时间离现在不超过 [`MAX_CLOCK_SKEW_MS`] 的请求：更早的会被判定为过时。
+#[derive(Default, Debug)]
+pub struct ReplayGuard {
+    seen: std::collections::BTreeMap<(PublicKey, [u8; 16]), Timestamp>,
+}
+
+impl ReplayGuard {
+    /// 第一次见到这个请求时记下并返回 `true`；见过则返回 `false`。
+    pub fn first_use(&mut self, agent: &PublicKey, assertion: &Assertion, now: Timestamp) -> bool {
+        // 签署时间早于「现在减去两倍容差」的记录不可能再通过判定，可以忘掉。
+        let horizon = now.0.saturating_sub(2 * MAX_CLOCK_SKEW_MS);
+        self.seen.retain(|_, issued| issued.0 >= horizon);
+        match self.seen.entry((*agent, assertion.nonce)) {
+            std::collections::btree_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(assertion.issued_at);
+                true
+            }
+        }
+    }
+
+    /// 当前记住的请求数。
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
     }
 }
 
@@ -267,5 +302,36 @@ mod tests {
         for stale in [-300_001, 300_001, -3_600_000] {
             assert_eq!(at(stale), Outcome::Deny(DenyReason::Stale), "偏差 {stale} 毫秒应当拒绝");
         }
+    }
+
+    #[test]
+    fn replay_guard_rejects_second_use_and_forgets_old_requests() {
+        let a = SecretKey::from_seed([3; 32]).public();
+        let b = SecretKey::from_seed([4; 32]).public();
+        let action = Action {
+            capability: Capability::parse("term.exec").unwrap(),
+            resource: ResourcePath::parse("home").unwrap(),
+        };
+        let assertion = |nonce: u8, at: u64| Assertion {
+            target: NodeId([1; 32]),
+            action: action.clone(),
+            issued_at: Timestamp(at),
+            nonce: [nonce; 16],
+        };
+        let now = Timestamp(100 * MAX_CLOCK_SKEW_MS);
+        let mut g = ReplayGuard::default();
+        assert!(g.is_empty());
+        assert!(g.first_use(&a, &assertion(1, now.0), now));
+        assert!(!g.first_use(&a, &assertion(1, now.0), now), "同一个请求第二次使用");
+        assert!(g.first_use(&a, &assertion(2, now.0), now), "不同的随机数");
+        assert!(g.first_use(&b, &assertion(1, now.0), now), "不同的 agent");
+        assert_eq!(g.len(), 3);
+
+        // 签署时间恰好在「现在减两倍容差」上的还要记住，再早的可以忘掉。
+        let later = Timestamp(now.0 + 2 * MAX_CLOCK_SKEW_MS);
+        assert!(!g.first_use(&a, &assertion(1, now.0), later));
+        let much_later = Timestamp(later.0 + 1);
+        assert!(g.first_use(&a, &assertion(9, much_later.0), much_later));
+        assert_eq!(g.len(), 1, "过时的记录被清理");
     }
 }

@@ -27,7 +27,7 @@ postcard = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "sync", "net", "process", "signal"] }
 futures-util = "0.3"
 turmoil = "0.7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.3"
 tempfile = "3"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }

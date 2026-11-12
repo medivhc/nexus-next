@@ -95,6 +95,22 @@ impl System for RealSystem {
         }
     }
 
+    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let path = self.path(name)?.with_extension("log");
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        // 一次写入整条记录，避免并发追加时交错。
+        f.write_all(record)
+    }
+
+    fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
+        match std::fs::read(self.path(name)?.with_extension("log")) {
+            Ok(v) => Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let path = self.path(key)?;
         let tmp = path.with_extension("tmp");

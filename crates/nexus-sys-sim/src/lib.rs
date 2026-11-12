@@ -112,6 +112,15 @@ impl System for SimSystem {
         Ok(self.disk.0.borrow().get(key).cloned())
     }
 
+    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> {
+        self.disk.0.borrow_mut().entry(format!("log:{name}")).or_default().extend_from_slice(record);
+        Ok(())
+    }
+
+    fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
+        Ok(self.disk.0.borrow().get(&format!("log:{name}")).cloned().unwrap_or_default())
+    }
+
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         self.disk.0.borrow_mut().insert(key.to_string(), value.to_vec());
         Ok(())

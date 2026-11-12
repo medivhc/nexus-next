@@ -1,9 +1,9 @@
-use nexus_cli::{parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL, EXIT_USAGE};
+use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL, EXIT_USAGE};
 use nexus_fabric::{read_msg, write_msg, FrameReader};
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_real::RealSystem;
-use nexus_wire::{CtlRequest, CtlResponse, Input};
+use nexus_wire::{AgentCredential, CtlHello, CtlRequest, CtlResponse, Input};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,13 @@ fn main() {
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
     let data_dir = data_dir(&cli);
+    let agent = match cli.agent.as_deref().map(load_agent).transpose() {
+        Ok(a) => a,
+        Err(msg) => {
+            Terminal.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+            std::process::exit(EXIT_USAGE);
+        }
+    };
     let code = rt.block_on(async {
         match &cli.cmd {
             Cmd::Daemon { name, local_only, relay, no_discovery } => {
@@ -46,11 +53,11 @@ fn main() {
                 }
             }
             cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
-                let ctl = UnixCtl { socket: data_dir.join("ctl.sock") };
+                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
                 interactive_ssh(cmd, &ctl).await
             }
             cmd => {
-                let ctl = UnixCtl { socket: data_dir.join("ctl.sock") };
+                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
                 run_client(cmd, &ctl, &mut tokio::io::stdin(), &mut Terminal).await
             }
         }
@@ -113,12 +120,13 @@ fn data_dir(cli: &Cli) -> PathBuf {
 /// 命令行一侧：通过 Unix 套接字连接常驻程序，把套接字两个方向接到会话通道上。
 struct UnixCtl {
     socket: PathBuf,
+    agent: Option<AgentCredential>,
 }
 
 impl Ctl for UnixCtl {
     async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
         let mut stream = UnixStream::connect(&self.socket).await?;
-        write_msg(&mut stream, &req).await?;
+        write_msg(&mut stream, &CtlHello { agent: self.agent.clone(), request: req }).await?;
         let (rd, mut wr) = stream.into_split();
         let (in_tx, mut in_rx) = mpsc::channel::<Input>(16);
         let (resp_tx, resp_rx) = mpsc::channel::<CtlResponse>(16);
@@ -199,9 +207,9 @@ async fn terminate() {
 
 /// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
 async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>) {
-    let Ok(req) = read_msg::<_, CtlRequest>(&mut stream).await else { return };
-    let ((req, server), mut client) = ctl_session(req);
-    if tx.send((req, server)).await.is_err() {
+    let Ok(hello) = read_msg::<_, CtlHello>(&mut stream).await else { return };
+    let (call, mut client) = ctl_session(hello.request, hello.agent);
+    if tx.send(call).await.is_err() {
         return;
     }
     let (rd, mut wr) = stream.into_split();

@@ -3,6 +3,7 @@
 //! 帧 = 4 字节小端长度 + postcard 编码的消息。本 crate 只做编解码，不做 IO。
 #![forbid(unsafe_code)]
 
+use nexus_core_proto::authz::{AuditEvent, Principal, SignedAgentCert};
 use nexus_core_proto::roster::{DeviceRole, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PathKind, Timestamp};
 pub use nexus_term_proto::{ClientMsg, Size};
@@ -10,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 3;
+pub const WIRE_VERSION: u16 = 4;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -23,6 +24,8 @@ pub struct RequestHeader {
     pub version: u16,
     /// 发送方持有的名册版本，没有名册时为 0。双方据此发现谁的名册更旧。
     pub roster_version: u64,
+    /// 以谁的身份请求：对端设备自己，或经由它的一个 agent。
+    pub principal: Principal,
     pub body: Request,
 }
 
@@ -166,6 +169,13 @@ pub enum CtlRequest {
     List,
     /// 在某个节点上执行命令。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Exec`。
     Exec { node: String, spec: ExecSpec },
+    /// 签发一份 agent 凭据（只能在管理设备上）。授权条目写作 `能力@资源`。
+    AgentIssue { label: String, grants: Vec<String>, ttl_ms: u64 },
+    /// 撤销一个 agent，按名字或标识指定。
+    AgentRevoke { agent: String },
+    AgentList,
+    /// 本机的审计记录，最新的在后。
+    Audit { limit: Option<u32> },
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -182,6 +192,10 @@ pub enum CtlResponse {
     Exec(ExecEvent),
     Session(ClientMsg),
     Sessions(Vec<SessionInfo>),
+    AgentIssued(AgentIssueReport),
+    AgentRevoked(MembershipReport),
+    Agents(Vec<AgentInfo>),
+    Audit(Vec<AuditRecord>),
     Ok,
     Error(WireError),
 }
@@ -223,6 +237,67 @@ pub struct MembershipReport {
     pub pushed: u32,
     /// 暂时没能送达的设备名；它们会在下次与任一已更新的设备通信时得到新名册。
     pub unreachable: Vec<String>,
+}
+
+/// 命令行打开控制会话时发送的第一条消息。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtlHello {
+    /// 以这个 agent 的身份发出请求；`None` 表示以本机设备（用户本人）的身份。
+    pub agent: Option<AgentCredential>,
+    pub request: CtlRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIssueReport {
+    pub agent_id: nexus_core_proto::PublicKey,
+    pub label: String,
+    pub not_after: Timestamp,
+    /// 凭据文本（`nxa1-` 开头），含 agent 的私钥。
+    pub credential: String,
+}
+
+/// 管理设备记录的一个已签发的 agent。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub agent_id: nexus_core_proto::PublicKey,
+    pub label: String,
+    pub issued_at: Timestamp,
+    pub not_after: Timestamp,
+    pub grants: Vec<String>,
+    pub revoked: bool,
+}
+
+/// 一条审计记录，附上经由的设备在记录时的名字。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub event: AuditEvent,
+    pub peer_name: String,
+}
+
+/// agent 凭据：管理设备签发的证书，加上 agent 自己的私钥。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCredential {
+    pub cert: SignedAgentCert,
+    pub secret: [u8; 32],
+}
+
+const CREDENTIAL_PREFIX: &str = "nxa1-";
+
+impl AgentCredential {
+    pub fn encode(&self) -> String {
+        let bytes = postcard::to_allocvec(self).expect("内存中的值总能编码");
+        format!("{CREDENTIAL_PREFIX}{}", hex_encode(&bytes))
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let body = s.trim().strip_prefix(CREDENTIAL_PREFIX)?;
+        postcard::from_bytes(&hex_decode(body)?).ok()
+    }
+
+    /// 文本看起来是一份凭据（而不是凭据文件的路径）。
+    pub fn looks_like(s: &str) -> bool {
+        s.trim_start().starts_with(CREDENTIAL_PREFIX)
+    }
 }
 
 /// 加入码：新设备显示，管理设备输入。
@@ -362,7 +437,7 @@ mod tests {
     #[test]
     fn decoder_handles_byte_at_a_time_and_back_to_back_frames() {
         let mut bytes = encode(&sample()).unwrap();
-        bytes.extend(encode(&RequestHeader { version: WIRE_VERSION, roster_version: 0, body: Request::NodeInfo }).unwrap());
+        bytes.extend(encode(&RequestHeader { version: WIRE_VERSION, roster_version: 0, principal: nexus_core_proto::authz::Principal::Device, body: Request::NodeInfo }).unwrap());
         let mut dec = FrameDecoder::default();
         let mut got_first = false;
         let mut got_second = false;
