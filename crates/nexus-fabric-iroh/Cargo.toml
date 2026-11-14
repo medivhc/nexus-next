@@ -11,3 +11,8 @@ nexus-wire.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 postcard.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+nexus-core-proto.workspace = true
+iroh-relay.workspace = true

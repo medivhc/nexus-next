@@ -193,7 +193,7 @@ fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config
         "disabled" => Relay::Disabled,
         url => Relay::Custom(url.to_string()),
     };
-    Config { relay, discovery: !no_discovery, bind: None }
+    Config { relay, discovery: !no_discovery, bind: None, direct: true }
 }
 
 async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, config: Config) -> io::Result<()> {

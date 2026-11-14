@@ -33,24 +33,29 @@ pub struct Config {
     pub discovery: bool,
     /// 绑定的本地地址；`None` 时由 iroh 决定。
     pub bind: Option<SocketAddr>,
+    /// 是否使用直连（UDP）。`false` 时不开任何 UDP 套接字，只经中继通信，
+    /// 和浏览器里的网页节点相同。
+    pub direct: bool,
 }
 
 impl Config {
     /// 只在本机回环地址上通信，不连任何外部服务。用于测试。
     pub fn local_only() -> Self {
-        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()) }
+        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { relay: Relay::Default, discovery: true, bind: None }
+        Self { relay: Relay::Default, discovery: true, bind: None, direct: true }
     }
 }
 
 pub struct IrohTransport {
     ep: Endpoint,
     me: NodeId,
+    /// 自建中继：它总在本节点的地址提示里，哪怕还没连上它。
+    relay: Option<RelayUrl>,
     hints: RefCell<HashMap<NodeId, EndpointAddr>>,
     /// 复用到同一节点的连接，避免每次调用都重新握手。
     conns: RefCell<HashMap<NodeId, IrohConnection>>,
@@ -71,25 +76,32 @@ impl IrohTransport {
         builder = builder
             .secret_key(SecretKey::from_bytes(&seed))
             .alpns(Proto::ALL.iter().map(|p| p.alpn().to_vec()).collect());
+        let mut relay = None;
         builder = match &config.relay {
             Relay::Default => builder.relay_mode(RelayMode::Default),
             Relay::Disabled => builder.relay_mode(RelayMode::Disabled),
             Relay::Custom(url) => {
                 let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
+                relay = Some(url.clone());
                 builder.relay_mode(RelayMode::custom([url]))
             }
         };
-        if let Some(addr) = config.bind {
+        if !config.direct {
+            builder = builder.clear_ip_transports();
+        } else if let Some(addr) = config.bind {
             builder = builder.clear_ip_transports().bind_addr(addr).map_err(io_err)?;
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
-        Ok(Self { ep, me, hints: RefCell::default(), conns: RefCell::default() })
+        Ok(Self { ep, me, relay, hints: RefCell::default(), conns: RefCell::default() })
     }
 
     /// 本端点当前的完整地址。直连地址在没有外部服务时也包含绑定的本地套接字。
     fn current_addr(&self) -> EndpointAddr {
         let mut addr = self.ep.addr();
+        if let Some(url) = &self.relay {
+            addr = addr.with_relay_url(url.clone());
+        }
         for sock in self.ep.bound_sockets() {
             if !sock.ip().is_unspecified() {
                 addr = addr.with_ip_addr(sock);

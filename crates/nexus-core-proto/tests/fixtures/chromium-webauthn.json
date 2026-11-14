@@ -1,0 +1,17 @@
+{
+  "source": "Chromium（Playwright 驱动，CDP 虚拟认证器 ctap2/internal），tools/webauthn-probe/probe.js 生成",
+  "rp_id": "localhost",
+  "challenge_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+  "user_handle_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "registration": {
+    "id": "MjPXrdgZ9xbi7cNZcw9WX8MtFqDzlRcNBDUQftXfJpg=",
+    "alg": -7,
+    "spki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEwshdEsiomvA5VGqTXgeyV0kO7LtgRPdEzD8bxtlNeMxj/ofN5xqcQTfckD13u7diCYTVrrpH+fqLIH3huuV4Bg=="
+  },
+  "assertion": {
+    "userHandle": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+    "sig": "MEUCIQCdHl2b0xr2AZDfarE9spnC2oyANYtctwfUGTfhjdg2aAIgdcR6KWm86+CM8IkbwAThV88JEw+6TnD/4eLH6qhZQXc=",
+    "authData": "SZYN5YgOjGh0NBcPZHZgW4/krrmihjLHmVzzuoMdl2MFAAAAAg==",
+    "clientData": "{\"type\":\"webauthn.get\",\"challenge\":\"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\",\"origin\":\"http://localhost:44787\",\"crossOrigin\":false}"
+  }
+}

@@ -33,6 +33,7 @@ tempfile = "3"
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 proptest = "1"
 iroh = "1.4"
+iroh-relay = { version = "1.4", features = ["server"] }
 vt100 = "0.18"
 portable-pty = "0.9"
 crossterm = "0.29"

@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>probe</title>
+<script>
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+window.register = async () => {
+  const c = await navigator.credentials.create({ publicKey: {
+    rp: { id: "localhost", name: "Nexus" },
+    user: { id: new Uint8Array(32).fill(7), name: "xiang", displayName: "Xiang" },
+    challenge: new Uint8Array(32).fill(1),
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+  }});
+  return { id: b64(c.rawId), alg: c.response.getPublicKeyAlgorithm(), spki: b64(c.response.getPublicKey()) };
+};
+window.login = async () => {
+  const a = await navigator.credentials.get({ publicKey: { rpId: "localhost", challenge: new Uint8Array(32).fill(9), userVerification: "required" } });
+  return { userHandle: b64(a.response.userHandle), sig: b64(a.response.signature),
+           authData: b64(a.response.authenticatorData), clientData: new TextDecoder().decode(a.response.clientDataJSON) };
+};
+</script>
