@@ -28,6 +28,12 @@ impl SimClock {
     pub fn jump(&self, d: std::time::Duration) {
         self.0.set(self.0.get() + d.as_millis() as u64);
     }
+
+    /// 仿真里的当前时间：起点、跳过的时间，加上仿真已经运行的时间。
+    pub fn now(&self) -> Timestamp {
+        let elapsed = turmoil::sim_elapsed().unwrap_or_default();
+        Timestamp(SIM_EPOCH_MS + self.0.get() + elapsed.as_millis() as u64)
+    }
 }
 
 pub struct SimSystem {
@@ -97,8 +103,7 @@ impl System for SimSystem {
     }
 
     fn now(&self) -> Timestamp {
-        let elapsed = turmoil::sim_elapsed().unwrap_or_default();
-        Timestamp(SIM_EPOCH_MS + self.clock.0.get() + elapsed.as_millis() as u64)
+        self.clock.now()
     }
 
     fn random(&self, buf: &mut [u8]) {

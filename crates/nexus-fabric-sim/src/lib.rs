@@ -20,14 +20,20 @@ pub struct SimTransport {
     me: NodeId,
     host: String,
     hints: RefCell<HashMap<NodeId, String>>,
-    listener: TcpListener,
+    /// 只发起连接的一方（浏览器）没有监听。
+    listener: Option<TcpListener>,
 }
 
 impl SimTransport {
     /// 必须在 turmoil 的主机上下文里调用，`host` 是本主机的名字。
     pub async fn bind(me: NodeId, host: &str) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
-        Ok(Self { me, host: host.to_string(), hints: RefCell::default(), listener })
+        Ok(Self { me, host: host.to_string(), hints: RefCell::default(), listener: Some(listener) })
+    }
+
+    /// 只发起连接、不接受连接的一方，例如浏览器。同一台仿真主机上可以有任意多个。
+    pub fn client(me: NodeId) -> Self {
+        Self { me, host: String::new(), hints: RefCell::default(), listener: None }
     }
 }
 
@@ -69,8 +75,9 @@ impl Transport for SimTransport {
     }
 
     async fn accept(&self) -> io::Result<(SimConn, Proto)> {
+        let Some(listener) = &self.listener else { return std::future::pending().await };
         loop {
-            let (mut stream, _) = self.listener.accept().await?;
+            let (mut stream, _) = listener.accept().await?;
             let mut head = [0u8; 33];
             if stream.read_exact(&mut head).await.is_err() {
                 continue;

@@ -8,11 +8,11 @@
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use nexus_core_proto::authz::{
-    self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal, ReplayGuard,
+    self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal, ReplayGuard, WebSession,
 };
 use nexus_core_proto::path::{CapabilityPattern, ResourcePattern};
 use nexus_core_proto::roster::{RevokedAgent, WebKey};
-use nexus_core_proto::webauthn::P256Key;
+use nexus_core_proto::webauthn::{login_challenge, verify_assertion, P256Key, WebAuthnAssertion};
 use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
@@ -20,7 +20,7 @@ use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transpor
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
-    hex_encode, AddrHints, AgentCredential, NewCredential, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
+    hex_encode, AddrHints, AgentCredential, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
     WireError, WIRE_VERSION,
 };
@@ -62,8 +62,16 @@ pub fn ctl_session(req: CtlRequest, agent: Option<AgentCredential>) -> (CtlCall,
 enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
-    Session { name: String, create: bool, size: Size },
+    Session { name: String, create: bool, size: Size, guard: Option<Box<WebGuard>> },
     WebEnroll { token: [u8; 16], credential: NewCredential },
+}
+
+/// 网页登录连着的会话：名册变化时重新判定，登录到期时断开。
+struct WebGuard {
+    peer: NodeId,
+    principal: Principal,
+    action: Action,
+    not_after: Timestamp,
 }
 
 /// 一次等待浏览器完成的通行密钥登记。
@@ -189,7 +197,9 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } => return Ok(None),
+        Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } | Request::WebLogin { .. } => {
+            return Ok(None)
+        }
     };
     if let Some(name) = session {
         if !valid_segment(name) {
@@ -325,6 +335,8 @@ pub struct Node<T, S: System> {
     spawn_rx: RefCell<Option<mpsc::UnboundedReceiver<NewSession<S::Pty>>>>,
     replay: RefCell<ReplayGuard>,
     web_enrolls: RefCell<HashMap<[u8; 16], PendingWebEnroll>>,
+    /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
+    roster_epoch: tokio::sync::watch::Sender<u64>,
 }
 
 impl<T: Transport, S: System> Node<T, S> {
@@ -347,6 +359,7 @@ impl<T: Transport, S: System> Node<T, S> {
             spawn_rx: RefCell::new(Some(spawn_rx)),
             replay: RefCell::default(),
             web_enrolls: RefCell::default(),
+            roster_epoch: tokio::sync::watch::Sender::new(0),
             started_at: system.now(),
             transport,
             system,
@@ -416,6 +429,7 @@ impl<T: Transport, S: System> Node<T, S> {
         accept_update(current.as_ref(), candidate, &root).map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         save(&self.system, KEY_ROSTER, candidate).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(candidate.clone());
+        self.roster_epoch.send_modify(|v| *v += 1);
         Ok(())
     }
 
@@ -478,6 +492,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 Proto::Join => Dispatch::Reply(self.handle_join(header)),
                 Proto::Web => match header.body {
                     Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
+                    Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
                     _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
                 },
             },
@@ -486,7 +501,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let response = match dispatch {
             Dispatch::Reply(r) => r,
             Dispatch::Exec(spec) => return self.serve_exec(stream, spec).await,
-            Dispatch::Session { name, create, size } => return self.serve_session(stream, &name, create, size).await,
+            Dispatch::Session { name, create, size, guard } => {
+                return self.serve_session(stream, &name, create, size, guard).await
+            }
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
                 Ok(label) => Response::WebEnrolled { label },
                 Err(e) => Response::Error(e),
@@ -515,7 +532,9 @@ impl<T: Transport, S: System> Node<T, S> {
             });
         }
         let mine = self.roster_version();
-        if header.roster_version > mine {
+        // 浏览器没有名册：不交换版本。
+        let web = matches!(header.principal, Principal::Web { .. });
+        if !web && header.roster_version > mine {
             return Dispatch::Reply(Response::Error(err(ErrorCode::StaleRoster, format!("本机名册版本 {mine} 较旧"))));
         }
         let Some(roster) = self.roster() else {
@@ -530,15 +549,26 @@ impl<T: Transport, S: System> Node<T, S> {
         if let Err(e) = self.authorize(&roster, peer, &header.principal, &action) {
             return Dispatch::Reply(Response::Error(e));
         }
-        if mine > header.roster_version {
+        if !web && mine > header.roster_version {
             // 对方的名册旧了，稍后在后台推过去。
             let _ = self.push_tx.send(peer);
         }
         Dispatch::Reply(match header.body {
             Request::NodeInfo => Response::NodeInfo(self.info()),
             Request::Exec(spec) => return Dispatch::Exec(spec),
-            Request::SessionAttach { name, create, size } => return Dispatch::Session { name, create, size },
-            Request::SessionList => Response::Sessions(self.session_list(agent_cert(&header.principal))),
+            Request::SessionAttach { name, create, size } => {
+                let guard = match &header.principal {
+                    Principal::Web { session } => Some(Box::new(WebGuard {
+                        peer,
+                        principal: header.principal.clone(),
+                        action,
+                        not_after: session.session.not_after,
+                    })),
+                    _ => None,
+                };
+                return Dispatch::Session { name, create, size, guard };
+            }
+            Request::SessionList => Response::Sessions(self.session_list(|p| principal_sees(&roster, &header.principal, p))),
             Request::SessionKill { name } => match self.session_kill(&name) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
@@ -591,6 +621,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let mut trust = self.trust.borrow_mut();
             trust.root = Some(root);
             trust.roster = Some(roster);
+            self.roster_epoch.send_modify(|v| *v += 1);
         }
         *self.pending_join.borrow_mut() = None;
         let _ = self.learn_hints(&addrs);
@@ -881,6 +912,74 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(label)
     }
 
+    /// 浏览器用通行密钥登录：校验签名，签发网页会话凭证，给出它能看到的设备。
+    fn web_login(&self, peer: NodeId, issued_at: Timestamp, assertion: &WebAuthnAssertion) -> Response {
+        let result = (|| {
+            let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+            let key = roster
+                .web_keys
+                .iter()
+                .find(|k| k.credential_id == assertion.credential_id)
+                .ok_or_else(|| err(ErrorCode::Denied, "不认识这个通行密钥（可能已被撤销）"))?;
+            let now = self.system.now();
+            let me_name = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
+            let checked = if now.0.abs_diff(issued_at.0) > authz::MAX_CLOCK_SKEW_MS {
+                Err(err(ErrorCode::Denied, "通行密钥的签名时间与设备时钟相差太远（检查两边的时钟）"))
+            } else {
+                let challenge = login_challenge(issued_at, peer);
+                verify_assertion(&key.public_key, &key.rp_id, &challenge, assertion)
+                    .map(|_| ())
+                    .map_err(|e| err(ErrorCode::Denied, format!("通行密钥签名无效（{e:?}）")))
+            };
+            // 登录本身也记入审计。
+            let outcome = match &checked {
+                Ok(()) => Outcome::Allow,
+                Err(_) => Outcome::Deny(DenyReason::NoMatchingGrant),
+            };
+            self.audit(
+                &roster,
+                &AuditEvent {
+                    at: now,
+                    peer,
+                    principal: authz::PrincipalRef::Web { label: key.label.clone() },
+                    capability: "web.login".into(),
+                    resource: me_name,
+                    outcome,
+                },
+            );
+            checked?;
+            let device_key = load_or_create_device_key(&self.system).map_err(internal)?;
+            let session = WebSession {
+                browser: peer,
+                label: key.label.clone(),
+                issuer: self.me(),
+                issued_at: now,
+                not_after: Timestamp(now.0 + authz::MAX_WEB_SESSION_MS),
+            }
+            .sign(&device_key);
+            let hints: HashMap<NodeId, String> = self.addr_hints().into_iter().collect();
+            let devices = roster
+                .devices
+                .iter()
+                .filter(|d| ResourcePath::parse(&d.name).is_ok_and(|p| grants_see(&key.grants, &p)))
+                .map(|d| WebDevice {
+                    name: d.name.clone(),
+                    node_id: d.node_id,
+                    hint: if d.node_id == self.me() {
+                        self.transport.local_hint()
+                    } else {
+                        hints.get(&d.node_id).cloned().unwrap_or_default()
+                    },
+                })
+                .collect();
+            Ok((session, devices))
+        })();
+        match result {
+            Ok((session, devices)) => Response::WebLoggedIn { session, devices },
+            Err(e) => Response::Error(e),
+        }
+    }
+
     fn web_list(&self) -> Result<Vec<WebKeyInfo>, WireError> {
         let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         Ok(roster
@@ -913,6 +1012,7 @@ impl<T: Transport, S: System> Node<T, S> {
     fn install_roster(&self, signed: SignedRoster) -> Result<(), WireError> {
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
+        self.roster_epoch.send_modify(|v| *v += 1);
         Ok(())
     }
 
@@ -969,6 +1069,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
+        self.roster_epoch.send_modify(|v| *v += 1);
         agents[index].revoked = true;
         save(&self.system, KEY_AGENTS, &agents).map_err(internal)?;
         let (pushed, unreachable) = self.broadcast_roster(None).await;
@@ -1222,7 +1323,7 @@ impl<T: Transport, S: System> Node<T, S> {
                     }
                 }
             };
-            futures_util::future::join(self.serve_session(far, &name, true, size), client).await;
+            futures_util::future::join(self.serve_session(far, &name, true, size, None), client).await;
             return;
         }
         let body = Request::SessionAttach { name, create: true, size };
@@ -1304,7 +1405,19 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
-    async fn serve_session<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, name: &str, create: bool, size: Size) {
+    async fn serve_session<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: St,
+        name: &str,
+        create: bool,
+        size: Size,
+        guard: Option<Box<WebGuard>>,
+    ) {
+        let mut epoch = self.roster_epoch.subscribe();
+        let expires = guard.as_ref().map(|g| {
+            let left = g.not_after.0.saturating_sub(self.system.now().0);
+            tokio::time::Instant::now() + Duration::from_millis(left)
+        });
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
         let cmd = match self.open_session(name, create, size) {
@@ -1330,6 +1443,17 @@ impl<T: Transport, S: System> Node<T, S> {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(last_heard + PEER_SILENT) => break,
+                // 网页登录到期：断开。
+                _ = tokio::time::sleep_until(expires.unwrap_or(last_heard)), if expires.is_some() => break,
+                // 名册变了：网页登录的权限可能已被收回，重新判定。
+                Ok(()) = epoch.changed(), if guard.is_some() => {
+                    let g = guard.as_ref().expect("有网页登录");
+                    let Some(roster) = self.roster() else { break };
+                    let ctx = Context { roster: &roster, me: self.me(), now: self.system.now() };
+                    if authz::decide(&ctx, g.peer, &g.principal, &g.action).outcome != Outcome::Allow {
+                        break;
+                    }
+                }
                 _ = tokio::time::sleep_until(next_beat) => {
                     next_beat = tokio::time::Instant::now() + HEARTBEAT;
                     if !send_within(&mut wr, &SessionFrame::Heartbeat).await {
@@ -1436,15 +1560,13 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    /// 会话列表；给 agent 时只包含它能看到的会话。
-    fn session_list(&self, agent: Option<&authz::SignedAgentCert>) -> Vec<SessionInfo> {
+    /// 会话列表；给 agent 和网页登录时只包含它能看到的会话。
+    fn session_list(&self, sees: impl Fn(&ResourcePath) -> bool) -> Vec<SessionInfo> {
         let me = self.name();
         self.sessions
             .borrow()
             .iter()
-            .filter(|(name, _)| {
-                agent.is_none_or(|c| ResourcePath::parse(&format!("{me}/session/{name}")).is_ok_and(|p| c.can_see(&p)))
-            })
+            .filter(|(name, _)| ResourcePath::parse(&format!("{me}/session/{name}")).is_ok_and(|p| sees(&p)))
             .map(|(name, h)| SessionInfo { name: name.clone(), clients: h.clients.get(), created_at: h.created_at, size: h.size.get() })
             .collect()
     }
@@ -1473,7 +1595,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let device = self.resolve_for(node, agent)?;
         if device.node_id == self.me() {
             self.authorize_local(agent, &Request::SessionList)?;
-            return Ok(self.session_list(agent.map(|a| &a.cert)));
+            return Ok(self.session_list(|p| agent.is_none_or(|a| a.cert.can_see(p))));
         }
         match self.call_node(&device, Request::SessionList, agent).await? {
             Response::Sessions(list) => Ok(list),
@@ -1538,6 +1660,7 @@ impl<T: Transport, S: System> Node<T, S> {
         trust.root = Some(root.public());
         trust.root_key = Some(seed);
         trust.roster = Some(roster);
+        self.roster_epoch.send_modify(|v| *v += 1);
         Ok(InitReport { name, node_id: self.me(), root: root.public(), recovery_code: hex_encode(&seed) })
     }
 
@@ -1597,6 +1720,7 @@ impl<T: Transport, S: System> Node<T, S> {
         // 只有对方确认之后才更新本机名册，避免出现半加入的状态。
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
+        self.roster_epoch.send_modify(|v| *v += 1);
         let _ = self.learn_hints(&vec![(code.node_id, code.addr.clone())]);
         let (pushed, unreachable) = self.broadcast_roster(Some(code.node_id)).await;
         Ok(MembershipReport { name, node_id: code.node_id, roster_version: self.roster_version(), pushed, unreachable })
@@ -1617,6 +1741,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
+        self.roster_epoch.send_modify(|v| *v += 1);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: name.to_string(), node_id: device.node_id, roster_version: self.roster_version(), pushed, unreachable })
     }
@@ -1701,14 +1826,6 @@ fn visible(agent: &AgentCredential, device: &str) -> bool {
     ResourcePath::parse(device).is_ok_and(|p| agent.cert.can_see(&p))
 }
 
-fn agent_cert(p: &Principal) -> Option<&authz::SignedAgentCert> {
-    match p {
-        Principal::Device => None,
-        Principal::Agent { cert, .. } => Some(cert),
-        Principal::Web { .. } => None,
-    }
-}
-
 /// 限时写一帧：写入卡住 [`PEER_SILENT`] 也算失败（连接可能已经失效而传输层还没发现）。
 async fn send_within<W: AsyncWrite + Unpin, M: serde::Serialize>(wr: &mut W, msg: &M) -> bool {
     matches!(tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await, Ok(Ok(())))
@@ -1719,4 +1836,18 @@ fn page_rp_id(page: &str) -> Option<String> {
     let (_, rest) = page.split_once("://")?;
     let host = rest.split(':').next()?;
     (!host.is_empty() && nexus_core_proto::webauthn::origin_allowed(page, host)).then(|| host.to_string())
+}
+
+/// 一组授权能否看到 `path`（或它之下的东西）。
+fn grants_see(grants: &[Grant], path: &ResourcePath) -> bool {
+    grants.iter().any(|g| g.resource.may_match_within(path))
+}
+
+/// 一个主体能否看到 `path`：设备本人看到一切，agent 和网页登录按各自的授权。
+fn principal_sees(roster: &Roster, principal: &Principal, path: &ResourcePath) -> bool {
+    match principal {
+        Principal::Device => true,
+        Principal::Agent { cert, .. } => cert.can_see(path),
+        Principal::Web { session } => roster.web_key(&session.session.label).is_some_and(|k| grants_see(&k.grants, path)),
+    }
 }

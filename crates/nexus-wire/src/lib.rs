@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 6;
+pub const WIRE_VERSION: u16 = 7;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -43,6 +43,8 @@ pub enum Request {
     Exec(ExecSpec),
     /// 网页节点（协议 nexus/web/1）：用一次性登记码登记一个新建的通行密钥。
     WebEnroll { token: [u8; 16], credential: NewCredential },
+    /// 网页节点：用通行密钥登录。挑战是 `login_challenge(issued_at, 浏览器的临时节点标识)`。
+    WebLogin { issued_at: Timestamp, assertion: nexus_core_proto::webauthn::WebAuthnAssertion },
     /// 连上一个终端会话，不存在且 `create` 时创建。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后调用方发送 [`Input`]（`Stdin`、`Resize`、`Ack`、`Detach`），对方发送 [`ClientMsg`]。
     SessionAttach { name: String, create: bool, size: Size },
@@ -60,6 +62,14 @@ pub struct NewCredential {
     pub spki: Vec<u8>,
     /// 创建时页面所在的依赖方（域名）。
     pub rp_id: String,
+}
+
+/// 网页登录能看到的一台设备，带着连接它所需的地址提示。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDevice {
+    pub name: String,
+    pub node_id: NodeId,
+    pub hint: String,
 }
 
 /// 一个终端会话的概况。
@@ -140,6 +150,8 @@ pub enum Response {
     Sessions(Vec<SessionInfo>),
     /// 通行密钥登记成功，带上它的名字。
     WebEnrolled { label: String },
+    /// 登录成功：网页会话凭证，以及这个通行密钥能看到的设备。
+    WebLoggedIn { session: nexus_core_proto::authz::SignedWebSession, devices: Vec<WebDevice> },
     Error(WireError),
 }
 

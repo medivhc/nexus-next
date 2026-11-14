@@ -4,6 +4,9 @@
 //! 通行密钥由软件认证器扮演。这里只做协议，不碰浏览器 API：通行密钥的创建和签名由调用方完成。
 #![forbid(unsafe_code)]
 
+mod node;
+pub use node::{challenge, WebNode, WebTerminal};
+
 use nexus_core_proto::authz::Principal;
 use nexus_core_proto::NodeId;
 use nexus_fabric::{read_msg, write_msg, Connection, Proto, Transport};
@@ -36,15 +39,21 @@ impl EnrollLink {
     }
 }
 
-fn unreachable(e: std::io::Error) -> WireError {
-    WireError::new(ErrorCode::Unreachable, format!("连不上管理设备：{e}"))
+pub(crate) fn unreachable(e: std::io::Error) -> WireError {
+    WireError::new(ErrorCode::Unreachable, format!("连不上设备：{e}"))
 }
 
 /// 发一个请求、收一个回应，然后像常驻程序之间那样有序关闭这条流。
-async fn call<T: Transport>(transport: &T, to: NodeId, proto: Proto, body: Request) -> Result<Response, WireError> {
+pub(crate) async fn call<T: Transport>(
+    transport: &T,
+    to: NodeId,
+    proto: Proto,
+    principal: Principal,
+    body: Request,
+) -> Result<Response, WireError> {
     let conn = transport.connect(to, proto).await.map_err(unreachable)?;
     let mut stream = conn.open_bi().await.map_err(unreachable)?;
-    let header = RequestHeader { version: WIRE_VERSION, roster_version: 0, principal: Principal::Device, body };
+    let header = RequestHeader { version: WIRE_VERSION, roster_version: 0, principal, body };
     write_msg(&mut stream, &header).await.map_err(unreachable)?;
     let resp: Response = read_msg(&mut stream).await.map_err(unreachable)?;
     let _ = stream.shutdown().await;
@@ -57,7 +66,8 @@ async fn call<T: Transport>(transport: &T, to: NodeId, proto: Proto, body: Reque
 /// 把新建的通行密钥交给管理设备登记，返回它在网络里的名字。
 pub async fn enroll<T: Transport>(transport: &T, link: &EnrollLink, credential: NewCredential) -> Result<String, WireError> {
     transport.add_hint(link.node, &link.hint);
-    match call(transport, link.node, Proto::Web, Request::WebEnroll { token: link.token, credential }).await? {
+    let body = Request::WebEnroll { token: link.token, credential };
+    match call(transport, link.node, Proto::Web, Principal::Device, body).await? {
         Response::WebEnrolled { label } => Ok(label),
         Response::Error(e) => Err(e),
         other => Err(WireError::new(ErrorCode::Internal, format!("管理设备的回应无法理解：{other:?}"))),

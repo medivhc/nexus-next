@@ -258,19 +258,29 @@ impl World {
 }
 
 impl World {
+    /// 场景里的当前时间：仿真里是仿真时钟，真实后端里是系统时间。浏览器用它签名。
+    pub fn now(&self) -> nexus_core_proto::Timestamp {
+        match &self.inner {
+            Inner::Sim { clock, .. } => clock.now(),
+            Inner::Real(_) => nexus_core_proto::Timestamp(
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+            ),
+        }
+    }
+
     /// 一个浏览器：只有一个临时的节点身份，不在名册里，不运行常驻程序。
     /// 它运行的是网页节点核心（浏览器里同一份代码），通行密钥由软件认证器扮演。
-    ///
-    /// 仿真里每个场景最多一个浏览器。
     pub async fn browser(&self) -> Browser {
-        self.trace.borrow_mut().push("browser".into());
+        let n = {
+            let mut trace = self.trace.borrow_mut();
+            trace.push("browser".into());
+            trace.len()
+        };
         let transport = match &self.inner {
             Inner::Sim { .. } => {
-                // 场景本身运行在名为 scenario 的仿真主机上，浏览器就在这台主机上监听。
-                let n = self.trace.borrow().len() as u8;
-                let key = nexus_core_proto::SecretKey::from_seed([n.wrapping_add(200); 32]);
-                let id = nexus_core_proto::NodeId(key.public().0);
-                BrowserTransport::Sim(SimTransport::bind(id, "scenario").await.expect("仿真里每个场景最多一个浏览器"))
+                // 仿真里身份由种子决定，保持可复现。
+                let key = nexus_core_proto::SecretKey::from_seed([(n % 200) as u8 + 50; 32]);
+                BrowserTransport::Sim(SimTransport::client(nexus_core_proto::NodeId(key.public().0)))
             }
             Inner::Real(_) => {
                 let mut seed = [0u8; 32];
@@ -281,18 +291,45 @@ impl World {
                 BrowserTransport::Real(t)
             }
         };
-        Browser { transport }
+        Browser { state: RefCell::new(BrowserState::Fresh(transport)), label: format!("browser{n}") }
     }
 }
 
-/// 场景里的一个浏览器，见 [`World::browser`]。
+/// 场景里的一个浏览器，见 [`World::browser`]。登录前可以登记通行密钥，登录后访问各设备。
 pub struct Browser {
-    transport: BrowserTransport,
+    state: RefCell<BrowserState>,
+    label: String,
+}
+
+enum BrowserState {
+    Fresh(BrowserTransport),
+    LoggedIn(Rc<BrowserNode>),
+    /// 登录失败：临时身份已经用掉，换一个浏览器重来。
+    Spent,
 }
 
 enum BrowserTransport {
     Sim(SimTransport),
     Real(nexus_fabric_iroh::IrohTransport),
+}
+
+enum BrowserNode {
+    Sim(nexus_web_core::WebNode<SimTransport>),
+    Real(nexus_web_core::WebNode<nexus_fabric_iroh::IrohTransport>),
+}
+
+/// 对两种传输各写一遍同样的调用。
+macro_rules! on_node {
+    ($node:expr, $n:ident => $body:expr) => {
+        match &*$node {
+            BrowserNode::Sim($n) => $body,
+            BrowserNode::Real($n) => $body,
+        }
+    };
+}
+
+fn wire_err(code: nexus_wire::ErrorCode, m: impl Into<String>) -> nexus_wire::WireError {
+    nexus_wire::WireError::new(code, m)
 }
 
 impl Browser {
@@ -302,18 +339,155 @@ impl Browser {
         link: &str,
         auth: &nexus_core_proto::webauthn::soft::SoftAuthenticator,
     ) -> Result<String, nexus_wire::WireError> {
-        let link = nexus_web_core::EnrollLink::parse(link)
-            .map_err(|m| nexus_wire::WireError::new(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let link = nexus_web_core::EnrollLink::parse(link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
         let credential = nexus_wire::NewCredential {
             credential_id: auth.credential_id.clone(),
             spki: auth.spki(),
             rp_id: auth.rp_id.clone(),
         };
-        match &self.transport {
+        // 等待期间不持有借用：先取出传输，用完放回。
+        let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
+        let BrowserState::Fresh(t) = state else { panic!("{}：登记只能在登录之前", self.label) };
+        let result = match &t {
             BrowserTransport::Sim(t) => nexus_web_core::enroll(t, &link, credential).await,
             BrowserTransport::Real(t) => nexus_web_core::enroll(t, &link, credential).await,
+        };
+        *self.state.borrow_mut() = BrowserState::Fresh(t);
+        result
+    }
+
+    /// 用通行密钥对这个浏览器的登录挑战签名，签名时间是 `at`。
+    pub fn sign(
+        &self,
+        auth: &mut nexus_core_proto::webauthn::soft::SoftAuthenticator,
+        at: nexus_core_proto::Timestamp,
+    ) -> nexus_core_proto::webauthn::WebAuthnAssertion {
+        let state = self.state.borrow();
+        let BrowserState::Fresh(t) = &*state else { panic!("{}：已经登录过", self.label) };
+        let challenge = match t {
+            BrowserTransport::Sim(t) => nexus_web_core::challenge(t, at),
+            BrowserTransport::Real(t) => nexus_web_core::challenge(t, at),
+        };
+        auth.sign(&challenge)
+    }
+
+    /// 签名并登录。入口设备和它的地址提示取自登记链接（真实的页面里入口写在通行密钥里，中继由页面给出）。
+    pub async fn login(
+        &self,
+        w: &World,
+        entry_link: &str,
+        auth: &mut nexus_core_proto::webauthn::soft::SoftAuthenticator,
+    ) -> Result<(), nexus_wire::WireError> {
+        let at = w.now();
+        let assertion = self.sign(auth, at);
+        self.login_with(entry_link, at, assertion).await
+    }
+
+    /// 用给定的签名登录。
+    pub async fn login_with(
+        &self,
+        entry_link: &str,
+        at: nexus_core_proto::Timestamp,
+        assertion: nexus_core_proto::webauthn::WebAuthnAssertion,
+    ) -> Result<(), nexus_wire::WireError> {
+        let link = nexus_web_core::EnrollLink::parse(entry_link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
+        let BrowserState::Fresh(t) = state else { panic!("{}：每个浏览器只能登录一次", self.label) };
+        let node = match t {
+            BrowserTransport::Sim(t) => {
+                nexus_fabric::Transport::add_hint(&t, link.node, &link.hint);
+                BrowserNode::Sim(nexus_web_core::WebNode::login(t, link.node, at, assertion).await?)
+            }
+            BrowserTransport::Real(t) => {
+                nexus_fabric::Transport::add_hint(&t, link.node, &link.hint);
+                BrowserNode::Real(nexus_web_core::WebNode::login(t, link.node, at, assertion).await?)
+            }
+        };
+        *self.state.borrow_mut() = BrowserState::LoggedIn(Rc::new(node));
+        Ok(())
+    }
+
+    fn node(&self) -> Rc<BrowserNode> {
+        match &*self.state.borrow() {
+            BrowserState::LoggedIn(n) => n.clone(),
+            _ => panic!("{}：还没有登录", self.label),
         }
     }
+
+    /// 能看到的设备的名字，按字母排序。
+    pub fn devices(&self) -> Vec<String> {
+        let node = self.node();
+        let mut names: Vec<String> = on_node!(node, n => n.devices().iter().map(|d| d.name.clone()).collect());
+        names.sort();
+        names
+    }
+
+    pub async fn status(&self, device: &str) -> Result<nexus_core_proto::NodeInfo, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.status(device).await)
+    }
+
+    /// 一台设备上会话的名字。
+    pub async fn session_ls(&self, device: &str) -> Result<Vec<String>, nexus_wire::WireError> {
+        let node = self.node();
+        let list = on_node!(node, n => n.session_list(device).await)?;
+        Ok(list.into_iter().map(|s| s.name).collect())
+    }
+
+    /// 在页面里打开一台设备上的终端会话，80x24。
+    pub async fn term(&self, device: &str, session: &str) -> Result<Term, nexus_wire::WireError> {
+        let node = self.node();
+        let size = nexus_wire::Size::DEFAULT;
+        let state = Arc::new(TermState::new(size));
+        let label = format!("{}（网页）→ {device}/{session}", self.label);
+        let io = match &*node {
+            BrowserNode::Sim(n) => web_term(n.attach(device, session, size).await?, state.clone()),
+            BrowserNode::Real(n) => web_term(n.attach(device, session, size).await?, state.clone()),
+        };
+        Ok(Term { io: TermIo::Sim(io), state, label })
+    }
+}
+
+/// 页面里的终端：把会话的输出喂给内存终端并确认，键盘输入送回会话，每 5 秒发一次心跳。
+/// 会话结束时退出码是 shell 的退出码；连接被断开时是 -1；按 Ctrl-] 离开时是 0。
+fn web_term<S>(mut term: nexus_web_core::WebTerminal<S>, state: Arc<TermState>) -> SimTerm
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let (input, mut keys) = tokio::io::duplex(4096);
+    tokio::task::spawn_local(async move {
+        let mut buf = vec![0u8; 4096];
+        let mut beat = tokio::time::Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            tokio::select! {
+                biased;
+                frame = term.next() => match frame {
+                    Some(nexus_wire::SessionFrame::Msg(nexus_wire::ClientMsg::Exit(code))) => break code.unwrap_or(0),
+                    Some(nexus_wire::SessionFrame::Msg(nexus_wire::ClientMsg::Restore(b) | nexus_wire::ClientMsg::Output(b))) => {
+                        state.feed(&b);
+                        let _ = term.send(nexus_wire::Input::Ack(b.len() as u64)).await;
+                    }
+                    Some(nexus_wire::SessionFrame::Heartbeat) => {}
+                    None => break -1,
+                },
+                _ = tokio::time::sleep_until(beat) => {
+                    beat = tokio::time::Instant::now() + Duration::from_secs(5);
+                    let _ = term.send(nexus_wire::Input::Ping).await;
+                }
+                n = keys.read(&mut buf) => {
+                    let n = n.unwrap_or(0);
+                    let data = &buf[..n];
+                    if n == 0 || data.contains(&nexus_cli::DETACH_KEY) {
+                        let _ = term.send(nexus_wire::Input::Detach).await;
+                        break 0;
+                    }
+                    let _ = term.send(nexus_wire::Input::Stdin(data.to_vec())).await;
+                }
+            }
+        };
+        *state.exit.lock().unwrap() = Some(code);
+    });
+    SimTerm { input: tokio::sync::Mutex::new(Some(input)) }
 }
 
 /// 后台运行的一条 nexus 命令。
@@ -859,7 +1033,8 @@ where
         trace: Rc::new(RefCell::new(Vec::new())),
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(scenario(world));
+    // 和仿真一样在单线程的本地任务集里运行，场景可以启动本地任务（例如页面里的终端）。
+    tokio::task::LocalSet::new().block_on(&rt, scenario(world));
 }
 
 /// 声明一个验收场景，并为它生成 `sim` 和 `real` 两个测试。

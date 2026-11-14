@@ -156,10 +156,11 @@ fn roster_rejects_bad_web_keys() {
 }
 
 #[test]
-fn login_challenge_binds_nonce_browser_and_target() {
-    let base = login_challenge(&[1; 32], BROWSER, id(&home_key()));
-    assert_eq!(base, login_challenge(&[1; 32], BROWSER, id(&home_key())));
-    assert_ne!(base, login_challenge(&[2; 32], BROWSER, id(&home_key())));
-    assert_ne!(base, login_challenge(&[1; 32], NodeId([8; 32]), id(&home_key())));
-    assert_ne!(base, login_challenge(&[1; 32], BROWSER, id(&laptop_key())));
+fn login_challenge_binds_time_and_browser() {
+    // 浏览器在知道入口设备之前就要发起通行密钥签名（入口写在通行密钥里，签完才知道），
+    // 所以挑战只绑定时间和浏览器这次的临时身份；只有持有这个临时身份的浏览器才能使用签名。
+    let base = login_challenge(Timestamp(1000), BROWSER);
+    assert_eq!(base, login_challenge(Timestamp(1000), BROWSER));
+    assert_ne!(base, login_challenge(Timestamp(1001), BROWSER));
+    assert_ne!(base, login_challenge(Timestamp(1000), NodeId([8; 32])));
 }

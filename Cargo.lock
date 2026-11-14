@@ -2786,6 +2786,7 @@ dependencies = [
  "getrandom 0.3.4",
  "nexus-cli",
  "nexus-core-proto",
+ "nexus-fabric",
  "nexus-fabric-iroh",
  "nexus-fabric-sim",
  "nexus-runtime",

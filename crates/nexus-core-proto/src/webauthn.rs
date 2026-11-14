@@ -97,14 +97,16 @@ impl P256Key {
     }
 }
 
-/// 登录挑战：设备发出的随机数，绑定这次连接的浏览器（临时节点标识）和被访问的设备。
-/// 通行密钥对它签名，所以签名不能拿到别的连接或别的设备上使用。
-pub fn login_challenge(nonce: &[u8; 32], browser: crate::NodeId, target: crate::NodeId) -> [u8; 32] {
+/// 登录挑战：浏览器发起签名的时间，加上浏览器这次的临时节点标识。
+///
+/// 浏览器要先签名才知道入口设备（入口写在通行密钥的用户标识里），所以挑战由浏览器自己算，
+/// 不经过设备往返。重放无从谈起：连接握手保证对端持有这个临时身份的私钥，
+/// 签名只对这一个浏览器有用；设备只接受签名时间在容许偏差内的。
+pub fn login_challenge(issued_at: crate::Timestamp, browser: crate::NodeId) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"nexus/v1/web-login\0");
-    h.update(nonce);
+    h.update(issued_at.0.to_be_bytes());
     h.update(browser.0);
-    h.update(target.0);
     h.finalize().into()
 }
 

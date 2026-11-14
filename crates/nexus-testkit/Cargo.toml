@@ -11,6 +11,7 @@ nexus-wire.workspace = true
 nexus-sys.workspace = true
 nexus-sys-sim.workspace = true
 nexus-fabric-sim.workspace = true
+nexus-fabric.workspace = true
 nexus-fabric-iroh.workspace = true
 getrandom.workspace = true
 nexus-runtime.workspace = true
