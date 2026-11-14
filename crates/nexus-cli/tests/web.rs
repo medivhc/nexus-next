@@ -266,3 +266,162 @@ scenario! {
         assert!(e.message.contains("过期"), "{e:?}");
     },
 }
+
+// ---------------------------------------------------------------- M2.3 网页终端
+
+scenario! {
+    name: web_terminal_behaves_like_ssh,
+    covers: "R30",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let cli = w.term("laptop", &["ssh", "home"]).await;
+        cli.expect_prompt().await;
+        cli.send(&say("before-web")).await;
+        cli.expect_line("before-web").await;
+
+        let mut phone = phone_passkey();
+        let entry = enrolled(&w, "phone", &[], &phone).await;
+        let browser = w.browser().await;
+        browser.login(&w, &entry, &mut phone).await.unwrap();
+        let page = browser.term("home", "main").await.unwrap();
+        // 恢复屏幕。
+        page.expect_line("before-web").await;
+
+        // 多客户端共享。
+        page.send(&say("from-the-page")).await;
+        page.expect_line("from-the-page").await;
+        cli.expect_line("from-the-page").await;
+
+        // 尺寸跟随最近输入的客户端。
+        page.resize(nexus_wire::Size { cols: 100, rows: 30 }).await;
+        page.send("stty size\r").await;
+        page.expect_line("30 100").await;
+
+        assert_eq!(page.detach().await, 0);
+        cli.detach().await;
+    },
+}
+
+scenario! {
+    name: web_terminal_reconnects_after_an_outage,
+    covers: "R34",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let mut phone = phone_passkey();
+        let entry = enrolled(&w, "phone", &[], &phone).await;
+        let browser = w.browser().await;
+        browser.login(&w, &entry, &mut phone).await.unwrap();
+        let t = browser.term("home", "main").await.unwrap();
+        t.expect_prompt().await;
+        t.send(&format!("sleep 2; {}", say("after-outage"))).await;
+        t.expect_contains("sleep 2").await;
+
+        // 断网长到两端都认定连接已死：页面提示正在重连。
+        let notice = async {
+            t.expect_contains_within("正在重连", Duration::from_secs(25)).await;
+        };
+        tokio::join!(w.cut_browser("home", Duration::from_secs(25)), notice);
+        // 网络恢复后自动连回同一个会话，不需要再用通行密钥。
+        t.expect_line_within("after-outage", Duration::from_secs(30)).await;
+        t.send(&say("reconnected")).await;
+        t.expect_line("reconnected").await;
+        assert_eq!(t.detach().await, 0);
+    },
+}
+
+scenario! {
+    name: web_terminal_stops_when_it_may_not_reconnect,
+    covers: "R34, R31",
+    nodes: ["laptop", "home"],
+    real: (pending "真实后端的断网是暂停 home 的进程，撤销推送不到 home"),
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let mut phone = phone_passkey();
+        let entry = enrolled(&w, "phone", &[], &phone).await;
+        let browser = w.browser().await;
+        browser.login(&w, &entry, &mut phone).await.unwrap();
+        let t = browser.term("home", "main").await.unwrap();
+        t.expect_prompt().await;
+
+        let revoke = async {
+            t.expect_contains_within("正在重连", Duration::from_secs(25)).await;
+            w.cli_ok("laptop", &["web", "revoke", "phone"]).await;
+        };
+        tokio::join!(w.cut_browser("home", Duration::from_secs(25)), revoke);
+        assert_ne!(t.wait_exit_within(Duration::from_secs(30)).await, 0, "重连被拒绝后终端应当结束");
+        t.expect_contains("通行密钥已被撤销").await;
+    },
+}
+
+/// 一个 HTTP GET，返回（状态码，Content-Type，正文）。
+fn http_get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连不上页面服务");
+    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("回应没有头部");
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).expect("没有状态码");
+    let ctype = head
+        .lines()
+        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-type:").map(|v| v.trim().to_string()))
+        .unwrap_or_default();
+    (status, ctype, raw[split + 4..].to_vec())
+}
+
+scenario! {
+    name: page_can_be_served_locally,
+    covers: "R30",
+    nodes: ["laptop"],
+    sim: (pending "页面服务是本机的 HTTP 服务，只在真实后端运行"),
+    real: yes,
+    run: |w: World| async move {
+        let dir = w.home_dir("laptop").join("page");
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        std::fs::write(dir.join("index.html"), "<!doctype html><title>nexus</title>").unwrap();
+        std::fs::write(dir.join("pkg/web_bg.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(w.home_dir("laptop").join("secret.txt"), "no").unwrap();
+
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let listen = format!("127.0.0.1:{port}");
+        let _server = w.spawn_cli("laptop", &["web", "serve", "--dir", dir.to_str().unwrap(), "--listen", &listen]);
+        let mut up = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                up = true;
+                break;
+            }
+            w.run_for(Duration::from_millis(50)).await;
+        }
+        assert!(up, "页面服务没有起来");
+
+        let (code, ctype, body) = http_get(port, "/");
+        assert_eq!(code, 200);
+        assert!(ctype.starts_with("text/html"), "{ctype}");
+        assert_eq!(body, b"<!doctype html><title>nexus</title>");
+        let (code, ctype, body) = http_get(port, "/pkg/web_bg.wasm");
+        assert_eq!((code, ctype.as_str()), (200, "application/wasm"));
+        assert_eq!(body, b"\0asm\x01\0\0\0");
+        assert_eq!(http_get(port, "/../secret.txt").0, 404);
+        assert_eq!(http_get(port, "/pkg/%2e%2e/%2e%2e/secret.txt").0, 404);
+        assert_eq!(http_get(port, "/nope.js").0, 404);
+
+        // 只监听本机地址。
+        let out = w.cli("laptop", &["web", "serve", "--dir", dir.to_str().unwrap(), "--listen", "0.0.0.0:0"]).await;
+        assert_eq!(out.code, 107, "{}", out.stderr);
+
+        // 用本机页面登记。
+        w.cli_ok("laptop", &["init", "--name", "laptop"]).await;
+        let page = format!("http://localhost:{port}");
+        let v = w.cli_ok("laptop", &["web", "enroll", "--label", "dev", "--page", &page]).await;
+        assert!(v["url"].as_str().unwrap().starts_with(&format!("{page}/#enroll=")), "{v}");
+    },
+}

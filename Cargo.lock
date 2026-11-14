@@ -636,6 +636,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,9 +1469,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2804,9 +2816,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-web"
+version = "0.0.1"
+dependencies = [
+ "console_error_panic_hook",
+ "getrandom 0.3.4",
+ "js-sys",
+ "nexus-core-proto",
+ "nexus-fabric",
+ "nexus-fabric-iroh",
+ "nexus-web-core",
+ "nexus-wire",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "nexus-web-core"
 version = "0.0.1"
 dependencies = [
+ "n0-future",
  "nexus-core-proto",
  "nexus-fabric",
  "nexus-wire",

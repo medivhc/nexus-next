@@ -13,6 +13,7 @@ step "L0 检查脚本自检"         python3 tools/check.py --self-test
 step "L0 clippy"               cargo clippy --all-targets --quiet -- -D warnings
 step "编译测试"                cargo test --no-run --quiet
 step "L1 纯逻辑"               cargo test --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-sys-sim -p nexus-web-core
+step "L1 命令行单元"            cargo test --quiet -p nexus-cli --lib --bins
 step "L2 仿真场景"             cargo test --quiet --test scenarios --test terminal --test agent --test web -- sim
 step "L3 本机中继"             cargo test --quiet -p nexus-fabric-iroh --test relay
 step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web -- real

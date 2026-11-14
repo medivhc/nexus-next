@@ -1,0 +1,25 @@
+[package]
+name = "nexus-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 外壳：网页节点核心在浏览器里的绑定。用 wasm-pack 编译成 WebAssembly（见 web/README.md）。
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nexus-core-proto.workspace = true
+nexus-wire.workspace = true
+nexus-fabric.workspace = true
+nexus-fabric-iroh.workspace = true
+nexus-web-core.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", default-features = false, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+console_error_panic_hook = "0.1"

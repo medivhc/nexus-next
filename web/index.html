@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Nexus</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <span class="brand">Nexus</span>
+  <span id="who"></span>
+  <span id="status" role="status"></span>
+</header>
+<main>
+  <section id="enroll" hidden>
+    <h1>登记这台设备的通行密钥</h1>
+    <p>创建之后，在任何浏览器里都可以用它登录你的 Nexus。</p>
+    <button id="enroll-go">创建通行密钥</button>
+  </section>
+  <section id="login" hidden>
+    <h1>登录</h1>
+    <p>用你登记过的通行密钥登录。关掉页面后，这台电脑上不留下任何东西。</p>
+    <button id="login-go">用通行密钥登录</button>
+  </section>
+  <section id="devices" hidden>
+    <h1>设备</h1>
+    <ul id="device-list"></ul>
+  </section>
+  <section id="terminal" hidden>
+    <div class="bar"><button id="term-leave">离开</button><span id="term-title"></span></div>
+    <div id="xterm"></div>
+  </section>
+  <p id="error" role="alert"></p>
+</main>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -49,6 +49,11 @@ FORBIDDEN_DEPS = {
     "nexus-fabric": {"turmoil", "iroh"},
     "nexus-cli": {"turmoil", "nexus-sys-sim", "nexus-fabric-sim"},
     # 网页节点核心要编译进浏览器：只能依赖接缝和纯逻辑。
+    # 浏览器绑定：和网页节点核心一样不能碰仿真、系统驱动和运行时。
+    "nexus-web": {
+        "turmoil", "portable-pty", "russh", "nexus-runtime",
+        "nexus-sys-real", "nexus-sys-sim", "nexus-fabric-sim",
+    },
     "nexus-web-core": {
         "iroh", "turmoil", "portable-pty", "russh", "nexus-runtime",
         "nexus-sys-real", "nexus-sys-sim", "nexus-fabric-sim", "nexus-fabric-iroh",

@@ -9,8 +9,12 @@ nexus-core-proto.workspace = true
 nexus-fabric.workspace = true
 nexus-wire.workspace = true
 iroh.workspace = true
-tokio.workspace = true
+# 也要编译进浏览器：只用 tokio 的读写接口。
+tokio = { version = "1", default-features = false, features = ["io-util"] }
 postcard.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iroh = { workspace = true, features = ["metrics", "portmapper", "fast-apple-datapath"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

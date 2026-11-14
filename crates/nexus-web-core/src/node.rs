@@ -124,4 +124,10 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebTerminal<S> {
     pub async fn send(&mut self, input: Input) -> Result<(), WireError> {
         write_msg(&mut self.writer, &input).await.map_err(unreachable)
     }
+
+    /// 有序关闭发送方向：已经发出的消息都会送到。
+    pub async fn close(&mut self) {
+        use tokio::io::AsyncWriteExt;
+        let _ = self.writer.shutdown().await;
+    }
 }

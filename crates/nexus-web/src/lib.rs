@@ -1,0 +1,217 @@
+//! 网页节点核心在浏览器里的绑定。页面（web/）通过这些接口登记、登录、打开终端；
+//! 通行密钥由页面调用浏览器的 WebAuthn 接口完成，这里只处理协议。
+//!
+//! 浏览器里只能经中继通信：每个浏览器启动时生成一个只在内存里的临时身份，页面关闭即消失。
+#![forbid(unsafe_code)]
+
+use js_sys::Function;
+use nexus_core_proto::webauthn::WebAuthnAssertion;
+use nexus_core_proto::Timestamp;
+use nexus_fabric::Transport;
+use nexus_fabric_iroh::{Config, IrohTransport, Relay};
+use nexus_web_core::{EnrollLink, EntryHandle, Notice, TerminalEnd, TerminalUi, UiEvent, WebNode};
+use nexus_wire::{NewCredential, Size, WireError};
+use std::cell::RefCell;
+use std::rc::Rc;
+use tokio::sync::mpsc;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
+
+fn js_err(e: WireError) -> JsError {
+    JsError::new(&e.message)
+}
+
+/// 页面加载后调用一次。
+#[wasm_bindgen(start)]
+pub fn start() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+}
+
+/// 这个浏览器：一个临时身份，可以登记通行密钥，然后登录一次。
+#[wasm_bindgen]
+pub struct Browser {
+    transport: Rc<RefCell<Option<IrohTransport>>>,
+    /// 页面默认使用的中继（入口信息里没有中继时）。
+    relay: String,
+}
+
+#[wasm_bindgen]
+impl Browser {
+    /// 生成临时身份并连上中继 `relay`（例如 https://bewith.link）。
+    pub async fn create(relay: String) -> Result<Browser, JsError> {
+        let mut seed = [0u8; 32];
+        getrandom_fill(&mut seed)?;
+        let config = Config { relay: Relay::Custom(relay.clone()), discovery: false, bind: None, direct: false };
+        let transport = IrohTransport::bind(seed, config).await.map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(Browser { transport: Rc::new(RefCell::new(Some(transport))), relay })
+    }
+
+    /// 签名时间为 `issued_at_ms` 的登录挑战：交给 `navigator.credentials.get` 签名。
+    pub fn challenge(&self, issued_at_ms: f64) -> Result<Vec<u8>, JsError> {
+        let t = self.transport.borrow();
+        let t = t.as_ref().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
+        Ok(nexus_web_core::challenge(t, Timestamp(issued_at_ms as u64)).to_vec())
+    }
+
+    /// 登记链接（或其中 `#` 之后的部分）对应的入口信息，作为新通行密钥的用户标识。
+    pub fn user_handle(link: String) -> Result<Vec<u8>, JsError> {
+        let link = EnrollLink::parse(&link).map_err(|m| JsError::new(&m))?;
+        let relay = nexus_fabric_iroh::hint_relay(&link.hint);
+        EntryHandle { node: link.node, relay }.encode().map_err(|m| JsError::new(&m))
+    }
+
+    /// 把新建的通行密钥交给管理设备登记。Promise 的结果是它在网络里的名字。
+    pub fn enroll(&self, link: String, credential_id: Vec<u8>, spki: Vec<u8>, rp_id: String) -> js_sys::Promise {
+        let cell = self.transport.clone();
+        future_to_promise(async move {
+            let link = EnrollLink::parse(&link).map_err(|m| JsError::new(&m))?;
+            let t = cell.borrow_mut().take().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
+            let result = nexus_web_core::enroll(&t, &link, NewCredential { credential_id, spki, rp_id }).await;
+            *cell.borrow_mut() = Some(t);
+            Ok(JsValue::from(result.map_err(js_err)?))
+        })
+    }
+
+    /// 用通行密钥的签名登录，Promise 的结果是 [`Session`]。`user_handle` 是通行密钥返回的用户标识。
+    /// 无论成败，之后这个浏览器都不能再登录（换一个新的）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn login(
+        &self,
+        user_handle: Vec<u8>,
+        issued_at_ms: f64,
+        credential_id: Vec<u8>,
+        client_data_json: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> js_sys::Promise {
+        let cell = self.transport.clone();
+        let default_relay = self.relay.clone();
+        future_to_promise(async move {
+            let entry = EntryHandle::decode(&user_handle).ok_or_else(|| JsError::new("这个通行密钥不是 Nexus 的"))?;
+            let t = cell.borrow_mut().take().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
+            let relay = entry.relay.unwrap_or(default_relay);
+            let hint = nexus_fabric_iroh::relay_hint(entry.node, &relay).map_err(|e: String| JsError::new(&e))?;
+            t.add_hint(entry.node, &hint);
+            let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
+            let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
+            Ok(JsValue::from(Session { node: Rc::new(node) }))
+        })
+    }
+}
+
+fn getrandom_fill(buf: &mut [u8]) -> Result<(), JsError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        getrandom::fill(buf).map_err(|e| JsError::new(&e.to_string()))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = buf;
+        Err(JsError::new("只在浏览器里运行"))
+    }
+}
+
+/// 登录之后。
+#[wasm_bindgen]
+pub struct Session {
+    node: Rc<WebNode<IrohTransport>>,
+}
+
+#[wasm_bindgen]
+impl Session {
+    /// 通行密钥在网络里的名字。
+    pub fn label(&self) -> String {
+        self.node.label().to_string()
+    }
+
+    /// 登录到期的时间（毫秒）。
+    pub fn expires_at_ms(&self) -> f64 {
+        self.node.expires_at().0 as f64
+    }
+
+    /// 能看到的设备的名字（JSON 数组）。
+    pub fn devices(&self) -> String {
+        let names: Vec<&str> = self.node.devices().iter().map(|d| d.name.as_str()).collect();
+        serde_json::to_string(&names).expect("名字总能编码")
+    }
+
+    /// 一台设备上的会话：Promise 的结果是 JSON 数组，每项有 name、clients。
+    pub fn sessions(&self, device: String) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.session_list(&device).await.map_err(js_err)?;
+            let list: Vec<_> = list.iter().map(|s| serde_json::json!({ "name": s.name, "clients": s.clients })).collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 打开一台设备上的终端会话（不存在时创建）。
+    ///
+    /// `on_output(Uint8Array)` 显示输出；`on_notice(string)` 在连接中断（"reconnecting"）和恢复（"reconnected"）时调用；
+    /// `on_end(code, message)` 在终端结束时调用一次：会话退出时 code 是退出码，用户离开时是 0，出错时是 -1 并带原因。
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(&self, device: String, session: String, cols: u16, rows: u16, on_output: Function, on_notice: Function, on_end: Function) -> Terminal {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let node = self.node.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut ui = JsUi { on_output, on_notice, rx };
+            let size = Size { cols, rows };
+            let (code, message) = match node.run_terminal(&device, &session, size, &mut ui).await {
+                Ok(TerminalEnd::Exited(code)) => (code.unwrap_or(0), String::new()),
+                Ok(TerminalEnd::Left) => (0, String::new()),
+                Err(e) => (-1, e.message),
+            };
+            let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
+        });
+        Terminal { tx }
+    }
+}
+
+/// 一个打开的终端：把按键、尺寸变化和离开送给网页节点核心。
+#[wasm_bindgen]
+pub struct Terminal {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+#[wasm_bindgen]
+impl Terminal {
+    /// 用户的输入（已编码成终端的字节，xterm.js 的 onData 给出的字符串按 UTF-8 编码）。
+    pub fn keys(&self, data: Vec<u8>) {
+        let _ = self.tx.send(UiEvent::Keys(data));
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.tx.send(UiEvent::Resize(Size { cols, rows }));
+    }
+
+    /// 离开：会话继续运行。
+    pub fn leave(&self) {
+        let _ = self.tx.send(UiEvent::Leave);
+    }
+}
+
+struct JsUi {
+    on_output: Function,
+    on_notice: Function,
+    rx: mpsc::UnboundedReceiver<UiEvent>,
+}
+
+impl TerminalUi for JsUi {
+    fn output(&mut self, bytes: &[u8]) {
+        let _ = self.on_output.call1(&JsValue::NULL, &js_sys::Uint8Array::from(bytes));
+    }
+
+    fn notice(&mut self, notice: Notice) {
+        let text = match notice {
+            Notice::Reconnecting => "reconnecting",
+            Notice::Reconnected => "reconnected",
+        };
+        let _ = self.on_notice.call1(&JsValue::NULL, &JsValue::from_str(text));
+    }
+
+    async fn event(&mut self) -> UiEvent {
+        // 页面没了（终端对象被丢弃）就是离开。
+        self.rx.recv().await.unwrap_or(UiEvent::Leave)
+    }
+}

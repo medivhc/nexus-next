@@ -258,6 +258,16 @@ impl World {
 }
 
 impl World {
+    /// 让场景里的浏览器和 `device` 之间断网这么久，见 [`World::cut`]。
+    pub async fn cut_browser(&self, device: &str, d: Duration) {
+        self.cut(SCENARIO_HOST, device, d).await
+    }
+}
+
+/// 仿真里场景本身（以及其中的浏览器）所在的主机。
+const SCENARIO_HOST: &str = "scenario";
+
+impl World {
     /// 场景里的当前时间：仿真里是仿真时钟，真实后端里是系统时间。浏览器用它签名。
     pub fn now(&self) -> nexus_core_proto::Timestamp {
         match &self.inner {
@@ -434,60 +444,98 @@ impl Browser {
         Ok(list.into_iter().map(|s| s.name).collect())
     }
 
-    /// 在页面里打开一台设备上的终端会话，80x24。
+    /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
     pub async fn term(&self, device: &str, session: &str) -> Result<Term, nexus_wire::WireError> {
         let node = self.node();
         let size = nexus_wire::Size::DEFAULT;
         let state = Arc::new(TermState::new(size));
         let label = format!("{}（网页）→ {device}/{session}", self.label);
-        let io = match &*node {
-            BrowserNode::Sim(n) => web_term(n.attach(device, session, size).await?, state.clone()),
-            BrowserNode::Real(n) => web_term(n.attach(device, session, size).await?, state.clone()),
-        };
-        Ok(Term { io: TermIo::Sim(io), state, label })
+        let (input, keys) = tokio::io::duplex(4096);
+        let (resize_tx, resizes) = mpsc::channel(8);
+        let mut ui = PageUi { state: state.clone(), keys, resizes, buf: vec![0u8; 4096] };
+        // 第一次连接的结果同步返回，之后的事在后台进行。
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (device, session) = (device.to_string(), session.to_string());
+        let st = state.clone();
+        tokio::task::spawn_local(async move {
+            let mut first = Some(first_tx);
+            let result = on_node!(node, n => n.run_terminal(&device, &session, size, &mut FirstOutput(&mut ui, &mut first)).await);
+            let code = match result {
+                Ok(nexus_web_core::TerminalEnd::Exited(code)) => code.unwrap_or(0),
+                Ok(nexus_web_core::TerminalEnd::Left) => 0,
+                Err(e) => {
+                    if let Some(tx) = first.take() {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    st.feed(format!("\r\n[{}]\r\n", e.message).as_bytes());
+                    -1
+                }
+            };
+            if let Some(tx) = first.take() {
+                let _ = tx.send(Ok(()));
+            }
+            *st.exit.lock().unwrap() = Some(code);
+        });
+        first_rx.await.expect("页面终端的任务提前结束")?;
+        Ok(Term { io: TermIo::Sim(SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: Some(resize_tx) }), state, label })
     }
 }
 
-/// 页面里的终端：把会话的输出喂给内存终端并确认，键盘输入送回会话，每 5 秒发一次心跳。
-/// 会话结束时退出码是 shell 的退出码；连接被断开时是 -1；按 Ctrl-] 离开时是 0。
-fn web_term<S>(mut term: nexus_web_core::WebTerminal<S>, state: Arc<TermState>) -> SimTerm
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
-{
-    let (input, mut keys) = tokio::io::duplex(4096);
-    tokio::task::spawn_local(async move {
-        let mut buf = vec![0u8; 4096];
-        let mut beat = tokio::time::Instant::now() + Duration::from_secs(5);
-        let code = loop {
-            tokio::select! {
-                biased;
-                frame = term.next() => match frame {
-                    Some(nexus_wire::SessionFrame::Msg(nexus_wire::ClientMsg::Exit(code))) => break code.unwrap_or(0),
-                    Some(nexus_wire::SessionFrame::Msg(nexus_wire::ClientMsg::Restore(b) | nexus_wire::ClientMsg::Output(b))) => {
-                        state.feed(&b);
-                        let _ = term.send(nexus_wire::Input::Ack(b.len() as u64)).await;
-                    }
-                    Some(nexus_wire::SessionFrame::Heartbeat) => {}
-                    None => break -1,
-                },
-                _ = tokio::time::sleep_until(beat) => {
-                    beat = tokio::time::Instant::now() + Duration::from_secs(5);
-                    let _ = term.send(nexus_wire::Input::Ping).await;
-                }
-                n = keys.read(&mut buf) => {
-                    let n = n.unwrap_or(0);
-                    let data = &buf[..n];
-                    if n == 0 || data.contains(&nexus_cli::DETACH_KEY) {
-                        let _ = term.send(nexus_wire::Input::Detach).await;
-                        break 0;
-                    }
-                    let _ = term.send(nexus_wire::Input::Stdin(data.to_vec())).await;
+/// 场景里的页面：会话输出喂给内存终端，按键来自 [`Term::send`]，尺寸来自 [`Term::resize`]。
+struct PageUi {
+    state: Arc<TermState>,
+    keys: tokio::io::DuplexStream,
+    resizes: mpsc::Receiver<nexus_wire::Size>,
+    buf: Vec<u8>,
+}
+
+impl nexus_web_core::TerminalUi for PageUi {
+    fn output(&mut self, bytes: &[u8]) {
+        self.state.feed(bytes);
+    }
+
+    fn notice(&mut self, notice: nexus_web_core::Notice) {
+        let text: &[u8] = match notice {
+            nexus_web_core::Notice::Reconnecting => "\r\n[连接中断，正在重连…]\r\n".as_bytes(),
+            nexus_web_core::Notice::Reconnected => b"",
+        };
+        self.state.feed(text);
+    }
+
+    async fn event(&mut self) -> nexus_web_core::UiEvent {
+        // 尺寸变化优先：它总是先于之后的按键发生。
+        tokio::select! {
+            biased;
+            Some(s) = self.resizes.recv() => nexus_web_core::UiEvent::Resize(s),
+            n = self.keys.read(&mut self.buf) => {
+                let data = &self.buf[..n.unwrap_or(0)];
+                if data.is_empty() || data.contains(&nexus_cli::DETACH_KEY) {
+                    nexus_web_core::UiEvent::Leave
+                } else {
+                    nexus_web_core::UiEvent::Keys(data.to_vec())
                 }
             }
-        };
-        *state.exit.lock().unwrap() = Some(code);
-    });
-    SimTerm { input: tokio::sync::Mutex::new(Some(input)) }
+        }
+    }
+}
+
+/// 第一段输出到来（第一次连接成功）时通知等待的一方。
+struct FirstOutput<'a>(&'a mut PageUi, &'a mut Option<tokio::sync::oneshot::Sender<Result<(), nexus_wire::WireError>>>);
+
+impl nexus_web_core::TerminalUi for FirstOutput<'_> {
+    fn output(&mut self, bytes: &[u8]) {
+        if let Some(tx) = self.1.take() {
+            let _ = tx.send(Ok(()));
+        }
+        self.0.output(bytes);
+    }
+    fn notice(&mut self, notice: nexus_web_core::Notice) {
+        self.0.notice(notice);
+    }
+    async fn event(&mut self) -> nexus_web_core::UiEvent {
+        self.0.event().await
+    }
 }
 
 /// 后台运行的一条 nexus 命令。
@@ -607,7 +655,19 @@ impl Term {
 
     /// 等到屏幕上出现 `text`。
     pub async fn expect_contains(&self, text: &str) {
-        self.wait_until(&format!("{text:?}"), |s| s.contents().contains(text)).await
+        self.expect_contains_within(text, EXPECT_TIMEOUT).await
+    }
+
+    pub async fn expect_contains_within(&self, text: &str, limit: Duration) {
+        self.wait_until_within(&format!("{text:?}"), limit, |s| s.contents().contains(text)).await
+    }
+
+    /// 改变终端的尺寸（只用于页面里的终端）。
+    pub async fn resize(&self, size: nexus_wire::Size) {
+        match &self.io {
+            TermIo::Sim(SimTerm { resize: Some(tx), .. }) => tx.send(size).await.expect("终端已经结束"),
+            _ => panic!("{}：只有页面里的终端可以改变尺寸", self.label),
+        }
     }
 
     /// 等到 shell 的提示符 `$ ` 出现：之前输入的内容可能在提示符之前回显，打乱屏幕。
@@ -632,6 +692,10 @@ impl Term {
 
     /// 等命令结束，返回它的退出码。
     pub async fn wait_exit(&self) -> i32 {
+        self.wait_exit_within(EXPECT_TIMEOUT).await
+    }
+
+    pub async fn wait_exit_within(&self, limit: Duration) -> i32 {
         let start = tokio::time::Instant::now();
         loop {
             if let TermIo::Real(t) = &self.io {
@@ -640,8 +704,8 @@ impl Term {
             if let Some(code) = *self.state.exit.lock().unwrap() {
                 return code;
             }
-            if start.elapsed() >= EXPECT_TIMEOUT {
-                panic!("{}：{EXPECT_TIMEOUT:?} 内没有结束。屏幕：\n{}\n", self.label, self.screen());
+            if start.elapsed() >= limit {
+                panic!("{}：{limit:?} 内没有结束。屏幕：\n{}\n", self.label, self.screen());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -651,6 +715,8 @@ impl Term {
 // 仿真：在场景所在的任务里直接运行 `nexus ssh` 的客户端代码，用内存管道代替终端。
 struct SimTerm {
     input: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
+    /// 只有页面里的终端可以改变尺寸。
+    resize: Option<mpsc::Sender<nexus_wire::Size>>,
 }
 
 fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, state: Arc<TermState>) -> SimTerm {
@@ -681,7 +747,7 @@ fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, state: Arc<TermState>) -> 
             }
         }
     });
-    SimTerm { input: tokio::sync::Mutex::new(Some(input)) }
+    SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: None }
 }
 
 // 真实后端：真正的 `nexus ssh` 进程，标准输入和输出都是管道。
@@ -801,7 +867,7 @@ where
     let trace = Rc::new(RefCell::new(Vec::new()));
     let world = World { inner: Inner::Sim { nodes: ctl, clock }, trace: trace.clone() };
     let fut = scenario(world);
-    sim.client("scenario", async move {
+    sim.client(SCENARIO_HOST, async move {
         fut.await;
         Ok(())
     });

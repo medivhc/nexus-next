@@ -13,6 +13,7 @@ nexus-core-proto = { path = "crates/nexus-core-proto" }
 nexus-wire = { path = "crates/nexus-wire" }
 nexus-term-proto = { path = "crates/nexus-term-proto" }
 nexus-web-core = { path = "crates/nexus-web-core" }
+nexus-web = { path = "crates/nexus-web" }
 nexus-sys = { path = "crates/nexus-sys" }
 nexus-sys-real = { path = "crates/nexus-sys-real" }
 nexus-sys-sim = { path = "crates/nexus-sys-sim" }
@@ -35,7 +36,8 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha2 = { version = "0.10", default-features = false }
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 proptest = "1"
-iroh = "1.4"
+# 浏览器里只能用 tls-ring、不能用端口映射；原生环境的其余默认特性由 nexus-fabric-iroh 按目标开启。
+iroh = { version = "1.4", default-features = false, features = ["tls-ring"] }
 iroh-relay = { version = "1.4", features = ["server"] }
 vt100 = "0.18"
 portable-pty = "0.9"

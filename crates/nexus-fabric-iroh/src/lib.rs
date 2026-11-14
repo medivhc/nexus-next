@@ -86,6 +86,8 @@ impl IrohTransport {
                 builder.relay_mode(RelayMode::custom([url]))
             }
         };
+        // 浏览器里本来就只有中继。
+        #[cfg(not(target_arch = "wasm32"))]
         if !config.direct {
             builder = builder.clear_ip_transports();
         } else if let Some(addr) = config.bind {
@@ -102,6 +104,7 @@ impl IrohTransport {
         if let Some(url) = &self.relay {
             addr = addr.with_relay_url(url.clone());
         }
+        #[cfg(not(target_arch = "wasm32"))]
         for sock in self.ep.bound_sockets() {
             if !sock.ip().is_unspecified() {
                 addr = addr.with_ip_addr(sock);
@@ -166,6 +169,22 @@ impl Transport for IrohTransport {
     }
 }
 
+/// 只经中继 `relay` 联系 `node` 的地址提示（浏览器从通行密钥里只知道入口设备和它的中继）。
+pub fn relay_hint(node: NodeId, relay: &str) -> Result<String, String> {
+    let id = iroh::EndpointId::from_bytes(&node.0).map_err(|e| format!("设备标识无效：{e}"))?;
+    let url: RelayUrl = relay.parse().map_err(|e| format!("中继地址无效：{e}"))?;
+    let addr = EndpointAddr::new(id).with_relay_url(url);
+    Ok(nexus_wire::hex_encode(&postcard::to_allocvec(&addr).expect("地址总能编码")))
+}
+
+/// 地址提示里的中继地址（有多个时取第一个）。
+pub fn hint_relay(hint: &str) -> Option<String> {
+    let bytes = nexus_wire::hex_decode(hint)?;
+    let addr = postcard::from_bytes::<EndpointAddr>(&bytes).ok()?;
+    let first = addr.relay_urls().next().map(|u| u.to_string());
+    first
+}
+
 pub struct IrohConn {
     conn: IrohConnection,
     remote: NodeId,
@@ -194,5 +213,19 @@ impl Connection for IrohConn {
             Ok((send, recv)) => Ok(Some(tokio::io::join(recv, send))),
             Err(_) => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_hints_round_trip() {
+        let node = NodeId(*SecretKey::from_bytes(&[3; 32]).public().as_bytes());
+        let hint = relay_hint(node, "https://bewith.link").unwrap();
+        assert_eq!(hint_relay(&hint).as_deref(), Some("https://bewith.link/"));
+        assert!(relay_hint(node, "not a url").is_err());
+        assert_eq!(hint_relay("zz"), None);
     }
 }

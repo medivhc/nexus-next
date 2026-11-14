@@ -265,6 +265,19 @@ pub enum WebCmd {
         #[arg(long)]
         json: bool,
     },
+    /// 在本机托管网页节点的页面（开发和自用），按 Ctrl-C 停止
+    ///
+    /// 例：nexus web serve --dir ./web/dist，然后 nexus web enroll --label dev --page http://localhost:8080
+    ///
+    /// 只监听本机地址：通行密钥要求页面是 https，只有 localhost 例外。
+    Serve {
+        /// 页面所在的目录（包含 index.html）
+        #[arg(long, value_name = "目录")]
+        dir: PathBuf,
+        /// 监听的地址，只能是本机地址
+        #[arg(long, value_name = "地址:端口", default_value = "127.0.0.1:8080")]
+        listen: String,
+    },
 }
 
 /// 网页节点页面的默认地址。
@@ -485,7 +498,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
         }
         Cmd::Mcp => return mcp(ctl, stdin, sink).await,
-        Cmd::SshConfig | Cmd::SshProxy { .. } => {
+        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
             return fail(sink, EXIT_USAGE, "usage", "这条命令只能由 nexus 程序直接运行")
         }
         Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {

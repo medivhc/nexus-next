@@ -12,6 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 mod ssh_proxy;
+mod web_serve;
 
 /// 写到真实终端，每段都立即刷新，长时间运行的命令也能实时看到输出。
 struct Terminal;
@@ -60,6 +61,7 @@ fn main() {
                 let ctl = UnixCtl::new(&data_dir, agent.clone());
                 ssh_proxy::run(ctl, host).await
             }
+            Cmd::Web { cmd: nexus_cli::WebCmd::Serve { dir, listen } } => web_serve::run(&mut Terminal, dir, listen).await,
             Cmd::SshConfig => {
                 let exe = std::env::current_exe().unwrap_or_else(|_| "nexus".into());
                 let dir = std::fs::canonicalize(&data_dir).unwrap_or(data_dir.clone());
