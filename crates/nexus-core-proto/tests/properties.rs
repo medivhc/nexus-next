@@ -124,6 +124,7 @@ proptest! {
             version: v,
             devices: vec![Device { node_id: NodeId([v as u8; 32]), name: format!("d{v}"), role: DeviceRole::Member, added_at: Timestamp(v) }],
             revoked_agents: vec![],
+            web_keys: vec![],
         }.sign(key);
         let mut all: Vec<(SignedRoster, bool)> = versions.iter().map(|v| (make(*v, &root), true)).collect();
         all.extend(forged.iter().map(|v| (make(*v, &other), false)));

@@ -12,6 +12,8 @@ pub enum Purpose {
     AgentAssertion,
     /// 派生 SSH 呈现层的主机密钥。这类签名从不发布，只作为确定性的密钥材料。
     SshHostKey,
+    /// 设备在验证通行密钥之后签发的网页会话凭证。
+    WebSession,
 }
 
 impl Purpose {
@@ -21,6 +23,7 @@ impl Purpose {
             Purpose::AgentCert => b"nexus/v1/agent-cert\0",
             Purpose::AgentAssertion => b"nexus/v1/agent-assertion\0",
             Purpose::SshHostKey => b"nexus/v1/ssh-host-key\0",
+            Purpose::WebSession => b"nexus/v1/web-session\0",
         }
     }
 }

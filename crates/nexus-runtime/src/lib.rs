@@ -11,7 +11,8 @@ use nexus_core_proto::authz::{
     self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal, ReplayGuard,
 };
 use nexus_core_proto::path::{CapabilityPattern, ResourcePattern};
-use nexus_core_proto::roster::RevokedAgent;
+use nexus_core_proto::roster::{RevokedAgent, WebKey};
+use nexus_core_proto::webauthn::P256Key;
 use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
@@ -19,14 +20,14 @@ use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transpor
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
-    hex_encode, AddrHints, AgentCredential, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
+    hex_encode, AddrHints, AgentCredential, NewCredential, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
     WireError, WIRE_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -62,7 +63,19 @@ enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
     Session { name: String, create: bool, size: Size },
+    WebEnroll { token: [u8; 16], credential: NewCredential },
 }
+
+/// 一次等待浏览器完成的通行密钥登记。
+struct PendingWebEnroll {
+    label: String,
+    grants: Vec<Grant>,
+    rp_id: String,
+    expires_at: Timestamp,
+}
+
+/// 网页登录默认的权限：所有设备的终端会话和状态查看。
+const DEFAULT_WEB_GRANTS: [&str; 2] = ["term.session.*@**", "node.info@**"];
 
 /// 发给一个终端会话任务的命令。
 enum SessCmd {
@@ -176,7 +189,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::RosterPush { .. } | Request::JoinOffer { .. } => return Ok(None),
+        Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } => return Ok(None),
     };
     if let Some(name) = session {
         if !valid_segment(name) {
@@ -207,6 +220,13 @@ fn deny_text(reason: &DenyReason) -> &'static str {
         DenyReason::Stale => "请求的签署时间与当前时间相差太远（检查两台设备的时钟）",
         DenyReason::NoMatchingGrant => "没有授权做这件事",
         DenyReason::Replayed => "同一个请求被重复使用",
+        DenyReason::IssuerNotInRoster => "网页登录凭证的签发设备不在名册里",
+        DenyReason::SessionBadSignature => "网页登录凭证无效",
+        DenyReason::SessionNotYetValid => "网页登录凭证还没有生效（检查时钟）",
+        DenyReason::SessionExpired => "网页登录已过期，请重新登录",
+        DenyReason::SessionTooLong => "网页登录凭证的有效期超过上限",
+        DenyReason::WrongBrowser => "网页登录凭证属于另一个浏览器",
+        DenyReason::WebKeyRevoked => "这个通行密钥已被撤销",
     }
 }
 
@@ -304,6 +324,7 @@ pub struct Node<T, S: System> {
     spawn_tx: mpsc::UnboundedSender<NewSession<S::Pty>>,
     spawn_rx: RefCell<Option<mpsc::UnboundedReceiver<NewSession<S::Pty>>>>,
     replay: RefCell<ReplayGuard>,
+    web_enrolls: RefCell<HashMap<[u8; 16], PendingWebEnroll>>,
 }
 
 impl<T: Transport, S: System> Node<T, S> {
@@ -325,6 +346,7 @@ impl<T: Transport, S: System> Node<T, S> {
             spawn_tx,
             spawn_rx: RefCell::new(Some(spawn_rx)),
             replay: RefCell::default(),
+            web_enrolls: RefCell::default(),
             started_at: system.now(),
             transport,
             system,
@@ -454,6 +476,10 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(header) => match proto {
                 Proto::Rpc => self.handle_rpc(peer, header),
                 Proto::Join => Dispatch::Reply(self.handle_join(header)),
+                Proto::Web => match header.body {
+                    Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
+                    _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
+                },
             },
             Err(_) => return,
         };
@@ -461,6 +487,10 @@ impl<T: Transport, S: System> Node<T, S> {
             Dispatch::Reply(r) => r,
             Dispatch::Exec(spec) => return self.serve_exec(stream, spec).await,
             Dispatch::Session { name, create, size } => return self.serve_session(stream, &name, create, size).await,
+            Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
+                Ok(label) => Response::WebEnrolled { label },
+                Err(e) => Response::Error(e),
+            },
         };
         if write_msg(&mut stream, &response).await.is_err() {
             return;
@@ -708,6 +738,11 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::AgentList => self.agent_list().map(CtlResponse::Agents),
             CtlRequest::Audit { limit } => self.read_audit(limit).map(CtlResponse::Audit),
             CtlRequest::SshHostKey { node } => self.ssh_host_key(&node, agent_ref).map(CtlResponse::SshHostKey),
+            CtlRequest::WebEnroll { label, grants, ttl_ms, page } => {
+                self.web_enroll_start(label, &grants, ttl_ms, &page).map(CtlResponse::WebEnroll)
+            }
+            CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
+            CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
         };
         let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
     }
@@ -724,6 +759,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::AgentRevoke { .. }
                 | CtlRequest::AgentList
                 | CtlRequest::Audit { .. }
+                | CtlRequest::WebEnroll { .. }
+                | CtlRequest::WebList
+                | CtlRequest::WebRevoke { .. }
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -769,6 +807,113 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&sig[32..]);
         Ok(seed)
+    }
+
+    // ------------------------------------------------------------ 通行密钥
+
+    /// 管理设备发起登记：记下一次性登记码，给出在浏览器里打开的链接。
+    fn web_enroll_start(&self, label: String, grants: &[String], ttl_ms: u64, page: &str) -> Result<WebEnrollReport, WireError> {
+        self.admin_key()?;
+        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        if !valid_segment(&label) {
+            return Err(err(ErrorCode::InvalidInput, format!("名字 {label:?} 不合法：只能用字母、数字、- 和 _")));
+        }
+        if roster.device_by_name(&label).is_some() || roster.web_key(&label).is_some() {
+            return Err(err(ErrorCode::InvalidInput, format!("名字 {label} 已被使用（设备和通行密钥不能重名）")));
+        }
+        let grants: Vec<Grant> = if grants.is_empty() {
+            DEFAULT_WEB_GRANTS.iter().map(|g| parse_grant(g)).collect::<Result<_, _>>()?
+        } else {
+            grants.iter().map(|g| parse_grant(g)).collect::<Result<_, _>>()?
+        };
+        let page = page.trim_end_matches('/');
+        let rp_id = page_rp_id(page).ok_or_else(|| {
+            err(ErrorCode::InvalidInput, format!("页面地址 {page} 不合法：应当是 https://域名，开发时可以用 http://localhost:端口"))
+        })?;
+        let mut token = [0u8; 16];
+        self.system.random(&mut token);
+        let expires_at = Timestamp(self.system.now().0.saturating_add(ttl_ms));
+        self.web_enrolls.borrow_mut().insert(token, PendingWebEnroll { label: label.clone(), grants, rp_id, expires_at });
+        let url = format!(
+            "{page}/#enroll={}&node={}&hint={}",
+            hex_encode(&token),
+            self.me(),
+            self.transport.local_hint()
+        );
+        Ok(WebEnrollReport { label, url, expires_at })
+    }
+
+    /// 浏览器交来新建的通行密钥：核对登记码和依赖方，写进名册并推送。
+    async fn web_enroll_finish(&self, token: [u8; 16], credential: NewCredential) -> Result<String, WireError> {
+        let invalid = || err(ErrorCode::Denied, "登记码无效、已用过或已过期");
+        let (label, grants, key) = {
+            let mut pending = self.web_enrolls.borrow_mut();
+            let p = pending.get(&token).ok_or_else(invalid)?;
+            if self.system.now() >= p.expires_at {
+                pending.remove(&token);
+                return Err(invalid());
+            }
+            // 依赖方不符时登记码保留：用户可以回到正确的页面重试。
+            if credential.rp_id != p.rp_id {
+                return Err(err(
+                    ErrorCode::InvalidInput,
+                    format!("通行密钥是为 {} 创建的，登记链接要求 {}", credential.rp_id, p.rp_id),
+                ));
+            }
+            let key = P256Key::from_spki(&credential.spki).map_err(|_| err(ErrorCode::InvalidInput, "公钥不是 P-256（ES256）"))?;
+            let p = pending.remove(&token).expect("刚刚找到");
+            (p.label, p.grants, key)
+        };
+        let root = self.admin_key()?;
+        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        roster.version += 1;
+        roster.web_keys.push(WebKey {
+            label: label.clone(),
+            credential_id: credential.credential_id,
+            public_key: key,
+            rp_id: credential.rp_id,
+            grants,
+            added_at: self.system.now(),
+        });
+        roster.validate().map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        self.install_roster(roster.sign(&root))?;
+        self.broadcast_roster(None).await;
+        Ok(label)
+    }
+
+    fn web_list(&self) -> Result<Vec<WebKeyInfo>, WireError> {
+        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        Ok(roster
+            .web_keys
+            .iter()
+            .map(|k| WebKeyInfo {
+                label: k.label.clone(),
+                rp_id: k.rp_id.clone(),
+                grants: k.grants.iter().map(grant_text).collect(),
+                added_at: k.added_at,
+            })
+            .collect())
+    }
+
+    async fn web_revoke(&self, label: &str) -> Result<MembershipReport, WireError> {
+        let root = self.admin_key()?;
+        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let before = roster.web_keys.len();
+        roster.web_keys.retain(|k| k.label != label);
+        if roster.web_keys.len() == before {
+            return Err(err(ErrorCode::NotFound, format!("没有名为 {label} 的通行密钥")));
+        }
+        roster.version += 1;
+        self.install_roster(roster.sign(&root))?;
+        let (pushed, unreachable) = self.broadcast_roster(None).await;
+        Ok(MembershipReport { name: label.to_string(), node_id: self.me(), roster_version: self.roster_version(), pushed, unreachable })
+    }
+
+    /// 本机签发的新名册：落盘并生效。
+    fn install_roster(&self, signed: SignedRoster) -> Result<(), WireError> {
+        save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
+        self.trust.borrow_mut().roster = Some(signed);
+        Ok(())
     }
 
     fn load_agents(&self) -> Result<Vec<AgentInfo>, WireError> {
@@ -1379,6 +1524,7 @@ impl<T: Transport, S: System> Node<T, S> {
             version: 1,
             devices: vec![Device { node_id: self.me(), name: name.clone(), role: DeviceRole::Admin, added_at: self.system.now() }],
             revoked_agents: vec![],
+            web_keys: vec![],
         }
         .sign(&root);
         let persist = || -> io::Result<()> {
@@ -1559,10 +1705,18 @@ fn agent_cert(p: &Principal) -> Option<&authz::SignedAgentCert> {
     match p {
         Principal::Device => None,
         Principal::Agent { cert, .. } => Some(cert),
+        Principal::Web { .. } => None,
     }
 }
 
 /// 限时写一帧：写入卡住 [`PEER_SILENT`] 也算失败（连接可能已经失效而传输层还没发现）。
 async fn send_within<W: AsyncWrite + Unpin, M: serde::Serialize>(wr: &mut W, msg: &M) -> bool {
     matches!(tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await, Ok(Ok(())))
+}
+
+/// 页面地址对应的依赖方（通行密钥绑定的域名）：`https://域名[:端口]`，或开发用的 `http://localhost[:端口]`。
+fn page_rp_id(page: &str) -> Option<String> {
+    let (_, rest) = page.split_once("://")?;
+    let host = rest.split(':').next()?;
+    (!host.is_empty() && nexus_core_proto::webauthn::origin_allowed(page, host)).then(|| host.to_string())
 }

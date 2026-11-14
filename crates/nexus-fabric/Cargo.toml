@@ -8,4 +8,5 @@ license.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true
 serde.workspace = true
-tokio.workspace = true
+# 接缝要能编译进浏览器：只用读写接口和计时。
+tokio = { version = "1", default-features = false, features = ["io-util", "time"] }

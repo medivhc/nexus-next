@@ -1,0 +1,5 @@
+# 等价变异：两个操作数的二进制位互不重叠时，按位或和按位异或结果相同，测试无法区分。
+exclude_re = [
+    "webauthn.rs.*replace \\| with \\^ in base64url",
+    "webauthn.rs.*replace \\| with \\^ in soft::SoftAuthenticator::sign",
+]

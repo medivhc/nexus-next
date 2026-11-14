@@ -12,6 +12,7 @@ pub mod authz;
 pub mod crypto;
 pub mod path;
 pub mod roster;
+pub mod webauthn;
 
 pub use crypto::{PublicKey, SecretKey, Signature};
 

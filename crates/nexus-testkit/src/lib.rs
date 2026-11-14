@@ -257,6 +257,65 @@ impl World {
     }
 }
 
+impl World {
+    /// 一个浏览器：只有一个临时的节点身份，不在名册里，不运行常驻程序。
+    /// 它运行的是网页节点核心（浏览器里同一份代码），通行密钥由软件认证器扮演。
+    ///
+    /// 仿真里每个场景最多一个浏览器。
+    pub async fn browser(&self) -> Browser {
+        self.trace.borrow_mut().push("browser".into());
+        let transport = match &self.inner {
+            Inner::Sim { .. } => {
+                // 场景本身运行在名为 scenario 的仿真主机上，浏览器就在这台主机上监听。
+                let n = self.trace.borrow().len() as u8;
+                let key = nexus_core_proto::SecretKey::from_seed([n.wrapping_add(200); 32]);
+                let id = nexus_core_proto::NodeId(key.public().0);
+                BrowserTransport::Sim(SimTransport::bind(id, "scenario").await.expect("仿真里每个场景最多一个浏览器"))
+            }
+            Inner::Real(_) => {
+                let mut seed = [0u8; 32];
+                getrandom::fill(&mut seed).expect("无法取得随机数");
+                let t = nexus_fabric_iroh::IrohTransport::bind(seed, nexus_fabric_iroh::Config::local_only())
+                    .await
+                    .expect("浏览器的传输无法启动");
+                BrowserTransport::Real(t)
+            }
+        };
+        Browser { transport }
+    }
+}
+
+/// 场景里的一个浏览器，见 [`World::browser`]。
+pub struct Browser {
+    transport: BrowserTransport,
+}
+
+enum BrowserTransport {
+    Sim(SimTransport),
+    Real(nexus_fabric_iroh::IrohTransport),
+}
+
+impl Browser {
+    /// 打开登记链接，用 `auth` 创建通行密钥并登记。返回它在网络里的名字。
+    pub async fn enroll(
+        &self,
+        link: &str,
+        auth: &nexus_core_proto::webauthn::soft::SoftAuthenticator,
+    ) -> Result<String, nexus_wire::WireError> {
+        let link = nexus_web_core::EnrollLink::parse(link)
+            .map_err(|m| nexus_wire::WireError::new(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let credential = nexus_wire::NewCredential {
+            credential_id: auth.credential_id.clone(),
+            spki: auth.spki(),
+            rp_id: auth.rp_id.clone(),
+        };
+        match &self.transport {
+            BrowserTransport::Sim(t) => nexus_web_core::enroll(t, &link, credential).await,
+            BrowserTransport::Real(t) => nexus_web_core::enroll(t, &link, credential).await,
+        }
+    }
+}
+
 /// 后台运行的一条 nexus 命令。
 pub struct Background {
     child: Child,

@@ -12,6 +12,34 @@ use serde::{Deserialize, Serialize};
 /// agent 请求的签署时间与当前时间允许相差的最大毫秒数。
 pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
 
+/// 一次网页登录最长的有效期：12 小时。
+pub const MAX_WEB_SESSION_MS: u64 = 12 * 3600 * 1000;
+
+/// 网页会话凭证：一台名册内的设备验证了浏览器的通行密钥之后签发，
+/// 证明「这个浏览器（以它这次的临时节点标识）是通行密钥 label 的持有者」。
+/// 浏览器拿着它直接访问其他设备，只需要用一次通行密钥。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSession {
+    pub browser: NodeId,
+    pub label: String,
+    pub issuer: NodeId,
+    pub issued_at: Timestamp,
+    pub not_after: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedWebSession {
+    pub session: WebSession,
+    pub signature: Signature,
+}
+
+impl WebSession {
+    pub fn sign(self, issuer: &SecretKey) -> SignedWebSession {
+        let signature = issuer.sign(Purpose::WebSession, &canonical(&self));
+        SignedWebSession { session: self, signature }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     pub capability: CapabilityPattern,
@@ -90,6 +118,8 @@ pub enum Principal {
     Device,
     /// 一个 agent，经由对端设备发出请求。
     Agent { cert: SignedAgentCert, assertion: Assertion, signature: Signature },
+    /// 网页登录：对端是浏览器，凭一张网页会话凭证。
+    Web { session: SignedWebSession },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +140,17 @@ pub enum DenyReason {
     NoMatchingGrant,
     /// 同一个签过名的请求已经用过一次。由运行时的 [`ReplayGuard`] 发现。
     Replayed,
+    /// 网页会话凭证的签发者不在名册里。
+    IssuerNotInRoster,
+    SessionBadSignature,
+    SessionNotYetValid,
+    SessionExpired,
+    /// 凭证的有效期超过了 [`MAX_WEB_SESSION_MS`]。
+    SessionTooLong,
+    /// 对端不是凭证里写的那个浏览器。
+    WrongBrowser,
+    /// 通行密钥已不在名册里。
+    WebKeyRevoked,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +164,7 @@ pub enum Outcome {
 pub enum PrincipalRef {
     Device(NodeId),
     Agent { id: PublicKey, label: String },
+    Web { label: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +241,7 @@ pub fn decide(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &A
         Principal::Agent { cert, .. } => {
             PrincipalRef::Agent { id: cert.cert.agent, label: cert.cert.label.clone() }
         }
+        Principal::Web { session } => PrincipalRef::Web { label: session.session.label.clone() },
     };
     let audit = AuditEvent {
         at: ctx.now,
@@ -213,7 +256,10 @@ pub fn decide(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &A
 
 fn check(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &Action) -> Result<(), DenyReason> {
     use DenyReason::*;
-    // 不论主体是谁，承载请求的设备必须在名册里。
+    if let Principal::Web { session } = principal {
+        return check_web(ctx, peer, session, action);
+    }
+    // 设备和 agent：承载请求的设备必须在名册里。
     ctx.roster.device(peer).ok_or(PeerNotInRoster)?;
     let Principal::Agent { cert, assertion, signature } = principal else {
         // 名册内的设备代表用户本人。
@@ -250,6 +296,33 @@ fn check(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &Action
     Ok(())
 }
 
+/// 网页会话：对端是浏览器而不是名册内的设备，凭签发设备的签名和名册里的通行密钥判定。
+fn check_web(ctx: &Context<'_>, peer: NodeId, s: &SignedWebSession, action: &Action) -> Result<(), DenyReason> {
+    use DenyReason::*;
+    let w = &s.session;
+    ctx.roster.device(w.issuer).ok_or(IssuerNotInRoster)?;
+    if !w.issuer.public_key().verify(Purpose::WebSession, &canonical(w), &s.signature) {
+        return Err(SessionBadSignature);
+    }
+    if peer != w.browser {
+        return Err(WrongBrowser);
+    }
+    if w.not_after.0.saturating_sub(w.issued_at.0) > MAX_WEB_SESSION_MS {
+        return Err(SessionTooLong);
+    }
+    if ctx.now.0.saturating_add(MAX_CLOCK_SKEW_MS) < w.issued_at.0 {
+        return Err(SessionNotYetValid);
+    }
+    if ctx.now >= w.not_after {
+        return Err(SessionExpired);
+    }
+    let key = ctx.roster.web_key(&w.label).ok_or(WebKeyRevoked)?;
+    if !key.grants.iter().any(|g| g.allows(action)) {
+        return Err(NoMatchingGrant);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +341,7 @@ mod tests {
             version: 1,
             devices: vec![Device { node_id: peer, name: "laptop".into(), role: DeviceRole::Member, added_at: Timestamp(0) }],
             revoked_agents: vec![],
+            web_keys: vec![],
         };
         let action = Action {
             capability: Capability::parse("term.exec").unwrap(),

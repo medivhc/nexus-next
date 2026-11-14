@@ -80,7 +80,7 @@ fn grants(shape: &[(&str, &str)]) -> Vec<Grant> {
 
 fn roster(kind: Kind) -> Roster {
     let dev = |id, name: &str| Device { node_id: id, name: name.into(), role: DeviceRole::Member, added_at: Timestamp(0) };
-    let mut r = Roster { root: root().public(), version: 3, devices: vec![dev(LAPTOP, "laptop"), dev(HOME, "home")], revoked_agents: vec![] };
+    let mut r = Roster { root: root().public(), version: 3, devices: vec![dev(LAPTOP, "laptop"), dev(HOME, "home")], revoked_agents: vec![], web_keys: vec![] };
     if kind == Kind::AgentRevoked {
         r.revoked_agents.push(RevokedAgent { agent: agent_key().public(), revoked_at: Timestamp(NOW.0 - 1) });
     }

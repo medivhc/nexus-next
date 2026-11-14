@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 5;
+pub const WIRE_VERSION: u16 = 6;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -41,6 +41,8 @@ pub enum Request {
     /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
     /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
     Exec(ExecSpec),
+    /// 网页节点（协议 nexus/web/1）：用一次性登记码登记一个新建的通行密钥。
+    WebEnroll { token: [u8; 16], credential: NewCredential },
     /// 连上一个终端会话，不存在且 `create` 时创建。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后调用方发送 [`Input`]（`Stdin`、`Resize`、`Ack`、`Detach`），对方发送 [`ClientMsg`]。
     SessionAttach { name: String, create: bool, size: Size },
@@ -48,6 +50,16 @@ pub enum Request {
     SessionList,
     /// 结束对方的一个终端会话。
     SessionKill { name: String },
+}
+
+/// 浏览器新建的通行密钥（`navigator.credentials.create` 的结果）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewCredential {
+    pub credential_id: Vec<u8>,
+    /// `getPublicKey()` 给出的 SubjectPublicKeyInfo（DER）。
+    pub spki: Vec<u8>,
+    /// 创建时页面所在的依赖方（域名）。
+    pub rp_id: String,
 }
 
 /// 一个终端会话的概况。
@@ -126,6 +138,8 @@ pub enum Response {
     Roster { roster: Option<SignedRoster>, addrs: AddrHints },
     Ok,
     Sessions(Vec<SessionInfo>),
+    /// 通行密钥登记成功，带上它的名字。
+    WebEnrolled { label: String },
     Error(WireError),
 }
 
@@ -188,6 +202,10 @@ pub enum CtlRequest {
     Audit { limit: Option<u32> },
     /// 本机 SSH 呈现层为某个设备使用的主机密钥（种子）。对同一台目标设备总是相同。
     SshHostKey { node: String },
+    /// 发起通行密钥登记（只能在管理设备上）：`page` 是页面地址，它的主机名就是通行密钥的依赖方。
+    WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: String },
+    WebList,
+    WebRevoke { label: String },
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -209,6 +227,9 @@ pub enum CtlResponse {
     Agents(Vec<AgentInfo>),
     Audit(Vec<AuditRecord>),
     SshHostKey([u8; 32]),
+    WebEnroll(WebEnrollReport),
+    WebKeys(Vec<WebKeyInfo>),
+    WebRevoked(MembershipReport),
     Ok,
     Error(WireError),
 }
@@ -250,6 +271,22 @@ pub struct MembershipReport {
     pub pushed: u32,
     /// 暂时没能送达的设备名；它们会在下次与任一已更新的设备通信时得到新名册。
     pub unreachable: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebEnrollReport {
+    pub label: String,
+    /// 在要用的设备上打开这个链接完成登记。
+    pub url: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebKeyInfo {
+    pub label: String,
+    pub rp_id: String,
+    pub grants: Vec<String>,
+    pub added_at: Timestamp,
 }
 
 /// 命令行打开控制会话时发送的第一条消息。

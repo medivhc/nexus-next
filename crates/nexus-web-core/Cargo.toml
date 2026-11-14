@@ -1,0 +1,14 @@
+[package]
+name = "nexus-web-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 网页节点的客户端逻辑：浏览器里（编译成 WebAssembly）和仿真里运行的是同一份代码。
+# 只依赖接缝和纯逻辑，不依赖任何具体的传输或系统。
+[dependencies]
+nexus-core-proto.workspace = true
+nexus-wire.workspace = true
+nexus-fabric.workspace = true
+# 浏览器里没有操作系统的网络和线程：只用 tokio 的读写接口。
+tokio = { version = "1", default-features = false, features = ["io-util"] }

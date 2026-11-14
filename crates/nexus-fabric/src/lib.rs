@@ -18,15 +18,18 @@ pub enum Proto {
     Rpc,
     /// 加入流程：管理设备向等待加入的设备发出邀请。
     Join,
+    /// 网页节点：登记通行密钥、网页登录。对端是浏览器，不在名册里。
+    Web,
 }
 
 impl Proto {
-    pub const ALL: [Proto; 2] = [Proto::Rpc, Proto::Join];
+    pub const ALL: [Proto; 3] = [Proto::Rpc, Proto::Join, Proto::Web];
 
     pub fn alpn(self) -> &'static [u8] {
         match self {
             Proto::Rpc => b"nexus/rpc/2",
             Proto::Join => b"nexus/join/2",
+            Proto::Web => b"nexus/web/1",
         }
     }
 

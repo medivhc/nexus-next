@@ -40,6 +40,7 @@ fn proto_byte(p: Proto) -> u8 {
     match p {
         Proto::Rpc => 1,
         Proto::Join => 2,
+        Proto::Web => 3,
     }
 }
 
@@ -77,6 +78,7 @@ impl Transport for SimTransport {
             let proto = match head[32] {
                 1 => Proto::Rpc,
                 2 => Proto::Join,
+                3 => Proto::Web,
                 _ => continue,
             };
             let mut id = [0u8; 32];

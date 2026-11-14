@@ -1,6 +1,8 @@
 //! 名册：由根密钥签名的「谁是我的设备」清单，是判断对端是否可信的唯一依据。
 
+use crate::authz::Grant;
 use crate::crypto::{canonical, PublicKey, Purpose, SecretKey, Signature};
+use crate::webauthn::P256Key;
 use crate::path::valid_segment;
 use crate::{NodeId, Timestamp};
 use core::fmt;
@@ -28,6 +30,19 @@ pub struct RevokedAgent {
     pub revoked_at: Timestamp,
 }
 
+/// 登记进网络的一个通行密钥：网页登录的身份。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebKey {
+    /// 名字：审计里的主体。和设备名在同一个命名空间里，不能重复。
+    pub label: String,
+    pub credential_id: Vec<u8>,
+    pub public_key: P256Key,
+    /// 创建通行密钥时页面所在的依赖方（域名），登录时必须一致。
+    pub rp_id: String,
+    pub grants: Vec<Grant>,
+    pub added_at: Timestamp,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Roster {
     pub root: PublicKey,
@@ -35,6 +50,7 @@ pub struct Roster {
     pub version: u64,
     pub devices: Vec<Device>,
     pub revoked_agents: Vec<RevokedAgent>,
+    pub web_keys: Vec<WebKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +100,10 @@ impl Roster {
         self.devices.iter().find(|d| d.name == name)
     }
 
+    pub fn web_key(&self, label: &str) -> Option<&WebKey> {
+        self.web_keys.iter().find(|k| k.label == label)
+    }
+
     pub fn is_agent_revoked(&self, agent: &PublicKey) -> bool {
         self.revoked_agents.iter().any(|r| r.agent == *agent)
     }
@@ -100,6 +120,14 @@ impl Roster {
             }
             if earlier.iter().any(|e| e.name == d.name) {
                 return Err(RosterError::DuplicateName(d.name.clone()));
+            }
+        }
+        for (i, k) in self.web_keys.iter().enumerate() {
+            if !valid_segment(&k.label) {
+                return Err(RosterError::InvalidName(k.label.clone()));
+            }
+            if self.web_keys[..i].iter().any(|e| e.label == k.label) || self.device_by_name(&k.label).is_some() {
+                return Err(RosterError::DuplicateName(k.label.clone()));
             }
         }
         Ok(())
@@ -148,7 +176,7 @@ mod tests {
     }
 
     fn roster(version: u64, devices: Vec<Device>) -> Roster {
-        Roster { root: root().public(), version, devices, revoked_agents: vec![] }
+        Roster { root: root().public(), version, devices, revoked_agents: vec![], web_keys: vec![] }
     }
 
     #[test]

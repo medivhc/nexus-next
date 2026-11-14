@@ -167,6 +167,11 @@ pub enum Cmd {
     /// 提供工具 nexus_ls、nexus_status、nexus_exec、nexus_session_ls。
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
+    /// 登记、列出、撤销用于网页登录的通行密钥
+    Web {
+        #[command(subcommand)]
+        cmd: WebCmd,
+    },
     /// 输出一段 ~/.ssh/config 配置，让系统自带的 ssh、scp、git 能用 <设备名>.nexus 访问设备
     ///
     /// 用法：nexus ssh-config >> ~/.ssh/config，之后 ssh home.nexus、scp f home.nexus:/tmp/、
@@ -223,6 +228,47 @@ pub enum SessionCmd {
         json: bool,
     },
 }
+
+#[derive(Subcommand, Debug)]
+pub enum WebCmd {
+    /// 发起登记（只能在管理设备上）：输出一个链接，在要用的设备上打开它，创建通行密钥后即登记完成
+    ///
+    /// 例：nexus web enroll --label phone
+    ///
+    /// 默认权限是所有设备的终端会话和状态查看（term.session.*@**、node.info@**），
+    /// 不能执行命令，也不能做管理操作；用 --grant 改为别的权限，格式同 nexus agent issue。
+    Enroll {
+        /// 通行密钥在网络里的名字，例如 phone
+        #[arg(long)]
+        label: String,
+        /// 授权条目，格式 能力@资源；可重复。不给时使用默认权限
+        #[arg(long = "grant", value_name = "能力@资源")]
+        grants: Vec<String>,
+        /// 登记链接的有效期
+        #[arg(long, value_name = "时长", default_value = "10m")]
+        ttl: String,
+        /// 网页节点的页面地址；通行密钥绑定在它的域名上
+        #[arg(long, value_name = "地址", default_value = DEFAULT_WEB_PAGE)]
+        page: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出登记的通行密钥（任何设备上都可以查看）
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 撤销一个通行密钥（只能在管理设备上）：之后用它不能再登录
+    Revoke {
+        #[arg(value_name = "名字")]
+        label: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// 网页节点页面的默认地址。
+pub const DEFAULT_WEB_PAGE: &str = "https://bewith.link";
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCmd {
@@ -451,6 +497,14 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         Cmd::Agent { cmd: AgentCmd::Revoke { who, json } } => (CtlRequest::AgentRevoke { agent: who.clone() }, *json),
         Cmd::Agent { cmd: AgentCmd::Ls { json } } => (CtlRequest::AgentList, *json),
         Cmd::Audit { limit, json } => (CtlRequest::Audit { limit: *limit }, *json),
+        Cmd::Web { cmd: WebCmd::Enroll { label, grants, ttl, page, json } } => {
+            let Some(ttl_ms) = parse_ttl(ttl) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 10m：{ttl}"));
+            };
+            (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
+        }
+        Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
+        Cmd::Web { cmd: WebCmd::Revoke { label, json } } => (CtlRequest::WebRevoke { label: label.clone() }, *json),
         Cmd::Session { cmd: SessionCmd::Ls { node, json } } => (CtlRequest::SessionList { node: node.clone() }, *json),
         Cmd::Session { cmd: SessionCmd::Kill { node, session, json } } => {
             (CtlRequest::SessionKill { node: node.clone(), session: session.clone() }, *json)
@@ -518,6 +572,39 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
         }
         CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::WebEnroll(r) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "label": r.label, "url": r.url, "expires_at_ms": r.expires_at.0 }))
+            } else {
+                format!("在要用的设备上打开下面的链接，创建通行密钥后登记即完成（链接只能用一次）：\n\n{}\n", r.url)
+            }
+        }
+        CtlResponse::WebKeys(list) => {
+            if json {
+                let keys: Vec<Value> = list
+                    .iter()
+                    .map(|k| json!({ "label": k.label, "rp_id": k.rp_id, "grants": k.grants, "added_at_ms": k.added_at.0 }))
+                    .collect();
+                doc(json!({ "schema": JSON_SCHEMA, "passkeys": keys }))
+            } else if list.is_empty() {
+                "还没有登记通行密钥\n".to_string()
+            } else {
+                list.iter().map(|k| format!("{:<16} {}  {}\n", k.label, k.rp_id, k.grants.join(" "))).collect()
+            }
+        }
+        CtlResponse::WebRevoked(m) => {
+            if json {
+                doc(json!({
+                    "schema": JSON_SCHEMA,
+                    "label": m.name,
+                    "roster_version": m.roster_version,
+                    "pushed": m.pushed,
+                    "unreachable": m.unreachable,
+                }))
+            } else {
+                format!("已撤销通行密钥 {}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed)
+            }
+        }
         CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
         CtlResponse::Ok => match cmd {
             Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
@@ -629,6 +716,13 @@ fn deny_kind(r: &nexus_core_proto::authz::DenyReason) -> &'static str {
         Stale => "stale",
         NoMatchingGrant => "no_matching_grant",
         Replayed => "replayed",
+        IssuerNotInRoster => "issuer_not_in_roster",
+        SessionBadSignature => "session_bad_signature",
+        SessionNotYetValid => "session_not_yet_valid",
+        SessionExpired => "session_expired",
+        SessionTooLong => "session_too_long",
+        WrongBrowser => "wrong_browser",
+        WebKeyRevoked => "web_key_revoked",
     }
 }
 
@@ -641,6 +735,7 @@ fn audit_json(records: &[AuditRecord]) -> String {
             let principal = match &e.principal {
                 PrincipalRef::Device(_) => json!({ "device": r.peer_name }),
                 PrincipalRef::Agent { id, label } => json!({ "agent_id": nexus_core_proto::NodeId(id.0).to_string(), "label": label }),
+                PrincipalRef::Web { label } => json!({ "passkey": label }),
             };
             let (outcome, reason) = match &e.outcome {
                 Outcome::Allow => ("allow", None),
@@ -672,6 +767,7 @@ fn audit_text(records: &[AuditRecord]) -> String {
             let who = match &e.principal {
                 PrincipalRef::Device(_) => r.peer_name.clone(),
                 PrincipalRef::Agent { label, .. } => format!("agent {label}（经由 {}）", r.peer_name),
+                PrincipalRef::Web { label } => format!("网页 {label}"),
             };
             let outcome = match &e.outcome {
                 Outcome::Allow => "允许".to_string(),

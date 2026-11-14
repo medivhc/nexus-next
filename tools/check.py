@@ -23,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # 纯逻辑层：crate 名 -> 允许的依赖
 PURE = {
-    "nexus-core-proto": {"serde", "postcard", "ed25519-dalek"},
+    "nexus-core-proto": {"serde", "postcard", "ed25519-dalek", "p256", "sha2", "serde_json"},
     "nexus-wire": {"nexus-core-proto", "nexus-term-proto", "serde", "postcard"},
     "nexus-term-proto": {"serde", "vt100"},
 }
@@ -48,6 +48,11 @@ FORBIDDEN_DEPS = {
     "nexus-sys": {"tokio", "turmoil", "iroh"},
     "nexus-fabric": {"turmoil", "iroh"},
     "nexus-cli": {"turmoil", "nexus-sys-sim", "nexus-fabric-sim"},
+    # 网页节点核心要编译进浏览器：只能依赖接缝和纯逻辑。
+    "nexus-web-core": {
+        "iroh", "turmoil", "portable-pty", "russh", "nexus-runtime",
+        "nexus-sys-real", "nexus-sys-sim", "nexus-fabric-sim", "nexus-fabric-iroh",
+    },
 }
 
 ALLOWED_LICENSES = {
