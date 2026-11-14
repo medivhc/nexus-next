@@ -3,7 +3,7 @@ use nexus_fabric::{read_msg, write_msg, FrameReader};
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
 use nexus_sys_real::RealSystem;
-use nexus_wire::{AgentCredential, CtlHello, CtlRequest, CtlResponse, Input};
+use nexus_wire::{AgentCredential, CtlHello, CtlRequest, CtlResponse, ErrorCode, Input, WireError};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -45,8 +45,10 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery } => {
-                match daemon(&data_dir, name.clone(), transport_config(*local_only, relay, *no_discovery)).await {
+            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket } => {
+                let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
+                let config = transport_config(*local_only, relay, *no_discovery);
+                match daemon(&data_dir, &agent_socket, name.clone(), config).await {
                     Ok(()) => 0,
                     Err(e) => {
                         Terminal.err(format!("nexus daemon: {e}\n").as_bytes());
@@ -55,7 +57,7 @@ fn main() {
                 }
             }
             Cmd::SshProxy { host } => {
-                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
+                let ctl = UnixCtl::new(&data_dir, agent.clone());
                 ssh_proxy::run(ctl, host).await
             }
             Cmd::SshConfig => {
@@ -74,11 +76,11 @@ fn main() {
                 0
             }
             cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
-                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
+                let ctl = UnixCtl::new(&data_dir, agent.clone());
                 interactive_ssh(cmd, &ctl).await
             }
             cmd => {
-                let ctl = UnixCtl { socket: data_dir.join("ctl.sock"), agent: agent.clone() };
+                let ctl = UnixCtl::new(&data_dir, agent.clone());
                 run_client(cmd, &ctl, &mut tokio::io::stdin(), &mut Terminal).await
             }
         }
@@ -144,6 +146,17 @@ pub(crate) struct UnixCtl {
     agent: Option<AgentCredential>,
 }
 
+impl UnixCtl {
+    /// 用户本人用数据目录里的控制入口；带凭据时用 agent 入口（`NEXUS_AGENT_SOCKET` 或数据目录里的 agent.sock）。
+    fn new(data_dir: &Path, agent: Option<AgentCredential>) -> Self {
+        let socket = match &agent {
+            None => data_dir.join("ctl.sock"),
+            Some(_) => std::env::var_os("NEXUS_AGENT_SOCKET").map(PathBuf::from).unwrap_or_else(|| data_dir.join("agent.sock")),
+        };
+        Self { socket, agent }
+    }
+}
+
 impl Ctl for UnixCtl {
     async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
         let mut stream = UnixStream::connect(&self.socket).await?;
@@ -183,7 +196,7 @@ fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config
     Config { relay, discovery: !no_discovery, bind: None }
 }
 
-async fn daemon(data_dir: &Path, name: Option<String>, config: Config) -> io::Result<()> {
+async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, config: Config) -> io::Result<()> {
     let system = RealSystem::new(data_dir)?;
     let key = load_or_create_device_key(&system)?;
     let name = name
@@ -200,10 +213,21 @@ async fn daemon(data_dir: &Path, name: Option<String>, config: Config) -> io::Re
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
+    // agent 入口：本机任何账号都能连上，但只接受 agent 凭据，因此给以独立账号运行的 agent 用。
+    let _ = std::fs::remove_file(agent_socket);
+    let agent_listener = UnixListener::bind(agent_socket)?;
+    std::fs::set_permissions(agent_socket, std::fs::Permissions::from_mode(0o666))?;
+
     let (tx, mut rx) = mpsc::channel::<CtlCall>(64);
+    let agent_tx = tx.clone();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve_ctl(stream, tx.clone()));
+            tokio::spawn(serve_ctl(stream, tx.clone(), false));
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = agent_listener.accept().await {
+            tokio::spawn(serve_ctl(stream, agent_tx.clone(), true));
         }
     });
 
@@ -213,6 +237,7 @@ async fn daemon(data_dir: &Path, name: Option<String>, config: Config) -> io::Re
         _ = terminate() => Ok(()),
     };
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(agent_socket);
     result
 }
 
@@ -227,8 +252,14 @@ async fn terminate() {
 }
 
 /// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
-async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>) {
+async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>, agent_only: bool) {
     let Ok(hello) = read_msg::<_, CtlHello>(&mut stream).await else { return };
+    if agent_only && hello.agent.is_none() {
+        let e = WireError::new(ErrorCode::Denied, "agent 入口只接受 agent 凭据（--agent 或 NEXUS_AGENT）");
+        let _ = write_msg(&mut stream, &CtlResponse::Error(e)).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
     let (call, mut client) = ctl_session(hello.request, hello.agent);
     if tx.send(call).await.is_err() {
         return;

@@ -95,20 +95,29 @@ impl System for RealSystem {
         }
     }
 
-    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> {
+    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> {
         use std::io::Write;
         let path = self.path(name)?.with_extension("log");
+        let current = std::fs::metadata(&path).map_or(0, |m| m.len());
+        if current > 0 && current + record.len() as u64 > max_bytes {
+            // rename 是原子的：读的人看到的要么是轮转前，要么是轮转后。
+            std::fs::rename(&path, path.with_extension("log.1"))?;
+        }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
         // 一次写入整条记录，避免并发追加时交错。
         f.write_all(record)
     }
 
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
-        match std::fs::read(self.path(name)?.with_extension("log")) {
+        let path = self.path(name)?.with_extension("log");
+        let read = |p: &std::path::Path| match std::fs::read(p) {
             Ok(v) => Ok(v),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e),
-        }
+        };
+        let mut out = read(&path.with_extension("log.1"))?;
+        out.extend(read(&path)?);
+        Ok(out)
     }
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
@@ -301,5 +310,17 @@ impl Pty for RealPty {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
         }
         let _ = self.killer.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_rotate_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = RealSystem::new(dir.path()).unwrap();
+        nexus_sys::check_log_rotation(&sys);
     }
 }

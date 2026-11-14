@@ -485,3 +485,42 @@ scenario! {
         assert_eq!((out.code, out.stdout.as_str()), (0, "hi\n"), "stderr: {}", out.stderr);
     },
 }
+
+scenario! {
+    name: exec_stops_when_the_caller_leaves,
+    covers: "R10",
+    nodes: ["laptop", "home"],
+    sim: (pending "要中断一个真实的命令行进程，只在真实后端运行"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let marker = "nexus-caller-left-7f3a";
+        // 查找用的模式本身不含 marker 原文，否则会匹配到发出查找的那条命令行。
+        let pattern = "nexus-caller-lef[t]-7f3a";
+        let running = w.spawn_cli("laptop", &["exec", "home", "--", "sh", "-c", &format!("sleep 60; : {marker}")]);
+        // 等命令确实在 home 上跑起来。
+        let mut started = false;
+        for _ in 0..100 {
+            let out = w.cli("home", &["exec", "home", "--", "pgrep", "-f", pattern]).await;
+            if out.code == 0 {
+                started = true;
+                break;
+            }
+            w.run_for(Duration::from_millis(50)).await;
+        }
+        assert!(started, "命令没有在 home 上运行起来");
+
+        running.interrupt();
+        // 调用方离开后，远端命令连同它派生的进程一起被终止。
+        let mut gone = false;
+        for _ in 0..100 {
+            let out = w.cli("home", &["exec", "home", "--", "pgrep", "-f", pattern]).await;
+            if out.code == 1 {
+                gone = true;
+                break;
+            }
+            w.run_for(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "调用方离开 5 秒后命令仍在运行");
+    },
+}

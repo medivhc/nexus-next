@@ -298,3 +298,50 @@ scenario! {
         assert!(issue.stdout.contains("term.exec@home"), "签发的帮助应当给出授权条目的例子：{}", issue.stdout);
     },
 }
+
+scenario! {
+    name: agent_can_run_under_its_own_account,
+    covers: "R16",
+    nodes: ["laptop", "home"],
+    sim: (pending "需要多个系统账号和本机套接字，只在真实后端运行"),
+    real: yes,
+    run: |w: World| async move {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        w.network("laptop", &["home"]).await;
+        let cred = issue(&w, "laptop", "builder", &["term.exec@home"], "1h").await;
+
+        // agent 入口对本机所有账号开放，但只接受凭据：不带凭据的请求被拒绝。
+        let socket = w.agent_socket("laptop");
+        let mode = std::fs::metadata(&socket).expect("应当有 agent 入口").permissions().mode();
+        assert_eq!(mode & 0o777, 0o666, "{mode:o}");
+        let mut conn = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let hello = nexus_wire::CtlHello { agent: None, request: nexus_wire::CtlRequest::Status };
+        conn.write_all(&nexus_wire::encode(&hello).unwrap()).unwrap();
+        let mut buf = Vec::new();
+        conn.read_to_end(&mut buf).unwrap();
+        let mut decoder = nexus_wire::FrameDecoder::default();
+        decoder.push(&buf);
+        match decoder.next_frame::<nexus_wire::CtlResponse>() {
+            Ok(Some(nexus_wire::CtlResponse::Error(e))) => assert_eq!(e.code, nexus_wire::ErrorCode::Denied, "{e:?}"),
+            other => panic!("不带凭据应当被拒绝：{other:?}"),
+        }
+
+        let is_root = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").unwrap()) == 0;
+        if !is_root {
+            eprintln!("不是 root，跳过以其他系统账号运行的部分");
+            return;
+        }
+        let nobody = 65534;
+        // 其他账号用不了用户自己的控制入口。
+        let out = w.host_as("laptop", nobody, &["nexus", "status"], b"").await;
+        assert_eq!(out.code, 101, "{}", out.stderr);
+        // 带着凭据，经 agent 入口可以做被授权的事，越权的照样被拒绝。
+        let out = w.host_as("laptop", nobody, &["nexus", "--agent", &cred, "exec", "home", "--", "echo", "hi"], b"").await;
+        assert_eq!((out.code, out.stdout.as_str()), (0, "hi\n"), "{}", out.stderr);
+        let out = w.host_as("laptop", nobody, &["nexus", "--agent", &cred, "session", "ls", "home"], b"").await;
+        assert_eq!(out.code, 105, "{}", out.stderr);
+        let out = w.host_as("laptop", nobody, &["nexus", "--agent", &cred, "device", "revoke", "home"], b"").await;
+        assert_eq!(out.code, 105, "{}", out.stderr);
+    },
+}

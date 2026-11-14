@@ -112,13 +112,23 @@ impl System for SimSystem {
         Ok(self.disk.0.borrow().get(key).cloned())
     }
 
-    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> {
-        self.disk.0.borrow_mut().entry(format!("log:{name}")).or_default().extend_from_slice(record);
+    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> {
+        let mut disk = self.disk.0.borrow_mut();
+        let key = format!("log:{name}");
+        let current = disk.get(&key).map_or(0, Vec::len) as u64;
+        if current > 0 && current + record.len() as u64 > max_bytes {
+            let old = disk.remove(&key).unwrap_or_default();
+            disk.insert(format!("log:{name}.1"), old);
+        }
+        disk.entry(key).or_default().extend_from_slice(record);
         Ok(())
     }
 
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
-        Ok(self.disk.0.borrow().get(&format!("log:{name}")).cloned().unwrap_or_default())
+        let disk = self.disk.0.borrow();
+        let mut out = disk.get(&format!("log:{name}.1")).cloned().unwrap_or_default();
+        out.extend_from_slice(disk.get(&format!("log:{name}")).map_or(&[][..], Vec::as_slice));
+        Ok(out)
     }
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
@@ -555,6 +565,12 @@ impl Pty for SimPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_rotate_at_the_limit() {
+        let sys = SimSystem::new(SimDisk::default(), 1, SimClock::default());
+        nexus_sys::check_log_rotation(&sys);
+    }
 
     #[test]
     fn tokenize_and_unescape_behave_like_sh_and_printf() {

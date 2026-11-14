@@ -196,13 +196,85 @@ impl World {
     pub async fn host(&self, node: &str, argv: &[&str], stdin: &[u8]) -> Output {
         let Inner::Real(real) = &self.inner else { panic!("host 只能用于真实后端") };
         self.trace.borrow_mut().push(format!("host {node}$ {}", argv.join(" ")));
-        real.host(node, argv, stdin)
+        real.host(node, None, argv, stdin)
+    }
+
+    /// 和 [`World::host`] 一样，但以另一个系统账号（`uid`）运行。`NEXUS_AGENT_SOCKET` 指向该节点的 agent 入口。
+    pub async fn host_as(&self, node: &str, uid: u32, argv: &[&str], stdin: &[u8]) -> Output {
+        let Inner::Real(real) = &self.inner else { panic!("host_as 只能用于真实后端") };
+        self.trace.borrow_mut().push(format!("host {node} uid={uid}$ {}", argv.join(" ")));
+        real.host(node, Some(uid), argv, stdin)
+    }
+
+    /// 在后台启动一条 nexus 命令，不等它结束，只用于真实后端。用来模拟调用方中途离开。
+    pub fn spawn_cli(&self, node: &str, args: &[&str]) -> Background {
+        let Inner::Real(real) = &self.inner else { panic!("spawn_cli 只能用于真实后端") };
+        self.trace.borrow_mut().push(format!("spawn {node}$ nexus {}", args.join(" ")));
+        let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let child = Command::new(&real.bin)
+            .args(["--data-dir", dir.to_str().unwrap()])
+            .args(args)
+            .env("NEXUS_AGENT_SOCKET", real.agent_socket(node))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("无法执行 nexus");
+        Background { child }
+    }
+
+    /// 某个节点的 agent 入口（套接字路径），只用于真实后端。
+    pub fn agent_socket(&self, node: &str) -> PathBuf {
+        let Inner::Real(real) = &self.inner else { panic!("agent_socket 只能用于真实后端") };
+        real.agent_socket(node)
     }
 
     /// 某个节点的 `HOME`（见 [`World::host`]），只用于真实后端。
     pub fn home_dir(&self, node: &str) -> PathBuf {
         let Inner::Real(real) = &self.inner else { panic!("home_dir 只能用于真实后端") };
         real.home(node)
+    }
+}
+
+impl World {
+    /// 让 `a` 和 `b` 之间断网这么久：期间发出的数据全部丢失，长到连接两端都认为对方已经失联。
+    ///
+    /// 仿真里切断两者之间的网络（发出的数据直接丢弃），到时恢复；
+    /// 真实后端里把 `b` 的常驻程序暂停（SIGSTOP）这么久。
+    pub async fn cut(&self, a: &str, b: &str, d: Duration) {
+        match &self.inner {
+            Inner::Sim { .. } => {
+                turmoil::partition(a, b);
+                tokio::time::sleep(d).await;
+                turmoil::repair(a, b);
+            }
+            Inner::Real(real) => {
+                real.signal(b, nix::sys::signal::Signal::SIGSTOP);
+                tokio::time::sleep(d).await;
+                real.signal(b, nix::sys::signal::Signal::SIGCONT);
+            }
+        }
+    }
+}
+
+/// 后台运行的一条 nexus 命令。
+pub struct Background {
+    child: Child,
+}
+
+impl Background {
+    /// 像在终端里按下 Ctrl-C 一样中断它，并等它退出。
+    pub fn interrupt(mut self) {
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -528,18 +600,27 @@ struct RealWorld {
     dirs: HashMap<String, PathBuf>,
     children: RefCell<HashMap<String, Child>>,
     _tmp: tempfile::TempDir,
+    /// 各节点的 agent 入口放在这里：其他系统账号也能进入这个目录。
+    sockets: tempfile::TempDir,
 }
 
 impl RealWorld {
     fn start(nodes: &[&str], bin: &str) -> Self {
         let tmp = tempfile::tempdir().expect("无法创建临时目录");
-        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), _tmp: tmp };
+        let sockets = tempfile::tempdir().expect("无法创建临时目录");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), _tmp: tmp, sockets };
         for name in nodes {
             let dir = world._tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
             let child = Command::new(&world.bin)
                 .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name, "--local-only"])
+                .arg("--agent-socket")
+                .arg(world.sockets.path().join(format!("{name}.sock")))
                 // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
                 .env("SHELL", "/bin/sh")
                 .env("PS1", "$ ")
@@ -578,19 +659,37 @@ impl RealWorld {
         dir
     }
 
-    fn host(&self, node: &str, argv: &[&str], stdin: &[u8]) -> Output {
+    fn agent_socket(&self, node: &str) -> PathBuf {
+        assert!(self.dirs.contains_key(node), "场景里没有节点 {node}");
+        self.sockets.path().join(format!("{node}.sock"))
+    }
+
+    fn host(&self, node: &str, uid: Option<u32>, argv: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
+        use std::os::unix::process::CommandExt;
         let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         let bin_dir = self.bin.parent().unwrap();
         let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
-        let mut child = Command::new(argv[0])
-            .args(&argv[1..])
+        let mut cmd = Command::new(argv[0]);
+        cmd.args(&argv[1..])
             .env("PATH", path)
-            .env("HOME", self.home(node))
-            .env("NEXUS_DATA_DIR", dir)
+            .env("NEXUS_AGENT_SOCKET", self.agent_socket(node))
             .env_remove("NEXUS_AGENT")
-            .env_remove("SSH_AUTH_SOCK")
-            .current_dir(self.home(node))
+            .env_remove("SSH_AUTH_SOCK");
+        match uid {
+            // 本机上的另一个系统账号：进不了用户的数据目录，只能用 agent 入口。
+            Some(uid) => {
+                cmd.uid(uid)
+                    .gid(uid)
+                    .env("HOME", "/tmp")
+                    .env("NEXUS_DATA_DIR", dir)
+                    .current_dir("/");
+            }
+            None => {
+                cmd.env("HOME", self.home(node)).env("NEXUS_DATA_DIR", dir).current_dir(self.home(node));
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -624,6 +723,7 @@ impl RealWorld {
         let mut child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
+            .env("NEXUS_AGENT_SOCKET", self.agent_socket(node))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -662,6 +762,7 @@ impl RealWorld {
         let mut child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
+            .env("NEXUS_AGENT_SOCKET", self.agent_socket(node))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

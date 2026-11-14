@@ -77,8 +77,11 @@ pub trait System {
     /// 原子地写入一个小的持久化值。
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()>;
     /// 在一份只追加的日志末尾写一条记录（审计用）。记录本身由调用方编码。
-    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()>;
-    /// 读出一份日志的全部内容；不存在时为空。
+    ///
+    /// 写入后会超过 `max_bytes` 时，先把当前内容轮转为旧日志（替换更早的旧日志），
+    /// 再写进一份新的。因此日志最多占用约两倍 `max_bytes`，而最近 `max_bytes` 的记录总在。
+    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()>;
+    /// 读出一份日志的全部内容（旧日志在前）；不存在时为空。
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>>;
     /// 启动一个进程，标准输入、输出、错误都通过管道连接。
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc>;
@@ -93,7 +96,7 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
-    fn append_log(&self, name: &str, record: &[u8]) -> io::Result<()> { (**self).append_log(name, record) }
+    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> { (**self).append_log(name, record, max_bytes) }
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }
     fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty> { (**self).spawn_pty(size) }
@@ -107,4 +110,29 @@ impl Proc for NoProc {
     fn write_stdin(&mut self, _: Vec<u8>) { match *self {} }
     fn close_stdin(&mut self) { match *self {} }
     fn kill(&mut self) { match *self {} }
+}
+
+/// 日志轮转的约定，真实和仿真两种实现都用它测试。
+#[doc(hidden)]
+pub fn check_log_rotation<S: System>(sys: &S) {
+    let read = |name: &str| String::from_utf8(sys.read_log(name).unwrap()).unwrap();
+    assert_eq!(read("audit"), "", "不存在的日志读出为空");
+    sys.append_log("audit", b"aaaa", 10).unwrap();
+    sys.append_log("audit", b"bbbb", 10).unwrap();
+    assert_eq!(read("audit"), "aaaabbbb");
+    // 再写就超过上限：当前内容成为旧日志。
+    sys.append_log("audit", b"cccc", 10).unwrap();
+    assert_eq!(read("audit"), "aaaabbbbcccc");
+    sys.append_log("audit", b"dddd", 10).unwrap();
+    assert_eq!(read("audit"), "aaaabbbbccccdddd");
+    // 第二次轮转：更早的旧日志被丢弃。
+    sys.append_log("audit", b"eeee", 10).unwrap();
+    assert_eq!(read("audit"), "ccccddddeeee");
+    // 比上限还大的一条记录照样写下，独占一份日志。
+    sys.append_log("audit", b"0123456789xx", 10).unwrap();
+    assert_eq!(read("audit"), "eeee0123456789xx");
+    // 不同名字的日志互不影响。
+    sys.append_log("other", b"z", 10).unwrap();
+    assert_eq!(read("other"), "z");
+    assert_eq!(read("audit"), "eeee0123456789xx");
 }

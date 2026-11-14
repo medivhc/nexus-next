@@ -2509,6 +2509,7 @@ dependencies = [
  "nexus-sys",
  "nix 0.31.3",
  "portable-pty",
+ "tempfile",
  "tokio",
 ]
 

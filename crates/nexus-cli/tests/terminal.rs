@@ -208,3 +208,33 @@ scenario! {
         work.detach().await;
     },
 }
+
+scenario! {
+    name: session_survives_a_long_outage,
+    covers: "R23",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let t = w.term("laptop", &["ssh", "home"]).await;
+        t.expect_prompt().await;
+        t.send(&format!("sleep 2; {}", say("after-long-outage"))).await;
+        t.expect_contains("sleep 2").await;
+        // 断网时间长到两端都认定连接已死：客户端自己发现并重新连上，会话还在。
+        w.cut("laptop", "home", Duration::from_secs(25)).await;
+        t.expect_line_within("after-long-outage", Duration::from_secs(30)).await;
+        t.send(&say("reconnected")).await;
+        t.expect_line("reconnected").await;
+        t.detach().await;
+        // 失联的旧连接已被清理：重新连上的客户端断开后（断开在对方那里生效需要一点时间），会话里没有客户端。
+        let mut ls = serde_json::Value::Null;
+        for _ in 0..50 {
+            ls = w.cli_ok("laptop", &["session", "ls", "home"]).await;
+            if ls["sessions"][0]["clients"] == 0 {
+                break;
+            }
+            w.run_for(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ls["sessions"][0]["clients"], 0, "{ls}");
+    },
+}

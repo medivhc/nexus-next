@@ -128,7 +128,8 @@ scenario! {
         w.run_for(Duration::from_secs(2)).await;
 
         let t = w.term("laptop", &["ssh", "home"]).await;
-        t.expect_line("during").await;
+        // 输入可能先于提示符到达，输出会和提示符在同一行；命令行本身写的是 "dur ing"，不会误匹配。
+        t.expect_contains("during").await;
         t.detach().await;
 
         // 在会话里退出 shell，ssh 带着它的退出码结束。

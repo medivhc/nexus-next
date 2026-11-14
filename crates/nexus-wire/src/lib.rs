@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 4;
+pub const WIRE_VERSION: u16 = 5;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -88,6 +88,16 @@ pub enum Input {
     Ack(u64),
     /// 终端会话：客户端离开，会话继续运行。
     Detach,
+    /// 终端会话：客户端还在。长时间收不到任何消息，会话一侧就认为这个客户端已经失联。
+    Ping,
+}
+
+/// 终端会话流上，会话一侧发给客户端的帧。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionFrame {
+    Msg(ClientMsg),
+    /// 会话还在。客户端长时间收不到任何帧，就认为连接已经失效，重新连接。
+    Heartbeat,
 }
 
 /// 执行过程中产生的事件。

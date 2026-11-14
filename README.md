@@ -2,7 +2,37 @@
 
 把一个人的所有设备组成一个整体，让这个人和他的 agent 用同一套身份使用其中任何一台设备上的能力。
 
-当前进度：**M0**（仓库骨架、测试工具箱、结构约束）。需求见 `FEATURES.md`。
+当前进度：**阶段 1 完成**（组网、免密终端、结构化执行、agent 身份与授权、对本机表现为 SSH）。
+需求见 `FEATURES.md`，各里程碑的功能点见 `docs/feature-points/`。尚待在两台不同网络的真实设备上验证，步骤见 `docs/real-network-check.md`。
+
+## 上手
+
+```sh
+# 每台设备
+nexus daemon &
+
+# 第一台设备
+nexus init --name laptop
+
+# 新设备：输出一段加入码
+nexus join
+# 第一台设备：批准
+nexus device approve <加入码> --name home
+
+nexus ls                          # 所有设备及状态
+nexus ssh home                    # 常驻终端，Ctrl-] 断开，会话继续运行
+nexus exec home -- uname -a       # 结构化执行，--json 输出
+nexus ssh-config >> ~/.ssh/config # 之后 ssh/scp/git 用 home.nexus
+
+# agent
+nexus agent issue --label builder --grant term.exec@home --ttl 4h
+NEXUS_AGENT=<凭据> nexus exec home -- make
+nexus mcp                         # 给 agent 框架用的 MCP 服务器
+nexus audit                       # 本机的审计记录
+```
+
+以独立系统账号运行的 agent：常驻程序加 `--agent-socket /某个那个账号能进入的目录/agent.sock`，
+agent 一侧设置同样的 `NEXUS_AGENT_SOCKET` 和 `NEXUS_AGENT`。这样 agent 用不了你本人的控制入口，只能做凭据允许的事。
 
 ## 运行
 
@@ -52,3 +82,7 @@ scenario! {
 ```
 
 它会生成 `sim` 和 `real` 两个测试。仿真后端里每个种子跑两遍，两遍的事件轨迹必须相同。
+
+## 许可证
+
+Apache-2.0，见 `LICENSE`。

@@ -20,7 +20,7 @@ use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
     hex_encode, AddrHints, AgentCredential, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
-    Input, JoinCode, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
+    Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
     WireError, WIRE_VERSION,
 };
 use serde::de::DeserializeOwned;
@@ -136,6 +136,11 @@ impl LiveSession {
     }
 }
 
+/// 终端会话流上两端发送心跳的间隔。
+const HEARTBEAT: Duration = Duration::from_secs(5);
+/// 这么久收不到对方的任何消息，就认为连接已经失效。写入卡住这么久也一样。
+const PEER_SILENT: Duration = Duration::from_secs(15);
+
 /// 会话里的程序结束后，等落后的客户端追上最终屏幕的最长时间。
 const SESSION_LINGER: Duration = Duration::from_secs(10);
 
@@ -158,6 +163,8 @@ const KEY_ROSTER: &str = "roster";
 const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const LOG_AUDIT: &str = "audit";
+/// 审计日志的轮转上限：最近这么多字节（约 4 万条）的记录总在，总占用不超过约两倍。
+const AUDIT_LOG_MAX: u64 = 8 << 20;
 
 /// 一个请求需要的能力和资源。名册推送和加入邀请不走授权判定，返回 `None`。
 /// 调用方和被调用方用同一个函数算，agent 签署的动作因此与被调用方判定的动作一致。
@@ -606,7 +613,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let peer_name = roster.device(event.peer).map(|d| d.name.clone()).unwrap_or_else(|| event.peer.short());
         let record = AuditRecord { event: event.clone(), peer_name };
         if let Ok(frame) = nexus_wire::encode(&record) {
-            let _ = self.system.append_log(LOG_AUDIT, &frame);
+            let _ = self.system.append_log(LOG_AUDIT, &frame, AUDIT_LOG_MAX);
         }
     }
 
@@ -1026,7 +1033,7 @@ impl<T: Transport, S: System> Node<T, S> {
                         proc.close_stdin();
                     }
                     // 终端会话的消息对执行没有意义。
-                    Ok(Some(Input::Resize(_) | Input::Ack(_))) => {}
+                    Ok(Some(Input::Resize(_) | Input::Ack(_) | Input::Ping)) => {}
                     Ok(Some(Input::Cancel | Input::Detach)) | Err(_) => {
                         input_open = false;
                         caller_gone = true;
@@ -1096,40 +1103,59 @@ impl<T: Transport, S: System> Node<T, S> {
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
         let mut input_open = true;
+        let mut last_heard = tokio::time::Instant::now();
+        let mut next_ping = last_heard + HEARTBEAT;
+        let lost = || err(ErrorCode::Unreachable, "与会话的连接中断");
+        // 连接可能已经失效而传输层还没发现：写入卡住和长时间收不到心跳都当作中断。
         loop {
             tokio::select! {
                 biased;
-                msg = reader.next::<ClientMsg>() => match msg {
-                    Ok(Some(msg)) => {
+                _ = tokio::time::sleep_until(last_heard + PEER_SILENT) => {
+                    let _ = server.tx.send(CtlResponse::Error(lost())).await;
+                    break;
+                }
+                _ = tokio::time::sleep_until(next_ping), if input_open => {
+                    next_ping = tokio::time::Instant::now() + HEARTBEAT;
+                    if !send_within(&mut wr, &Input::Ping).await {
+                        let _ = server.tx.send(CtlResponse::Error(lost())).await;
+                        break;
+                    }
+                }
+                frame = reader.next::<SessionFrame>() => match frame {
+                    Ok(Some(frame)) => {
+                        last_heard = tokio::time::Instant::now();
+                        let SessionFrame::Msg(msg) = frame else { continue };
                         let done = matches!(msg, ClientMsg::Exit(_));
                         if server.tx.send(CtlResponse::Session(msg)).await.is_err() && input_open {
                             input_open = false;
-                            let _ = write_msg(&mut wr, &Input::Detach).await;
+                            let _ = send_within(&mut wr, &Input::Detach).await;
                         }
                         if done {
                             break;
                         }
                     }
                     Ok(None) | Err(_) => {
-                        let lost = err(ErrorCode::Unreachable, "与会话的连接中断");
-                        let _ = server.tx.send(CtlResponse::Error(lost)).await;
+                        let _ = server.tx.send(CtlResponse::Error(lost())).await;
                         break;
                     }
                 },
                 input = server.rx.recv(), if input_open => {
                     let input = input.unwrap_or(Input::Detach);
                     let leaving = matches!(input, Input::Detach | Input::Cancel);
-                    if write_msg(&mut wr, &input).await.is_err() || leaving {
-                        input_open = false;
-                        if leaving {
-                            break;
+                    if !send_within(&mut wr, &input).await {
+                        if !leaving {
+                            let _ = server.tx.send(CtlResponse::Error(lost())).await;
                         }
+                        break;
+                    }
+                    if leaving {
+                        break;
                     }
                 }
             }
         }
-        let _ = wr.shutdown().await;
-        reader.drain().await;
+        let _ = tokio::time::timeout(PEER_SILENT, wr.shutdown()).await;
+        let _ = tokio::time::timeout(PEER_SILENT, reader.drain()).await;
     }
 
     /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
@@ -1152,24 +1178,35 @@ impl<T: Transport, S: System> Node<T, S> {
             let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
             return;
         }
+        // 写入卡住和长时间收不到客户端的任何消息，都说明客户端已经失联：让它离开会话。
+        let mut last_heard = tokio::time::Instant::now();
+        let mut next_beat = last_heard + HEARTBEAT;
         loop {
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep_until(last_heard + PEER_SILENT) => break,
+                _ = tokio::time::sleep_until(next_beat) => {
+                    next_beat = tokio::time::Instant::now() + HEARTBEAT;
+                    if !send_within(&mut wr, &SessionFrame::Heartbeat).await {
+                        break;
+                    }
+                }
                 msg = out.recv() => match msg {
                     Some(msg) => {
                         let done = matches!(msg, ClientMsg::Exit(_));
-                        if write_msg(&mut wr, &msg).await.is_err() || done {
+                        if !send_within(&mut wr, &SessionFrame::Msg(msg)).await || done {
                             break;
                         }
                     }
                     None => break,
                 },
                 input = reader.next::<Input>() => {
+                    last_heard = tokio::time::Instant::now();
                     let event = match input {
                         Ok(Some(Input::Stdin(bytes))) => TermEvent::Input { client, bytes },
                         Ok(Some(Input::Resize(size))) => TermEvent::Resize { client, size },
                         Ok(Some(Input::Ack(bytes))) => TermEvent::Ack { client, bytes },
-                        Ok(Some(Input::CloseStdin)) => continue,
+                        Ok(Some(Input::CloseStdin | Input::Ping)) => continue,
                         Ok(Some(Input::Detach | Input::Cancel)) | Ok(None) | Err(_) => break,
                     };
                     if cmd.send(SessCmd::Event(event)).is_err() {
@@ -1179,8 +1216,8 @@ impl<T: Transport, S: System> Node<T, S> {
             }
         }
         let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
-        let _ = wr.shutdown().await;
-        reader.drain().await;
+        let _ = tokio::time::timeout(PEER_SILENT, wr.shutdown()).await;
+        let _ = tokio::time::timeout(PEER_SILENT, reader.drain()).await;
     }
 
     /// 找到名为 `name` 的会话；不存在且 `create` 时启动一个新的。
@@ -1523,4 +1560,9 @@ fn agent_cert(p: &Principal) -> Option<&authz::SignedAgentCert> {
         Principal::Device => None,
         Principal::Agent { cert, .. } => Some(cert),
     }
+}
+
+/// 限时写一帧：写入卡住 [`PEER_SILENT`] 也算失败（连接可能已经失效而传输层还没发现）。
+async fn send_within<W: AsyncWrite + Unpin, M: serde::Serialize>(wr: &mut W, msg: &M) -> bool {
+    matches!(tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await, Ok(Ok(())))
 }
