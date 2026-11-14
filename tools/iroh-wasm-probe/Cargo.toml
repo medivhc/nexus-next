@@ -1,0 +1,31 @@
+# M2.0 技术验证：浏览器里的 iroh 经中继连上原生节点。独立于工作区，按 README.md 构建。
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+anyhow = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+console_error_panic_hook = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iroh = { version = "=1.4.1" }
+iroh-relay = { version = "=1.4.1", features = ["server"] }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
