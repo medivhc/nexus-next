@@ -524,3 +524,25 @@ scenario! {
         assert!(gone, "调用方离开 5 秒后命令仍在运行");
     },
 }
+
+scenario! {
+    name: concurrent_approvals_keep_both_devices,
+    covers: "R02, R03",
+    nodes: ["laptop", "home", "office"],
+    real: yes,
+    run: |w: World| async move {
+        w.cli_ok("laptop", &["init"]).await;
+        let home = w.cli_ok("home", &["join"]).await;
+        let office = w.cli_ok("office", &["join"]).await;
+        let home_args = ["device", "approve", home["code"].as_str().unwrap(), "--name", "home"];
+        let office_args = ["device", "approve", office["code"].as_str().unwrap(), "--name", "office"];
+        let (a, b) = tokio::join!(w.cli("laptop", &home_args), w.cli("laptop", &office_args));
+        assert_eq!(a.code, 0, "{}", a.stderr);
+        assert_eq!(b.code, 0, "{}", b.stderr);
+        for node in ["laptop", "home", "office"] {
+            let list = w.cli_ok(node, &["ls"]).await;
+            assert_eq!(list["devices"].as_array().unwrap().len(), 3, "{node}: {list}");
+            assert_eq!(w.cli_ok(node, &["status"]).await["roster_version"], 3);
+        }
+    },
+}

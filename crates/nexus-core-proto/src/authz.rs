@@ -20,6 +20,8 @@ pub const MAX_WEB_SESSION_MS: u64 = 12 * 3600 * 1000;
 /// 浏览器拿着它直接访问其他设备，只需要用一次通行密钥。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebSession {
+    /// 签发时验证的通行密钥，不能仅按可复用的名字识别。
+    pub credential_id: Vec<u8>,
     pub browser: NodeId,
     pub label: String,
     pub issuer: NodeId,
@@ -78,6 +80,25 @@ impl AgentCert {
 }
 
 impl SignedAgentCert {
+    /// 校验证书本身，不要求某个具体动作（用于设备发现和长连接复查）。
+    pub fn validate(&self, roster: &Roster, now: Timestamp) -> Result<(), DenyReason> {
+        use DenyReason::*;
+        let c = &self.cert;
+        if !roster.root.verify(Purpose::AgentCert, &canonical(c), &self.signature) {
+            return Err(CertBadSignature);
+        }
+        if now < c.not_before {
+            return Err(CertNotYetValid);
+        }
+        if now >= c.not_after {
+            return Err(CertExpired);
+        }
+        if roster.is_agent_revoked(&c.agent) {
+            return Err(AgentRevoked);
+        }
+        Ok(())
+    }
+
     /// 这张证书的授权是否让它能看到 `path` 或 `path` 之下的东西。
     /// 只看授权条目，不检查证书本身是否有效；有效性由 [`decide`] 负责。
     pub fn can_see(&self, path: &ResourcePath) -> bool {
@@ -266,18 +287,7 @@ fn check(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &Action
         return Ok(());
     };
     let c = &cert.cert;
-    if !ctx.roster.root.verify(Purpose::AgentCert, &canonical(c), &cert.signature) {
-        return Err(CertBadSignature);
-    }
-    if ctx.now < c.not_before {
-        return Err(CertNotYetValid);
-    }
-    if ctx.now >= c.not_after {
-        return Err(CertExpired);
-    }
-    if ctx.roster.is_agent_revoked(&c.agent) {
-        return Err(AgentRevoked);
-    }
+    cert.validate(ctx.roster, ctx.now)?;
     if !c.agent.verify(Purpose::AgentAssertion, &canonical(assertion), signature) {
         return Err(AssertionBadSignature);
     }
@@ -316,7 +326,7 @@ fn check_web(ctx: &Context<'_>, peer: NodeId, s: &SignedWebSession, action: &Act
     if ctx.now >= w.not_after {
         return Err(SessionExpired);
     }
-    let key = ctx.roster.web_key(&w.label).ok_or(WebKeyRevoked)?;
+    let key = ctx.roster.web_key(&w.label).filter(|k| k.credential_id == w.credential_id).ok_or(WebKeyRevoked)?;
     if !key.grants.iter().any(|g| g.allows(action)) {
         return Err(NoMatchingGrant);
     }

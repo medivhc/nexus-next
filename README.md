@@ -34,6 +34,12 @@ nexus audit                       # 本机的审计记录
 以独立系统账号运行的 agent：常驻程序加 `--agent-socket /某个那个账号能进入的目录/agent.sock`，
 agent 一侧设置同样的 `NEXUS_AGENT_SOCKET` 和 `NEXUS_AGENT`。这样 agent 用不了你本人的控制入口，只能做凭据允许的事。
 
+## 升级兼容性
+
+当前协议为 RPC `nexus/rpc/3`、加入 `nexus/join/3`、网页 `nexus/web/2`（wire 版本 8）。
+设备程序和网页 WASM 需要一起升级；旧版本的连接会因协议不匹配而失败。
+升级保留已有设备密钥和名册，浏览器需要重新登录。
+
 ## 运行
 
 ```sh

@@ -238,3 +238,17 @@ scenario! {
         assert_eq!(ls["sessions"][0]["clients"], 0, "{ls}");
     },
 }
+
+scenario! {
+    name: revoked_device_loses_its_existing_terminal,
+    covers: "R18",
+    nodes: ["laptop", "home", "office"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home", "office"]).await;
+        let t = w.term("office", &["ssh", "home"]).await;
+        t.expect_prompt().await;
+        w.cli_ok("laptop", &["device", "revoke", "office"]).await;
+        assert_ne!(t.wait_exit().await, 0);
+    },
+}

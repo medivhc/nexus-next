@@ -59,6 +59,7 @@ fn action(cap: &str, res: &str) -> Action {
 /// laptop 验证了通行密钥后签发的网页会话凭证。
 fn session(now: u64, hours: u64) -> Principal {
     let s = WebSession {
+        credential_id: web_key("phone").credential_id,
         browser: BROWSER,
         label: "phone".into(),
         issuer: id(&laptop_key()),
@@ -101,7 +102,7 @@ fn only_a_roster_device_can_issue_a_session() {
     let r = roster(vec![web_key("phone")]);
     let now = 100 * HOUR;
     let stranger = SecretKey::from_seed([5; 32]);
-    let s = WebSession { browser: BROWSER, label: "phone".into(), issuer: id(&stranger), issued_at: Timestamp(now), not_after: Timestamp(now + HOUR) };
+    let s = WebSession { credential_id: web_key("phone").credential_id, browser: BROWSER, label: "phone".into(), issuer: id(&stranger), issued_at: Timestamp(now), not_after: Timestamp(now + HOUR) };
     let p = Principal::Web { session: s.clone().sign(&stranger) };
     assert_eq!(judge(&r, now, BROWSER, &p, &action("node.info", "home")), Outcome::Deny(DenyReason::IssuerNotInRoster));
     // 声称由 laptop 签发，实际不是。
@@ -163,4 +164,16 @@ fn login_challenge_binds_time_and_browser() {
     assert_eq!(base, login_challenge(Timestamp(1000), BROWSER));
     assert_ne!(base, login_challenge(Timestamp(1001), BROWSER));
     assert_ne!(base, login_challenge(Timestamp(1000), NodeId([8; 32])));
+}
+
+#[test]
+fn reusing_a_label_does_not_reauthorize_a_previous_credential() {
+    let now = 100 * HOUR;
+    let old = session(now, 12);
+    let mut replacement = web_key("phone");
+    replacement.credential_id = vec![8; 16];
+    assert_eq!(
+        judge(&roster(vec![replacement]), now, BROWSER, &old, &action("node.info", "home")),
+        Outcome::Deny(DenyReason::WebKeyRevoked)
+    );
 }
