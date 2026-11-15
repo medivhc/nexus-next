@@ -118,7 +118,7 @@ try {
   // 离开后会话还在（终端的常驻会话）。
   await page.click("#term-leave");
   await page.waitForSelector("#device-list li");
-  const sessions = nexus("home", ["session", "ls", "--json"]);
+  const sessions = nexus("home", ["session", "ls", "home", "--json"]);
   if (!JSON.stringify(sessions).includes("main")) throw new Error(`home 上的会话：${JSON.stringify(sessions)}`);
 
   // 浏览器里不留存储（R32 的一部分；关闭后的检查在 M2.5）。
