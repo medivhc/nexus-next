@@ -105,7 +105,7 @@ try {
   await page.click("#login-go");
   await page.waitForSelector("#device-list li", { timeout: 20000 });
   const devices = await page.$$eval("#device-list .name", (els) => els.map((e) => e.textContent));
-  if (devices.join() !== "home,laptop") throw new Error(`设备列表：${devices}`);
+  if ([...devices].sort().join() !== "home,laptop") throw new Error(`设备列表：${devices}`);
   const loginMs = Date.now() - loginStart;
   await page.click("#device-list li:has-text('home') button");
   const screen = () => page.$eval(".xterm-rows", (e) => e.innerText);
