@@ -169,6 +169,11 @@ impl Transport for IrohTransport {
     }
 }
 
+/// 以 `seed` 为私钥的节点的标识（与 [`IrohTransport::bind`] 得到的一致），不需要先建立端点。
+pub fn node_id_from_seed(seed: &[u8; 32]) -> NodeId {
+    NodeId(*SecretKey::from_bytes(seed).public().as_bytes())
+}
+
 /// 只经中继 `relay` 联系 `node` 的地址提示（浏览器从通行密钥里只知道入口设备和它的中继）。
 pub fn relay_hint(node: NodeId, relay: &str) -> Result<String, String> {
     let id = iroh::EndpointId::from_bytes(&node.0).map_err(|e| format!("设备标识无效：{e}"))?;
@@ -227,5 +232,6 @@ mod tests {
         assert_eq!(hint_relay(&hint).as_deref(), Some("https://bewith.link/"));
         assert!(relay_hint(node, "not a url").is_err());
         assert_eq!(hint_relay("zz"), None);
+        assert_eq!(node_id_from_seed(&[3; 32]), node);
     }
 }

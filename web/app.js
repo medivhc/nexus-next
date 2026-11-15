@@ -8,9 +8,8 @@ const status = (text) => { $("status").textContent = text; };
 const fail = (e) => { $("error").textContent = String(e && e.message ? e.message : e); };
 const bytes = (buf) => new Uint8Array(buf);
 
-// 中继：默认是页面所在的站点（锚点在同一台机器上提供页面和中继），开发时可以用 ?relay= 指定。
-const params = new URLSearchParams(location.search);
-const relay = params.get("relay") || location.origin;
+// 中继来自登记链接或通行密钥里的入口信息；都没有时是页面所在的站点（锚点在同一台机器上提供页面和中继）。
+const relay = location.origin;
 const rpId = location.hostname;
 
 async function enroll(link) {
@@ -18,8 +17,7 @@ async function enroll(link) {
   $("enroll-go").onclick = async () => {
     $("error").textContent = "";
     try {
-      status("连接中…");
-      const browser = await Browser.create(relay);
+      const browser = new Browser(relay);
       const cred = await navigator.credentials.create({
         publicKey: {
           rp: { id: rpId, name: "Nexus" },
@@ -31,6 +29,7 @@ async function enroll(link) {
       });
       const spki = cred.response.getPublicKey();
       if (!spki) throw new Error("这个浏览器不支持读取通行密钥的公钥");
+      status("连接中…");
       const label = await browser.enroll(link, bytes(cred.rawId), bytes(spki), rpId);
       history.replaceState(null, "", location.pathname + location.search);
       status("");
@@ -44,15 +43,15 @@ async function login() {
   $("login-go").onclick = async () => {
     $("error").textContent = "";
     try {
-      status("连接中…");
       // 每次尝试都用新的临时身份：一个身份只能登录一次。
-      const browser = await Browser.create(relay);
+      const browser = new Browser(relay);
       const issuedAt = Date.now();
       const got = await navigator.credentials.get({
         publicKey: { challenge: browser.challenge(issuedAt), rpId, userVerification: "required" },
       });
       const r = got.response;
       if (!r.userHandle) throw new Error("这个通行密钥不是 Nexus 的");
+      status("连接中…");
       const session = await browser.login(
         bytes(r.userHandle), issuedAt, bytes(got.rawId),
         bytes(r.clientDataJSON), bytes(r.authenticatorData), bytes(r.signature),

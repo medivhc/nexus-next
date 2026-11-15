@@ -28,48 +28,57 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// 这个浏览器：一个临时身份，可以登记通行密钥，然后登录一次。
+/// 这个浏览器：一个只在内存里的临时身份。先签名再连接：签名时页面还不知道该经哪个中继，
+/// 中继来自登记链接或通行密钥里的入口信息，所以连接（建立端点）推迟到登记或登录时。
 #[wasm_bindgen]
 pub struct Browser {
-    transport: Rc<RefCell<Option<IrohTransport>>>,
-    /// 页面默认使用的中继（入口信息里没有中继时）。
-    relay: String,
+    seed: [u8; 32],
+    /// 用过之后（登录过）不能再用。
+    used: Rc<RefCell<bool>>,
+    /// 入口信息里没有中继时使用的中继（通常是页面所在的站点）。
+    default_relay: String,
+}
+
+async fn connect(seed: [u8; 32], relay: String) -> Result<IrohTransport, JsError> {
+    let config = Config { relay: Relay::Custom(relay), discovery: false, bind: None, direct: false };
+    IrohTransport::bind(seed, config).await.map_err(|e| JsError::new(&format!("连不上中继：{e}")))
+}
+
+fn entry_of(link: &EnrollLink) -> EntryHandle {
+    EntryHandle { node: link.node, relay: nexus_fabric_iroh::hint_relay(&link.hint) }
 }
 
 #[wasm_bindgen]
 impl Browser {
-    /// 生成临时身份并连上中继 `relay`（例如 https://bewith.link）。
-    pub async fn create(relay: String) -> Result<Browser, JsError> {
+    /// 生成临时身份。`default_relay` 例如 https://bewith.link。
+    #[wasm_bindgen(constructor)]
+    pub fn new(default_relay: String) -> Result<Browser, JsError> {
         let mut seed = [0u8; 32];
         getrandom_fill(&mut seed)?;
-        let config = Config { relay: Relay::Custom(relay.clone()), discovery: false, bind: None, direct: false };
-        let transport = IrohTransport::bind(seed, config).await.map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(Browser { transport: Rc::new(RefCell::new(Some(transport))), relay })
+        Ok(Browser { seed, used: Rc::new(RefCell::new(false)), default_relay })
     }
 
     /// 签名时间为 `issued_at_ms` 的登录挑战：交给 `navigator.credentials.get` 签名。
-    pub fn challenge(&self, issued_at_ms: f64) -> Result<Vec<u8>, JsError> {
-        let t = self.transport.borrow();
-        let t = t.as_ref().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
-        Ok(nexus_web_core::challenge(t, Timestamp(issued_at_ms as u64)).to_vec())
+    pub fn challenge(&self, issued_at_ms: f64) -> Vec<u8> {
+        let me = nexus_fabric_iroh::node_id_from_seed(&self.seed);
+        nexus_core_proto::webauthn::login_challenge(Timestamp(issued_at_ms as u64), me).to_vec()
     }
 
     /// 登记链接（或其中 `#` 之后的部分）对应的入口信息，作为新通行密钥的用户标识。
     pub fn user_handle(link: String) -> Result<Vec<u8>, JsError> {
         let link = EnrollLink::parse(&link).map_err(|m| JsError::new(&m))?;
-        let relay = nexus_fabric_iroh::hint_relay(&link.hint);
-        EntryHandle { node: link.node, relay }.encode().map_err(|m| JsError::new(&m))
+        entry_of(&link).encode().map_err(|m| JsError::new(&m))
     }
 
     /// 把新建的通行密钥交给管理设备登记。Promise 的结果是它在网络里的名字。
     pub fn enroll(&self, link: String, credential_id: Vec<u8>, spki: Vec<u8>, rp_id: String) -> js_sys::Promise {
-        let cell = self.transport.clone();
+        let (seed, default_relay) = (self.seed, self.default_relay.clone());
         future_to_promise(async move {
             let link = EnrollLink::parse(&link).map_err(|m| JsError::new(&m))?;
-            let t = cell.borrow_mut().take().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
-            let result = nexus_web_core::enroll(&t, &link, NewCredential { credential_id, spki, rp_id }).await;
-            *cell.borrow_mut() = Some(t);
-            Ok(JsValue::from(result.map_err(js_err)?))
+            let relay = entry_of(&link).relay.unwrap_or(default_relay);
+            let t = connect(seed, relay).await?;
+            let label = nexus_web_core::enroll(&t, &link, NewCredential { credential_id, spki, rp_id }).await.map_err(js_err)?;
+            Ok(JsValue::from(label))
         })
     }
 
@@ -85,13 +94,15 @@ impl Browser {
         authenticator_data: Vec<u8>,
         signature: Vec<u8>,
     ) -> js_sys::Promise {
-        let cell = self.transport.clone();
-        let default_relay = self.relay.clone();
+        let (seed, default_relay, used) = (self.seed, self.default_relay.clone(), self.used.clone());
         future_to_promise(async move {
+            if used.replace(true) {
+                return Err(JsError::new("这个浏览器已经登录过").into());
+            }
             let entry = EntryHandle::decode(&user_handle).ok_or_else(|| JsError::new("这个通行密钥不是 Nexus 的"))?;
-            let t = cell.borrow_mut().take().ok_or_else(|| JsError::new("这个浏览器已经登录过"))?;
             let relay = entry.relay.unwrap_or(default_relay);
             let hint = nexus_fabric_iroh::relay_hint(entry.node, &relay).map_err(|e: String| JsError::new(&e))?;
+            let t = connect(seed, relay).await?;
             t.add_hint(entry.node, &hint);
             let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
             let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
