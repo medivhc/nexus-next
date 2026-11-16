@@ -164,7 +164,7 @@ try {
   // 体积预算（FP-2.5-04）。
   const wasm = new Uint8Array(await fetch(`${pageUrl}/pkg/nexus_web_bg.wasm`).then((r) => r.arrayBuffer()));
   const gzipBytes = gzipSync(wasm, { level: 9 }).length;
-  if (gzipBytes > 1.5 * 1024 * 1024) throw new Error(`WebAssembly gzip 后 ${gzipBytes} 字节，超过 1.5 MB 预算`);
+  if (gzipBytes > 1.2 * 1024 * 1024) throw new Error(`WebAssembly gzip 后 ${gzipBytes} 字节，超过 1.2 MB 预算`);
 
   console.log(JSON.stringify({
     result: "通过", steps, step_count: steps.length, login_ms: loginMs, login_to_prompt_ms: toPromptMs,
