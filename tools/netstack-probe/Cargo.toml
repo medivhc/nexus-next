@@ -1,0 +1,13 @@
+[package]
+name = "netstack-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# 独立于工作区：M3.0 技术验证，用户态协议栈 + Linux 虚拟网卡。
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+ipstack = "1.0"
