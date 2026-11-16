@@ -1346,11 +1346,21 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         if device.node_id == self.me() {
             let body = Request::SessionAttach { name: name.clone(), create: true, size };
-            let check = required_action(&body, &device.name).and_then(|_| self.authorize_local(agent.as_ref(), &body));
-            if let Err(e) = check {
-                let _ = server.tx.send(CtlResponse::Error(e)).await;
-                return;
-            }
+            // agent 的会话要一直接受复查：授权通过后为它建立守卫。
+            let check = required_action(&body, &device.name).and_then(|action| {
+                self.authorize_local(agent.as_ref(), &body)?;
+                let Some(a) = agent.as_ref() else { return Ok(None) };
+                let action = action.ok_or_else(|| internal("会话请求应当需要授权"))?;
+                let principal = self.principal_for(Some(a), &device, &body)?;
+                Ok(Some(Box::new(SessionGuard::new(self.me(), principal, action))))
+            });
+            let guard = match check {
+                Ok(guard) => guard,
+                Err(e) => {
+                    let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    return;
+                }
+            };
             let (near, far) = tokio::io::duplex(256 * 1024);
             let client = async {
                 let mut near = near;
@@ -1364,11 +1374,6 @@ impl<T: Transport, S: System> Node<T, S> {
                     }
                 }
             };
-            let guard = agent.as_ref().map(|a| {
-                let principal = self.principal_for(Some(a), &device, &body).expect("已经授权的动作");
-                let action = required_action(&body, &device.name).expect("合法会话").expect("需要授权");
-                Box::new(SessionGuard::new(self.me(), principal, action))
-            });
             futures_util::future::join(self.serve_session(far, &name, true, size, guard), client).await;
             return;
         }
@@ -1735,6 +1740,8 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     async fn approve(&self, code: &str, name: Option<String>) -> Result<MembershipReport, WireError> {
+        // 名册的修改串行进行。等新设备确认期间（最长两倍请求超时）一直持有：
+        // 发给它的名册必须是最新的，同时发生的撤销等它确认之后再写入下一个版本。
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let code = JoinCode::decode(code).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
@@ -1907,7 +1914,10 @@ fn principal_sees(roster: &Roster, principal: &Principal, path: &ResourcePath) -
     match principal {
         Principal::Device => true,
         Principal::Agent { cert, .. } => cert.can_see(path),
-        Principal::Web { session } => roster.web_key(&session.session.label).is_some_and(|k| grants_see(&k.grants, path)),
+        Principal::Web { session } => roster
+            .web_key(&session.session.label)
+            .filter(|k| k.credential_id == session.session.credential_id)
+            .is_some_and(|k| grants_see(&k.grants, path)),
     }
 }
 
