@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { gzipSync } from "node:zlib";
 
 const { values: opt } = parseArgs({
   options: {
@@ -101,37 +102,72 @@ try {
   if (keys.join() !== "phone") throw new Error(`home 上的通行密钥：${keys}`);
   log("登记成功");
 
-  // 登录（R28）并进入 home 的会话（R30）。
+  // 上手成本（R36，FP-2.5-05）：打开页面 → 点登录并选通行密钥 → 点终端，共 3 步，每步计时。
+  const steps = [];
+  let mark = Date.now();
+  const step = (name) => { const now = Date.now(); steps.push({ step: name, ms: now - mark }); mark = now; };
   await page.goto(pageUrl);
+  await page.waitForSelector("#login-go");
+  step("打开页面");
   const loginStart = Date.now();
   await page.click("#login-go");
   await page.waitForSelector("#device-list li", { timeout: 20000 });
+  step("点「用通行密钥登录」并选通行密钥");
   const devices = await page.$$eval("#device-list .name", (els) => els.map((e) => e.textContent));
   if ([...devices].sort().join() !== "home,laptop") throw new Error(`设备列表：${devices}`);
   const loginMs = Date.now() - loginStart;
   await page.click("#device-list li:has-text('home') button");
   const screen = () => page.$eval(".xterm-rows", (e) => e.innerText);
   await waitFor("提示符", async () => (await screen()).includes("$"), 20000);
+  step("点 home 的「终端」");
   const toPromptMs = Date.now() - loginStart;
   await page.keyboard.type("echo hello-$((6*7))\n");
   await waitFor("命令输出", async () => (await screen()).includes("hello-42"));
   log(`登录 ${loginMs} 毫秒；从点登录到出现提示符 ${toPromptMs} 毫秒`);
+  if (toPromptMs > 2000) throw new Error(`从点登录到出现提示符用了 ${toPromptMs} 毫秒，超过 2 秒`);
 
   // 离开后会话还在（终端的常驻会话）。
   await page.click("#term-leave");
   await page.waitForSelector("#device-list li");
-  const sessions = nexus("home", ["session", "ls", "home", "--json"]);
-  if (!JSON.stringify(sessions).includes("main")) throw new Error(`home 上的会话：${JSON.stringify(sessions)}`);
+  const clientsOf = (name) => (nexus("home", ["session", "ls", "home", "--json"]).sessions || []).find((s) => s.name === name);
+  if (!clientsOf("main")) throw new Error("离开后 home 上应当还有会话 main");
 
-  // 浏览器里不留存储（R32 的一部分；关闭后的检查在 M2.5）。
-  const stored = await page.evaluate(async () => ({
+  // 页面被冻结 20 秒（超过设备判定断线的 15 秒）后自动恢复（R34，FP-2.5-03）。
+  await page.click("#device-list li:has-text('home') button");
+  await waitFor("提示符", async () => (await screen()).includes("$"), 20000);
+  const cdpPage = await context.newCDPSession(page);
+  await cdpPage.send("Page.setWebLifecycleState", { state: "frozen" });
+  await new Promise((r) => setTimeout(r, 20000));
+  await cdpPage.send("Page.setWebLifecycleState", { state: "active" });
+  await page.keyboard.type("echo back-$((40+2))\n");
+  await waitFor("冻结后恢复", async () => (await screen()).includes("back-42"), 20000);
+  log("冻结 20 秒后恢复");
+
+  // 关闭即离开（R32，FP-2.5-02）：关掉页面，同一个浏览器里不留任何东西，home 上的客户端离开。
+  await waitFor("会话有客户端", () => clientsOf("main")?.clients === 1);
+  await page.close({ runBeforeUnload: true });
+  // 页面来得及时主动离开；来不及时（例如直接被杀掉）设备 15 秒没有心跳就判定断开。
+  await waitFor("关闭页面后客户端离开", () => clientsOf("main")?.clients === 0, 30000);
+  const after = await context.newPage();
+  await after.goto(pageUrl);
+  const stored = await after.evaluate(async () => ({
     local: localStorage.length, session: sessionStorage.length, cookies: document.cookie,
-    idb: (await indexedDB.databases()).length,
+    idb: (await indexedDB.databases()).length, caches: (await caches.keys()).length,
+    workers: (await navigator.serviceWorker.getRegistrations()).length,
   }));
-  if (stored.local || stored.session || stored.cookies || stored.idb) throw new Error(`浏览器里有存储：${JSON.stringify(stored)}`);
+  if (Object.values(stored).some((v) => v)) throw new Error(`关闭后浏览器里有存储：${JSON.stringify(stored)}`);
+  if (!(await after.isVisible("#login-go"))) throw new Error("重新打开页面后应当需要重新登录");
+  log("关闭后不留存储");
 
-  const wasm = await fetch(`${pageUrl}/pkg/nexus_web_bg.wasm`).then((r) => r.arrayBuffer());
-  console.log(JSON.stringify({ result: "通过", login_ms: loginMs, login_to_prompt_ms: toPromptMs, wasm_bytes: wasm.byteLength }));
+  // 体积预算（FP-2.5-04）。
+  const wasm = new Uint8Array(await fetch(`${pageUrl}/pkg/nexus_web_bg.wasm`).then((r) => r.arrayBuffer()));
+  const gzipBytes = gzipSync(wasm, { level: 9 }).length;
+  if (gzipBytes > 1.5 * 1024 * 1024) throw new Error(`WebAssembly gzip 后 ${gzipBytes} 字节，超过 1.5 MB 预算`);
+
+  console.log(JSON.stringify({
+    result: "通过", steps, step_count: steps.length, login_ms: loginMs, login_to_prompt_ms: toPromptMs,
+    wasm_bytes: wasm.byteLength, wasm_gzip_bytes: gzipBytes,
+  }));
 } catch (e) {
   console.error("失败：", e.message);
   process.exitCode = 1;

@@ -85,7 +85,9 @@ impl IrohTransport {
             Relay::Custom(url) => {
                 let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
                 relay = Some(url.clone());
-                builder.relay_mode(RelayMode::custom([url]))
+                // 自建中继（锚点）不提供 QUIC 地址探测：不登记它，否则启动时要等探测超时（3 秒）
+                // 才选定它为本端的中继，这期间别人经它连不上本端。
+                builder.relay_mode(RelayMode::Custom(iroh::RelayMap::from(iroh::RelayConfig::new(url, None))))
             }
         };
         // 浏览器里本来就只有中继。
