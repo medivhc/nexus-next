@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 8;
+pub const WIRE_VERSION: u16 = 9;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -41,7 +41,7 @@ pub enum Request {
     /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
     /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
     Exec(ExecSpec),
-    /// 网页节点（协议 nexus/web/2）：用一次性登记码登记一个新建的通行密钥。
+    /// 网页节点（协议 nexus/web）：用一次性登记码登记一个新建的通行密钥。
     WebEnroll { token: [u8; 16], credential: NewCredential },
     /// 网页节点：用通行密钥登录。挑战是 `login_challenge(issued_at, 浏览器的临时节点标识)`。
     WebLogin { issued_at: Timestamp, assertion: nexus_core_proto::webauthn::WebAuthnAssertion },
@@ -215,9 +215,13 @@ pub enum CtlRequest {
     /// 本机 SSH 呈现层为某个设备使用的主机密钥（种子）。对同一台目标设备总是相同。
     SshHostKey { node: String },
     /// 发起通行密钥登记（只能在管理设备上）：`page` 是页面地址，它的主机名就是通行密钥的依赖方。
-    WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: String },
+    /// `page` 为空时用名册里的锚点，没有锚点时用默认页面。
+    WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
     WebList,
     WebRevoke { label: String },
+    /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
+    AnchorSet { url: Option<String> },
+    AnchorShow,
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -242,6 +246,7 @@ pub enum CtlResponse {
     WebEnroll(WebEnrollReport),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
+    Anchor(AnchorReport),
     Ok,
     Error(WireError),
 }
@@ -282,6 +287,15 @@ pub struct MembershipReport {
     /// 新名册已经送达的其他设备数。
     pub pushed: u32,
     /// 暂时没能送达的设备名；它们会在下次与任一已更新的设备通信时得到新名册。
+    pub unreachable: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorReport {
+    pub anchor: Option<String>,
+    pub roster_version: u64,
+    /// 设置时：新名册已经送达的其他设备数和暂时没能送达的设备名。查看时为 0 和空。
+    pub pushed: u32,
     pub unreachable: Vec<String>,
 }
 

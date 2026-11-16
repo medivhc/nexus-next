@@ -3,7 +3,7 @@
 use nexus_cli::{Sink, EXIT_INTERNAL, EXIT_INVALID_INPUT};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub async fn run<K: Sink>(sink: &mut K, dir: &Path, listen: &str) -> i32 {
@@ -38,7 +38,12 @@ pub async fn run<K: Sink>(sink: &mut K, dir: &Path, listen: &str) -> i32 {
 }
 
 async fn serve(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
-    // 只需要请求行；读到头部结束或 8 KiB 为止。
+    let head = read_head(&mut stream).await?;
+    respond(&mut stream, root, &head).await
+}
+
+/// 读到请求头结束（或 8 KiB）为止。返回读到的全部字节，可能包含请求体的开头。
+pub async fn read_head<R: AsyncRead + Unpin>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut head = Vec::new();
     let mut buf = [0u8; 1024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 8192 {
@@ -48,9 +53,20 @@ async fn serve(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
         }
         head.extend_from_slice(&buf[..n]);
     }
-    let line = String::from_utf8_lossy(&head);
+    Ok(head)
+}
+
+/// 请求行里的方法和目标。
+pub fn request_line(head: &[u8]) -> (String, String) {
+    let line = String::from_utf8_lossy(head);
     let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string())
+}
+
+/// 按请求头回应目录里的静态文件，然后关闭。
+pub async fn respond<W: AsyncWrite + Unpin>(stream: &mut W, root: &Path, head: &[u8]) -> std::io::Result<()> {
+    let (method, target) = request_line(head);
+    let (method, target) = (method.as_str(), target.as_str());
     let found = match method {
         "GET" | "HEAD" => resolve(root, target).and_then(|p| std::fs::read(&p).ok().map(|b| (p, b))),
         _ => None,
@@ -72,7 +88,7 @@ async fn serve(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
 }
 
 /// 请求的路径对应的文件；不在目录里（含 `..`、符号链接指向外面）或不存在时为 `None`。
-fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
+pub fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     let path = target.split(['?', '#']).next()?;
     let decoded = percent_decode(path)?;
     let mut out = root.to_path_buf();

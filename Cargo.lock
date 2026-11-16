@@ -2677,6 +2677,8 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "crossterm",
+ "futures-util",
+ "iroh-relay",
  "nexus-core-proto",
  "nexus-fabric",
  "nexus-fabric-iroh",
@@ -2684,10 +2686,14 @@ dependencies = [
  "nexus-sys-real",
  "nexus-testkit",
  "nexus-wire",
+ "rcgen",
  "russh",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
+ "tokio-rustls-acme",
 ]
 
 [[package]]

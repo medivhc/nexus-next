@@ -304,6 +304,37 @@ impl World {
         };
         Browser { state: RefCell::new(BrowserState::Fresh(transport)), label: format!("browser{n}") }
     }
+
+    /// 和真正的浏览器一样只经中继 `relay` 通信的浏览器（只在真实后端）。
+    pub async fn browser_via(&self, relay: &str) -> Browser {
+        let Inner::Real(_) = &self.inner else { panic!("browser_via 只用于真实后端") };
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("无法取得随机数");
+        let config = nexus_fabric_iroh::Config {
+            relay: nexus_fabric_iroh::Relay::Custom(relay.to_string()),
+            discovery: false,
+            bind: None,
+            direct: false,
+        };
+        let t = nexus_fabric_iroh::IrohTransport::bind(seed, config).await.expect("浏览器的传输无法启动");
+        self.trace.borrow_mut().push("browser".into());
+        Browser { state: RefCell::new(BrowserState::Fresh(BrowserTransport::Real(t))), label: "browser-relayed".into() }
+    }
+
+    /// 以新的参数（`daemon` 之后的部分，替换默认的 `--local-only`）重启节点的常驻程序，保留数据目录。
+    /// 只在真实后端：用于锚点这样需要真实网络服务的设备。
+    pub async fn restart(&self, node: &str, args: &[&str]) {
+        let Inner::Real(real) = &self.inner else { panic!("restart 只用于真实后端") };
+        real.kill(node);
+        real.spawn_daemon(node, args);
+        real.wait_ready(node);
+    }
+
+    /// 节点的常驻程序到目前为止的日志（只在真实后端）。
+    pub fn daemon_log(&self, node: &str) -> String {
+        let Inner::Real(real) = &self.inner else { return String::new() };
+        std::fs::read_to_string(real.dirs[node].join("daemon.log")).unwrap_or_default()
+    }
 }
 
 /// 场景里的一个浏览器，见 [`World::browser`]。登录前可以登记通行密钥，登录后访问各设备。
@@ -916,34 +947,48 @@ impl RealWorld {
         for name in nodes {
             let dir = world._tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
-            let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
-            let child = Command::new(&world.bin)
-                .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name, "--local-only"])
-                .arg("--agent-socket")
-                .arg(world.sockets.path().join(format!("{name}.sock")))
-                // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
-                .env("SHELL", "/bin/sh")
-                .env("PS1", "$ ")
-                .env_remove("ENV")
-                .stdin(Stdio::null())
-                .stdout(log.try_clone().unwrap())
-                .stderr(log)
-                .spawn()
-                .expect("无法启动 nexus daemon");
-            world.children.borrow_mut().insert(name.to_string(), child);
             world.dirs.insert(name.to_string(), dir);
+            world.spawn_daemon(name, &["--local-only"]);
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        for (name, dir) in &world.dirs {
-            while !dir.join("ctl.sock").exists() {
-                if Instant::now() >= deadline {
-                    let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
-                    panic!("节点 {name} 在 10 秒内没有就绪。日志：\n{log}");
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        for name in nodes {
+            world.wait_ready(name);
         }
         world
+    }
+
+    /// 启动节点的常驻程序，`extra` 是 `daemon` 之后的其他参数。
+    fn spawn_daemon(&self, name: &str, extra: &[&str]) {
+        let dir = &self.dirs[name];
+        let _ = std::fs::remove_file(dir.join("ctl.sock"));
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
+        let child = Command::new(&self.bin)
+            .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+            .args(extra)
+            .arg("--agent-socket")
+            .arg(self.sockets.path().join(format!("{name}.sock")))
+            // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
+            .env("SHELL", "/bin/sh")
+            .env("PS1", "$ ")
+            .env_remove("ENV")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("无法启动 nexus daemon");
+        self.children.borrow_mut().insert(name.to_string(), child);
+    }
+
+    fn wait_ready(&self, name: &str) {
+        let dir = &self.dirs[name];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join("ctl.sock").exists() {
+            let exited = self.children.borrow_mut().get_mut(name).and_then(|c| c.try_wait().ok().flatten());
+            if Instant::now() >= deadline || exited.is_some() {
+                let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+                panic!("节点 {name} 没有就绪（{exited:?}）。日志：\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn kill(&self, node: &str) {

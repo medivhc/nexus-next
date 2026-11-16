@@ -1,7 +1,8 @@
-// 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 页面 + 本机中继 + 两台设备的常驻程序。
+// 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
+// laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
 // 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览器里不留存储。
 //
-// 用法：node run.mjs --nexus <nexus 可执行文件> --relay-bin <iroh-relay 可执行文件> --dist <web/dist> [--chrome <路径>]
+// 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync } from "node:fs";
@@ -12,17 +13,14 @@ import { parseArgs } from "node:util";
 const { values: opt } = parseArgs({
   options: {
     nexus: { type: "string" },
-    "relay-bin": { type: "string" },
     dist: { type: "string" },
     chrome: { type: "string", default: "/usr/bin/google-chrome" },
-    "relay-port": { type: "string", default: "3340" },
     "page-port": { type: "string", default: "8080" },
   },
 });
-for (const k of ["nexus", "relay-bin", "dist"]) if (!opt[k]) throw new Error(`缺少 --${k}`);
+for (const k of ["nexus", "dist"]) if (!opt[k]) throw new Error(`缺少 --${k}`);
 
 const root = mkdtempSync(join(tmpdir(), "nexus-web-e2e-"));
-const relayUrl = `http://127.0.0.1:${opt["relay-port"]}`;
 const pageUrl = `http://localhost:${opt["page-port"]}`;
 const children = [];
 const t0 = Date.now();
@@ -62,20 +60,22 @@ async function waitFor(what, fn, ms = 15000) {
 
 let browser;
 try {
-  // 中继、两台设备、页面服务。
-  background(opt["relay-bin"], ["--dev"]);
-  await waitFor("中继", () => fetch(relayUrl).then(() => true));
+  // laptop 是锚点（页面和中继），home 只以它为中继。
+  const daemonArgs = {
+    laptop: ["--anchor-dev", `127.0.0.1:${opt["page-port"]}`, "--page-dir", opt.dist],
+    home: ["--relay", pageUrl],
+  };
   for (const n of ["laptop", "home"]) {
     mkdirSync(join(root, n), { recursive: true });
-    background(opt.nexus, ["--data-dir", dataDir(n), "daemon", "--name", n, "--relay", relayUrl, "--no-discovery",
+    background(opt.nexus, ["--data-dir", dataDir(n), "daemon", "--name", n, ...daemonArgs[n], "--no-discovery",
       "--agent-socket", join(root, n, "agent.sock")], { HOME: join(root, n), SHELL: "/bin/sh", PS1: "$ " });
   }
+  await waitFor("锚点", () => fetch(pageUrl).then((r) => r.ok));
   await waitFor("常驻程序", () => nexus("laptop", ["status", "--json"]) && nexus("home", ["status", "--json"]));
   nexus("laptop", ["init", "--name", "laptop", "--json"]);
   const { code } = nexus("home", ["join", "--json"]);
   nexus("laptop", ["device", "approve", code, "--name", "home", "--json"]);
-  background(opt.nexus, ["web", "serve", "--dir", opt.dist, "--listen", `127.0.0.1:${opt["page-port"]}`]);
-  await waitFor("页面服务", () => fetch(pageUrl).then((r) => r.ok));
+  nexus("laptop", ["anchor", "set", pageUrl, "--json"]);
   log("网络就绪");
 
   browser = await chromium.launch({ executablePath: opt.chrome, args: ["--no-sandbox"] });
@@ -91,7 +91,9 @@ try {
   });
 
   // 登记（R29）。
-  const { url } = nexus("laptop", ["web", "enroll", "--label", "phone", "--page", pageUrl, "--json"]);
+  // 不给 --page：登记链接指向名册里的锚点。
+  const { url } = nexus("laptop", ["web", "enroll", "--label", "phone", "--json"]);
+  if (!url.startsWith(`${pageUrl}/#enroll=`)) throw new Error(`登记链接没有指向锚点：${url}`);
   await page.goto(url);
   await page.click("#enroll-go");
   await page.waitForSelector("text=已登记为 phone", { timeout: 20000 });

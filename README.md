@@ -36,9 +36,9 @@ agent 一侧设置同样的 `NEXUS_AGENT_SOCKET` 和 `NEXUS_AGENT`。这样 agen
 
 ## 升级兼容性
 
-当前协议为 RPC `nexus/rpc/3`、加入 `nexus/join/3`、网页 `nexus/web/2`（wire 版本 8）。
+当前协议为 RPC `nexus/rpc/4`、加入 `nexus/join/4`、网页 `nexus/web/3`（wire 版本 9）。
 设备程序和网页 WASM 需要一起升级；旧版本的连接会因协议不匹配而失败。
-升级保留已有设备密钥和名册，浏览器需要重新登录。
+升级保留已有设备密钥和名册（加入锚点之前保存的名册照样能读出，签名仍然有效），浏览器需要重新登录。
 
 ## 运行
 
