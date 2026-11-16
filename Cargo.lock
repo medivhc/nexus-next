@@ -2743,6 +2743,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-net-core"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "nexus-runtime"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,12 @@
+[package]
+name = "nexus-net-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 纯逻辑：统一入口的协议解析（SOCKS5、HTTP 代理）与路由判定。不碰系统，不碰运行时。
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -26,6 +26,7 @@ PURE = {
     "nexus-core-proto": {"serde", "postcard", "ed25519-dalek", "p256", "sha2", "serde_json"},
     "nexus-wire": {"nexus-core-proto", "nexus-term-proto", "serde", "postcard"},
     "nexus-term-proto": {"serde", "vt100"},
+    "nexus-net-core": {"serde"},
 }
 PURE_DEV_EXTRA = {"proptest"}
 

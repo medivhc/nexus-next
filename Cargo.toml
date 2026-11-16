@@ -14,6 +14,7 @@ nexus-wire = { path = "crates/nexus-wire" }
 nexus-term-proto = { path = "crates/nexus-term-proto" }
 nexus-web-core = { path = "crates/nexus-web-core" }
 nexus-web = { path = "crates/nexus-web" }
+nexus-net-core = { path = "crates/nexus-net-core" }
 nexus-sys = { path = "crates/nexus-sys" }
 nexus-sys-real = { path = "crates/nexus-sys-real" }
 nexus-sys-sim = { path = "crates/nexus-sys-sim" }
