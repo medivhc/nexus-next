@@ -156,7 +156,9 @@ try {
     workers: (await navigator.serviceWorker.getRegistrations()).length,
   }));
   if (Object.values(stored).some((v) => v)) throw new Error(`关闭后浏览器里有存储：${JSON.stringify(stored)}`);
-  if (!(await after.isVisible("#login-go"))) throw new Error("重新打开页面后应当需要重新登录");
+  // 重新打开后是登录界面：没有任何东西能恢复之前的登录。
+  await after.waitForSelector("#login-go", { state: "visible", timeout: 10000 });
+  if (await after.isVisible("#device-list li")) throw new Error("重新打开页面后不应当直接看到设备");
   log("关闭后不留存储");
 
   // 体积预算（FP-2.5-04）。
