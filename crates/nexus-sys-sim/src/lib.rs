@@ -94,6 +94,14 @@ impl System for SimSystem {
         }
     }
 
+    /// 仿真里只认识 localhost。
+    async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        match host {
+            "localhost" => Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])]),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("仿真里没有主机 {host}"))),
+        }
+    }
+
     fn spawn_pty(&self, size: Size) -> io::Result<SimPty> {
         Ok(SimPty {
             size,

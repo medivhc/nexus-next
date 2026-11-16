@@ -2682,6 +2682,7 @@ dependencies = [
  "nexus-core-proto",
  "nexus-fabric",
  "nexus-fabric-iroh",
+ "nexus-net-core",
  "nexus-runtime",
  "nexus-sys-real",
  "nexus-testkit",
@@ -2757,6 +2758,7 @@ dependencies = [
  "futures-util",
  "nexus-core-proto",
  "nexus-fabric",
+ "nexus-net-core",
  "nexus-sys",
  "nexus-term-proto",
  "nexus-wire",
@@ -2864,6 +2866,7 @@ name = "nexus-wire"
 version = "0.0.1"
 dependencies = [
  "nexus-core-proto",
+ "nexus-net-core",
  "nexus-term-proto",
  "postcard",
  "serde",

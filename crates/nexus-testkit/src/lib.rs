@@ -10,7 +10,7 @@ pub use nexus_cli::Output;
 
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
 use nexus_fabric_sim::SimTransport;
-use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
+use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node, ProxyStream};
 use nexus_sys_sim::{SimClock, SimDisk, SimServices, SimSystem};
 pub use nexus_sys_sim::SimService as Service;
 use nexus_wire::{AgentCredential, CtlRequest};
@@ -35,7 +35,13 @@ pub struct World {
 }
 
 enum Inner {
-    Sim { nodes: HashMap<String, mpsc::Sender<CtlCall>>, clock: SimClock, services: HashMap<String, SimServices>, next_port: std::cell::Cell<u16> },
+    Sim {
+        nodes: HashMap<String, mpsc::Sender<CtlCall>>,
+        clock: SimClock,
+        services: HashMap<String, SimServices>,
+        next_port: std::cell::Cell<u16>,
+        proxies: HashMap<String, mpsc::UnboundedSender<ProxyStream>>,
+    },
     Real(RealWorld),
 }
 
@@ -50,6 +56,16 @@ impl World {
                 port
             }
             Inner::Real(real) => real.serve(service).await,
+        }
+    }
+
+    /// 节点的本机统一入口（SOCKS5 / HTTP 代理）。
+    pub fn proxy(&self, node: &str) -> ProxyClient {
+        match &self.inner {
+            Inner::Sim { proxies, .. } => {
+                ProxyClient::Sim(proxies.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone())
+            }
+            Inner::Real(real) => ProxyClient::Real(real.proxy_port(node)),
         }
     }
 
@@ -903,7 +919,11 @@ where
     let clock = SimClock::default();
     let mut ctl = HashMap::new();
     let mut all_services = HashMap::new();
+    let mut proxies = HashMap::new();
     for (i, name) in nodes.iter().enumerate() {
+        let (ptx, prx) = mpsc::unbounded_channel::<ProxyStream>();
+        proxies.insert(name.to_string(), ptx);
+        let prx = Rc::new(tokio::sync::Mutex::new(prx));
         let disk = SimDisk::default();
         let services = SimServices::default();
         all_services.insert(name.to_string(), services.clone());
@@ -912,14 +932,26 @@ where
         let rx = Rc::new(tokio::sync::Mutex::new(rx));
         let (name, clock) = (name.to_string(), clock.clone());
         sim.host(name.clone(), move || {
-            let (disk, name, rx, clock, services) = (disk.clone(), name.clone(), rx.clone(), clock.clone(), services.clone());
+            let (disk, name, rx, clock, services, prx) = (disk.clone(), name.clone(), rx.clone(), clock.clone(), services.clone(), prx.clone());
             async move {
                 let system = SimSystem::with_services(disk, node_seed(seed, i), clock, services);
                 let key = load_or_create_device_key(&system)?;
                 let transport = SimTransport::bind(nexus_core_proto::NodeId(key.public().0), &name).await?;
                 let node = Node::new(transport, system, &name)?;
                 let mut rx = rx.lock().await;
-                node.run(&mut rx).await?;
+                // 入口上的连接转给这一次启动的节点（节点重启后换成新的节点）。
+                let entry = node.proxy_entry();
+                let forward = async {
+                    let mut prx = prx.lock().await;
+                    while let Some(conn) = prx.recv().await {
+                        let _ = entry.send(conn);
+                    }
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    r = node.run(&mut rx) => r?,
+                    _ = forward => {}
+                }
                 Ok(())
             }
         });
@@ -927,7 +959,7 @@ where
 
     let trace = Rc::new(RefCell::new(Vec::new()));
     let world = World {
-        inner: Inner::Sim { nodes: ctl, clock, services: all_services, next_port: std::cell::Cell::new(8000) },
+        inner: Inner::Sim { nodes: ctl, clock, services: all_services, next_port: std::cell::Cell::new(8000), proxies },
         trace: trace.clone(),
     };
     let fut = scenario(world);
@@ -962,6 +994,8 @@ struct RealWorld {
     bin: PathBuf,
     dirs: HashMap<String, PathBuf>,
     children: RefCell<HashMap<String, Child>>,
+    /// 各节点统一入口的端口。
+    proxy_ports: RefCell<HashMap<String, u16>>,
     _tmp: tempfile::TempDir,
     /// 各节点的 agent 入口放在这里：其他系统账号也能进入这个目录。
     sockets: tempfile::TempDir,
@@ -975,7 +1009,7 @@ impl RealWorld {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), _tmp: tmp, sockets };
+        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), proxy_ports: RefCell::default(), _tmp: tmp, sockets };
         for name in nodes {
             let dir = world._tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1008,14 +1042,26 @@ impl RealWorld {
         port
     }
 
-    /// 启动节点的常驻程序，`extra` 是 `daemon` 之后的其他参数。
+    fn proxy_port(&self, node: &str) -> u16 {
+        *self.proxy_ports.borrow().get(node).unwrap_or_else(|| panic!("节点 {node} 没有开统一入口"))
+    }
+
+    /// 启动节点的常驻程序，`extra` 是 `daemon` 之后的其他参数。没有给 `--proxy` 时开一个本机统一入口。
     fn spawn_daemon(&self, name: &str, extra: &[&str]) {
         let dir = &self.dirs[name];
+        let mut proxy = Vec::new();
+        if !extra.contains(&"--proxy") {
+            let port = *self.proxy_ports.borrow_mut().entry(name.to_string()).or_insert_with(|| {
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+            });
+            proxy = vec!["--proxy".to_string(), format!("127.0.0.1:{port}")];
+        }
         let _ = std::fs::remove_file(dir.join("ctl.sock"));
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
+            .args(&proxy)
             .arg("--agent-socket")
             .arg(self.sockets.path().join(format!("{name}.sock")))
             // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
@@ -1251,6 +1297,154 @@ macro_rules! __real_test {
             $crate::run_real(&[$($node),+], env!("CARGO_BIN_EXE_nexus"), $body);
         }
     };
+}
+
+/// 经统一入口的请求失败的方式。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxyError {
+    /// SOCKS5 回应了这个错误码。
+    Socks5(u8),
+    /// HTTP 代理的 CONNECT 回应了这个状态码。
+    Http(u16),
+    /// 连接意外断开或回应无法理解。
+    Io(String),
+}
+
+/// 一个节点的本机统一入口，像普通程序那样使用它。
+pub enum ProxyClient {
+    Sim(mpsc::UnboundedSender<ProxyStream>),
+    Real(u16),
+}
+
+trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+impl<X: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Duplex for X {}
+
+const PROXY_CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl ProxyClient {
+    async fn open(&self) -> Result<Box<dyn Duplex>, ProxyError> {
+        match self {
+            ProxyClient::Sim(tx) => {
+                let (near, far) = tokio::io::duplex(256 * 1024);
+                tx.send(Box::new(far)).map_err(|_| ProxyError::Io("节点没有在运行".into()))?;
+                Ok(Box::new(near))
+            }
+            ProxyClient::Real(port) => {
+                let s = tokio::net::TcpStream::connect(("127.0.0.1", *port)).await.map_err(io_err)?;
+                Ok(Box::new(s))
+            }
+        }
+    }
+
+    /// 经 SOCKS5 连到 `host:port`，发一个 HTTP GET，返回正文。
+    pub async fn socks5_http_get(&self, host: &str, port: u16, path: &str) -> Result<String, ProxyError> {
+        let go = async {
+            let mut s = self.open().await?;
+            s.write_all(&[5, 1, 0]).await.map_err(io_err)?;
+            let mut greet = [0u8; 2];
+            s.read_exact(&mut greet).await.map_err(io_err)?;
+            if greet != [5, 0] {
+                return Err(ProxyError::Io(format!("问候的回应不对：{greet:?}")));
+            }
+            let mut req = vec![5, 1, 0];
+            match host.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(ip)) => {
+                    req.push(1);
+                    req.extend_from_slice(&ip.octets());
+                }
+                Ok(std::net::IpAddr::V6(ip)) => {
+                    req.push(4);
+                    req.extend_from_slice(&ip.octets());
+                }
+                Err(_) => {
+                    req.push(3);
+                    req.push(host.len() as u8);
+                    req.extend_from_slice(host.as_bytes());
+                }
+            }
+            req.extend_from_slice(&port.to_be_bytes());
+            s.write_all(&req).await.map_err(io_err)?;
+            let mut reply = [0u8; 10];
+            s.read_exact(&mut reply).await.map_err(io_err)?;
+            if reply[1] != 0 {
+                return Err(ProxyError::Socks5(reply[1]));
+            }
+            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            let raw = read_all(&mut s).await?;
+            let (_, body) = split_response(&raw)?;
+            Ok(body)
+        };
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+    }
+
+    /// 经 HTTP 代理发一个 GET（绝对形式的地址），返回状态码和正文。
+    pub async fn http_get(&self, url: &str) -> Result<(u16, String), ProxyError> {
+        let go = async {
+            let mut s = self.open().await?;
+            let host = url.trim_start_matches("http://").split('/').next().unwrap_or_default();
+            s.write_all(format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            let raw = read_all(&mut s).await?;
+            split_response(&raw)
+        };
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+    }
+
+    /// 经 HTTP 代理的 CONNECT 建立隧道，送出 `data` 后关闭写方向，返回读到的全部字节。
+    pub async fn connect_tunnel(&self, target: &str, data: &[u8]) -> Result<Vec<u8>, ProxyError> {
+        let go = async {
+            let mut s = self.open().await?;
+            s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if s.read(&mut byte).await.map_err(io_err)? == 0 {
+                    return Err(ProxyError::Io("CONNECT 没有回应".into()));
+                }
+                head.push(byte[0]);
+            }
+            let status = status_of(&head)?;
+            if status != 200 {
+                return Err(ProxyError::Http(status));
+            }
+            s.write_all(data).await.map_err(io_err)?;
+            s.shutdown().await.map_err(io_err)?;
+            read_all(&mut s).await
+        };
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+    }
+
+    /// 送出任意字节，返回入口回的全部字节（它关闭连接为止）。
+    pub async fn raw(&self, data: &[u8]) -> Vec<u8> {
+        let go = async {
+            let mut s = self.open().await?;
+            s.write_all(data).await.map_err(io_err)?;
+            read_all(&mut s).await
+        };
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.expect("入口没有关闭连接").unwrap_or_default()
+    }
+}
+
+fn io_err(e: io::Error) -> ProxyError {
+    ProxyError::Io(e.to_string())
+}
+
+async fn read_all(s: &mut Box<dyn Duplex>) -> Result<Vec<u8>, ProxyError> {
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.map_err(io_err)?;
+    Ok(out)
+}
+
+fn status_of(head: &[u8]) -> Result<u16, ProxyError> {
+    let text = String::from_utf8_lossy(head);
+    text.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| ProxyError::Io(format!("回应无法理解：{text:?}")))
+}
+
+fn split_response(raw: &[u8]) -> Result<(u16, String), ProxyError> {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| ProxyError::Io(format!("回应没有头部：{:?}", String::from_utf8_lossy(raw))))?;
+    Ok((status_of(&raw[..split])?, String::from_utf8_lossy(&raw[split + 4..]).into_owned()))
 }
 
 /// 一个 HTTP GET（Connection: close），返回正文。用于验证端口转发这类真实的本机网络。

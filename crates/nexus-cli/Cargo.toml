@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nexus-net-core.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true
 nexus-sys-real.workspace = true

@@ -90,6 +90,8 @@ pub trait System {
     fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty>;
     /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
+    /// 解析主机名（统一入口直连时用）。
+    fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>>;
 }
 
 /// 本机 TCP 连接。
@@ -101,6 +103,7 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     type Pty = S::Pty;
     type Tcp = S::Tcp;
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> { (**self).tcp_connect(addr) }
+    fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>> { (**self).resolve(host) }
     fn now(&self) -> Timestamp { (**self).now() }
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }

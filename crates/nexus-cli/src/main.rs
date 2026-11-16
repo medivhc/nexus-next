@@ -47,7 +47,27 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, proxy, anchor: anchor_args } => {
+                // 统一入口只对本机开放：别的机器连得上就等于把网络借给了它。
+                let proxy = match proxy.as_deref().map(str::parse::<std::net::SocketAddr>) {
+                    None => None,
+                    Some(Ok(a)) if a.ip().is_loopback() => Some(a),
+                    Some(_) => {
+                        let msg = format!("--proxy 只能是本机地址，例如 127.0.0.1:1080：{}", proxy.as_deref().unwrap_or_default());
+                        Terminal.err(format!("{}\n", serde_json::json!({ "error": "invalid_input", "message": msg })).as_bytes());
+                        return nexus_cli::EXIT_INVALID_INPUT;
+                    }
+                };
+                let proxy = match proxy {
+                    None => None,
+                    Some(a) => match tokio::net::TcpListener::bind(a).await {
+                        Ok(l) => Some(l),
+                        Err(e) => {
+                            Terminal.err(format!("nexus daemon: 无法监听统一入口 {a}：{e}\n").as_bytes());
+                            return EXIT_INTERNAL;
+                        }
+                    },
+                };
                 let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
                 let mut config = transport_config(*local_only, relay, *no_discovery);
                 // 锚点：先起中继和页面，本机也用自己的中继。
@@ -81,7 +101,7 @@ fn main() {
                     }
                     None
                 };
-                match daemon(&data_dir, &agent_socket, name.clone(), config).await {
+                match daemon(&data_dir, &agent_socket, name.clone(), config, proxy).await {
                     Ok(()) => 0,
                     Err(e) => {
                         Terminal.err(format!("nexus daemon: {e}\n").as_bytes());
@@ -230,7 +250,7 @@ fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config
     Config { relay, discovery: !no_discovery, bind: None, direct: true }
 }
 
-async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, config: Config) -> io::Result<()> {
+async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, config: Config, proxy: Option<tokio::net::TcpListener>) -> io::Result<()> {
     let system = RealSystem::new(data_dir)?;
     let key = load_or_create_device_key(&system)?;
     let name = name
@@ -251,6 +271,21 @@ async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, conf
     let _ = std::fs::remove_file(agent_socket);
     let agent_listener = UnixListener::bind(agent_socket)?;
     std::fs::set_permissions(agent_socket, std::fs::Permissions::from_mode(0o666))?;
+
+    if let Some(listener) = proxy {
+        let entry = node.proxy_entry();
+        if let Ok(a) = listener.local_addr() {
+            eprintln!("nexus daemon: 统一入口 {a}（SOCKS5 / HTTP 代理）");
+        }
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = stream.set_nodelay(true);
+                if entry.send(Box::new(stream)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
 
     let (tx, mut rx) = mpsc::channel::<CtlCall>(64);
     let agent_tx = tx.clone();

@@ -59,6 +59,19 @@ pub enum Request {
     SvcList,
 }
 
+/// `nexus route explain` 的结果。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteExplanation {
+    /// 网络里的服务。
+    Service { device: String, service: String },
+    /// 以 .internal 结尾但不是「服务.设备.internal」。
+    BadInternalName,
+    /// 命中第 `index` 条规则（从 1 开始）。
+    Rule { index: u32, rule: nexus_net_core::route::Rule },
+    /// 没有规则匹配。
+    Default { outbound: nexus_net_core::route::Outbound },
+}
+
 /// 一个发布的服务，给使用方看的部分（不含发布方的本机地址）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
@@ -246,6 +259,13 @@ pub enum CtlRequest {
     /// 连到一台设备上的服务。回应 `Ok` 之后，调用方发送 `Input::Stdin` / `Input::CloseStdin`，
     /// 常驻程序发送 `PipeData`，服务结束发送时发送 `PipeEnd`。
     Connect { node: String, name: String },
+    /// 路由规则：加在最后。
+    RouteAdd { rule: nexus_net_core::route::Rule },
+    /// 删除第 `index` 条（从 1 开始）。
+    RouteRm { index: u32 },
+    RouteList,
+    /// 说明 `target`（主机:端口）会走哪里。
+    RouteExplain { target: String },
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -276,6 +296,9 @@ pub enum CtlResponse {
     Services { node: String, services: Vec<ServiceInfo> },
     PipeData(Vec<u8>),
     PipeEnd,
+    RouteAdded { index: u32 },
+    Routes(Vec<nexus_net_core::route::Rule>),
+    Explained(RouteExplanation),
     Ok,
     Error(WireError),
 }

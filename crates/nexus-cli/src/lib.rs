@@ -7,7 +7,9 @@
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
 use nexus_core_proto::PathKind;
+use nexus_net_core::route;
 use nexus_runtime::CtlClient;
+use nexus_wire::RouteExplanation;
 use nexus_wire::{
     AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, Size,
     StatusReport, WireError,
@@ -82,6 +84,9 @@ pub enum Cmd {
         /// 并让 agent 设置同样的 NEXUS_AGENT_SOCKET
         #[arg(long, env = "NEXUS_AGENT_SOCKET", value_name = "路径")]
         agent_socket: Option<PathBuf>,
+        /// 本机统一入口（SOCKS5 和 HTTP 代理同一个端口）的监听地址，例如 127.0.0.1:1080；只能是本机地址
+        #[arg(long, value_name = "地址:端口")]
+        proxy: Option<String>,
         #[command(flatten)]
         anchor: AnchorArgs,
     },
@@ -153,6 +158,24 @@ pub enum Cmd {
         /// 在本机这个地址上监听，每个连接各自接到服务
         #[arg(long, value_name = "地址:端口")]
         listen: Option<String>,
+    },
+    /// 统一入口的路由规则：名字以 .internal 结尾的去网络里的服务，其余按规则，第一条匹配的生效，都不匹配时直连
+    Route {
+        #[command(subcommand)]
+        cmd: RouteCmd,
+    },
+    /// 在本机运行一个程序，它用到的服务先在本机开好端口，并按服务的说明设置环境变量
+    ///
+    /// 例：nexus run --use home/llm -- python app.py
+    ///
+    /// 退出码与程序相同；用到的服务不存在或没有授权时程序不启动，退出码同 nexus connect。
+    Run {
+        /// 用到的服务 <设备>/<服务>，可以写多次
+        #[arg(long = "use", value_name = "设备/服务", required = true)]
+        uses: Vec<String>,
+        /// 要运行的程序及其参数
+        #[arg(last = true, required = true, value_name = "命令")]
+        command: Vec<String>,
     },
     /// 在一台设备上执行命令，返回它的输出和退出码
     ///
@@ -401,6 +424,50 @@ pub enum AnchorCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum RouteCmd {
+    /// 加一条规则（加在最后）
+    ///
+    /// 例：nexus route add --domain example.com --reject
+    Add {
+        /// 匹配这个域名和它的子域名
+        #[arg(long, value_name = "域名", required_unless_present = "cidr", conflicts_with = "cidr")]
+        domain: Option<String>,
+        /// 匹配这个地址段，例如 10.0.0.0/8
+        #[arg(long, value_name = "地址/前缀")]
+        cidr: Option<String>,
+        /// 拒绝
+        #[arg(long, required_unless_present = "direct", conflicts_with = "direct")]
+        reject: bool,
+        /// 直连
+        #[arg(long)]
+        direct: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除一条规则
+    Rm {
+        /// 规则的编号（见 nexus route ls）
+        index: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出规则
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 说明一个目标会走哪里
+    ///
+    /// 例：nexus route explain web.home.internal:80
+    Explain {
+        /// 主机:端口
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum AgentCmd {
     /// 签发一份 agent 凭据
     ///
@@ -628,6 +695,28 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Some(addr) => connect_listen(ctl, node, name, addr, sink).await,
             };
         }
+        Cmd::Route { cmd: RouteCmd::Add { domain, cidr, reject, json, .. } } => {
+            let matcher = match (domain, cidr) {
+                (Some(d), _) => route::Matcher::parse_domain(d),
+                (None, Some(c)) => route::Matcher::parse_cidr(c),
+                (None, None) => Err("需要 --domain 或 --cidr".to_string()),
+            };
+            let matcher = match matcher {
+                Ok(m) => m,
+                Err(msg) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg),
+            };
+            let outbound = if *reject { route::Outbound::Reject } else { route::Outbound::Direct };
+            (CtlRequest::RouteAdd { rule: route::Rule { matcher, outbound } }, *json)
+        }
+        Cmd::Route { cmd: RouteCmd::Rm { index, json } } => (CtlRequest::RouteRm { index: *index }, *json),
+        Cmd::Route { cmd: RouteCmd::Ls { json } } => (CtlRequest::RouteList, *json),
+        Cmd::Route { cmd: RouteCmd::Explain { target, json } } => {
+            if nexus_net_core::Target::parse(target).is_none() {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("目标应当写成 主机:端口：{target}"));
+            }
+            (CtlRequest::RouteExplain { target: target.clone() }, *json)
+        }
+        Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
         Cmd::Ssh { .. } => {
             let args = match ssh_args(cmd) {
                 Ok(a) => a,
@@ -797,6 +886,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     format!("已结束会话 {session}\n")
                 }
             }
+            Cmd::Route { cmd: RouteCmd::Rm { index, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": index }))
+                } else {
+                    format!("已删除第 {index} 条规则\n")
+                }
+            }
             Cmd::Unpublish { name, .. } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "unpublished": name }))
@@ -806,6 +902,60 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
             _ => String::new(),
         },
+        CtlResponse::RouteAdded { index } => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "index": index }))
+            } else {
+                format!("已加为第 {index} 条规则\n")
+            }
+        }
+        CtlResponse::Routes(rules) => {
+            if json {
+                let list: Vec<Value> = rules
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| json!({ "index": i + 1, "match": r.matcher.to_string(), "outbound": outbound_key(&r.outbound) }))
+                    .collect();
+                doc(json!({ "schema": JSON_SCHEMA, "rules": list }))
+            } else if rules.is_empty() {
+                format!("没有路由规则：.{SERVICE_SUFFIX} 的名字去网络里的服务，其余直连\n")
+            } else {
+                rules.iter().enumerate().map(|(i, r)| format!("{:>3}  {:<32} {}\n", i + 1, r.matcher.to_string(), r.outbound)).collect()
+            }
+        }
+        CtlResponse::Explained(e) => {
+            let target = match cmd {
+                Cmd::Route { cmd: RouteCmd::Explain { target, .. } } => target.as_str(),
+                _ => "",
+            };
+            if json {
+                let v = match &e {
+                    RouteExplanation::Service { device, service } => {
+                        json!({ "outbound": "nexus", "rule": null, "device": device, "service": service })
+                    }
+                    RouteExplanation::BadInternalName => json!({ "outbound": "invalid", "rule": null }),
+                    RouteExplanation::Rule { index, rule } => {
+                        json!({ "outbound": outbound_key(&rule.outbound), "rule": index, "match": rule.matcher.to_string() })
+                    }
+                    RouteExplanation::Default { outbound } => json!({ "outbound": outbound_key(outbound), "rule": null }),
+                };
+                let mut v = v;
+                v["schema"] = json!(JSON_SCHEMA);
+                v["target"] = json!(target);
+                doc(v)
+            } else {
+                match &e {
+                    RouteExplanation::Service { device, service } => format!("{target} → 经 Nexus 到 {device} 上的服务 {service}\n"),
+                    RouteExplanation::BadInternalName => {
+                        format!("{target} → 不可用：.{SERVICE_SUFFIX} 的名字应当是 <服务>.<设备>.{SERVICE_SUFFIX}\n")
+                    }
+                    RouteExplanation::Rule { index, rule } => {
+                        format!("{target} → {}（第 {index} 条规则：{}）\n", rule.outbound, rule.matcher)
+                    }
+                    RouteExplanation::Default { outbound } => format!("{target} → {outbound}（没有规则匹配）\n"),
+                }
+            }
+        }
         CtlResponse::Published { path } => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "path": path }))
@@ -1428,6 +1578,87 @@ async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen
             Some(()) = futures_util::StreamExt::next(&mut conns), if !conns.is_empty() => {}
         }
     }
+}
+
+fn outbound_key(o: &route::Outbound) -> &'static str {
+    match o {
+        route::Outbound::Direct => "direct",
+        route::Outbound::Reject => "reject",
+    }
+}
+
+/// `nexus run`：为每个用到的服务在本机开一个临时端口，设置环境变量，运行程序，程序退出后关闭端口。
+async fn run_with_services<C: Ctl, K: Sink>(ctl: &C, uses: &[String], command: &[String], sink: &mut K) -> i32 {
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut listeners = Vec::new();
+    for target in uses {
+        let Some((node, name)) = target.split_once('/').filter(|(n, s)| !n.is_empty() && !s.is_empty()) else {
+            return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("服务的路径应为 <设备>/<服务>：{target}"));
+        };
+        // 先确认服务能用（存在、有授权、本机程序在运行），再读它的说明。
+        match open_connect(ctl, node, name).await {
+            Ok(probe) => drop(probe.tx.try_send(Input::CloseStdin)),
+            Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
+        }
+        let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
+            Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
+            Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
+            _ => None,
+        };
+        let Some(info) = info else {
+            return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("{node} 上没有你能用的服务 {name}"));
+        };
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+        };
+        let addr = match listener.local_addr() {
+            Ok(a) => a.to_string(),
+            Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+        };
+        let var = format!("NEXUS_SVC_{}_{}", env_key(node), env_key(name));
+        env.push((var, addr.clone()));
+        for (k, v) in &info.env {
+            env.push((k.clone(), v.replace("{addr}", &addr)));
+        }
+        listeners.push((listener, node.to_string(), name.to_string()));
+    }
+    let mut child = match tokio::process::Command::new(&command[0]).args(&command[1..]).envs(env).spawn() {
+        Ok(c) => c,
+        Err(e) => return fail(sink, EXIT_SPAWN_FAILED, "spawn_failed", &format!("无法启动 {}：{e}", command[0])),
+    };
+    let serve = futures_util::future::join_all(listeners.iter().map(|(listener, node, name)| async move {
+        let conns = futures_util::stream::FuturesUnordered::new();
+        tokio::pin!(conns);
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((socket, _)) = accepted else { continue };
+                    conns.push(async move {
+                        let Ok(mut session) = open_connect(ctl, node, name).await else { return };
+                        let (mut rd, mut wr) = socket.into_split();
+                        pipe(&mut session, &mut rd, &mut wr).await;
+                    });
+                }
+                Some(()) = futures_util::StreamExt::next(&mut conns), if !conns.is_empty() => {}
+            }
+        }
+    }));
+    tokio::select! {
+        status = child.wait() => match status {
+            Ok(s) => {
+                use std::os::unix::process::ExitStatusExt;
+                s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+            }
+            Err(e) => fail(sink, EXIT_INTERNAL, "internal", &format!("等待程序结束时出错：{e}")),
+        },
+        _ = serve => EXIT_INTERNAL,
+    }
+}
+
+/// 环境变量名里用的形式：大写，其他字符换成 _。
+fn env_key(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect()
 }
 
 /// `nexus exec`：把本机标准输入送过去，把输出实时写出（或在 `--json` 时最后一次性输出）。

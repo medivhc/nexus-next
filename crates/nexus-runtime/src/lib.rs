@@ -17,12 +17,15 @@ use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
 use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
+use nexus_net_core::http::{self, BadRequest, ProxyRequest};
+use nexus_net_core::route::{self, Decision, Outbound, Rule};
+use nexus_net_core::{sniff, socks5, Entry, Host, RouteTable, Target, SERVICE_SUFFIX};
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
     hex_encode, AddrHints, AgentCredential, AnchorReport, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, ServiceInfo, SessionInfo, Size, StatusReport,
-    WireError, WIRE_VERSION,
+    RouteExplanation, WireError, WIRE_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -194,6 +197,50 @@ const PEER_SILENT: Duration = Duration::from_secs(15);
 /// 会话里的程序结束后，等落后的客户端追上最终屏幕的最长时间。
 const SESSION_LINGER: Duration = Duration::from_secs(10);
 
+/// 入口接不到出口的原因。
+enum ProxyFail {
+    /// 路由规则不允许。
+    Rejected,
+    /// 服务或主机不可达。
+    Unreachable(String),
+    /// 直连时对方拒绝。
+    Refused(String),
+}
+
+/// 入口接到的出口。
+enum Upstream<A, B> {
+    Tcp(A),
+    Remote(B),
+}
+
+impl<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin> Upstream<A, B> {
+    /// 先把已经读到的 `first` 送过去，然后双向转发，直到两个方向都结束。
+    async fn splice(self, client: ProxyStream, first: Vec<u8>) -> io::Result<()> {
+        async fn go<U: AsyncRead + AsyncWrite + Unpin>(mut client: ProxyStream, mut up: U, first: Vec<u8>) -> io::Result<()> {
+            if !first.is_empty() {
+                up.write_all(&first).await?;
+            }
+            tokio::io::copy_bidirectional(&mut client, &mut up).await.map(|_| ())
+        }
+        match self {
+            Upstream::Tcp(a) => go(client, a, first).await,
+            Upstream::Remote(b) => go(client, b, first).await,
+        }
+    }
+}
+
+/// 再读一些到 `buf` 末尾；连接结束或出错时返回 false。
+async fn fill<R: AsyncRead + Unpin + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    match r.read(&mut chunk).await {
+        Ok(0) | Err(_) => false,
+        Ok(n) => {
+            buf.extend_from_slice(&chunk[..n]);
+            true
+        }
+    }
+}
+
 /// 打开远端执行失败的原因。
 enum OpenError {
     StaleRoster,
@@ -213,6 +260,17 @@ const KEY_ROSTER: &str = "roster";
 const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
+const KEY_ROUTES: &str = "routes";
+
+/// 统一入口上的一条连接（SOCKS5 或 HTTP 代理），由常驻程序从本机监听的端口交给节点。
+pub type ProxyStream = Box<dyn ProxyIo + Send>;
+pub trait ProxyIo: AsyncRead + AsyncWrite + Unpin {}
+impl<X: AsyncRead + AsyncWrite + Unpin> ProxyIo for X {}
+
+/// 入口握手（读出目标）的时间上限。
+const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// HTTP 代理请求头的长度上限。
+const PROXY_MAX_HEAD: usize = 64 * 1024;
 
 /// 本机发布的一个服务。`addr` 只留在本机，不出现在任何发给别人的消息里。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +454,10 @@ pub struct Node<T, S: System> {
     web_enrolls: RefCell<HashMap<[u8; 16], PendingWebEnroll>>,
     /// 本机发布的服务（M3.1）。
     services: RefCell<Vec<PublishedService>>,
+    /// 本机的路由规则（M3.2）。
+    routes: RefCell<RouteTable>,
+    proxy_tx: mpsc::UnboundedSender<ProxyStream>,
+    proxy_rx: RefCell<Option<mpsc::UnboundedReceiver<ProxyStream>>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
     roster_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -419,7 +481,12 @@ impl<T: Transport, S: System> Node<T, S> {
         let (push_tx, push_rx) = mpsc::unbounded_channel();
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         let services = load::<_, Vec<PublishedService>>(&system, KEY_SERVICES)?.unwrap_or_default();
+        let routes = load::<_, RouteTable>(&system, KEY_ROUTES)?.unwrap_or_default();
+        let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         Ok(Self {
+            routes: RefCell::new(routes),
+            proxy_tx,
+            proxy_rx: RefCell::new(Some(proxy_rx)),
             services: RefCell::new(services),
             sessions: RefCell::default(),
             next_client: Cell::new(1),
@@ -438,6 +505,11 @@ impl<T: Transport, S: System> Node<T, S> {
             push_tx,
             push_rx: RefCell::new(Some(push_rx)),
         })
+    }
+
+    /// 统一入口：常驻程序把本机入口上接受的连接从这里交给节点。
+    pub fn proxy_entry(&self) -> mpsc::UnboundedSender<ProxyStream> {
+        self.proxy_tx.clone()
     }
 
     fn me(&self) -> NodeId {
@@ -506,6 +578,7 @@ impl<T: Transport, S: System> Node<T, S> {
     pub async fn run(&self, ctl: &mut mpsc::Receiver<CtlCall>) -> io::Result<()> {
         let mut pushes = self.push_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut spawns = self.spawn_rx.borrow_mut().take().expect("run 只能调用一次");
+        let mut proxied = self.proxy_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
         tasks.push(Box::pin(self.follow_anchor()));
         // accept 不保证可以安全取消，所以让同一个 future 跨循环存活。
@@ -529,6 +602,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Some(new) = spawns.recv() => {
                     tasks.push(Box::pin(self.run_session(new)));
+                }
+                Some(conn) = proxied.recv() => {
+                    tasks.push(Box::pin(self.serve_proxy(conn)));
                 }
             }
         }
@@ -869,6 +945,10 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Services { node } => {
                 self.remote_services(&node, agent_ref).await.map(|(node, services)| CtlResponse::Services { node, services })
             }
+            CtlRequest::RouteAdd { rule } => self.route_add(rule).map(|index| CtlResponse::RouteAdded { index }),
+            CtlRequest::RouteRm { index } => self.route_rm(index).map(|()| CtlResponse::Ok),
+            CtlRequest::RouteList => Ok(CtlResponse::Routes(self.routes.borrow().rules.clone())),
+            CtlRequest::RouteExplain { target } => self.route_explain(&target).map(CtlResponse::Explained),
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
                 anchor: self.roster().and_then(|r| r.anchor),
                 roster_version: self.roster_version(),
@@ -898,6 +978,8 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::AnchorShow
                 | CtlRequest::Publish { .. }
                 | CtlRequest::Unpublish { .. }
+                | CtlRequest::RouteAdd { .. }
+                | CtlRequest::RouteRm { .. }
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -1928,6 +2010,197 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
+    // ------------------------------------------------------------ 统一入口与路由（M3.2）
+
+    fn route_add(&self, rule: Rule) -> Result<u32, WireError> {
+        let mut routes = self.routes.borrow_mut();
+        routes.rules.push(rule);
+        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)?;
+        Ok(routes.rules.len() as u32)
+    }
+
+    fn route_rm(&self, index: u32) -> Result<(), WireError> {
+        let mut routes = self.routes.borrow_mut();
+        if index == 0 || index as usize > routes.rules.len() {
+            return Err(err(ErrorCode::NotFound, format!("没有第 {index} 条规则")));
+        }
+        routes.rules.remove(index as usize - 1);
+        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)
+    }
+
+    fn route_explain(&self, target: &str) -> Result<RouteExplanation, WireError> {
+        let t = Target::parse(target).ok_or_else(|| err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}")))?;
+        let rules = self.routes.borrow().rules.clone();
+        Ok(match route::decide(&t, &rules) {
+            Decision::Service { device, service } => RouteExplanation::Service { device, service },
+            Decision::BadInternalName => RouteExplanation::BadInternalName,
+            Decision::Rule { index, .. } => RouteExplanation::Rule { index: index as u32 + 1, rule: rules[index].clone() },
+            Decision::Default(outbound) => RouteExplanation::Default { outbound },
+        })
+    }
+
+    /// 入口上的一条连接：按第一个字节分辨 SOCKS5 和 HTTP 代理，读出目标，按路由接到出口，然后双向转发。
+    async fn serve_proxy(&self, mut client: ProxyStream) {
+        let mut buf = Vec::new();
+        let entry = match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, fill(&mut client, &mut buf)).await {
+            Ok(true) => sniff(buf[0]),
+            _ => None,
+        };
+        let _ = match entry {
+            Some(Entry::Socks5) => self.serve_socks5(client, buf).await,
+            Some(Entry::Http) => self.serve_http_proxy(client, buf).await,
+            None => {
+                let _ = client.shutdown().await;
+                Ok(())
+            }
+        };
+    }
+
+    async fn serve_socks5(&self, mut client: ProxyStream, mut buf: Vec<u8>) -> io::Result<()> {
+        let handshake = async {
+            let (used, no_auth) = loop {
+                match socks5::parse_greeting(&buf) {
+                    Ok(Some(g)) => break g,
+                    Ok(None) if fill(&mut client, &mut buf).await => {}
+                    _ => return Ok(None),
+                }
+            };
+            buf.drain(..used);
+            if !no_auth {
+                client.write_all(&socks5::NO_ACCEPTABLE).await?;
+                return Ok(None);
+            }
+            client.write_all(&socks5::NO_AUTH).await?;
+            loop {
+                match socks5::parse_request(&buf) {
+                    Ok(Some((used, target))) => {
+                        buf.drain(..used);
+                        return Ok(Some(target));
+                    }
+                    Ok(None) if fill(&mut client, &mut buf).await => {}
+                    Ok(None) => return Ok(None),
+                    Err(reply) => {
+                        client.write_all(&socks5::reply(reply)).await?;
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        let target = match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(Ok(Some(t))) => t,
+            Ok(Err(e)) => return Err(e),
+            _ => return client.shutdown().await,
+        };
+        match self.open_outbound(&target).await {
+            Err(fail) => {
+                let reply = match fail {
+                    ProxyFail::Rejected => socks5::Reply::NotAllowed,
+                    ProxyFail::Unreachable(_) => socks5::Reply::HostUnreachable,
+                    ProxyFail::Refused(_) => socks5::Reply::ConnectionRefused,
+                };
+                client.write_all(&socks5::reply(reply)).await?;
+                client.shutdown().await
+            }
+            Ok(up) => {
+                client.write_all(&socks5::reply(socks5::Reply::Succeeded)).await?;
+                up.splice(client, buf).await
+            }
+        }
+    }
+
+    async fn serve_http_proxy(&self, mut client: ProxyStream, mut buf: Vec<u8>) -> io::Result<()> {
+        let read_head = async {
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    return Some(end + 4);
+                }
+                if buf.len() > PROXY_MAX_HEAD || !fill(&mut client, &mut buf).await {
+                    return None;
+                }
+            }
+        };
+        let Ok(Some(end)) = tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, read_head).await else {
+            return client.shutdown().await;
+        };
+        let (target, first, connect) = match http::parse(&buf) {
+            Err(BadRequest(why)) => {
+                client.write_all(&http::response(400, "Bad Request", why)).await?;
+                return client.shutdown().await;
+            }
+            Ok(ProxyRequest::Connect(t)) => (t, buf[end..].to_vec(), true),
+            Ok(ProxyRequest::Forward { target, head }) => (target, head, false),
+        };
+        match self.open_outbound(&target).await {
+            Err(fail) => {
+                let (status, reason, why) = match fail {
+                    ProxyFail::Rejected => (403, "Forbidden", format!("路由规则不允许访问 {target}")),
+                    ProxyFail::Unreachable(why) | ProxyFail::Refused(why) => (502, "Bad Gateway", why),
+                };
+                client.write_all(&http::response(status, reason, &why)).await?;
+                client.shutdown().await
+            }
+            Ok(up) => {
+                if connect {
+                    client.write_all(http::CONNECT_OK).await?;
+                }
+                up.splice(client, first).await
+            }
+        }
+    }
+
+    /// 按路由接到出口。
+    async fn open_outbound(&self, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let decision = route::decide(target, &self.routes.borrow().rules);
+        let outbound = match decision {
+            Decision::Service { device, service } => return self.open_service(&device, &service).await,
+            Decision::BadInternalName => {
+                return Err(ProxyFail::Unreachable(format!("{target} 不是服务的名字：应当是 <服务>.<设备>.{SERVICE_SUFFIX}")))
+            }
+            Decision::Rule { outbound, .. } | Decision::Default(outbound) => outbound,
+        };
+        match outbound {
+            Outbound::Reject => Err(ProxyFail::Rejected),
+            Outbound::Direct => {
+                let ips = match &target.host {
+                    Host::Ip(ip) => vec![*ip],
+                    Host::Name(name) => self.system.resolve(name).await.map_err(|e| ProxyFail::Unreachable(format!("解析不了 {name}：{e}")))?,
+                };
+                let mut last = format!("{target} 没有地址");
+                for ip in ips {
+                    match self.system.tcp_connect(std::net::SocketAddr::new(ip, target.port)).await {
+                        Ok(c) => return Ok(Upstream::Tcp(c)),
+                        Err(e) => last = format!("连不上 {target}：{e}"),
+                    }
+                }
+                Err(ProxyFail::Refused(last))
+            }
+        }
+    }
+
+    /// 网络里的服务：本机的直接连，别的设备的经 Nexus 连（对方判定授权并审计）。
+    async fn open_service(&self, device: &str, name: &str) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
+        if device.node_id == self.me() {
+            let addr = self.service_addr(name).ok_or_else(|| ProxyFail::Unreachable(format!("本机没有发布服务 {name}")))?;
+            return self.system.tcp_connect(addr).await.map(Upstream::Tcp).map_err(|e| {
+                ProxyFail::Unreachable(format!("服务 {name} 的本机程序没有在运行（{e}）"))
+            });
+        }
+        let body = Request::SvcConnect { name: name.to_string() };
+        for attempt in 0..2 {
+            match self.open_stream(&device, body.clone(), None).await {
+                Ok(stream) => return Ok(Upstream::Remote(stream)),
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                }
+                Err(OpenError::StaleRoster) => break,
+                Err(OpenError::Remote(e)) => return Err(ProxyFail::Unreachable(e.message)),
+                Err(OpenError::Io(e)) => return Err(ProxyFail::Unreachable(format!("连不上 {}：{e}", device.name))),
+            }
+        }
+        Err(ProxyFail::Unreachable("对方的名册始终比本机旧".into()))
+    }
+
     async fn remote_session_kill(&self, node: &str, name: &str, agent: Option<&AgentCredential>) -> Result<(), WireError> {
         let device = self.resolve_for(node, agent)?;
         let body = Request::SessionKill { name: name.to_string() };
@@ -2269,6 +2542,9 @@ mod tests {
         type Tcp = DuplexStream;
         async fn tcp_connect(&self, _: std::net::SocketAddr) -> io::Result<DuplexStream> {
             Err(io::ErrorKind::ConnectionRefused.into())
+        }
+        async fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            Err(io::ErrorKind::NotFound.into())
         }
         fn now(&self) -> Timestamp {
             Timestamp(0)

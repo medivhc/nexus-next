@@ -8,6 +8,7 @@ license.workspace = true
 nexus-term-proto.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true
+nexus-net-core.workspace = true
 nexus-sys.workspace = true
 nexus-fabric.workspace = true
 tokio.workspace = true

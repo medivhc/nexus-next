@@ -43,6 +43,10 @@ impl System for RealSystem {
         Ok(s)
     }
 
+    async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        Ok(tokio::net::lookup_host((host, 0)).await?.map(|a| a.ip()).collect())
+    }
+
     fn spawn_pty(&self, size: Size) -> io::Result<RealPty> {
         RealPty::spawn(size)
     }
