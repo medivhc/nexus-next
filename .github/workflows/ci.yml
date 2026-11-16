@@ -1,0 +1,61 @@
+# Full CI for nexus-next, mirroring tools/ci.sh (L0 to L3).
+#
+# Why this exists: the sandbox only has 1.5 shared cores, so a full local
+# run takes well over half an hour (clippy alone took 603s on 2026-11-16).
+# GitHub-hosted ubuntu-24.04 runners have 4 vCPUs and 16 GiB, plus a
+# persistent cargo cache, so the same script runs much faster there.
+# Locally, run only the fast lane (cargo check / the crate you changed);
+# run the full script here on every push and pull request.
+#
+# The workflow intentionally calls tools/ci.sh instead of duplicating its
+# steps, so local CI and Actions CI can never drift apart. If a step needs
+# to change, change tools/ci.sh, not this file.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Full CI (tools/ci.sh)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install bc (used by tools/ci.sh for step timings)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache the whole workspace target dir, not just dependencies,
+          # so incremental rebuilds survive between runs.
+          cache-all-crates: true
+
+      - name: Run full CI
+        run: bash tools/ci.sh
+
+      - name: Upload CI log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-ci-log
+          path: /tmp/nexus-ci.log
+          if-no-files-found: ignore
