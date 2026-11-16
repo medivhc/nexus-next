@@ -54,8 +54,8 @@ impl Default for Config {
 pub struct IrohTransport {
     ep: Endpoint,
     me: NodeId,
-    /// 自建中继：它总在本节点的地址提示里，哪怕还没连上它。
-    relay: Option<RelayUrl>,
+    /// 自建中继（启动时指定的，或网络的锚点）：它总在本节点的地址提示里，哪怕还没连上它。
+    relay: RefCell<Option<RelayUrl>>,
     hints: RefCell<HashMap<NodeId, EndpointAddr>>,
     /// 复用到同一节点的连接，避免每次调用都重新握手。
     conns: RefCell<HashMap<NodeId, IrohConnection>>,
@@ -95,14 +95,14 @@ impl IrohTransport {
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
-        Ok(Self { ep, me, relay, hints: RefCell::default(), conns: RefCell::default() })
+        Ok(Self { ep, me, relay: RefCell::new(relay), hints: RefCell::default(), conns: RefCell::default() })
     }
 
     /// 本端点当前的完整地址。直连地址在没有外部服务时也包含绑定的本地套接字。
     fn current_addr(&self) -> EndpointAddr {
         let mut addr = self.ep.addr();
-        if let Some(url) = &self.relay {
-            addr = addr.with_relay_url(url.clone());
+        if let Some(url) = self.relay.borrow().clone() {
+            addr = addr.with_relay_url(url);
         }
         #[cfg(not(target_arch = "wasm32"))]
         for sock in self.ep.bound_sockets() {
@@ -166,6 +166,17 @@ impl Transport for IrohTransport {
             let remote = NodeId(*conn.remote_id().as_bytes());
             return Ok((IrohConn { conn, remote }, proto));
         }
+    }
+
+    async fn use_relay(&self, url: &str) -> io::Result<()> {
+        let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
+        if self.relay.borrow().as_ref() == Some(&url) {
+            return Ok(());
+        }
+        // 锚点只提供中继，不提供 QUIC 地址发现。
+        self.ep.insert_relay(url.clone(), std::sync::Arc::new(iroh::RelayConfig::new(url.clone(), None))).await;
+        *self.relay.borrow_mut() = Some(url);
+        Ok(())
     }
 }
 

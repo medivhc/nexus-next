@@ -352,6 +352,7 @@ mod tests {
             devices: vec![Device { node_id: peer, name: "laptop".into(), role: DeviceRole::Member, added_at: Timestamp(0) }],
             revoked_agents: vec![],
             web_keys: vec![],
+            anchor: None,
         };
         let action = Action {
             capability: Capability::parse("term.exec").unwrap(),

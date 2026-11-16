@@ -27,9 +27,9 @@ impl Proto {
 
     pub fn alpn(self) -> &'static [u8] {
         match self {
-            Proto::Rpc => b"nexus/rpc/3",
-            Proto::Join => b"nexus/join/3",
-            Proto::Web => b"nexus/web/2",
+            Proto::Rpc => b"nexus/rpc/4",
+            Proto::Join => b"nexus/join/4",
+            Proto::Web => b"nexus/web/3",
         }
     }
 
@@ -50,6 +50,12 @@ pub trait Transport {
     fn connect(&self, to: NodeId, proto: Proto) -> impl Future<Output = io::Result<Self::Conn>>;
     /// 等待下一个进入的连接。
     fn accept(&self) -> impl Future<Output = io::Result<(Self::Conn, Proto)>>;
+    /// 改用 `url` 这个中继（网络的锚点）：之后经它可达，地址提示里也带上它。
+    /// 不使用中继的传输（仿真）忽略。
+    fn use_relay(&self, url: &str) -> impl Future<Output = io::Result<()>> {
+        let _ = url;
+        std::future::ready(Ok(()))
+    }
 }
 
 pub trait Connection {

@@ -49,6 +49,7 @@ fn roster(web_keys: Vec<WebKey>) -> Roster {
         devices: vec![dev(&laptop_key(), "laptop", DeviceRole::Admin), dev(&home_key(), "home", DeviceRole::Member)],
         revoked_agents: vec![],
         web_keys,
+        anchor: None,
     }
 }
 

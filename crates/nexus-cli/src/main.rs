@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+mod anchor;
 mod ssh_proxy;
 mod web_serve;
 
@@ -46,9 +47,40 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket } => {
+            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, anchor: anchor_args } => {
                 let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
-                let config = transport_config(*local_only, relay, *no_discovery);
+                let mut config = transport_config(*local_only, relay, *no_discovery);
+                // 锚点：先起中继和页面，本机也用自己的中继。
+                let _anchor = if anchor_args.enabled() {
+                    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                        Terminal.err(format!("nexus daemon: 无法创建数据目录：{e}\n").as_bytes());
+                        return EXIT_INTERNAL;
+                    }
+                    match anchor::start(anchor_args, &data_dir).await {
+                        Err(anchor::BadArgs(msg)) => {
+                            Terminal.err(format!("{}\n", serde_json::json!({ "error": "invalid_input", "message": msg })).as_bytes());
+                            return nexus_cli::EXIT_INVALID_INPUT;
+                        }
+                        Ok(Err(e)) => {
+                            Terminal.err(format!("nexus daemon: 锚点：{e}\n").as_bytes());
+                            return EXIT_INTERNAL;
+                        }
+                        Ok(Ok(a)) => {
+                            eprintln!("nexus daemon: 锚点 {}（页面和中继）", a.url);
+                            if relay == "default" && !*local_only {
+                                config.relay = Relay::Custom(a.url.clone());
+                            }
+                            Some(a)
+                        }
+                    }
+                } else {
+                    if anchor_args.page_dir.is_some() {
+                        let msg = "--page-dir 只用于锚点（--anchor 或 --anchor-dev）";
+                        Terminal.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+                        return EXIT_USAGE;
+                    }
+                    None
+                };
                 match daemon(&data_dir, &agent_socket, name.clone(), config).await {
                     Ok(()) => 0,
                     Err(e) => {

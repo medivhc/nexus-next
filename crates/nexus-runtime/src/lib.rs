@@ -20,7 +20,7 @@ use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transpor
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
-    hex_encode, AddrHints, AgentCredential, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
+    hex_encode, AddrHints, AgentCredential, AnchorReport, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
     WireError, WIRE_VERSION,
 };
@@ -110,6 +110,8 @@ struct PendingWebEnroll {
 
 /// 网页登录默认的权限：所有设备的终端会话和状态查看。
 const DEFAULT_WEB_GRANTS: [&str; 2] = ["term.session.*@**", "node.info@**"];
+/// 名册里没有锚点、也没有指定页面时，登记链接指向的页面。
+pub const DEFAULT_WEB_PAGE: &str = "https://bewith.link";
 
 /// 发给一个终端会话任务的命令。
 enum SessCmd {
@@ -370,7 +372,12 @@ impl<T: Transport, S: System> Node<T, S> {
     pub fn new(transport: T, system: S, name: &str) -> io::Result<Self> {
         let trust = Trust {
             root: load(&system, KEY_ROOT_PUB)?,
-            roster: load(&system, KEY_ROSTER)?,
+            roster: match system.store_get(KEY_ROSTER)? {
+                None => None,
+                Some(bytes) => Some(SignedRoster::decode_stored(&bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{KEY_ROSTER} 文件损坏"))
+                })?),
+            },
             root_key: load(&system, KEY_ROOT_KEY)?,
             addrs: load::<_, Vec<(NodeId, String)>>(&system, KEY_ADDRS)?.unwrap_or_default().into_iter().collect(),
         };
@@ -466,6 +473,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut pushes = self.push_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut spawns = self.spawn_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
+        tasks.push(Box::pin(self.follow_anchor()));
         // accept 不保证可以安全取消，所以让同一个 future 跨循环存活。
         let mut accept = Box::pin(self.transport.accept());
         loop {
@@ -488,6 +496,23 @@ impl<T: Transport, S: System> Node<T, S> {
                 Some(new) = spawns.recv() => {
                     tasks.push(Box::pin(self.run_session(new)));
                 }
+            }
+        }
+    }
+
+    /// 名册里有锚点时把它用作中继；名册每次变化都检查一遍。清除锚点后，已经加入的中继保留到重启。
+    async fn follow_anchor(&self) {
+        let mut epoch = self.roster_epoch.subscribe();
+        let mut applied: Option<String> = None;
+        loop {
+            let anchor = self.roster().and_then(|r| r.anchor);
+            if let Some(url) = anchor.as_deref().filter(|_| anchor != applied) {
+                if self.transport.use_relay(url).await.is_ok() {
+                    applied = anchor.clone();
+                }
+            }
+            if epoch.changed().await.is_err() {
+                return;
             }
         }
     }
@@ -790,10 +815,20 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Audit { limit } => self.read_audit(limit).map(CtlResponse::Audit),
             CtlRequest::SshHostKey { node } => self.ssh_host_key(&node, agent_ref).map(CtlResponse::SshHostKey),
             CtlRequest::WebEnroll { label, grants, ttl_ms, page } => {
-                self.web_enroll_start(label, &grants, ttl_ms, &page).map(CtlResponse::WebEnroll)
+                let page = page
+                    .or_else(|| self.roster().and_then(|r| r.anchor))
+                    .unwrap_or_else(|| DEFAULT_WEB_PAGE.to_string());
+                self.web_enroll_start(label, &grants, ttl_ms, page.trim_end_matches('/')).map(CtlResponse::WebEnroll)
             }
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
             CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
+            CtlRequest::AnchorSet { url } => self.anchor_set(url).await.map(CtlResponse::Anchor),
+            CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
+                anchor: self.roster().and_then(|r| r.anchor),
+                roster_version: self.roster_version(),
+                pushed: 0,
+                unreachable: vec![],
+            })),
         };
         let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
     }
@@ -813,6 +848,8 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::WebEnroll { .. }
                 | CtlRequest::WebList
                 | CtlRequest::WebRevoke { .. }
+                | CtlRequest::AnchorSet { .. }
+                | CtlRequest::AnchorShow
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -1033,6 +1070,21 @@ impl<T: Transport, S: System> Node<T, S> {
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: label.to_string(), node_id: self.me(), roster_version: self.roster_version(), pushed, unreachable })
+    }
+
+    /// 设置或清除名册里的锚点，推送到各设备。
+    async fn anchor_set(&self, url: Option<String>) -> Result<AnchorReport, WireError> {
+        let _write = self.roster_write.lock().await;
+        let root = self.admin_key()?;
+        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let url = url.map(|u| u.trim_end_matches('/').to_string());
+        roster.anchor = url;
+        roster.version += 1;
+        roster.validate().map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        self.install_roster(roster.sign(&root))?;
+        drop(_write);
+        let (pushed, unreachable) = self.broadcast_roster(None).await;
+        Ok(AnchorReport { anchor: self.roster().and_then(|r| r.anchor), roster_version: self.roster_version(), pushed, unreachable })
     }
 
     /// 本机签发的新名册：落盘并生效。
@@ -1697,6 +1749,7 @@ impl<T: Transport, S: System> Node<T, S> {
             devices: vec![Device { node_id: self.me(), name: name.clone(), role: DeviceRole::Admin, added_at: self.system.now() }],
             revoked_agents: vec![],
             web_keys: vec![],
+            anchor: None,
         }
         .sign(&root);
         let persist = || -> io::Result<()> {

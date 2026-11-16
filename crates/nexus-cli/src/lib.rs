@@ -80,6 +80,8 @@ pub enum Cmd {
         /// 并让 agent 设置同样的 NEXUS_AGENT_SOCKET
         #[arg(long, env = "NEXUS_AGENT_SOCKET", value_name = "路径")]
         agent_socket: Option<PathBuf>,
+        #[command(flatten)]
+        anchor: AnchorArgs,
     },
     /// 在第一台设备上建立你的网络
     Init {
@@ -172,6 +174,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: WebCmd,
     },
+    /// 网络的锚点：常开、有公网地址的设备，提供中继和网页节点的页面
+    Anchor {
+        #[command(subcommand)]
+        cmd: AnchorCmd,
+    },
     /// 输出一段 ~/.ssh/config 配置，让系统自带的 ssh、scp、git 能用 <设备名>.nexus 访问设备
     ///
     /// 用法：nexus ssh-config >> ~/.ssh/config，之后 ssh home.nexus、scp f home.nexus:/tmp/、
@@ -247,9 +254,10 @@ pub enum WebCmd {
         /// 登记链接的有效期
         #[arg(long, value_name = "时长", default_value = "10m")]
         ttl: String,
-        /// 网页节点的页面地址；通行密钥绑定在它的域名上
-        #[arg(long, value_name = "地址", default_value = DEFAULT_WEB_PAGE)]
-        page: String,
+        /// 网页节点的页面地址；通行密钥绑定在它的域名上。不给时用网络的锚点（nexus anchor set），
+        /// 没有锚点时用 https://bewith.link
+        #[arg(long, value_name = "地址")]
+        page: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -280,8 +288,69 @@ pub enum WebCmd {
     },
 }
 
-/// 网页节点页面的默认地址。
-pub const DEFAULT_WEB_PAGE: &str = "https://bewith.link";
+/// 让这台设备同时做网络的锚点：内置中继、托管网页节点的页面、自动管理证书。
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct AnchorArgs {
+    /// 作为锚点运行，域名指向这台机器，例如 --anchor bewith.link：在 443 端口提供页面和中继，
+    /// 自动向 Let's Encrypt 申请证书（需要 443 端口可从公网访问），80 端口重定向到 https
+    #[arg(long, value_name = "域名", conflicts_with = "anchor_dev")]
+    pub anchor: Option<String>,
+    /// 开发用的锚点：只在本机地址上以 http 提供页面和中继，例如 --anchor-dev 127.0.0.1:3340；
+    /// 锚点地址是 http://localhost:端口
+    #[arg(long, value_name = "地址:端口")]
+    pub anchor_dev: Option<String>,
+    /// 网页节点的页面目录（包含 index.html，见 web/README.md）
+    #[arg(long, value_name = "目录")]
+    pub page_dir: Option<PathBuf>,
+    /// 使用这份证书（PEM，含证书链），不自动申请
+    #[arg(long, value_name = "文件", requires_all = ["tls_key", "anchor"])]
+    pub tls_cert: Option<PathBuf>,
+    /// 证书的私钥（PEM）
+    #[arg(long, value_name = "文件", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+    /// 申请证书时留给 Let's Encrypt 的联系邮箱（可选）
+    #[arg(long, value_name = "邮箱")]
+    pub acme_contact: Option<String>,
+    /// 使用 Let's Encrypt 的测试环境（证书不受浏览器信任，用于先试一遍流程）
+    #[arg(long)]
+    pub acme_staging: bool,
+    /// https 监听地址
+    #[arg(long, value_name = "地址:端口", default_value = "0.0.0.0:443")]
+    pub https_listen: String,
+    /// http 监听地址（重定向到 https）
+    #[arg(long, value_name = "地址:端口", default_value = "0.0.0.0:80")]
+    pub http_listen: String,
+}
+
+impl AnchorArgs {
+    pub fn enabled(&self) -> bool {
+        self.anchor.is_some() || self.anchor_dev.is_some()
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AnchorCmd {
+    /// 设置网络的锚点（只能在管理设备上）：各设备把它加为中继，登记链接默认指向它上面的页面
+    ///
+    /// 例：nexus anchor set https://bewith.link
+    ///
+    /// 锚点是一台运行 nexus daemon --anchor 的常开设备。
+    Set {
+        /// 锚点地址，https://主机[:端口]；本机开发可以用 http://localhost 或 http://127.0.0.1
+        #[arg(value_name = "地址", required_unless_present = "clear")]
+        url: Option<String>,
+        /// 清除锚点
+        #[arg(long, conflicts_with = "url")]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查看网络的锚点
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+}
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCmd {
@@ -517,6 +586,10 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
         }
         Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
+        Cmd::Anchor { cmd: AnchorCmd::Set { url, clear, json } } => {
+            (CtlRequest::AnchorSet { url: if *clear { None } else { url.clone() } }, *json)
+        }
+        Cmd::Anchor { cmd: AnchorCmd::Show { json } } => (CtlRequest::AnchorShow, *json),
         Cmd::Web { cmd: WebCmd::Revoke { label, json } } => (CtlRequest::WebRevoke { label: label.clone() }, *json),
         Cmd::Session { cmd: SessionCmd::Ls { node, json } } => (CtlRequest::SessionList { node: node.clone() }, *json),
         Cmd::Session { cmd: SessionCmd::Kill { node, session, json } } => {
@@ -616,6 +689,28 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 }))
             } else {
                 format!("已撤销通行密钥 {}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed)
+            }
+        }
+        CtlResponse::Anchor(a) => {
+            if json {
+                doc(json!({
+                    "schema": JSON_SCHEMA,
+                    "anchor": a.anchor,
+                    "roster_version": a.roster_version,
+                    "pushed": a.pushed,
+                    "unreachable": a.unreachable,
+                }))
+            } else {
+                let what = match &a.anchor {
+                    Some(url) => format!("锚点：{url}"),
+                    None => "没有设置锚点".to_string(),
+                };
+                match cmd {
+                    Cmd::Anchor { cmd: AnchorCmd::Set { .. } } => {
+                        format!("{what}。名册版本 {}，已通知 {} 台设备。\n", a.roster_version, a.pushed)
+                    }
+                    _ => format!("{what}\n"),
+                }
             }
         }
         CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
