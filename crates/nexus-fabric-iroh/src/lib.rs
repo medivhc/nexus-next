@@ -59,6 +59,8 @@ pub struct IrohTransport {
     hints: RefCell<HashMap<NodeId, EndpointAddr>>,
     /// 复用到同一节点的连接，避免每次调用都重新握手。
     conns: RefCell<HashMap<NodeId, IrohConnection>>,
+    /// 只经中继（浏览器）：地址提示里的 IP 地址用不上，留着反而让建立连接先在它们上面空等。
+    relay_only: bool,
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -95,7 +97,14 @@ impl IrohTransport {
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
-        Ok(Self { ep, me, relay: RefCell::new(relay), hints: RefCell::default(), conns: RefCell::default() })
+        Ok(Self {
+            ep,
+            me,
+            relay: RefCell::new(relay),
+            hints: RefCell::default(),
+            conns: RefCell::default(),
+            relay_only: !config.direct,
+        })
     }
 
     /// 本端点当前的完整地址。直连地址在没有外部服务时也包含绑定的本地套接字。
@@ -128,7 +137,10 @@ impl Transport for IrohTransport {
 
     fn add_hint(&self, node: NodeId, hint: &str) {
         let Some(bytes) = nexus_wire::hex_decode(hint) else { return };
-        let Ok(addr) = postcard::from_bytes::<EndpointAddr>(&bytes) else { return };
+        let Ok(mut addr) = postcard::from_bytes::<EndpointAddr>(&bytes) else { return };
+        if self.relay_only {
+            addr.addrs.retain(|a| a.is_relay());
+        }
         if addr.id.as_bytes() == &node.0 && node != self.me {
             self.hints.borrow_mut().insert(node, addr);
         }
