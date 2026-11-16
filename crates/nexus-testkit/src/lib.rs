@@ -161,7 +161,8 @@ impl World {
         let io = match &self.inner {
             Inner::Sim { nodes, .. } => {
                 let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
-                TermIo::Sim(sim_term(tx, ssh, state.clone()))
+                let agent = cli.agent.as_deref().map(load_agent).transpose().expect("合法凭据");
+                TermIo::Sim(sim_term(tx, ssh, agent, state.clone()))
             }
             Inner::Real(real) => TermIo::Real(real.term(node, &full, state.clone())),
         };
@@ -719,13 +720,13 @@ struct SimTerm {
     resize: Option<mpsc::Sender<nexus_wire::Size>>,
 }
 
-fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, state: Arc<TermState>) -> SimTerm {
+fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, agent: Option<AgentCredential>, state: Arc<TermState>) -> SimTerm {
     let (input, mut stdin) = tokio::io::duplex(4096);
     // 输出管道很小：暂停读取时，客户端很快就写不进去，不再确认输出。
     let (mut stdout, mut out_rd) = tokio::io::duplex(16 * 1024);
     let st = state.clone();
     tokio::task::spawn_local(async move {
-        let ctl = ChanCtl(tx, None);
+        let ctl = ChanCtl(tx, agent);
         let (_keep, mut resizes) = mpsc::channel(1);
         let code = match ssh(&ctl, &args, &mut stdin, &mut stdout, &mut resizes).await {
             Ok(code) => code,

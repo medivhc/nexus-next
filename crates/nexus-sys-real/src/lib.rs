@@ -18,7 +18,9 @@ pub struct RealSystem {
 impl RealSystem {
     /// `dir` 是本节点的数据目录，不存在时创建。
     pub fn new(dir: impl AsRef<Path>) -> io::Result<Self> {
-        std::fs::create_dir_all(dir.as_ref())?;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.as_ref())?;
+        std::fs::set_permissions(dir.as_ref(), std::fs::Permissions::from_mode(0o700))?;
         Ok(Self { dir: dir.as_ref().to_path_buf() })
     }
 
@@ -123,7 +125,11 @@ impl System for RealSystem {
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let path = self.path(key)?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, value)?;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(value)?;
         std::fs::rename(tmp, path)
     }
 }
@@ -316,6 +322,26 @@ impl Pty for RealPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_and_key_files_are_private_even_with_existing_permissive_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tmp = path.join("device_key.tmp");
+        std::fs::write(&tmp, b"old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sys = RealSystem::new(&path).unwrap();
+        sys.store_put("device_key", &[42; 32]).unwrap();
+        sys.store_put("root_key", &[43; 32]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+        for key in ["device_key", "root_key"] {
+            assert_eq!(std::fs::metadata(sys.path(key).unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(sys.store_get("device_key").unwrap().unwrap(), [42; 32]);
+    }
 
     #[test]
     fn logs_rotate_at_the_limit() {

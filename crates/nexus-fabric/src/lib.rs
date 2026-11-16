@@ -27,9 +27,9 @@ impl Proto {
 
     pub fn alpn(self) -> &'static [u8] {
         match self {
-            Proto::Rpc => b"nexus/rpc/2",
-            Proto::Join => b"nexus/join/2",
-            Proto::Web => b"nexus/web/1",
+            Proto::Rpc => b"nexus/rpc/3",
+            Proto::Join => b"nexus/join/3",
+            Proto::Web => b"nexus/web/2",
         }
     }
 

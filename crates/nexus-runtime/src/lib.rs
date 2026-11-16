@@ -62,16 +62,42 @@ pub fn ctl_session(req: CtlRequest, agent: Option<AgentCredential>) -> (CtlCall,
 enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
-    Session { name: String, create: bool, size: Size, guard: Option<Box<WebGuard>> },
+    Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
     WebEnroll { token: [u8; 16], credential: NewCredential },
 }
 
-/// 网页登录连着的会话：名册变化时重新判定，登录到期时断开。
-struct WebGuard {
+/// 终端连接的主体：名册变化时重新判定，凭据到期时断开。
+struct SessionGuard {
     peer: NodeId,
     principal: Principal,
     action: Action,
-    not_after: Timestamp,
+    not_after: Option<Timestamp>,
+}
+
+impl SessionGuard {
+    fn new(peer: NodeId, principal: Principal, action: Action) -> Self {
+        let not_after = match &principal {
+            Principal::Device => None,
+            Principal::Agent { cert, .. } => Some(cert.cert.not_after),
+            Principal::Web { session } => Some(session.session.not_after),
+        };
+        Self { peer, principal, action, not_after }
+    }
+
+    fn allowed(&self, roster: &Roster, me: NodeId, now: Timestamp) -> bool {
+        if roster.device(me).is_none() {
+            return false;
+        }
+        if let Principal::Agent { cert, .. } = &self.principal {
+            // 初始请求的签名、nonce 和时间已验证；长期连接复查证书和当前授权，
+            // 不把原断言的五分钟签署容差误当成会话有效期。
+            roster.device(self.peer).is_some()
+                && cert.validate(roster, now).is_ok()
+                && cert.cert.grants.iter().any(|g| g.allows(&self.action))
+        } else {
+            authz::decide(&Context { roster, me, now }, self.peer, &self.principal, &self.action).allowed()
+        }
+    }
 }
 
 /// 一次等待浏览器完成的通行密钥登记。
@@ -321,6 +347,7 @@ type Task<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 pub struct Node<T, S: System> {
     transport: T,
     system: S,
+    roster_write: tokio::sync::Mutex<()>,
     /// 尚未加入网络时使用的名字，也是加入时建议的名字。
     configured_name: String,
     started_at: Timestamp,
@@ -363,6 +390,7 @@ impl<T: Transport, S: System> Node<T, S> {
             started_at: system.now(),
             transport,
             system,
+            roster_write: tokio::sync::Mutex::new(()),
             configured_name: name.to_string(),
             trust: RefCell::new(trust),
             pending_join: RefCell::new(None),
@@ -557,15 +585,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Request::NodeInfo => Response::NodeInfo(self.info()),
             Request::Exec(spec) => return Dispatch::Exec(spec),
             Request::SessionAttach { name, create, size } => {
-                let guard = match &header.principal {
-                    Principal::Web { session } => Some(Box::new(WebGuard {
-                        peer,
-                        principal: header.principal.clone(),
-                        action,
-                        not_after: session.session.not_after,
-                    })),
-                    _ => None,
-                };
+                let guard = Some(Box::new(SessionGuard::new(peer, header.principal.clone(), action)));
                 return Dispatch::Session { name, create, size, guard };
             }
             Request::SessionList => Response::Sessions(self.session_list(|p| principal_sees(&roster, &header.principal, p))),
@@ -797,10 +817,12 @@ impl<T: Transport, S: System> Node<T, S> {
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
         }
-        if self.roster().is_none() {
-            return Err(err(ErrorCode::InvalidState, "本机还没有加入任何网络"));
+        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
+        // 执行和会话请求仍交给目标设备完整判定并审计，包括无效凭据的拒绝。
+        if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
+            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason))?;
         }
-        // 证书本身是否有效、授权是否覆盖，由被访问的设备判定；这里只拦下私钥与证书明显不配的凭据。
         if SecretKey::from_seed(agent.secret).public() != agent.cert.cert.agent {
             return Err(denied(&DenyReason::AssertionBadSignature));
         }
@@ -876,6 +898,7 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 浏览器交来新建的通行密钥：核对登记码和依赖方，写进名册并推送。
     async fn web_enroll_finish(&self, token: [u8; 16], credential: NewCredential) -> Result<String, WireError> {
+        let _write = self.roster_write.lock().await;
         let invalid = || err(ErrorCode::Denied, "登记码无效、已用过或已过期");
         let (label, grants, key) = {
             let mut pending = self.web_enrolls.borrow_mut();
@@ -908,6 +931,7 @@ impl<T: Transport, S: System> Node<T, S> {
         });
         roster.validate().map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         self.install_roster(roster.sign(&root))?;
+        drop(_write);
         self.broadcast_roster(None).await;
         Ok(label)
     }
@@ -950,6 +974,7 @@ impl<T: Transport, S: System> Node<T, S> {
             checked?;
             let device_key = load_or_create_device_key(&self.system).map_err(internal)?;
             let session = WebSession {
+                credential_id: key.credential_id.clone(),
                 browser: peer,
                 label: key.label.clone(),
                 issuer: self.me(),
@@ -995,6 +1020,7 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     async fn web_revoke(&self, label: &str) -> Result<MembershipReport, WireError> {
+        let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let before = roster.web_keys.len();
@@ -1004,6 +1030,7 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         roster.version += 1;
         self.install_roster(roster.sign(&root))?;
+        drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: label.to_string(), node_id: self.me(), roster_version: self.roster_version(), pushed, unreachable })
     }
@@ -1056,6 +1083,7 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     async fn agent_revoke(&self, who: &str) -> Result<MembershipReport, WireError> {
+        let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let mut agents = self.load_agents()?;
         let index = agents
@@ -1072,6 +1100,7 @@ impl<T: Transport, S: System> Node<T, S> {
         self.roster_epoch.send_modify(|v| *v += 1);
         agents[index].revoked = true;
         save(&self.system, KEY_AGENTS, &agents).map_err(internal)?;
+        drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport {
             name: agents[index].label.clone(),
@@ -1217,25 +1246,50 @@ impl<T: Transport, S: System> Node<T, S> {
                 return;
             }
         };
-        if write_msg(&mut wr, &Response::Ok).await.is_err() {
-            proc.kill();
-        }
+        // 保留写入游标：select! 取消写入时，已经发出的半帧不会被重发。
+        // 每次只缓存一帧，保留输出反压；计时和取消不依赖接收方继续读取。
+        let mut pending = Some((nexus_wire::encode(&Response::Ok).expect("固定回应可编码"), 0));
         let started = self.system.now();
         let limit = spec.timeout_ms.map(Duration::from_millis);
         let deadline = tokio::time::sleep(limit.unwrap_or(Duration::from_secs(100 * 365 * 24 * 3600)));
         tokio::pin!(deadline);
         let mut sent: u64 = 0;
-        let (mut timed_out, mut truncated, mut input_open, mut caller_gone) = (false, false, true, false);
+        let (mut timed_out, mut truncated, mut input_open, mut caller_gone, mut exited) = (false, false, true, false, false);
         loop {
+            if exited && pending.is_none() {
+                break;
+            }
             tokio::select! {
                 biased;
-                // 计时器放在最前：命令不停地输出时，超时也必须能生效。
-                _ = &mut deadline, if limit.is_some() && !timed_out => {
+                _ = &mut deadline, if limit.is_some() && !timed_out && !exited => {
                     timed_out = true;
                     proc.kill();
                 }
-                event = proc.next_event() => match event {
+                input = reader.next::<Input>(), if input_open && !exited => match input {
+                    Ok(Some(Input::Stdin(bytes))) => proc.write_stdin(bytes),
+                    Ok(Some(Input::CloseStdin)) => proc.close_stdin(),
+                    Ok(None) => {
+                        input_open = false;
+                        proc.close_stdin();
+                    }
+                    Ok(Some(Input::Resize(_) | Input::Ack(_) | Input::Ping)) => {}
+                    Ok(Some(Input::Cancel | Input::Detach)) | Err(_) => {
+                        input_open = false;
+                        caller_gone = true;
+                        pending = None;
+                        proc.kill();
+                    }
+                },
+                result = async { write_pending(&mut wr, pending.as_mut().expect("有待发送帧")).await }, if pending.is_some() => {
+                    pending = None;
+                    if result.is_err() {
+                        caller_gone = true;
+                        proc.kill();
+                    }
+                }
+                event = proc.next_event(), if pending.is_none() && !exited => match event {
                     ProcEvent::Exited(status) => {
+                        exited = true;
                         let result = ExecResult {
                             exit_code: status.code,
                             signal: status.signal,
@@ -1244,9 +1298,8 @@ impl<T: Transport, S: System> Node<T, S> {
                             duration_ms: self.system.now().millis_since(started),
                         };
                         if !caller_gone {
-                            let _ = write_msg(&mut wr, &ExecEvent::Exit(result)).await;
+                            pending = Some((nexus_wire::encode(&ExecEvent::Exit(result)).expect("执行结果可编码"), 0));
                         }
-                        break;
                     }
                     ProcEvent::Stdout(bytes) | ProcEvent::Stderr(bytes) if truncated || caller_gone => drop(bytes),
                     event => {
@@ -1264,26 +1317,14 @@ impl<T: Transport, S: System> Node<T, S> {
                         if !bytes.is_empty() {
                             sent += bytes.len() as u64;
                             let event = if is_err { ExecEvent::Stderr(bytes) } else { ExecEvent::Stdout(bytes) };
-                            if write_msg(&mut wr, &event).await.is_err() {
-                                caller_gone = true;
-                                proc.kill();
+                            match nexus_wire::encode(&event) {
+                                Ok(frame) => pending = Some((frame, 0)),
+                                Err(_) => {
+                                    caller_gone = true;
+                                    proc.kill();
+                                }
                             }
                         }
-                    }
-                },
-                input = reader.next::<Input>(), if input_open => match input {
-                    Ok(Some(Input::Stdin(bytes))) => proc.write_stdin(bytes),
-                    Ok(Some(Input::CloseStdin)) => proc.close_stdin(),
-                    Ok(None) => {
-                        input_open = false;
-                        proc.close_stdin();
-                    }
-                    // 终端会话的消息对执行没有意义。
-                    Ok(Some(Input::Resize(_) | Input::Ack(_) | Input::Ping)) => {}
-                    Ok(Some(Input::Cancel | Input::Detach)) | Err(_) => {
-                        input_open = false;
-                        caller_gone = true;
-                        proc.kill();
                     }
                 },
             }
@@ -1305,11 +1346,21 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         if device.node_id == self.me() {
             let body = Request::SessionAttach { name: name.clone(), create: true, size };
-            let check = required_action(&body, &device.name).and_then(|_| self.authorize_local(agent.as_ref(), &body));
-            if let Err(e) = check {
-                let _ = server.tx.send(CtlResponse::Error(e)).await;
-                return;
-            }
+            // agent 的会话要一直接受复查：授权通过后为它建立守卫。
+            let check = required_action(&body, &device.name).and_then(|action| {
+                self.authorize_local(agent.as_ref(), &body)?;
+                let Some(a) = agent.as_ref() else { return Ok(None) };
+                let action = action.ok_or_else(|| internal("会话请求应当需要授权"))?;
+                let principal = self.principal_for(Some(a), &device, &body)?;
+                Ok(Some(Box::new(SessionGuard::new(self.me(), principal, action))))
+            });
+            let guard = match check {
+                Ok(guard) => guard,
+                Err(e) => {
+                    let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    return;
+                }
+            };
             let (near, far) = tokio::io::duplex(256 * 1024);
             let client = async {
                 let mut near = near;
@@ -1323,7 +1374,7 @@ impl<T: Transport, S: System> Node<T, S> {
                     }
                 }
             };
-            futures_util::future::join(self.serve_session(far, &name, true, size, None), client).await;
+            futures_util::future::join(self.serve_session(far, &name, true, size, guard), client).await;
             return;
         }
         let body = Request::SessionAttach { name, create: true, size };
@@ -1411,11 +1462,11 @@ impl<T: Transport, S: System> Node<T, S> {
         name: &str,
         create: bool,
         size: Size,
-        guard: Option<Box<WebGuard>>,
+        guard: Option<Box<SessionGuard>>,
     ) {
         let mut epoch = self.roster_epoch.subscribe();
-        let expires = guard.as_ref().map(|g| {
-            let left = g.not_after.0.saturating_sub(self.system.now().0);
+        let expires = guard.as_ref().and_then(|g| g.not_after).map(|not_after| {
+            let left = not_after.0.saturating_sub(self.system.now().0);
             tokio::time::Instant::now() + Duration::from_millis(left)
         });
         let (rd, mut wr) = tokio::io::split(stream);
@@ -1443,14 +1494,13 @@ impl<T: Transport, S: System> Node<T, S> {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(last_heard + PEER_SILENT) => break,
-                // 网页登录到期：断开。
+                // 凭据到期：断开。
                 _ = tokio::time::sleep_until(expires.unwrap_or(last_heard)), if expires.is_some() => break,
-                // 名册变了：网页登录的权限可能已被收回，重新判定。
+                // 名册变了：设备、agent 或通行密钥的权限可能已收回。
                 Ok(()) = epoch.changed(), if guard.is_some() => {
-                    let g = guard.as_ref().expect("有网页登录");
+                    let g = guard.as_ref().expect("有授权守卫");
                     let Some(roster) = self.roster() else { break };
-                    let ctx = Context { roster: &roster, me: self.me(), now: self.system.now() };
-                    if authz::decide(&ctx, g.peer, &g.principal, &g.action).outcome != Outcome::Allow {
+                    if !g.allowed(&roster, self.me(), self.system.now()) {
                         break;
                     }
                 }
@@ -1690,6 +1740,9 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     async fn approve(&self, code: &str, name: Option<String>) -> Result<MembershipReport, WireError> {
+        // 名册的修改串行进行。等新设备确认期间（最长两倍请求超时）一直持有：
+        // 发给它的名册必须是最新的，同时发生的撤销等它确认之后再写入下一个版本。
+        let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let code = JoinCode::decode(code).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
         let name = name.unwrap_or_else(|| code.name.clone());
@@ -1718,15 +1771,15 @@ impl<T: Transport, S: System> Node<T, S> {
             Err(_) => return Err(err(ErrorCode::Unreachable, "连接这台设备超时")),
         }
         // 只有对方确认之后才更新本机名册，避免出现半加入的状态。
-        save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
-        self.trust.borrow_mut().roster = Some(signed);
-        self.roster_epoch.send_modify(|v| *v += 1);
+        self.adopt_roster(&signed)?;
         let _ = self.learn_hints(&vec![(code.node_id, code.addr.clone())]);
+        drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(Some(code.node_id)).await;
         Ok(MembershipReport { name, node_id: code.node_id, roster_version: self.roster_version(), pushed, unreachable })
     }
 
     async fn revoke(&self, name: &str) -> Result<MembershipReport, WireError> {
+        let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let device = roster
@@ -1742,6 +1795,7 @@ impl<T: Transport, S: System> Node<T, S> {
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
         self.roster_epoch.send_modify(|v| *v += 1);
+        drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: name.to_string(), node_id: device.node_id, roster_version: self.roster_version(), pushed, unreachable })
     }
@@ -1826,6 +1880,18 @@ fn visible(agent: &AgentCredential, device: &str) -> bool {
     ResourcePath::parse(device).is_ok_and(|p| agent.cert.can_see(&p))
 }
 
+/// 可取消的帧写入；部分写入的进度保存在调用方，不受 select! 取消影响。
+async fn write_pending<W: AsyncWrite + Unpin>(wr: &mut W, frame: &mut (Vec<u8>, usize)) -> io::Result<()> {
+    while frame.1 < frame.0.len() {
+        let n = wr.write(&frame.0[frame.1..]).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "无法发送执行输出"));
+        }
+        frame.1 += n;
+    }
+    wr.flush().await
+}
+
 /// 限时写一帧：写入卡住 [`PEER_SILENT`] 也算失败（连接可能已经失效而传输层还没发现）。
 async fn send_within<W: AsyncWrite + Unpin, M: serde::Serialize>(wr: &mut W, msg: &M) -> bool {
     matches!(tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await, Ok(Ok(())))
@@ -1848,6 +1914,190 @@ fn principal_sees(roster: &Roster, principal: &Principal, path: &ResourcePath) -
     match principal {
         Principal::Device => true,
         Principal::Agent { cert, .. } => cert.can_see(path),
-        Principal::Web { session } => roster.web_key(&session.session.label).is_some_and(|k| grants_see(&k.grants, path)),
+        Principal::Web { session } => roster
+            .web_key(&session.session.label)
+            .filter(|k| k.credential_id == session.session.credential_id)
+            .is_some_and(|k| grants_see(&k.grants, path)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_sys::{ExitStatus, Size};
+    use tokio::io::DuplexStream;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct ExecState {
+        output_ready: Notify,
+        killed: Notify,
+        is_killed: Cell<bool>,
+    }
+
+    struct TestSystem(Rc<ExecState>);
+    struct TestProc {
+        state: Rc<ExecState>,
+        output_sent: bool,
+    }
+    struct TestPty;
+    struct TestTransport;
+    struct TestConnection;
+
+    impl Transport for TestTransport {
+        type Conn = TestConnection;
+        fn node_id(&self) -> NodeId {
+            NodeId([1; 32])
+        }
+        fn local_hint(&self) -> String {
+            String::new()
+        }
+        fn add_hint(&self, _: NodeId, _: &str) {}
+        async fn connect(&self, _: NodeId, _: Proto) -> io::Result<TestConnection> {
+            unreachable!()
+        }
+        async fn accept(&self) -> io::Result<(TestConnection, Proto)> {
+            unreachable!()
+        }
+    }
+    impl Connection for TestConnection {
+        type Stream = DuplexStream;
+        fn remote(&self) -> NodeId {
+            unreachable!()
+        }
+        fn path_kind(&self) -> Option<nexus_core_proto::PathKind> {
+            None
+        }
+        async fn open_bi(&self) -> io::Result<DuplexStream> {
+            unreachable!()
+        }
+        async fn accept_bi(&self) -> io::Result<Option<DuplexStream>> {
+            unreachable!()
+        }
+    }
+    impl System for TestSystem {
+        type Proc = TestProc;
+        type Pty = TestPty;
+        fn now(&self) -> Timestamp {
+            Timestamp(0)
+        }
+        fn random(&self, _: &mut [u8]) {
+            unreachable!()
+        }
+        fn store_get(&self, _: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn store_put(&self, _: &str, _: &[u8]) -> io::Result<()> {
+            unreachable!()
+        }
+        fn append_log(&self, _: &str, _: &[u8], _: u64) -> io::Result<()> {
+            unreachable!()
+        }
+        fn read_log(&self, _: &str) -> io::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn spawn(&self, _: Cmd) -> io::Result<TestProc> {
+            Ok(TestProc {
+                state: self.0.clone(),
+                output_sent: false,
+            })
+        }
+        fn spawn_pty(&self, _: Size) -> io::Result<TestPty> {
+            unreachable!()
+        }
+    }
+    impl Pty for TestPty {
+        async fn next_event(&mut self) -> PtyEvent {
+            unreachable!()
+        }
+        fn write(&mut self, _: Vec<u8>) {
+            unreachable!()
+        }
+        fn resize(&mut self, _: Size) {
+            unreachable!()
+        }
+        fn kill(&mut self) {
+            unreachable!()
+        }
+    }
+    impl Proc for TestProc {
+        async fn next_event(&mut self) -> ProcEvent {
+            if self.state.is_killed.get() {
+                return ProcEvent::Exited(ExitStatus {
+                    code: None,
+                    signal: Some(9),
+                });
+            }
+            if !self.output_sent {
+                self.output_sent = true;
+                self.state.output_ready.notify_one();
+                return ProcEvent::Stdout(vec![b'x'; 65536]);
+            }
+            std::future::pending().await
+        }
+        fn write_stdin(&mut self, _: Vec<u8>) {}
+        fn close_stdin(&mut self) {}
+        fn kill(&mut self) {
+            self.state.is_killed.set(true);
+            self.state.killed.notify_one();
+        }
+    }
+
+    async fn stalled_exec(cancel: bool) {
+        let state = Rc::new(ExecState::default());
+        let node = Node::new(TestTransport, TestSystem(state.clone()), "test").unwrap();
+        // 比输出帧小得多，强制发生部分写入和反压。
+        let (mut client, server) = tokio::io::duplex(16);
+        let spec = ExecSpec {
+            program: "test".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            timeout_ms: (!cancel).then_some(200),
+            max_output: 1 << 20,
+        };
+        let observer = async {
+            assert!(matches!(
+                read_msg::<_, Response>(&mut client).await.unwrap(),
+                Response::Ok
+            ));
+            state.output_ready.notified().await;
+            if cancel {
+                write_msg(&mut client, &Input::Cancel).await.unwrap();
+            }
+            // 此时故意不读输出；超时和取消必须在窗口仍被堵住时杀掉进程。
+            tokio::time::timeout(Duration::from_secs(1), state.killed.notified())
+                .await
+                .expect("反压不能阻止进程终止");
+            if !cancel {
+                // 超时打断部分写入之后，恢复读取，帧和结果仍完整。
+                assert!(
+                    matches!(read_msg::<_, ExecEvent>(&mut client).await.unwrap(), ExecEvent::Stdout(b) if b == vec![b'x'; 65536])
+                );
+                let ExecEvent::Exit(result) = read_msg(&mut client).await.unwrap() else {
+                    panic!("应当收到退出结果")
+                };
+                assert!(result.timed_out);
+            }
+            drop(client);
+        };
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::future::join(node.serve_exec(server, spec), observer),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_exec_while_output_is_blocked() {
+        // covers: R10
+        stalled_exec(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_exec_while_output_is_blocked() {
+        // covers: R10
+        stalled_exec(true).await;
     }
 }

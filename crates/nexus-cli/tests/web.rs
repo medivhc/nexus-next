@@ -425,3 +425,25 @@ scenario! {
         assert!(v["url"].as_str().unwrap().starts_with(&format!("{page}/#enroll=")), "{v}");
     },
 }
+
+scenario! {
+    name: reusing_a_passkey_label_does_not_restore_old_sessions,
+    covers: "R31, R33",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let mut old = phone_passkey();
+        let entry = enrolled(&w, "phone", &[], &old).await;
+        let browser = w.browser().await;
+        browser.login(&w, &entry, &mut old).await.unwrap();
+        assert!(browser.status("home").await.is_ok());
+        w.cli_ok("laptop", &["web", "revoke", "phone"]).await;
+        let mut replacement = SoftAuthenticator::new([43; 32], "bewith.link", "https://bewith.link");
+        let entry = enrolled(&w, "phone", &[], &replacement).await;
+        assert!(browser.status("home").await.is_err(), "旧会话不得因名字复用而复活");
+        let fresh = w.browser().await;
+        fresh.login(&w, &entry, &mut replacement).await.unwrap();
+        assert!(fresh.status("home").await.is_ok());
+    },
+}

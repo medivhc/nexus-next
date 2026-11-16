@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 7;
+pub const WIRE_VERSION: u16 = 8;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -41,7 +41,7 @@ pub enum Request {
     /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
     /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
     Exec(ExecSpec),
-    /// 网页节点（协议 nexus/web/1）：用一次性登记码登记一个新建的通行密钥。
+    /// 网页节点（协议 nexus/web/2）：用一次性登记码登记一个新建的通行密钥。
     WebEnroll { token: [u8; 16], credential: NewCredential },
     /// 网页节点：用通行密钥登录。挑战是 `login_challenge(issued_at, 浏览器的临时节点标识)`。
     WebLogin { issued_at: Timestamp, assertion: nexus_core_proto::webauthn::WebAuthnAssertion },

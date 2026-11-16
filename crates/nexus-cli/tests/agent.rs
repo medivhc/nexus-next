@@ -345,3 +345,91 @@ scenario! {
         assert_eq!(out.code, 105, "{}", out.stderr);
     },
 }
+
+scenario! {
+    name: invalid_credentials_cannot_discover_devices,
+    covers: "R13, R14, R15, R16",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let cred = issue(&w, "laptop", "builder", &["term.exec@home"], "4h").await;
+        let mut forged = AgentCredential::decode(&cred).unwrap();
+        forged.cert.cert.grants[0].resource = nexus_core_proto::path::ResourcePattern::parse("**").unwrap();
+        for args in [&["ls"][..], &["status"], &["status", "home"]] {
+            let out = as_agent(&w, "laptop", &forged.encode(), args).await;
+            assert_eq!(out.code, 105, "{args:?}: {}", out.stderr);
+            assert!(!out.stdout.contains("home"));
+        }
+        w.cli_ok("laptop", &["agent", "revoke", "builder"]).await;
+        for args in [&["ls"][..], &["status"], &["status", "home"]] {
+            assert_eq!(as_agent(&w, "laptop", &cred, args).await.code, 105);
+        }
+        let short = issue(&w, "laptop", "short", &["term.exec@home"], "2s").await;
+        w.run_for(Duration::from_secs(3)).await;
+        for args in [&["ls"][..], &["status"], &["status", "home"]] {
+            assert_eq!(as_agent(&w, "laptop", &short, args).await.code, 105);
+        }
+    },
+}
+
+scenario! {
+    name: revocation_disconnects_existing_agent_terminals,
+    covers: "R14",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let cred = issue(&w, "laptop", "builder", &["term.session.*@**"], "4h").await;
+        let local = w.term("laptop", &["--agent", &cred, "ssh", "laptop"]).await;
+        local.expect_prompt().await;
+        let remote = w.term("laptop", &["--agent", &cred, "ssh", "home"]).await;
+        remote.expect_prompt().await;
+        w.cli_ok("laptop", &["agent", "revoke", "builder"]).await;
+        assert_ne!(local.wait_exit().await, 0);
+        assert_ne!(remote.wait_exit().await, 0);
+        // 只断开失权的客户端，常驻会话本身还在。
+        let human = w.term("laptop", &["ssh", "home"]).await;
+        human.expect_prompt().await;
+        human.detach().await;
+    },
+}
+
+scenario! {
+    name: expiry_disconnects_existing_agent_terminals,
+    covers: "R13",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let cred = issue(&w, "laptop", "builder", &["term.session.*@**"], "5s").await;
+        let local = w.term("laptop", &["--agent", &cred, "ssh", "laptop"]).await;
+        local.expect_prompt().await;
+        let remote = w.term("laptop", &["--agent", &cred, "ssh", "home"]).await;
+        remote.expect_prompt().await;
+        w.run_for(Duration::from_secs(6)).await;
+        assert_ne!(local.wait_exit().await, 0);
+        assert_ne!(remote.wait_exit().await, 0);
+    },
+}
+
+scenario! {
+    name: approval_preserves_concurrent_agent_revocation,
+    covers: "R02, R14",
+    nodes: ["laptop", "home", "office"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let cred = issue(&w, "laptop", "builder", &["term.exec@**"], "4h").await;
+        let joined = w.cli_ok("office", &["join"]).await;
+        let code = joined["code"].as_str().expect("加入码");
+        let approve_args = ["device", "approve", code, "--name", "office"];
+        let revoke_args = ["agent", "revoke", "builder"];
+        let (approve, revoke) = tokio::join!(w.cli("laptop", &approve_args), w.cli("laptop", &revoke_args));
+        assert_eq!(approve.code, 0, "{}", approve.stderr);
+        assert_eq!(revoke.code, 0, "{}", revoke.stderr);
+        for target in ["laptop", "home", "office"] {
+            assert_eq!(as_agent(&w, "home", &cred, &["exec", target, "--", "true"]).await.code, 105);
+        }
+    },
+}
