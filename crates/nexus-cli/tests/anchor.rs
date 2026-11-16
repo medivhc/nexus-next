@@ -83,6 +83,17 @@ scenario! {
         assert!(ctype.starts_with("text/html"), "{ctype}");
         assert_eq!(http_get(port, "/pkg/nexus_web_bg.wasm").1, "application/wasm");
         assert_eq!(http_get(port, "/../secret").0, 404);
+        // 中继的探测路径（浏览器里的 iroh 会请求它）回应后关闭连接：浏览器复用这条连接请求页面时，
+        // 不能落到中继那里去。
+        {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "GET /ping HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: keep-alive\r\n\r\n").unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).expect("探测之后连接应当关闭");
+            assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&raw));
+        }
 
         // 其他设备只知道锚点这一个中继。
         for node in ["laptop", "home"] {

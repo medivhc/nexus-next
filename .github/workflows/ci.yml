@@ -34,9 +34,6 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Install bc (used by tools/ci.sh for step timings)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,8 +42,8 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
-          # Cache the whole workspace target dir, not just dependencies,
-          # so incremental rebuilds survive between runs.
+          # Also keep crates that are not dependencies of the current lockfile
+          # (rust-cache prunes workspace crates from the cached target dir).
           cache-all-crates: true
 
       - name: Run full CI

@@ -6,7 +6,7 @@ step() {
   local name=$1; shift
   local start=$(date +%s.%N)
   "$@" > /tmp/nexus-ci.log 2>&1 || { cat /tmp/nexus-ci.log; echo "失败：$name"; exit 1; }
-  printf '%-28s %6.1f 秒\n' "$name" "$(echo "$(date +%s.%N) - $start" | bc)"
+  printf '%-28s %6.1f 秒\n' "$name" "$(awk -v a="$(date +%s.%N)" -v b="$start" 'BEGIN { print a - b }')"
 }
 step "L0 结构、追溯、许可证"   python3 tools/check.py
 step "L0 检查脚本自检"         python3 tools/check.py --self-test

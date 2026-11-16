@@ -10,8 +10,8 @@ mkdir -p "$out/vendor"
 # ring 编译成 WebAssembly 需要 clang。
 export CC_wasm32_unknown_unknown="${CC_wasm32_unknown_unknown:-clang}"
 export RUSTFLAGS="${RUSTFLAGS:-} --cfg getrandom_backend=\"wasm_js\""
-cargo build --release --target wasm32-unknown-unknown -p nexus-web
-wasm-bindgen --target web --no-typescript --out-dir "$out/pkg" target/wasm32-unknown-unknown/release/nexus_web.wasm
+cargo build --profile wasm --target wasm32-unknown-unknown -p nexus-web
+wasm-bindgen --target web --no-typescript --out-dir "$out/pkg" target/wasm32-unknown-unknown/wasm/nexus_web.wasm
 "${WASM_OPT:-wasm-opt}" -Oz --enable-bulk-memory --enable-nontrapping-float-to-int -o "$out/pkg/nexus_web_bg.wasm" "$out/pkg/nexus_web_bg.wasm"
 
 cp web/index.html web/app.js web/app.css "$out/"

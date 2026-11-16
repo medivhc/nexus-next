@@ -126,9 +126,14 @@ def parse_features(root):
 def collect_covers(root):
     """返回 {编号: [引用它的文件]}。识别 `covers: "R01, R02"` 和 `// covers: R01`。"""
     found = {}
-    files = list((root / "crates").rglob("*.rs")) + list((root / "tools").glob("*.py"))
+    # 浏览器端到端测试（tools/web-e2e/*.mjs）也算：有些需求只能在真实浏览器里验证。
+    files = (
+        list((root / "crates").rglob("*.rs"))
+        + list((root / "tools").glob("*.py"))
+        + list((root / "tools").glob("*/*.mjs"))
+    )
     for path in files:
-        if "target" in path.parts:
+        if "target" in path.parts or "node_modules" in path.parts:
             continue
         for m in re.finditer(r"covers:\s*\"?((?:R\d\d)(?:\s*,\s*R\d\d)*)", path.read_text(encoding="utf-8")):
             for rid in re.findall(r"R\d\d", m.group(1)):

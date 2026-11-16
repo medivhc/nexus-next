@@ -169,12 +169,43 @@ async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, page: &Path, re
     let (_, target) = web_serve::request_line(&head);
     if is_relay_path(&target) {
         let mut upstream = TcpStream::connect(relay).await?;
+        // 按连接上的第一个请求分流：不是协议升级的请求（探测）回应后必须关闭连接，
+        // 否则浏览器复用这条连接请求页面时会落到中继那里。
+        let head = if is_upgrade(&head) { head } else { force_close(&head) };
         upstream.write_all(&head).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
         Ok(())
     } else {
         web_serve::respond(&mut stream, page, &head).await
     }
+}
+
+/// 请求头里是否要求协议升级（中继的 WebSocket 或 HTTP 升级）。
+fn is_upgrade(head: &[u8]) -> bool {
+    header_lines(head).any(|l| l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("upgrade")))
+}
+
+fn header_lines(head: &[u8]) -> impl Iterator<Item = &str> {
+    let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(head.len());
+    std::str::from_utf8(&head[..end]).unwrap_or("").split("\r\n").skip(1)
+}
+
+/// 把请求头改成回应后关闭连接（去掉原有的 Connection 头，加上 `Connection: close`）。
+fn force_close(head: &[u8]) -> Vec<u8> {
+    let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else { return head.to_vec() };
+    let text = String::from_utf8_lossy(&head[..end]);
+    let mut lines = text.split("\r\n");
+    let mut out = String::from(lines.next().unwrap_or(""));
+    for l in lines {
+        if !l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("connection")) {
+            out.push_str("\r\n");
+            out.push_str(l);
+        }
+    }
+    out.push_str("\r\nConnection: close\r\n\r\n");
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(&head[end + 4..]);
+    bytes
 }
 
 /// 80 端口：一律重定向到 https。
@@ -221,5 +252,14 @@ mod tests {
         for p in ["/", "/index.html", "/relayx", "/pkg/relay", "/app.js"] {
             assert!(!is_relay_path(p), "{p}");
         }
+    }
+
+    #[test]
+    fn probes_are_forwarded_with_connection_close() {
+        let head = b"GET /ping HTTP/1.1\r\nHost: x\r\nconnection: keep-alive\r\n\r\n";
+        assert!(!is_upgrade(head));
+        assert_eq!(force_close(head), b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec());
+        let ws = b"GET /relay HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        assert!(is_upgrade(ws));
     }
 }
