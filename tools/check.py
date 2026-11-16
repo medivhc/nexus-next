@@ -45,7 +45,8 @@ FORBIDDEN_DEPS = {
         "iroh", "portable-pty", "turmoil", "russh",
         "nexus-sys-real", "nexus-sys-sim", "nexus-fabric-sim", "nexus-fabric-iroh",
     },
-    "nexus-sys": {"tokio", "turmoil", "iroh"},
+    # 接缝和 nexus-fabric 一样可以用 tokio 的读写接口（本机 TCP 连接的类型），不能碰仿真和网络实现。
+    "nexus-sys": {"turmoil", "iroh"},
     "nexus-fabric": {"turmoil", "iroh"},
     "nexus-cli": {"turmoil", "nexus-sys-sim", "nexus-fabric-sim"},
     # 网页节点核心要编译进浏览器：只能依赖接缝和纯逻辑。

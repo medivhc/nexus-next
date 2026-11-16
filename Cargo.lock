@@ -2763,6 +2763,7 @@ version = "0.0.1"
 dependencies = [
  "nexus-core-proto",
  "nexus-term-proto",
+ "tokio",
 ]
 
 [[package]]

@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 nexus-term-proto.workspace = true
 nexus-core-proto.workspace = true
+# 只用读写接口：本机 TCP 连接的类型。
+tokio = { version = "1", default-features = false, features = ["io-util"] }

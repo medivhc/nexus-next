@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 9;
+pub const WIRE_VERSION: u16 = 10;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -52,6 +52,21 @@ pub enum Request {
     SessionList,
     /// 结束对方的一个终端会话。
     SessionKill { name: String },
+    /// 连到对方发布的一个服务。对方先回 `Response::Ok` 或 `Response::Error`；
+    /// 之后这条流就是到那个服务的字节流，任一方向结束发送即关闭那个方向。
+    SvcConnect { name: String },
+    /// 列出对方发布的、调用者能用的服务。
+    SvcList,
+}
+
+/// 一个发布的服务，给使用方看的部分（不含发布方的本机地址）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    pub name: String,
+    /// `tcp` 或 `http`。
+    pub proto: String,
+    /// 使用方需要的环境变量，值里的 `{addr}` 由使用方换成它访问服务用的地址。
+    pub env: Vec<(String, String)>,
 }
 
 /// 浏览器新建的通行密钥（`navigator.credentials.create` 的结果）。
@@ -148,6 +163,7 @@ pub enum Response {
     Roster { roster: Option<SignedRoster>, addrs: AddrHints },
     Ok,
     Sessions(Vec<SessionInfo>),
+    Services(Vec<ServiceInfo>),
     /// 通行密钥登记成功，带上它的名字。
     WebEnrolled { label: String },
     /// 登录成功：网页会话凭证，以及这个通行密钥能看到的设备。
@@ -222,6 +238,14 @@ pub enum CtlRequest {
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
+    /// 在本机发布一个服务：本机地址只留在本机。
+    Publish { name: String, addr: core::net::SocketAddr, proto: String, env: Vec<(String, String)> },
+    Unpublish { name: String },
+    /// 列出一台设备上调用者能用的服务。
+    Services { node: String },
+    /// 连到一台设备上的服务。回应 `Ok` 之后，调用方发送 `Input::Stdin` / `Input::CloseStdin`，
+    /// 常驻程序发送 `PipeData`，服务结束发送时发送 `PipeEnd`。
+    Connect { node: String, name: String },
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -247,6 +271,11 @@ pub enum CtlResponse {
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),
+    /// 发布成功，带上服务的路径（例如 `home/web`）。
+    Published { path: String },
+    Services { node: String, services: Vec<ServiceInfo> },
+    PipeData(Vec<u8>),
+    PipeEnd,
     Ok,
     Error(WireError),
 }

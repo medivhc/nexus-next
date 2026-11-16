@@ -11,7 +11,8 @@ pub use nexus_cli::Output;
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
 use nexus_fabric_sim::SimTransport;
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node};
-use nexus_sys_sim::{SimClock, SimDisk, SimSystem};
+use nexus_sys_sim::{SimClock, SimDisk, SimServices, SimSystem};
+pub use nexus_sys_sim::SimService as Service;
 use nexus_wire::{AgentCredential, CtlRequest};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,11 +35,36 @@ pub struct World {
 }
 
 enum Inner {
-    Sim { nodes: HashMap<String, mpsc::Sender<CtlCall>>, clock: SimClock },
+    Sim { nodes: HashMap<String, mpsc::Sender<CtlCall>>, clock: SimClock, services: HashMap<String, SimServices>, next_port: std::cell::Cell<u16> },
     Real(RealWorld),
 }
 
 impl World {
+    /// 在节点上运行一个只监听本机的服务，返回它的端口。
+    pub async fn serve(&self, node: &str, service: Service) -> u16 {
+        match &self.inner {
+            Inner::Sim { services, next_port, .. } => {
+                let port = next_port.get();
+                next_port.set(port + 1);
+                services.get(node).unwrap_or_else(|| panic!("没有节点 {node}")).add(port, service);
+                port
+            }
+            Inner::Real(real) => real.serve(service).await,
+        }
+    }
+
+    /// 一个现在没有程序在用的本机端口。
+    pub fn unused_port(&self) -> u16 {
+        match &self.inner {
+            Inner::Sim { next_port, .. } => {
+                let port = next_port.get();
+                next_port.set(port + 1);
+                port
+            }
+            Inner::Real(_) => std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(),
+        }
+    }
+
     /// 在某个节点上执行一条 `nexus` 命令。
     pub async fn cli(&self, node: &str, args: &[&str]) -> Output {
         self.cli_with_stdin(node, args, b"").await
@@ -876,16 +902,19 @@ where
     // 每个节点从零开始：没有名册，互不认识，和刚装好的设备一样。
     let clock = SimClock::default();
     let mut ctl = HashMap::new();
+    let mut all_services = HashMap::new();
     for (i, name) in nodes.iter().enumerate() {
         let disk = SimDisk::default();
+        let services = SimServices::default();
+        all_services.insert(name.to_string(), services.clone());
         let (tx, rx) = mpsc::channel::<CtlCall>(64);
         ctl.insert(name.to_string(), tx);
         let rx = Rc::new(tokio::sync::Mutex::new(rx));
         let (name, clock) = (name.to_string(), clock.clone());
         sim.host(name.clone(), move || {
-            let (disk, name, rx, clock) = (disk.clone(), name.clone(), rx.clone(), clock.clone());
+            let (disk, name, rx, clock, services) = (disk.clone(), name.clone(), rx.clone(), clock.clone(), services.clone());
             async move {
-                let system = SimSystem::new(disk, node_seed(seed, i), clock);
+                let system = SimSystem::with_services(disk, node_seed(seed, i), clock, services);
                 let key = load_or_create_device_key(&system)?;
                 let transport = SimTransport::bind(nexus_core_proto::NodeId(key.public().0), &name).await?;
                 let node = Node::new(transport, system, &name)?;
@@ -897,7 +926,10 @@ where
     }
 
     let trace = Rc::new(RefCell::new(Vec::new()));
-    let world = World { inner: Inner::Sim { nodes: ctl, clock }, trace: trace.clone() };
+    let world = World {
+        inner: Inner::Sim { nodes: ctl, clock, services: all_services, next_port: std::cell::Cell::new(8000) },
+        trace: trace.clone(),
+    };
     let fut = scenario(world);
     sim.client(SCENARIO_HOST, async move {
         fut.await;
@@ -954,6 +986,26 @@ impl RealWorld {
             world.wait_ready(name);
         }
         world
+    }
+
+    /// 在本机回环地址上运行一个测试服务，直到测试进程结束。
+    ///
+    /// 服务跑在自己的线程里：执行命令行时测试线程会同步等待子进程，服务不能依赖测试线程。
+    async fn serve(&self, service: Service) -> u16 {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("无法监听");
+        let port = std_listener.local_addr().unwrap().port();
+        std_listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("测试服务的运行时");
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
+                loop {
+                    let Ok((s, _)) = listener.accept().await else { return };
+                    tokio::spawn(run_test_service(service.clone(), s));
+                }
+            });
+        });
+        port
     }
 
     /// 启动节点的常驻程序，`extra` 是 `daemon` 之后的其他参数。
@@ -1199,4 +1251,42 @@ macro_rules! __real_test {
             $crate::run_real(&[$($node),+], env!("CARGO_BIN_EXE_nexus"), $body);
         }
     };
+}
+
+/// 一个 HTTP GET（Connection: close），返回正文。用于验证端口转发这类真实的本机网络。
+pub fn http_get(port: u16, path: &str) -> io::Result<String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io::Error::other("回应没有头部"))?;
+    Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
+}
+
+async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
+    match service {
+        Service::Echo => {
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let _ = w.shutdown().await;
+        }
+        Service::Http(body) => {
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(reply.as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
+    }
 }

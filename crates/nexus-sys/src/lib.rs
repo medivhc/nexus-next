@@ -67,6 +67,7 @@ pub trait Pty {
 pub trait System {
     type Proc: Proc;
     type Pty: Pty;
+    type Tcp: TcpConn;
 
     /// 当前时间。
     fn now(&self) -> Timestamp;
@@ -87,11 +88,19 @@ pub trait System {
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc>;
     /// 在一个新的伪终端里启动当前用户的登录 shell。
     fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty>;
+    /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
+    fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
 }
+
+/// 本机 TCP 连接。
+pub trait TcpConn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static> TcpConn for T {}
 
 impl<S: System + ?Sized> System for std::rc::Rc<S> {
     type Proc = S::Proc;
     type Pty = S::Pty;
+    type Tcp = S::Tcp;
+    fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> { (**self).tcp_connect(addr) }
     fn now(&self) -> Timestamp { (**self).now() }
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }

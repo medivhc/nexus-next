@@ -40,11 +40,35 @@ pub struct SimSystem {
     disk: SimDisk,
     rng: Cell<u64>,
     clock: SimClock,
+    services: SimServices,
+}
+
+/// 仿真节点上「本机运行着的 TCP 服务」，按端口登记。克隆后共享，测试可以随时增加。
+#[derive(Clone, Default)]
+pub struct SimServices(Rc<RefCell<BTreeMap<u16, SimService>>>);
+
+/// 仿真里的本机服务。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SimService {
+    /// 把收到的字节原样送回，对方结束发送后也结束。
+    Echo,
+    /// 读完一个 HTTP 请求头，回应 200 和这段正文，然后关闭。
+    Http(String),
+}
+
+impl SimServices {
+    pub fn add(&self, port: u16, service: SimService) {
+        self.0.borrow_mut().insert(port, service);
+    }
 }
 
 impl SimSystem {
     pub fn new(disk: SimDisk, seed: u64, clock: SimClock) -> Self {
-        Self { disk, rng: Cell::new(seed ^ 0x9e37_79b9_7f4a_7c15), clock }
+        Self::with_services(disk, seed, clock, SimServices::default())
+    }
+
+    pub fn with_services(disk: SimDisk, seed: u64, clock: SimClock, services: SimServices) -> Self {
+        Self { disk, rng: Cell::new(seed ^ 0x9e37_79b9_7f4a_7c15), clock, services }
     }
 
     fn next_u64(&self) -> u64 {
@@ -60,6 +84,15 @@ impl SimSystem {
 impl System for SimSystem {
     type Proc = SimProc;
     type Pty = SimPty;
+    type Tcp = SimTcp;
+
+    async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<SimTcp> {
+        let service = if addr.ip().is_loopback() { self.services.0.borrow().get(&addr.port()).cloned() } else { None };
+        match service {
+            Some(service) => Ok(SimTcp { service, inbox: Vec::new(), outbox: VecDeque::new(), closed: false, reader: None, writer: None }),
+            None => Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("{addr} 上没有服务"))),
+        }
+    }
 
     fn spawn_pty(&self, size: Size) -> io::Result<SimPty> {
         Ok(SimPty {
@@ -564,6 +597,95 @@ impl Pty for SimPty {
     fn kill(&mut self) {
         self.killed = true;
         self.notify.notify_one();
+    }
+}
+
+/// 到仿真本机服务的一条连接。服务的行为直接在读写里完成，不需要另起任务。
+pub struct SimTcp {
+    service: SimService,
+    /// 收到、还没处理的字节（HTTP 请求头）。
+    inbox: Vec<u8>,
+    /// 等对方读走的字节。
+    outbox: VecDeque<u8>,
+    /// 服务已经写完（回声：对方结束发送之后；HTTP：回应之后）。
+    closed: bool,
+    reader: Option<std::task::Waker>,
+    writer: Option<std::task::Waker>,
+}
+
+impl SimTcp {
+    fn wake_reader(&mut self) {
+        if let Some(w) = self.reader.take() {
+            w.wake();
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for SimTcp {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+        if self.outbox.is_empty() {
+            if self.closed {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.reader = Some(cx.waker().clone());
+            return std::task::Poll::Pending;
+        }
+        let n = buf.remaining().min(self.outbox.len());
+        let chunk: Vec<u8> = self.outbox.drain(..n).collect();
+        buf.put_slice(&chunk);
+        if let Some(w) = self.writer.take() {
+            w.wake();
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// 回声在缓冲里最多攒这么多：对方不读时写入就停下（反压）。
+const SIM_TCP_BUFFER: usize = 256 * 1024;
+
+impl tokio::io::AsyncWrite for SimTcp {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        if self.closed {
+            return std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        match self.service.clone() {
+            SimService::Echo => {
+                let room = SIM_TCP_BUFFER.saturating_sub(self.outbox.len());
+                if room == 0 {
+                    // 等对方读走一些再写。
+                    self.writer = Some(cx.waker().clone());
+                    return std::task::Poll::Pending;
+                }
+                let n = room.min(data.len());
+                self.outbox.extend(&data[..n]);
+                self.wake_reader();
+                std::task::Poll::Ready(Ok(n))
+            }
+            SimService::Http(body) => {
+                self.inbox.extend_from_slice(data);
+                if self.inbox.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    self.outbox.extend(reply.as_bytes());
+                    self.closed = true;
+                    self.wake_reader();
+                }
+                std::task::Poll::Ready(Ok(data.len()))
+            }
+        }
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        // 回声：对方结束发送，服务送完剩下的也结束。
+        self.closed = true;
+        self.wake_reader();
+        std::task::Poll::Ready(Ok(()))
     }
 }
 

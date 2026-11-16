@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 /// `--json` 输出的结构版本。结构发生不兼容变化时递增。
 pub const JSON_SCHEMA: u32 = 2;
 
+/// 服务名字的后缀：home 上的 web 是 web.home.internal。
+pub const SERVICE_SUFFIX: &str = "internal";
 pub const EXIT_DAEMON_UNREACHABLE: i32 = 101;
 pub const EXIT_USAGE: i32 = 102;
 pub const EXIT_UNKNOWN_NODE: i32 = 103;
@@ -101,10 +103,56 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
-    /// 列出你的所有设备及其状态
+    /// 列出你的所有设备及其状态；给出设备名时，列出那台设备上你能用的服务
+    ///
+    /// 例：nexus ls home --json
     Ls {
+        /// 设备名：列出它发布的服务
+        node: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// 把本机的一个服务发布给网络里的其他设备（只监听本机的服务也可以）
+    ///
+    /// 例：nexus publish web --port 8080 --proto http --env OPENAI_BASE_URL=http://{addr}/v1
+    ///
+    /// 你自己的设备默认可以使用；agent 和网页登录需要授权 svc.connect@<设备>/svc/<名字>。
+    /// 使用方：nexus connect <设备>/<名字>。
+    Publish {
+        /// 服务的名字（字母、数字、- 和 _）
+        name: String,
+        /// 服务在本机监听的端口
+        #[arg(long)]
+        port: u16,
+        /// 服务在本机监听的地址
+        #[arg(long, default_value = "127.0.0.1")]
+        host: std::net::IpAddr,
+        /// 协议，告诉使用方怎么用：tcp 或 http
+        #[arg(long, default_value = "tcp")]
+        proto: String,
+        /// 使用方需要的环境变量，值里的 {addr} 换成使用方访问服务的地址；可以写多次
+        #[arg(long, value_name = "名字=值")]
+        env: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 撤销一个服务的发布
+    Unpublish {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 连到一台设备上发布的服务：标准输入输出接到服务上，或者在本机开一个端口转发过去
+    ///
+    /// 例：nexus connect home/web --listen 127.0.0.1:8080
+    ///
+    /// 不需要任何密钥：目标设备按你的身份判定。
+    Connect {
+        /// <设备>/<服务>
+        target: String,
+        /// 在本机这个地址上监听，每个连接各自接到服务
+        #[arg(long, value_name = "地址:端口")]
+        listen: Option<String>,
     },
     /// 在一台设备上执行命令，返回它的输出和退出码
     ///
@@ -475,7 +523,13 @@ fn fail<K: Sink>(sink: &mut K, code: i32, kind: &str, message: &str) -> i32 {
 }
 
 fn fail_wire<K: Sink>(sink: &mut K, e: &nexus_wire::WireError) -> i32 {
-    let (code, kind) = match e.code {
+    let (code, kind) = exit_for(e.code);
+    fail(sink, code, kind, &e.message)
+}
+
+/// 错误码对应的退出码和错误种类。
+fn exit_for(code: ErrorCode) -> (i32, &'static str) {
+    match code {
         ErrorCode::UnknownNode => (EXIT_UNKNOWN_NODE, "unknown_node"),
         ErrorCode::Denied => (EXIT_DENIED, "denied"),
         ErrorCode::InvalidState => (EXIT_INVALID_STATE, "invalid_state"),
@@ -484,8 +538,7 @@ fn fail_wire<K: Sink>(sink: &mut K, e: &nexus_wire::WireError) -> i32 {
         ErrorCode::SpawnFailed => (EXIT_SPAWN_FAILED, "spawn_failed"),
         ErrorCode::NotFound => (EXIT_NOT_FOUND, "not_found"),
         _ => (EXIT_INTERNAL, "internal"),
-    };
-    fail(sink, code, kind, &e.message)
+    }
 }
 
 /// 解析参数。帮助和版本信息写到 `sink` 后以 `Err(0)` 返回，用法错误以 `Err(EXIT_USAGE)` 返回。
@@ -552,7 +605,29 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             (CtlRequest::Approve { code: code.clone(), name: name.clone() }, *json)
         }
         Cmd::Device { cmd: DeviceCmd::Revoke { name, json } } => (CtlRequest::Revoke { name: name.clone() }, *json),
-        Cmd::Ls { json } => (CtlRequest::List, *json),
+        Cmd::Ls { node: None, json } => (CtlRequest::List, *json),
+        Cmd::Ls { node: Some(node), json } => (CtlRequest::Services { node: node.clone() }, *json),
+        Cmd::Publish { name, port, host, proto, env, json } => {
+            let mut pairs = Vec::new();
+            for kv in env {
+                match kv.split_once('=') {
+                    Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
+                    None => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("--env 的格式应为 名字=值：{kv}")),
+                }
+            }
+            let addr = std::net::SocketAddr::new(*host, *port);
+            (CtlRequest::Publish { name: name.clone(), addr, proto: proto.clone(), env: pairs }, *json)
+        }
+        Cmd::Unpublish { name, json } => (CtlRequest::Unpublish { name: name.clone() }, *json),
+        Cmd::Connect { target, listen } => {
+            let Some((node, name)) = target.split_once('/').filter(|(n, s)| !n.is_empty() && !s.is_empty()) else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("服务的路径应为 <设备>/<服务>：{target}"));
+            };
+            return match listen {
+                None => connect_stdio(ctl, node, name, stdin, sink).await,
+                Some(addr) => connect_listen(ctl, node, name, addr, sink).await,
+            };
+        }
         Cmd::Ssh { .. } => {
             let args = match ssh_args(cmd) {
                 Ok(a) => a,
@@ -604,7 +679,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     };
     let text = match resp {
         CtlResponse::Error(e) => return fail_wire(sink, &e),
-        CtlResponse::Exec(_) | CtlResponse::Session(_) | CtlResponse::SshHostKey(_) => {
+        CtlResponse::Exec(_) | CtlResponse::Session(_) | CtlResponse::SshHostKey(_) | CtlResponse::PipeData(_) | CtlResponse::PipeEnd => {
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
         CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },
@@ -722,8 +797,51 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     format!("已结束会话 {session}\n")
                 }
             }
+            Cmd::Unpublish { name, .. } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "unpublished": name }))
+                } else {
+                    format!("已撤销发布 {name}\n")
+                }
+            }
             _ => String::new(),
         },
+        CtlResponse::Published { path } => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "path": path }))
+            } else {
+                format!("已发布 {path}。其他设备：nexus connect {path}\n")
+            }
+        }
+        CtlResponse::Services { node, services } => {
+            if json {
+                let list: Vec<Value> = services
+                    .iter()
+                    .map(|s| {
+                        let env: serde_json::Map<String, Value> = s.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                        json!({
+                            "name": s.name,
+                            "path": format!("{node}/{}", s.name),
+                            "dns": format!("{}.{node}.{SERVICE_SUFFIX}", s.name),
+                            "proto": s.proto,
+                            "env": env,
+                        })
+                    })
+                    .collect();
+                doc(json!({ "schema": JSON_SCHEMA, "node": node, "services": list }))
+            } else if services.is_empty() {
+                format!("{node} 上没有你能用的服务\n")
+            } else {
+                let mut out = String::new();
+                for s in &services {
+                    out.push_str(&format!("{node}/{:<20} {}\n", s.name, s.proto));
+                    for (k, v) in &s.env {
+                        out.push_str(&format!("    {k}={v}\n"));
+                    }
+                }
+                out
+            }
+        }
         CtlResponse::Status(r) => if json { doc(status_json(&r)) } else { status_text(&r) },
         CtlResponse::List(entries) => if json { list_json(&entries) } else { list_text(&entries) },
         CtlResponse::Init(r) => {
@@ -1119,7 +1237,7 @@ fn mcp_tools() -> Value {
 async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
     let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
     let cmd = match name {
-        "nexus_ls" => Cmd::Ls { json: true },
+        "nexus_ls" => Cmd::Ls { node: None, json: true },
         "nexus_status" => Cmd::Status { node: text("node"), json: true },
         "nexus_session_ls" => match text("node") {
             Some(node) => Cmd::Session { cmd: SessionCmd::Ls { node, json: true } },
@@ -1208,6 +1326,108 @@ async fn mcp<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, stdin: &mut R, sink
         }
     }
     0
+}
+
+/// 打开到服务的一条连接：等常驻程序确认，返回会话。
+async fn open_connect<C: Ctl>(ctl: &C, node: &str, name: &str) -> Result<CtlClient, (i32, &'static str, String)> {
+    let mut session = ctl
+        .open(CtlRequest::Connect { node: node.to_string(), name: name.to_string() })
+        .await
+        .map_err(|e| (EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}")))?;
+    match session.rx.recv().await {
+        Some(CtlResponse::Ok) => Ok(session),
+        Some(CtlResponse::Error(e)) => {
+            let (code, kind) = exit_for(e.code);
+            Err((code, kind, e.message))
+        }
+        _ => Err((EXIT_INTERNAL, "internal", "常驻程序的回应无法理解".to_string())),
+    }
+}
+
+/// 在一条到服务的连接上搬运字节：`input` 的数据送到服务，服务的数据写到 `output`，直到两个方向都结束。
+async fn pipe<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(session: &mut CtlClient, input: &mut R, output: &mut W) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut reading, mut writing) = (true, true);
+    let mut pending: Option<Input> = None;
+    while reading {
+        tokio::select! {
+            biased;
+            resp = session.rx.recv() => match resp {
+                Some(CtlResponse::PipeData(b)) => {
+                    if output.write_all(&b).await.is_err() {
+                        break;
+                    }
+                    let _ = output.flush().await;
+                }
+                _ => {
+                    reading = false;
+                    let _ = output.shutdown().await;
+                }
+            },
+            permit = session.tx.reserve(), if pending.is_some() => match permit {
+                Ok(p) => p.send(pending.take().expect("有待发的输入")),
+                Err(_) => {
+                    pending = None;
+                    writing = false;
+                }
+            },
+            n = input.read(&mut buf), if writing && pending.is_none() => {
+                pending = Some(match n {
+                    Ok(0) | Err(_) => {
+                        writing = false;
+                        Input::CloseStdin
+                    }
+                    Ok(n) => Input::Stdin(buf[..n].to_vec()),
+                });
+            }
+        }
+    }
+}
+
+/// `nexus connect <设备>/<服务>`：标准输入输出接到服务上。
+async fn connect_stdio<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, node: &str, name: &str, stdin: &mut R, sink: &mut K) -> i32 {
+    let mut session = match open_connect(ctl, node, name).await {
+        Ok(s) => s,
+        Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
+    };
+    let mut out = SinkWriter(sink);
+    pipe(&mut session, stdin, &mut out).await;
+    0
+}
+
+/// `nexus connect <设备>/<服务> --listen <地址>`：本机每个连接各自接到服务，直到被中断。
+async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen: &str, sink: &mut K) -> i32 {
+    let addr: std::net::SocketAddr = match listen.parse() {
+        Ok(a) => a,
+        Err(_) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("--listen 应当是 地址:端口：{listen}")),
+    };
+    // 先确认服务能用，再开始监听：名字写错时立即报错。
+    match open_connect(ctl, node, name).await {
+        Ok(probe) => drop(probe.tx.try_send(Input::CloseStdin)),
+        Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
+    }
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法监听 {addr}：{e}")),
+    };
+    let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
+    sink.out(format!("{node}/{name} → {local}（按 Ctrl-C 停止）\n").as_bytes());
+    let conns = futures_util::stream::FuturesUnordered::new();
+    tokio::pin!(conns);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((socket, _)) = accepted else { continue };
+                let (node, name) = (node.to_string(), name.to_string());
+                conns.push(async move {
+                    let Ok(mut session) = open_connect(ctl, &node, &name).await else { return };
+                    let (mut rd, mut wr) = socket.into_split();
+                    pipe(&mut session, &mut rd, &mut wr).await;
+                });
+            }
+            Some(()) = futures_util::StreamExt::next(&mut conns), if !conns.is_empty() => {}
+        }
+    }
 }
 
 /// `nexus exec`：把本机标准输入送过去，把输出实时写出（或在 `--json` 时最后一次性输出）。

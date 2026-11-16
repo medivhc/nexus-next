@@ -35,6 +35,13 @@ impl RealSystem {
 impl System for RealSystem {
     type Proc = RealProc;
     type Pty = RealPty;
+    type Tcp = tokio::net::TcpStream;
+
+    async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<tokio::net::TcpStream> {
+        let s = tokio::net::TcpStream::connect(addr).await?;
+        let _ = s.set_nodelay(true);
+        Ok(s)
+    }
 
     fn spawn_pty(&self, size: Size) -> io::Result<RealPty> {
         RealPty::spawn(size)

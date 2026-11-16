@@ -21,11 +21,11 @@ use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
     hex_encode, AddrHints, AgentCredential, AnchorReport, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
-    Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, SessionInfo, Size, StatusReport,
+    Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, ServiceInfo, SessionInfo, Size, StatusReport,
     WireError, WIRE_VERSION,
 };
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -33,7 +33,7 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// 常驻程序一侧的控制会话：向命令行发送回应，接收命令行的输入。
@@ -63,6 +63,7 @@ enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
     Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
+    Pipe { addr: std::net::SocketAddr, name: String },
     WebEnroll { token: [u8; 16], credential: NewCredential },
 }
 
@@ -211,6 +212,25 @@ const KEY_ROOT_KEY: &str = "root_key";
 const KEY_ROSTER: &str = "roster";
 const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
+const KEY_SERVICES: &str = "services";
+
+/// 本机发布的一个服务。`addr` 只留在本机，不出现在任何发给别人的消息里。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PublishedService {
+    name: String,
+    addr: std::net::SocketAddr,
+    proto: String,
+    env: Vec<(String, String)>,
+}
+
+impl PublishedService {
+    fn info(&self) -> ServiceInfo {
+        ServiceInfo { name: self.name.clone(), proto: self.proto.clone(), env: self.env.clone() }
+    }
+}
+
+/// 服务的协议：只用来告诉使用方怎么用。
+const SERVICE_PROTOS: [&str; 2] = ["tcp", "http"];
 const LOG_AUDIT: &str = "audit";
 /// 审计日志的轮转上限：最近这么多字节（约 4 万条）的记录总在，总占用不超过约两倍。
 const AUDIT_LOG_MAX: u64 = 8 << 20;
@@ -225,6 +245,16 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
+        Request::SvcList => ("node.info", None),
+        Request::SvcConnect { name } => {
+            if !valid_segment(name) {
+                return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            }
+            return Ok(Some(Action {
+                capability: Capability::parse("svc.connect").expect("内置能力名合法"),
+                resource: ResourcePath::parse(&format!("{node}/svc/{name}")).map_err(|_| internal("本机不在名册里"))?,
+            }));
+        }
         Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } | Request::WebLogin { .. } => {
             return Ok(None)
         }
@@ -364,6 +394,8 @@ pub struct Node<T, S: System> {
     spawn_rx: RefCell<Option<mpsc::UnboundedReceiver<NewSession<S::Pty>>>>,
     replay: RefCell<ReplayGuard>,
     web_enrolls: RefCell<HashMap<[u8; 16], PendingWebEnroll>>,
+    /// 本机发布的服务（M3.1）。
+    services: RefCell<Vec<PublishedService>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
     roster_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -386,7 +418,9 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let (push_tx, push_rx) = mpsc::unbounded_channel();
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
+        let services = load::<_, Vec<PublishedService>>(&system, KEY_SERVICES)?.unwrap_or_default();
         Ok(Self {
+            services: RefCell::new(services),
             sessions: RefCell::default(),
             next_client: Cell::new(1),
             spawn_tx,
@@ -557,6 +591,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Dispatch::Session { name, create, size, guard } => {
                 return self.serve_session(stream, &name, create, size, guard).await
             }
+            Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
                 Ok(label) => Response::WebEnrolled { label },
                 Err(e) => Response::Error(e),
@@ -614,6 +649,11 @@ impl<T: Transport, S: System> Node<T, S> {
                 return Dispatch::Session { name, create, size, guard };
             }
             Request::SessionList => Response::Sessions(self.session_list(|p| principal_sees(&roster, &header.principal, p))),
+            Request::SvcList => Response::Services(self.service_list(&me, |a| principal_may(&roster, &header.principal, a))),
+            Request::SvcConnect { name } => match self.service_addr(&name) {
+                Some(addr) => return Dispatch::Pipe { addr, name },
+                None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
+            },
             Request::SessionKill { name } => match self.session_kill(&name) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
@@ -823,6 +863,12 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
             CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
             CtlRequest::AnchorSet { url } => self.anchor_set(url).await.map(CtlResponse::Anchor),
+            CtlRequest::Connect { node, name } => return self.connect(&node, &name, agent, server).await,
+            CtlRequest::Publish { name, addr, proto, env } => self.publish(name, addr, proto, env).map(|path| CtlResponse::Published { path }),
+            CtlRequest::Unpublish { name } => self.unpublish(&name).map(|()| CtlResponse::Ok),
+            CtlRequest::Services { node } => {
+                self.remote_services(&node, agent_ref).await.map(|(node, services)| CtlResponse::Services { node, services })
+            }
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
                 anchor: self.roster().and_then(|r| r.anchor),
                 roster_version: self.roster_version(),
@@ -850,6 +896,8 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::WebRevoke { .. }
                 | CtlRequest::AnchorSet { .. }
                 | CtlRequest::AnchorShow
+                | CtlRequest::Publish { .. }
+                | CtlRequest::Unpublish { .. }
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -1705,6 +1753,181 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
+    // ------------------------------------------------------------ 发布服务（M3.1）
+
+    fn publish(&self, name: String, addr: std::net::SocketAddr, proto: String, env: Vec<(String, String)>) -> Result<String, WireError> {
+        let me = self.my_name()?;
+        if !valid_segment(&name) {
+            return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+        }
+        if !SERVICE_PROTOS.contains(&proto.as_str()) {
+            return Err(err(ErrorCode::InvalidInput, format!("不认识的协议 {proto}：可用 {}", SERVICE_PROTOS.join("、"))));
+        }
+        for (k, _) in &env {
+            let ok = !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !k.as_bytes()[0].is_ascii_digit();
+            if !ok {
+                return Err(err(ErrorCode::InvalidInput, format!("环境变量名 {k:?} 不合法")));
+            }
+        }
+        let mut services = self.services.borrow_mut();
+        if services.iter().any(|s| s.name == name) {
+            return Err(err(ErrorCode::InvalidInput, format!("服务 {name} 已经发布了")));
+        }
+        services.push(PublishedService { name: name.clone(), addr, proto, env });
+        save(&self.system, KEY_SERVICES, &*services).map_err(internal)?;
+        Ok(format!("{me}/{name}"))
+    }
+
+    fn unpublish(&self, name: &str) -> Result<(), WireError> {
+        let mut services = self.services.borrow_mut();
+        let before = services.len();
+        services.retain(|s| s.name != name);
+        if services.len() == before {
+            return Err(err(ErrorCode::NotFound, format!("没有发布服务 {name}")));
+        }
+        save(&self.system, KEY_SERVICES, &*services).map_err(internal)
+    }
+
+    fn my_name(&self) -> Result<String, WireError> {
+        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        roster.device(self.me()).map(|d| d.name.clone()).ok_or_else(|| internal("本机不在名册里"))
+    }
+
+    /// 本机发布的服务中，`may` 允许连接的那些。
+    fn service_list(&self, me: &str, may: impl Fn(&Action) -> bool) -> Vec<ServiceInfo> {
+        self.services
+            .borrow()
+            .iter()
+            .filter(|s| {
+                required_action(&Request::SvcConnect { name: s.name.clone() }, me).ok().flatten().is_some_and(|a| may(&a))
+            })
+            .map(PublishedService::info)
+            .collect()
+    }
+
+    fn service_addr(&self, name: &str) -> Option<std::net::SocketAddr> {
+        self.services.borrow().iter().find(|s| s.name == name).map(|s| s.addr)
+    }
+
+    async fn remote_services(&self, node: &str, agent: Option<&AgentCredential>) -> Result<(String, Vec<ServiceInfo>), WireError> {
+        let device = self.resolve_for(node, agent)?;
+        if device.node_id == self.me() {
+            self.authorize_local(agent, &Request::SvcList)?;
+            let list = self.service_list(&device.name, |a| agent.is_none_or(|ag| ag.cert.cert.grants.iter().any(|g| g.allows(a))));
+            return Ok((device.name, list));
+        }
+        match self.call_node(&device, Request::SvcList, agent).await? {
+            Response::Services(list) => Ok((device.name, list)),
+            other => Err(internal(format!("对方的回应无法理解：{other:?}"))),
+        }
+    }
+
+    /// 服务一侧：接到本机服务，然后双向转发，直到两个方向都结束。
+    async fn serve_pipe<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, addr: std::net::SocketAddr, name: &str) {
+        let mut local = match self.system.tcp_connect(addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                let failure = err(ErrorCode::Unreachable, format!("服务 {name} 的本机程序没有在运行（{e}）"));
+                let _ = write_msg(&mut stream, &Response::Error(failure)).await;
+                let _ = stream.shutdown().await;
+                drain(&mut stream).await;
+                return;
+            }
+        };
+        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+    }
+
+    /// `nexus connect`：调用方一侧把命令行的输入送到服务，把服务的输出送回命令行。
+    async fn connect(&self, node: &str, name: &str, agent: Option<AgentCredential>, server: CtlServer) {
+        let body = Request::SvcConnect { name: name.to_string() };
+        let device = match self.resolve_for(node, agent.as_ref()) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = server.tx.send(CtlResponse::Error(e)).await;
+                return;
+            }
+        };
+        if device.node_id == self.me() {
+            let check = required_action(&body, &device.name).and_then(|_| self.authorize_local(agent.as_ref(), &body));
+            let addr = check.and_then(|()| self.service_addr(name).ok_or_else(|| err(ErrorCode::NotFound, format!("本机没有发布服务 {name}"))));
+            let addr = match addr {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    return;
+                }
+            };
+            // 在本机：用内存管道连接两端，走和远端完全相同的代码。
+            let (near, far) = tokio::io::duplex(256 * 1024);
+            let client = async {
+                let mut near = near;
+                match read_msg::<_, Response>(&mut near).await {
+                    Ok(Response::Ok) => self.pump_pipe(near, server).await,
+                    Ok(Response::Error(e)) => {
+                        let _ = server.tx.send(CtlResponse::Error(e)).await;
+                    }
+                    other => {
+                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                    }
+                }
+            };
+            futures_util::future::join(self.serve_pipe(far, addr, name), client).await;
+            return;
+        }
+        for attempt in 0..2 {
+            let failure = match self.open_stream(&device, body.clone(), agent.as_ref()).await {
+                Ok(stream) => return self.pump_pipe(stream, server).await,
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                    continue;
+                }
+                Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
+                Err(OpenError::Remote(e)) => e,
+                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+            };
+            let _ = server.tx.send(CtlResponse::Error(failure)).await;
+            return;
+        }
+    }
+
+    async fn pump_pipe<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+        if server.tx.send(CtlResponse::Ok).await.is_err() {
+            return;
+        }
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut reading, mut writing) = (true, true);
+        while reading || writing {
+            tokio::select! {
+                n = rd.read(&mut buf), if reading => match n {
+                    Ok(0) | Err(_) => {
+                        reading = false;
+                        let _ = server.tx.send(CtlResponse::PipeEnd).await;
+                    }
+                    Ok(n) => {
+                        if server.tx.send(CtlResponse::PipeData(buf[..n].to_vec())).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+                input = server.rx.recv(), if writing => match input {
+                    Some(Input::Stdin(b)) => {
+                        if wr.write_all(&b).await.is_err() {
+                            writing = false;
+                        }
+                    }
+                    Some(_) | None => {
+                        writing = false;
+                        let _ = wr.shutdown().await;
+                    }
+                },
+            }
+        }
+    }
+
     async fn remote_session_kill(&self, node: &str, name: &str, agent: Option<&AgentCredential>) -> Result<(), WireError> {
         let device = self.resolve_for(node, agent)?;
         let body = Request::SessionKill { name: name.to_string() };
@@ -1962,6 +2185,18 @@ fn grants_see(grants: &[Grant], path: &ResourcePath) -> bool {
     grants.iter().any(|g| g.resource.may_match_within(path))
 }
 
+/// 一个主体是否被授权做这个动作（只看授权范围；身份和凭据已在请求入口校验过）。
+fn principal_may(roster: &Roster, principal: &Principal, action: &Action) -> bool {
+    match principal {
+        Principal::Device => true,
+        Principal::Agent { cert, .. } => cert.cert.grants.iter().any(|g| g.allows(action)),
+        Principal::Web { session } => roster
+            .web_key(&session.session.label)
+            .filter(|k| k.credential_id == session.session.credential_id)
+            .is_some_and(|k| k.grants.iter().any(|g| g.allows(action))),
+    }
+}
+
 /// 一个主体能否看到 `path`：设备本人看到一切，agent 和网页登录按各自的授权。
 fn principal_sees(roster: &Roster, principal: &Principal, path: &ResourcePath) -> bool {
     match principal {
@@ -2031,6 +2266,10 @@ mod tests {
     impl System for TestSystem {
         type Proc = TestProc;
         type Pty = TestPty;
+        type Tcp = DuplexStream;
+        async fn tcp_connect(&self, _: std::net::SocketAddr) -> io::Result<DuplexStream> {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        }
         fn now(&self) -> Timestamp {
             Timestamp(0)
         }
