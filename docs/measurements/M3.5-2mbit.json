@@ -1,0 +1,38 @@
+{
+  "rate_mbit": 2.0,
+  "seconds": 15,
+  "results": [
+    {
+      "scheduling": true,
+      "idle": {
+        "n": 15,
+        "p50_ms": 4.3,
+        "p95_ms": 6.1,
+        "max_ms": 6.1
+      },
+      "loaded": {
+        "n": 40,
+        "p50_ms": 17.3,
+        "p95_ms": 41.3,
+        "max_ms": 110.2
+      },
+      "throughput_mbit": 1.9
+    },
+    {
+      "scheduling": false,
+      "idle": {
+        "n": 15,
+        "p50_ms": 4.4,
+        "p95_ms": 5.1,
+        "max_ms": 5.1
+      },
+      "loaded": {
+        "n": 40,
+        "p50_ms": 295.1,
+        "p95_ms": 507.0,
+        "max_ms": 507.5
+      },
+      "throughput_mbit": 1.92
+    }
+  ]
+}

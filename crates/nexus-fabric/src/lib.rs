@@ -68,6 +68,10 @@ pub trait Connection {
     fn open_bi(&self) -> impl Future<Output = io::Result<Self::Stream>>;
     /// 对端关闭连接后返回 `Ok(None)`。
     fn accept_bi(&self) -> impl Future<Output = io::Result<Option<Self::Stream>>>;
+    /// 设置流在这一端的发送优先级，越大越先发（同一条连接上）。不支持的传输忽略。
+    fn set_priority(&self, stream: &mut Self::Stream, priority: i32) {
+        let _ = (stream, priority);
+    }
 }
 
 /// 在流上写一帧。

@@ -49,7 +49,7 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, relay, no_discovery, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
                 let tun = match tun {
                     None => None,
                     Some(dev) => match parse_tun_net(tun_net) {
@@ -83,6 +83,7 @@ fn main() {
                 };
                 let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
                 let mut config = transport_config(*local_only, relay, *no_discovery);
+                config.scheduling = !*no_scheduling;
                 // 锚点：先起中继和页面，本机也用自己的中继。
                 let _anchor = if anchor_args.enabled() {
                     if let Err(e) = std::fs::create_dir_all(&data_dir) {
@@ -260,7 +261,7 @@ fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config
         "disabled" => Relay::Disabled,
         url => Relay::Custom(url.to_string()),
     };
-    Config { relay, discovery: !no_discovery, bind: None, direct: true }
+    Config { relay, discovery: !no_discovery, bind: None, direct: true, scheduling: true }
 }
 
 /// `--tun-net`：网段的起点加前缀。

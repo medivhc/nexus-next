@@ -2939,6 +2939,7 @@ dependencies = [
  "nexus-core-proto",
  "nexus-fabric",
  "nexus-wire",
+ "noq-proto",
  "postcard",
  "tokio",
 ]

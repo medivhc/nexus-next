@@ -61,6 +61,47 @@ pub enum Request {
     ExitConnect { target: String },
 }
 
+/// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrafficClass {
+    /// 终端、控制、查询。
+    Interactive,
+    /// 远端命令：输出可能很大，但通常短。
+    Normal,
+    /// 服务和出口的连接。
+    Bulk,
+}
+
+impl TrafficClass {
+    /// 发送优先级，越大越先发。
+    pub fn priority(self) -> i32 {
+        match self {
+            TrafficClass::Interactive => 8,
+            TrafficClass::Normal => 0,
+            TrafficClass::Bulk => -8,
+        }
+    }
+}
+
+impl Request {
+    pub fn class(&self) -> TrafficClass {
+        match self {
+            Request::Exec(_) => TrafficClass::Normal,
+            Request::SvcConnect { .. } | Request::ExitConnect { .. } => TrafficClass::Bulk,
+            Request::NodeInfo
+            | Request::RosterSync
+            | Request::RosterPush { .. }
+            | Request::JoinOffer { .. }
+            | Request::WebEnroll { .. }
+            | Request::WebLogin { .. }
+            | Request::SessionAttach { .. }
+            | Request::SessionList
+            | Request::SessionKill { .. }
+            | Request::SvcList => TrafficClass::Interactive,
+        }
+    }
+}
+
 /// 完整节点的虚拟网卡。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunReport {

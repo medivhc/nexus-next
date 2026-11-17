@@ -81,6 +81,9 @@ pub enum Cmd {
         /// 不使用公共地址发现服务
         #[arg(long)]
         no_discovery: bool,
+        /// 关掉流量调度（只用于对比测量）
+        #[arg(long, hide = true)]
+        no_scheduling: bool,
         /// agent 入口（只接受 agent 凭据的本机套接字）的位置，默认在数据目录里。
         /// 要让以其他系统账号运行的 agent 使用 Nexus，把它放在那个账号能进入的目录，
         /// 并让 agent 设置同样的 NEXUS_AGENT_SOCKET

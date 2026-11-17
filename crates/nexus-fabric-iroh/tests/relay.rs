@@ -18,11 +18,11 @@ async fn local_relay() -> (iroh_relay::server::Server, String) {
 async fn relay_only_node_reaches_a_daemon_through_a_local_relay() {
     let (_relay, url) = local_relay().await;
     // 常驻程序：本机回环地址加中继。
-    let daemon = IrohTransport::bind([1; 32], Config { relay: Relay::Custom(url.clone()), discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true })
+    let daemon = IrohTransport::bind([1; 32], Config { relay: Relay::Custom(url.clone()), discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true, scheduling: true })
         .await
         .unwrap();
     // 网页节点的替身：没有任何直连地址，只能经中继。
-    let web = IrohTransport::bind([2; 32], Config { relay: Relay::Custom(url), discovery: false, bind: None, direct: false })
+    let web = IrohTransport::bind([2; 32], Config { relay: Relay::Custom(url), discovery: false, bind: None, direct: false, scheduling: true })
         .await
         .unwrap();
     web.add_hint(daemon.node_id(), &daemon.local_hint());

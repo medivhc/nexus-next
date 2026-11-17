@@ -706,7 +706,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 Some(()) = streams.next(), if !streams.is_empty() => {}
                 stream = &mut accept => match stream {
                     Ok(Some(stream)) => {
-                        streams.push(Box::pin(self.serve_stream(peer, proto, stream)));
+                        streams.push(Box::pin(self.serve_stream(&conn, peer, proto, stream)));
                         accept = Box::pin(conn.accept_bi());
                     }
                     _ => break,
@@ -716,18 +716,18 @@ impl<T: Transport, S: System> Node<T, S> {
         while streams.next().await.is_some() {}
     }
 
-    async fn serve_stream(&self, peer: NodeId, proto: Proto, mut stream: <T::Conn as Connection>::Stream) {
-        let dispatch = match read_msg::<_, RequestHeader>(&mut stream).await {
-            Ok(header) => match proto {
-                Proto::Rpc => self.handle_rpc(peer, header),
-                Proto::Join => Dispatch::Reply(self.handle_join(header)),
-                Proto::Web => match header.body {
-                    Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
-                    Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
-                    _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
-                },
+    async fn serve_stream(&self, conn: &T::Conn, peer: NodeId, proto: Proto, mut stream: <T::Conn as Connection>::Stream) {
+        let Ok(header) = read_msg::<_, RequestHeader>(&mut stream).await else { return };
+        // 回应方向的优先级由这一端定：和请求同一类。
+        conn.set_priority(&mut stream, header.body.class().priority());
+        let dispatch = match proto {
+            Proto::Rpc => self.handle_rpc(peer, header),
+            Proto::Join => Dispatch::Reply(self.handle_join(header)),
+            Proto::Web => match header.body {
+                Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
+                Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
+                _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
             },
-            Err(_) => return,
         };
         let response = match dispatch {
             Dispatch::Reply(r) => r,
@@ -940,6 +940,7 @@ impl<T: Transport, S: System> Node<T, S> {
     ) -> io::Result<(Response, Option<nexus_core_proto::PathKind>)> {
         let conn = self.transport.connect(to, proto).await?;
         let mut stream = conn.open_bi().await?;
+        conn.set_priority(&mut stream, body.class().priority());
         let header = RequestHeader { version: WIRE_VERSION, roster_version: self.roster_version(), principal, body };
         write_msg(&mut stream, &header).await?;
         stream.shutdown().await?;
@@ -1443,9 +1444,11 @@ impl<T: Transport, S: System> Node<T, S> {
         agent: Option<&AgentCredential>,
     ) -> Result<<T::Conn as Connection>::Stream, OpenError> {
         let principal = self.principal_for(agent, to, &body).map_err(OpenError::Remote)?;
+        let priority = body.class().priority();
         let open = async {
             let conn = self.transport.connect(to.node_id, Proto::Rpc).await?;
             let mut stream = conn.open_bi().await?;
+            conn.set_priority(&mut stream, priority);
             let header = RequestHeader { version: WIRE_VERSION, roster_version: self.roster_version(), principal, body };
             write_msg(&mut stream, &header).await?;
             let resp: Response = read_msg(&mut stream).await?;

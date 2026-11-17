@@ -375,6 +375,7 @@ impl World {
             discovery: false,
             bind: None,
             direct: false,
+            scheduling: true,
         };
         let t = nexus_fabric_iroh::IrohTransport::bind(seed, config).await.expect("浏览器的传输无法启动");
         self.trace.borrow_mut().push("browser".into());

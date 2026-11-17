@@ -42,6 +42,8 @@ iroh = { version = "1.4", default-features = false, features = ["tls-ring"] }
 tun-rs = { version = "2.8", features = ["async_tokio"] }
 ipstack = "1.0"
 iroh-relay = { version = "1.4", features = ["server"] }
+# iroh 的 QUIC 实现；只用它的拥塞控制配置，版本跟随 iroh。
+noq-proto = { version = "1.4", default-features = false }
 vt100 = "0.18"
 portable-pty = "0.9"
 crossterm = "0.29"

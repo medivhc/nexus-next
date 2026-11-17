@@ -5,7 +5,7 @@
 //! 没有提示也能按标识拨号。
 #![forbid(unsafe_code)]
 
-use iroh::endpoint::{presets, Connection as IrohConnection, RecvStream, SendStream};
+use iroh::endpoint::{presets, Connection as IrohConnection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use nexus_core_proto::{NodeId, PathKind};
 use nexus_fabric::{Connection, Proto, Transport};
@@ -36,18 +36,21 @@ pub struct Config {
     /// 是否使用直连（UDP）。`false` 时不开任何 UDP 套接字，只经中继通信，
     /// 和浏览器里的网页节点相同。
     pub direct: bool,
+    /// 流量调度（M3.5）：按带宽和时延控制发送量（BBR），不把排队推到网络里；
+    /// 同一条连接上按流的优先级发送。关掉只用于对比测量。
+    pub scheduling: bool,
 }
 
 impl Config {
     /// 只在本机回环地址上通信，不连任何外部服务。用于测试。
     pub fn local_only() -> Self {
-        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true }
+        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true, scheduling: true }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { relay: Relay::Default, discovery: true, bind: None, direct: true }
+        Self { relay: Relay::Default, discovery: true, bind: None, direct: true, scheduling: true }
     }
 }
 
@@ -61,6 +64,7 @@ pub struct IrohTransport {
     conns: RefCell<HashMap<NodeId, IrohConnection>>,
     /// 只经中继（浏览器）：地址提示里的 IP 地址用不上，留着反而让建立连接先在它们上面空等。
     relay_only: bool,
+    scheduling: bool,
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -78,6 +82,16 @@ impl IrohTransport {
         builder = builder
             .secret_key(SecretKey::from_bytes(&seed))
             .alpns(Proto::ALL.iter().map(|p| p.alpn().to_vec()).collect());
+        if config.scheduling {
+            // 默认的拥塞控制（CUBIC）一直加大发送量直到丢包，排队就推到了瓶颈处的缓冲里：
+            // 大下载时终端的每个字都要排在几百毫秒的队尾。BBR 按测得的带宽和最小时延发送，队列留在本端，
+            // 在本端再按流的优先级发。
+            builder = builder.transport_config(
+                QuicTransportConfig::builder()
+                    .congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()))
+                    .build(),
+            );
+        }
         let mut relay = None;
         builder = match &config.relay {
             Relay::Default => builder.relay_mode(RelayMode::Default),
@@ -106,6 +120,7 @@ impl IrohTransport {
             hints: RefCell::default(),
             conns: RefCell::default(),
             relay_only: !config.direct,
+            scheduling: config.scheduling,
         })
     }
 
@@ -153,7 +168,7 @@ impl Transport for IrohTransport {
             let cached = self.conns.borrow().get(&to).cloned();
             if let Some(conn) = cached {
                 if conn.close_reason().is_none() {
-                    return Ok(IrohConn { conn, remote: to });
+                    return Ok(IrohConn { conn, remote: to, scheduling: self.scheduling });
                 }
                 self.conns.borrow_mut().remove(&to);
             }
@@ -164,7 +179,7 @@ impl Transport for IrohTransport {
         if proto == Proto::Rpc {
             self.conns.borrow_mut().insert(to, conn.clone());
         }
-        Ok(IrohConn { conn, remote: to })
+        Ok(IrohConn { conn, remote: to, scheduling: self.scheduling })
     }
 
     async fn accept(&self) -> io::Result<(IrohConn, Proto)> {
@@ -178,7 +193,7 @@ impl Transport for IrohTransport {
             let Ok(conn) = incoming.await else { continue };
             let Some(proto) = Proto::from_alpn(conn.alpn()) else { continue };
             let remote = NodeId(*conn.remote_id().as_bytes());
-            return Ok((IrohConn { conn, remote }, proto));
+            return Ok((IrohConn { conn, remote, scheduling: self.scheduling }, proto));
         }
     }
 
@@ -218,6 +233,7 @@ pub fn hint_relay(hint: &str) -> Option<String> {
 pub struct IrohConn {
     conn: IrohConnection,
     remote: NodeId,
+    scheduling: bool,
 }
 
 impl Connection for IrohConn {
@@ -236,6 +252,12 @@ impl Connection for IrohConn {
     async fn open_bi(&self) -> io::Result<Self::Stream> {
         let (send, recv) = self.conn.open_bi().await.map_err(io_err)?;
         Ok(tokio::io::join(recv, send))
+    }
+
+    fn set_priority(&self, stream: &mut Self::Stream, priority: i32) {
+        if self.scheduling {
+            let _ = stream.writer().set_priority(priority);
+        }
     }
 
     async fn accept_bi(&self) -> io::Result<Option<Self::Stream>> {
