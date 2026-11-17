@@ -1,3 +1,5 @@
+mod tun;
+
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Ctl, Sink, EXIT_INTERNAL, EXIT_USAGE};
 use nexus_fabric::{read_msg, write_msg, FrameReader};
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
@@ -47,7 +49,18 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, proxy, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, relay, no_discovery, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+                let tun = match tun {
+                    None => None,
+                    Some(dev) => match parse_tun_net(tun_net) {
+                        Some(pool) => Some((dev.clone(), pool)),
+                        None => {
+                            let msg = format!("--tun-net 应当是网段的起点加前缀（8 到 29），例如 198.18.0.0/16：{tun_net}");
+                            Terminal.err(format!("{}\n", serde_json::json!({ "error": "invalid_input", "message": msg })).as_bytes());
+                            return nexus_cli::EXIT_INVALID_INPUT;
+                        }
+                    },
+                };
                 // 统一入口只对本机开放：别的机器连得上就等于把网络借给了它。
                 let proxy = match proxy.as_deref().map(str::parse::<std::net::SocketAddr>) {
                     None => None,
@@ -101,7 +114,7 @@ fn main() {
                     }
                     None
                 };
-                match daemon(&data_dir, &agent_socket, name.clone(), config, proxy).await {
+                match daemon(&data_dir, &agent_socket, name.clone(), config, proxy, tun).await {
                     Ok(()) => 0,
                     Err(e) => {
                         Terminal.err(format!("nexus daemon: {e}\n").as_bytes());
@@ -250,7 +263,21 @@ fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config
     Config { relay, discovery: !no_discovery, bind: None, direct: true }
 }
 
-async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, config: Config, proxy: Option<tokio::net::TcpListener>) -> io::Result<()> {
+/// `--tun-net`：网段的起点加前缀。
+fn parse_tun_net(s: &str) -> Option<nexus_net_core::fakeip::FakePool> {
+    let (ip, prefix) = s.split_once('/')?;
+    nexus_net_core::fakeip::FakePool::new(ip.parse().ok()?, prefix.parse().ok()?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn daemon(
+    data_dir: &Path,
+    agent_socket: &Path,
+    name: Option<String>,
+    config: Config,
+    proxy: Option<tokio::net::TcpListener>,
+    tun: Option<(String, nexus_net_core::fakeip::FakePool)>,
+) -> io::Result<()> {
     let system = RealSystem::new(data_dir)?;
     let key = load_or_create_device_key(&system)?;
     let name = name
@@ -261,6 +288,14 @@ async fn daemon(data_dir: &Path, agent_socket: &Path, name: Option<String>, conf
     let name = if name.is_empty() { "node".to_string() } else { name };
     let transport = IrohTransport::bind(key.to_seed(), config).await?;
     let node = Node::new(transport, system, &name)?;
+
+    // 虚拟网卡先于控制套接字：控制套接字出现时完整节点已经可用。
+    if let Some((dev, pool)) = tun {
+        let entry = node.enable_tun(&dev, pool.clone());
+        tun::start(&dev, &pool, entry).map_err(|e| io::Error::other(format!("无法建虚拟网卡 {dev}（需要管理员权限）：{e}")))?;
+        let (net, prefix) = pool.network();
+        eprintln!("nexus daemon: 完整节点：虚拟网卡 {dev}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
+    }
 
     let socket = data_dir.join("ctl.sock");
     let _ = std::fs::remove_file(&socket);

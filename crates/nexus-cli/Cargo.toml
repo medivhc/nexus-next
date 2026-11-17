@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tun-rs.workspace = true
+ipstack.workspace = true
 nexus-net-core.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true

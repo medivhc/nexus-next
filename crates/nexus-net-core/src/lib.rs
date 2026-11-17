@@ -410,3 +410,180 @@ pub mod route {
 pub struct RouteTable {
     pub rules: Vec<route::Rule>,
 }
+
+/// 完整节点的名字服务用到的 DNS 报文：只回答一个问题的普通查询，回答里只有地址记录。
+pub mod dns {
+    use core::net::IpAddr;
+
+    pub const A: u16 = 1;
+    pub const AAAA: u16 = 28;
+    pub const SERVFAIL: u8 = 2;
+    pub const NXDOMAIN: u8 = 3;
+    pub const NOTIMP: u8 = 4;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Query {
+        pub id: u16,
+        /// 小写，没有末尾的点。
+        pub name: String,
+        pub qtype: u16,
+        /// 查询方是否要求递归（回应里原样带回）。
+        recursion: bool,
+        /// 问题段的原始字节（回应里原样带回）。
+        question: Vec<u8>,
+    }
+
+    /// 一个查询；回应、多个问题、截断或不认识的报文返回 `None`。
+    pub fn parse_query(buf: &[u8]) -> Option<Query> {
+        if buf.len() < 12 {
+            return None;
+        }
+        let flags = u16::from_be_bytes([buf[2], buf[3]]);
+        let opcode = (flags >> 11) & 0xf;
+        if flags & 0x8000 != 0 || opcode != 0 || buf[4..6] != [0, 1] {
+            return None;
+        }
+        let mut pos = 12;
+        let mut labels: Vec<String> = Vec::new();
+        loop {
+            let len = *buf.get(pos)? as usize;
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            if len > 63 {
+                return None; // 问题里不应当有压缩指针
+            }
+            let label = buf.get(pos..pos + len)?;
+            labels.push(core::str::from_utf8(label).ok()?.to_ascii_lowercase());
+            pos += len;
+            if pos > 12 + 255 {
+                return None;
+            }
+        }
+        let tail = buf.get(pos..pos + 4)?;
+        Some(Query {
+            id: u16::from_be_bytes([buf[0], buf[1]]),
+            name: labels.join("."),
+            qtype: u16::from_be_bytes([tail[0], tail[1]]),
+            recursion: flags & 0x0100 != 0,
+            question: buf[12..pos + 4].to_vec(),
+        })
+    }
+
+    fn header(q: &Query, rcode: u8, answers: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + q.question.len());
+        out.extend_from_slice(&q.id.to_be_bytes());
+        // 回应、权威、可以递归；保留查询方的「要求递归」。
+        out.push(0x84 | u8::from(q.recursion));
+        out.push(0x80 | (rcode & 0x0f));
+        out.extend_from_slice(&[0, 1]);
+        out.extend_from_slice(&answers.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&q.question);
+        out
+    }
+
+    /// 回答：只带和问题类型一致的地址；没有时是没有回答的 NOERROR。
+    pub fn answer(q: &Query, ips: &[IpAddr], ttl: u32) -> Vec<u8> {
+        let records: Vec<&IpAddr> = ips
+            .iter()
+            .filter(|ip| matches!((ip, q.qtype), (IpAddr::V4(_), A) | (IpAddr::V6(_), AAAA)))
+            .take(16)
+            .collect();
+        let mut out = header(q, 0, records.len() as u16);
+        for ip in records {
+            out.extend_from_slice(&[0xc0, 12]);
+            out.extend_from_slice(&q.qtype.to_be_bytes());
+            out.extend_from_slice(&[0, 1]);
+            out.extend_from_slice(&ttl.to_be_bytes());
+            match ip {
+                IpAddr::V4(v4) => {
+                    out.extend_from_slice(&[0, 4]);
+                    out.extend_from_slice(&v4.octets());
+                }
+                IpAddr::V6(v6) => {
+                    out.extend_from_slice(&[0, 16]);
+                    out.extend_from_slice(&v6.octets());
+                }
+            }
+        }
+        out
+    }
+
+    /// 出错的回应（例如 NXDOMAIN）。
+    pub fn error(q: &Query, rcode: u8) -> Vec<u8> {
+        header(q, rcode, 0)
+    }
+}
+
+/// 完整节点给名字分配的本机临时地址：同一个名字总是同一个地址，地址可以反查名字；
+/// 用完时重新用最早分配的地址。网段的第一个地址留给网段本身，第二个给本机一侧，第三个给名字服务，最后一个是广播。
+pub mod fakeip {
+    use std::collections::BTreeMap;
+    use core::net::Ipv4Addr;
+
+    #[derive(Clone, Debug)]
+    pub struct FakePool {
+        base: u32,
+        prefix: u8,
+        /// 可分配地址的个数（从 base + 3 开始）。
+        size: u32,
+        next: u32,
+        by_name: BTreeMap<String, u32>,
+        by_ip: BTreeMap<u32, String>,
+    }
+
+    impl FakePool {
+        /// 网段要从起点给出，前缀在 8 到 29 之间。
+        pub fn new(net: Ipv4Addr, prefix: u8) -> Option<Self> {
+            if !(8..=29).contains(&prefix) {
+                return None;
+            }
+            let base = u32::from(net);
+            let mask = u32::MAX << (32 - prefix);
+            if base & !mask != 0 {
+                return None;
+            }
+            let size = (1u32 << (32 - prefix)) - 4;
+            Some(Self { base, prefix, size, next: 0, by_name: BTreeMap::new(), by_ip: BTreeMap::new() })
+        }
+
+        pub fn network(&self) -> (Ipv4Addr, u8) {
+            (Ipv4Addr::from(self.base), self.prefix)
+        }
+
+        /// 本机一侧（虚拟网卡）的地址。
+        pub fn gateway(&self) -> Ipv4Addr {
+            Ipv4Addr::from(self.base + 1)
+        }
+
+        /// 名字服务的地址。
+        pub fn dns(&self) -> Ipv4Addr {
+            Ipv4Addr::from(self.base + 2)
+        }
+
+        pub fn contains(&self, ip: Ipv4Addr) -> bool {
+            let ip = u32::from(ip);
+            ip >= self.base + 3 && ip < self.base + 3 + self.size
+        }
+
+        pub fn assign(&mut self, name: &str) -> Ipv4Addr {
+            if let Some(&ip) = self.by_name.get(name) {
+                return Ipv4Addr::from(ip);
+            }
+            let ip = self.base + 3 + self.next;
+            self.next = (self.next + 1) % self.size;
+            if let Some(old) = self.by_ip.remove(&ip) {
+                self.by_name.remove(&old);
+            }
+            self.by_name.insert(name.into(), ip);
+            self.by_ip.insert(ip, name.into());
+            Ipv4Addr::from(ip)
+        }
+
+        pub fn lookup(&self, ip: Ipv4Addr) -> Option<&str> {
+            self.by_ip.get(&u32::from(ip)).map(String::as_str)
+        }
+    }
+}

@@ -19,7 +19,8 @@ use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
 use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
 use nexus_net_core::http::{self, BadRequest, ProxyRequest};
 use nexus_net_core::route::{self, Decision, Outbound, Rule};
-use nexus_net_core::{sniff, socks5, Entry, Host, RouteTable, Target, SERVICE_SUFFIX};
+use nexus_net_core::fakeip::FakePool;
+use nexus_net_core::{dns, sniff, socks5, Entry, Host, RouteTable, Target, SERVICE_SUFFIX};
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
 use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
 use nexus_wire::{
@@ -277,6 +278,25 @@ const KEY_EXIT: &str = "exit";
 
 /// 统一入口上的一条连接（SOCKS5 或 HTTP 代理），由常驻程序从本机监听的端口交给节点。
 pub type ProxyStream = Box<dyn ProxyIo + Send>;
+
+/// 完整节点的虚拟网卡上收到的东西，由常驻程序交给节点（M3.4）。
+pub enum TunInbound {
+    /// 一条 TCP 连接，`dst` 是程序连的地址。
+    Tcp { stream: ProxyStream, dst: std::net::SocketAddr },
+    /// 一个发给名字服务的查询；回应从 `reply` 送回（为空时不回应）。
+    Dns { query: Vec<u8>, reply: tokio::sync::oneshot::Sender<Vec<u8>> },
+}
+
+/// 完整节点的虚拟网卡。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TunInfo {
+    pub name: String,
+    pub net: (std::net::Ipv4Addr, u8),
+    pub dns: std::net::Ipv4Addr,
+}
+
+/// 名字服务给出的回答的有效期（秒）。
+const DNS_TTL: u32 = 30;
 pub trait ProxyIo: AsyncRead + AsyncWrite + Unpin {}
 impl<X: AsyncRead + AsyncWrite + Unpin> ProxyIo for X {}
 
@@ -479,6 +499,10 @@ pub struct Node<T, S: System> {
     routes: RefCell<RouteTable>,
     proxy_tx: mpsc::UnboundedSender<ProxyStream>,
     proxy_rx: RefCell<Option<mpsc::UnboundedReceiver<ProxyStream>>>,
+    /// 完整节点：虚拟网卡的名字和本机临时地址。
+    tun: RefCell<Option<(String, FakePool)>>,
+    tun_tx: mpsc::UnboundedSender<TunInbound>,
+    tun_rx: RefCell<Option<mpsc::UnboundedReceiver<TunInbound>>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
     roster_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -505,11 +529,15 @@ impl<T: Transport, S: System> Node<T, S> {
         let routes = load::<_, RouteTable>(&system, KEY_ROUTES)?.unwrap_or_default();
         let exit_enabled = load::<_, bool>(&system, KEY_EXIT)?.unwrap_or(false);
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
+        let (tun_tx, tun_rx) = mpsc::unbounded_channel();
         Ok(Self {
             routes: RefCell::new(routes),
             exit_enabled: Cell::new(exit_enabled),
             proxy_tx,
             proxy_rx: RefCell::new(Some(proxy_rx)),
+            tun: RefCell::new(None),
+            tun_tx,
+            tun_rx: RefCell::new(Some(tun_rx)),
             services: RefCell::new(services),
             sessions: RefCell::default(),
             next_client: Cell::new(1),
@@ -533,6 +561,16 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 统一入口：常驻程序把本机入口上接受的连接从这里交给节点。
     pub fn proxy_entry(&self) -> mpsc::UnboundedSender<ProxyStream> {
         self.proxy_tx.clone()
+    }
+
+    /// 成为完整节点：常驻程序建好虚拟网卡后调用，之后把网卡上收到的东西从返回的通道交给节点。
+    pub fn enable_tun(&self, name: &str, pool: FakePool) -> mpsc::UnboundedSender<TunInbound> {
+        *self.tun.borrow_mut() = Some((name.to_string(), pool));
+        self.tun_tx.clone()
+    }
+
+    pub fn tun_info(&self) -> Option<TunInfo> {
+        self.tun.borrow().as_ref().map(|(name, pool)| TunInfo { name: name.clone(), net: pool.network(), dns: pool.dns() })
     }
 
     fn me(&self) -> NodeId {
@@ -602,6 +640,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut pushes = self.push_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut spawns = self.spawn_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut proxied = self.proxy_rx.borrow_mut().take().expect("run 只能调用一次");
+        let mut tunneled = self.tun_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
         tasks.push(Box::pin(self.follow_anchor()));
         // accept 不保证可以安全取消，所以让同一个 future 跨循环存活。
@@ -629,6 +668,12 @@ impl<T: Transport, S: System> Node<T, S> {
                 Some(conn) = proxied.recv() => {
                     tasks.push(Box::pin(self.serve_proxy(conn)));
                 }
+                Some(inbound) = tunneled.recv() => match inbound {
+                    TunInbound::Tcp { stream, dst } => tasks.push(Box::pin(self.serve_tun(stream, dst))),
+                    TunInbound::Dns { query, reply } => tasks.push(Box::pin(async move {
+                        let _ = reply.send(self.answer_dns(&query).await);
+                    })),
+                },
             }
         }
     }
@@ -985,6 +1030,11 @@ impl<T: Transport, S: System> Node<T, S> {
                 self.exit_enabled.set(enabled);
                 save(&self.system, KEY_EXIT, &enabled).map_err(internal).map(|()| CtlResponse::Exit { enabled })
             }
+            CtlRequest::TunShow => Ok(CtlResponse::Tun(self.tun_info().map(|t| nexus_wire::TunReport {
+                name: t.name,
+                net: format!("{}/{}", t.net.0, t.net.1),
+                dns: t.dns.to_string(),
+            }))),
             CtlRequest::ExitShow => Ok(CtlResponse::Exit { enabled: self.exit_enabled.get() }),
             CtlRequest::RouteList => Ok(CtlResponse::Routes(self.routes.borrow().rules.clone())),
             CtlRequest::RouteExplain { target } => self.route_explain(&target).map(CtlResponse::Explained),
@@ -2127,6 +2177,61 @@ impl<T: Transport, S: System> Node<T, S> {
             Decision::Rule { index, .. } => RouteExplanation::Rule { index: index as u32 + 1, rule: rules[index].clone() },
             Decision::Default(outbound) => RouteExplanation::Default { outbound },
         })
+    }
+
+    /// 名字服务：服务的名字和规则里不直连的域名给本机临时地址，其余照常解析。
+    async fn answer_dns(&self, raw: &[u8]) -> Vec<u8> {
+        let Some(q) = dns::parse_query(raw) else { return Vec::new() };
+        if self.tun.borrow().is_none() {
+            return dns::error(&q, dns::SERVFAIL);
+        }
+        let target = Target { host: Host::Name(q.name.clone()), port: 0 };
+        let capture = match route::decide(&target, &self.routes.borrow().rules) {
+            Decision::Service { device, .. } => {
+                if self.resolve(&device).is_err() {
+                    return dns::error(&q, dns::NXDOMAIN);
+                }
+                true
+            }
+            Decision::BadInternalName => return dns::error(&q, dns::NXDOMAIN),
+            Decision::Rule { outbound, .. } | Decision::Default(outbound) => outbound != Outbound::Direct,
+        };
+        if capture {
+            let ip = match self.tun.borrow_mut().as_mut() {
+                Some((_, pool)) => pool.assign(&q.name),
+                None => return dns::error(&q, dns::SERVFAIL),
+            };
+            return dns::answer(&q, &[std::net::IpAddr::V4(ip)], DNS_TTL);
+        }
+        if q.qtype != dns::A && q.qtype != dns::AAAA {
+            return dns::answer(&q, &[], DNS_TTL);
+        }
+        match self.system.resolve(&q.name).await {
+            Ok(ips) => dns::answer(&q, &ips, DNS_TTL),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => dns::error(&q, dns::NXDOMAIN),
+            Err(_) => dns::error(&q, dns::SERVFAIL),
+        }
+    }
+
+    /// 虚拟网卡上的一条 TCP 连接：按地址找回名字，然后和统一入口一样按路由接到出口。
+    async fn serve_tun(&self, mut client: ProxyStream, dst: std::net::SocketAddr) {
+        let name = match (dst.ip(), self.tun.borrow().as_ref()) {
+            (std::net::IpAddr::V4(ip), Some((_, pool))) => pool.lookup(ip).map(str::to_string),
+            _ => None,
+        };
+        let Some(name) = name else {
+            let _ = client.shutdown().await;
+            return;
+        };
+        let target = Target { host: Host::Name(name), port: dst.port() };
+        match self.open_outbound(&target).await {
+            Ok(up) => {
+                let _ = up.splice(client, Vec::new()).await;
+            }
+            Err(_) => {
+                let _ = client.shutdown().await;
+            }
+        }
     }
 
     /// 入口上的一条连接：按第一个字节分辨 SOCKS5 和 HTTP 代理，读出目标，按路由接到出口，然后双向转发。

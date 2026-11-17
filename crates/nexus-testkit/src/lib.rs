@@ -386,8 +386,24 @@ impl World {
     pub async fn restart(&self, node: &str, args: &[&str]) {
         let Inner::Real(real) = &self.inner else { panic!("restart 只用于真实后端") };
         real.kill(node);
+        // 被杀掉的常驻程序留下的控制套接字文件不代表新的已经就绪。
+        let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
         real.spawn_daemon(node, args);
         real.wait_ready(node);
+    }
+
+    /// 把节点的常驻程序换成完整节点（虚拟网卡 + 名字服务）重新启动。只在真实后端；需要 CAP_NET_ADMIN。
+    pub async fn full_node(&self, node: &str) -> FullNode {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 同一台机器上并行的测试各用一张网卡、一个网段。
+        let tag = (std::process::id() % 1000) * 64 + n % 64;
+        let name = format!("nxt{tag}");
+        let net = std::net::Ipv4Addr::new(198, 18, (tag % 250) as u8 + 1, 0);
+        let net_arg = format!("{net}/24");
+        self.restart(node, &["--local-only", "--tun", &name, "--tun-net", &net_arg]).await;
+        let o = net.octets();
+        FullNode { net, dns: std::net::Ipv4Addr::new(o[0], o[1], o[2], 2) }
     }
 
     /// 节点的常驻程序到目前为止的日志（只在真实后端）。
@@ -1460,6 +1476,95 @@ pub fn http_get(port: u16, path: &str) -> io::Result<String> {
     write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)?;
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io::Error::other("回应没有头部"))?;
+    Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
+}
+
+/// 一个完整节点，见 [`World::full_node`]。用系统的网络栈访问它，就像普通程序那样。
+pub struct FullNode {
+    net: std::net::Ipv4Addr,
+    dns: std::net::Ipv4Addr,
+}
+
+impl FullNode {
+    pub fn net(&self) -> (std::net::Ipv4Addr, u8) {
+        (self.net, 24)
+    }
+
+    pub fn dns(&self) -> std::net::Ipv4Addr {
+        self.dns
+    }
+
+    /// 地址是否在完整节点的网段里（名字服务、本机一侧除外）。
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let (a, b) = (v4.octets(), self.net.octets());
+                a[..3] == b[..3] && a[3] > 2 && a[3] < 255
+            }
+            _ => false,
+        }
+    }
+
+    /// 向名字服务查询（qtype 1 是 IPv4，28 是 IPv6）。返回地址，或出错的 rcode。
+    pub fn resolve(&self, name: &str, qtype: u16) -> Result<Vec<std::net::IpAddr>, u8> {
+        let mut q = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.extend_from_slice(&[0, (qtype >> 8) as u8, qtype as u8, 0, 1]);
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("UDP");
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 1500];
+        let n = (0..5)
+            .find_map(|_| {
+                sock.send_to(&q, (self.dns, 53)).ok()?;
+                sock.recv(&mut buf).ok()
+            })
+            .unwrap_or_else(|| panic!("名字服务 {} 没有回应 {name}", self.dns));
+        let r = &buf[..n];
+        assert_eq!(&r[..2], &[0xab, 0xcd], "回应的 id 不对");
+        let rcode = r[3] & 0x0f;
+        if rcode != 0 {
+            return Err(rcode);
+        }
+        let answers = u16::from_be_bytes([r[6], r[7]]);
+        // 跳过问题段，逐条读回答（名字都是压缩指针）。
+        let mut pos = q.len();
+        let mut out = Vec::new();
+        for _ in 0..answers {
+            assert_eq!(r[pos] & 0xc0, 0xc0, "回答的名字应当是压缩指针");
+            let rtype = u16::from_be_bytes([r[pos + 2], r[pos + 3]]);
+            let len = u16::from_be_bytes([r[pos + 10], r[pos + 11]]) as usize;
+            let data = &r[pos + 12..pos + 12 + len];
+            match (rtype, len) {
+                (1, 4) => out.push(std::net::IpAddr::from(<[u8; 4]>::try_from(data).unwrap())),
+                (28, 16) => out.push(std::net::IpAddr::from(<[u8; 16]>::try_from(data).unwrap())),
+                _ => panic!("意外的回答类型 {rtype}"),
+            }
+            pos += 12 + len;
+        }
+        Ok(out)
+    }
+
+    /// 用系统的网络栈连 `ip:port`，发一个 HTTP GET，返回正文；连接被关闭时正文为空。
+    pub fn http_get(&self, ip: std::net::IpAddr, port: u16, path: &str) -> io::Result<String> {
+        http_get_at((ip, port).into(), path)
+    }
+}
+
+/// 一个 HTTP GET（Connection: close），返回正文；对方不回应就关闭时正文为空。
+pub fn http_get_at(addr: std::net::SocketAddr, path: &str) -> io::Result<String> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io::Error::other("回应没有头部"))?;
     Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
 }

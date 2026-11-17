@@ -61,6 +61,16 @@ pub enum Request {
     ExitConnect { target: String },
 }
 
+/// 完整节点的虚拟网卡。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunReport {
+    pub name: String,
+    /// 网段，例如 198.18.0.0/16。
+    pub net: String,
+    /// 名字服务的地址。
+    pub dns: String,
+}
+
 /// `nexus route explain` 的结果。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteExplanation {
@@ -271,6 +281,8 @@ pub enum CtlRequest {
     /// 开放或关闭本机的出口。
     ExitSet { enabled: bool },
     ExitShow,
+    /// 完整节点的虚拟网卡（不是完整节点时为空）。
+    TunShow,
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -305,6 +317,7 @@ pub enum CtlResponse {
     Routes(Vec<nexus_net_core::route::Rule>),
     Explained(RouteExplanation),
     Exit { enabled: bool },
+    Tun(Option<TunReport>),
     Ok,
     Error(WireError),
 }

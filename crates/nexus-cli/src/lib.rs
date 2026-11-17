@@ -63,6 +63,8 @@ pub struct Cli {
     pub cmd: Cmd,
 }
 
+// 命令行只解析一次，变体大小不重要。
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// 运行常驻程序
@@ -87,6 +89,12 @@ pub enum Cmd {
         /// 本机统一入口（SOCKS5 和 HTTP 代理同一个端口）的监听地址，例如 127.0.0.1:1080；只能是本机地址
         #[arg(long, value_name = "地址:端口")]
         proxy: Option<String>,
+        /// 成为完整节点：建这个名字的虚拟网卡，系统里的程序不设代理按名字访问服务（需要管理员权限）
+        #[arg(long, value_name = "网卡名")]
+        tun: Option<String>,
+        /// 完整节点的网段：本机临时地址从这里分配，第三个地址是名字服务
+        #[arg(long, value_name = "地址/前缀", requires = "tun", default_value = "198.18.0.0/16")]
+        tun_net: String,
         #[command(flatten)]
         anchor: AnchorArgs,
     },
@@ -811,7 +819,12 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
     };
     let text = match resp {
         CtlResponse::Error(e) => return fail_wire(sink, &e),
-        CtlResponse::Exec(_) | CtlResponse::Session(_) | CtlResponse::SshHostKey(_) | CtlResponse::PipeData(_) | CtlResponse::PipeEnd => {
+        CtlResponse::Exec(_)
+        | CtlResponse::Session(_)
+        | CtlResponse::SshHostKey(_)
+        | CtlResponse::PipeData(_)
+        | CtlResponse::PipeEnd
+        | CtlResponse::Tun(_) => {
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
         CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },
@@ -1044,7 +1057,29 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 out
             }
         }
-        CtlResponse::Status(r) => if json { doc(status_json(&r)) } else { status_text(&r) },
+        CtlResponse::Status(r) => {
+            // 本机的状态里加上完整节点的虚拟网卡。
+            let tun = match cmd {
+                Cmd::Status { node: None, .. } => match call(ctl, CtlRequest::TunShow).await {
+                    Ok(CtlResponse::Tun(t)) => t,
+                    _ => None,
+                },
+                _ => None,
+            };
+            if json {
+                let mut v = status_json(&r);
+                if let Some(t) = &tun {
+                    v["tun"] = json!({ "name": t.name, "net": t.net, "dns": t.dns });
+                }
+                doc(v)
+            } else {
+                let mut out = status_text(&r);
+                if let Some(t) = &tun {
+                    out.push_str(&format!("  完整节点：虚拟网卡 {}，网段 {}，名字服务 {}\n", t.name, t.net, t.dns));
+                }
+                out
+            }
+        }
         CtlResponse::List(entries) => if json { list_json(&entries) } else { list_text(&entries) },
         CtlResponse::Init(r) => {
             let v = json!({
