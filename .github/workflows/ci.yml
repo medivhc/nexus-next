@@ -9,7 +9,8 @@
 #
 # The workflow intentionally calls tools/ci.sh instead of duplicating its
 # steps, so local CI and Actions CI can never drift apart. If a step needs
-# to change, change tools/ci.sh, not this file.
+# to change, change tools/ci.sh, not this file. Runner-environment prep
+# (e.g. freeing disk) is the exception: it lives here, before the build.
 name: CI
 
 on:
@@ -34,6 +35,20 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        # 2026-11-17: main run 44029489521 died with ENOSPC (72 MB left)
+        # while writing the iroh rlib. ubuntu-24.04 runners start with
+        # ~14 GB free; the restored cargo cache plus a full test compile
+        # exceeds it. Remove preinstalled toolchains this repo never uses
+        # (Android SDK, .NET, GHC, CodeQL) and prune Docker images.
+        # Keep node/python in the toolcache: later actions run on them.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          df -h /
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -56,3 +71,4 @@ jobs:
           name: nexus-ci-log
           path: /tmp/nexus-ci.log
           if-no-files-found: ignore
+
