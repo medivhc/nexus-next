@@ -15,8 +15,21 @@ step "编译测试"                cargo test --no-run --quiet
 step "L1 纯逻辑"               cargo test --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-sys-sim -p nexus-web-core
 step "L1 命令行与运行时单元"   cargo test --quiet -p nexus-cli -p nexus-runtime --lib --bins
 step "L2 仿真场景"             cargo test --quiet --test scenarios --test terminal --test agent --test web --test anchor --test services --test proxy --test exit --test fullnode -- sim
+# 完整节点的场景要建虚拟网卡（CAP_NET_ADMIN）：不是 root 但能免密 sudo 时（例如 GitHub 的 runner），
+# 给测试用的二进制加上这项能力；都不行时跳过这些场景并说明。
+FULLNODE="--test fullnode"
+SUDO=""
+if [ "$(id -u)" != 0 ]; then
+  if sudo -n true 2>/dev/null; then
+    SUDO="sudo -n"
+    sudo -n setcap cap_net_admin+ep target/debug/nexus
+  else
+    echo "跳过完整节点的真实场景：不是 root，也不能免密 sudo（需要 CAP_NET_ADMIN 建虚拟网卡）"
+    FULLNODE=""
+  fi
+fi
 step "L3 本机中继"             cargo test --quiet -p nexus-fabric-iroh --test relay
-step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web --test anchor --test services --test proxy --test exit --test fullnode -- real
+step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web --test anchor --test services --test proxy --test exit $FULLNODE -- real
 # 需要 root、ip、tc；不满足时跳过（脚本自己说明原因）。
-step "L3 满载测量"             python3 tools/sched_bench.py --only-scheduled
+step "L3 满载测量"             $SUDO python3 tools/sched_bench.py --only-scheduled
 echo "全部通过"
