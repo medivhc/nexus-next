@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 10;
+pub const WIRE_VERSION: u16 = 11;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -57,6 +57,8 @@ pub enum Request {
     SvcConnect { name: String },
     /// 列出对方发布的、调用者能用的服务。
     SvcList,
+    /// 经对方出去：对方连到 `target`（主机:端口），之后同 `SvcConnect`。对方要先开放出口。
+    ExitConnect { target: String },
 }
 
 /// `nexus route explain` 的结果。
@@ -266,6 +268,9 @@ pub enum CtlRequest {
     RouteList,
     /// 说明 `target`（主机:端口）会走哪里。
     RouteExplain { target: String },
+    /// 开放或关闭本机的出口。
+    ExitSet { enabled: bool },
+    ExitShow,
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -299,6 +304,7 @@ pub enum CtlResponse {
     RouteAdded { index: u32 },
     Routes(Vec<nexus_net_core::route::Rule>),
     Explained(RouteExplanation),
+    Exit { enabled: bool },
     Ok,
     Error(WireError),
 }

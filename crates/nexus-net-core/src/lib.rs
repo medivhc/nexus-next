@@ -152,6 +152,49 @@ pub mod socks5 {
     pub fn reply(r: Reply) -> [u8; 10] {
         [5, r as u8, 0, 1, 0, 0, 0, 0, 0, 0]
     }
+
+    /// 作为客户端连上游代理时的请求（CONNECT）。名字原样交给上游，不在本机解析。
+    pub fn request(target: &Target) -> Vec<u8> {
+        let mut out = vec![5, 1, 0];
+        match &target.host {
+            Host::Ip(IpAddr::V4(ip)) => {
+                out.push(1);
+                out.extend_from_slice(&ip.octets());
+            }
+            Host::Ip(IpAddr::V6(ip)) => {
+                out.push(4);
+                out.extend_from_slice(&ip.octets());
+            }
+            Host::Name(name) => {
+                out.push(3);
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
+        }
+        out.extend_from_slice(&target.port.to_be_bytes());
+        out
+    }
+
+    /// 上游代理的回应。返回（消耗的字节，回应码）；不完整时 `None`；无法理解时 `Err`。
+    /// 上游代理的回应无法理解。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct BadReply;
+
+    pub fn parse_reply(buf: &[u8]) -> Result<Option<(usize, u8)>, BadReply> {
+        if buf.len() < 5 {
+            return Ok(None);
+        }
+        if buf[0] != 5 {
+            return Err(BadReply);
+        }
+        let len = match buf[3] {
+            1 => 4 + 4 + 2,
+            4 => 4 + 16 + 2,
+            3 => 4 + 1 + buf[4] as usize + 2,
+            _ => return Err(BadReply),
+        };
+        Ok((buf.len() >= len).then_some((len, buf[1])))
+    }
 }
 
 pub mod http {
@@ -306,6 +349,10 @@ pub mod route {
     pub enum Outbound {
         Direct,
         Reject,
+        /// 经网络里的这台设备出去。
+        Exit(String),
+        /// 交给这个上游 SOCKS5 代理（主机:端口）。
+        Socks5(String),
     }
 
     impl core::fmt::Display for Outbound {
@@ -313,6 +360,8 @@ pub mod route {
             match self {
                 Outbound::Direct => write!(f, "直连"),
                 Outbound::Reject => write!(f, "拒绝"),
+                Outbound::Exit(device) => write!(f, "经 {device} 出去"),
+                Outbound::Socks5(upstream) => write!(f, "经上游代理 {upstream}"),
             }
         }
     }

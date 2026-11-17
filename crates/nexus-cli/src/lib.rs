@@ -159,6 +159,13 @@ pub enum Cmd {
         #[arg(long, value_name = "地址:端口")]
         listen: Option<String>,
     },
+    /// 本机作为出口：开放后，名册里的设备可以经本机访问外网（路由规则 --via 本机）
+    ///
+    /// agent 和网页登录需要授权 net.exit@<本机>/exit。出口不替别人连本机地址。
+    Exit {
+        #[command(subcommand)]
+        cmd: ExitCmd,
+    },
     /// 统一入口的路由规则：名字以 .internal 结尾的去网络里的服务，其余按规则，第一条匹配的生效，都不匹配时直连
     Route {
         #[command(subcommand)]
@@ -424,10 +431,32 @@ pub enum AnchorCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ExitCmd {
+    /// 开放出口
+    On {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 关闭出口
+    Off {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 出口是否开放
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum RouteCmd {
     /// 加一条规则（加在最后）
     ///
     /// 例：nexus route add --domain example.com --reject
+    ///     nexus route add --domain example.com --via anchor
+    ///     nexus route add --cidr 10.0.0.0/8 --socks5 127.0.0.1:7890
+    #[command(group = clap::ArgGroup::new("outbound").required(true))]
     Add {
         /// 匹配这个域名和它的子域名
         #[arg(long, value_name = "域名", required_unless_present = "cidr", conflicts_with = "cidr")]
@@ -436,11 +465,17 @@ pub enum RouteCmd {
         #[arg(long, value_name = "地址/前缀")]
         cidr: Option<String>,
         /// 拒绝
-        #[arg(long, required_unless_present = "direct", conflicts_with = "direct")]
+        #[arg(long, group = "outbound")]
         reject: bool,
         /// 直连
-        #[arg(long)]
+        #[arg(long, group = "outbound")]
         direct: bool,
+        /// 经网络里的这台设备出去（它要先 nexus exit on）
+        #[arg(long, value_name = "设备", group = "outbound")]
+        via: Option<String>,
+        /// 交给这个上游 SOCKS5 代理，例如 127.0.0.1:7890
+        #[arg(long, value_name = "主机:端口", group = "outbound")]
+        socks5: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -695,7 +730,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Some(addr) => connect_listen(ctl, node, name, addr, sink).await,
             };
         }
-        Cmd::Route { cmd: RouteCmd::Add { domain, cidr, reject, json, .. } } => {
+        Cmd::Route { cmd: RouteCmd::Add { domain, cidr, reject, via, socks5, json, .. } } => {
             let matcher = match (domain, cidr) {
                 (Some(d), _) => route::Matcher::parse_domain(d),
                 (None, Some(c)) => route::Matcher::parse_cidr(c),
@@ -705,9 +740,17 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Ok(m) => m,
                 Err(msg) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg),
             };
-            let outbound = if *reject { route::Outbound::Reject } else { route::Outbound::Direct };
+            let outbound = match (via, socks5) {
+                (Some(device), _) => route::Outbound::Exit(device.clone()),
+                (None, Some(upstream)) => route::Outbound::Socks5(upstream.clone()),
+                (None, None) if *reject => route::Outbound::Reject,
+                (None, None) => route::Outbound::Direct,
+            };
             (CtlRequest::RouteAdd { rule: route::Rule { matcher, outbound } }, *json)
         }
+        Cmd::Exit { cmd: ExitCmd::On { json } } => (CtlRequest::ExitSet { enabled: true }, *json),
+        Cmd::Exit { cmd: ExitCmd::Off { json } } => (CtlRequest::ExitSet { enabled: false }, *json),
+        Cmd::Exit { cmd: ExitCmd::Status { json } } => (CtlRequest::ExitShow, *json),
         Cmd::Route { cmd: RouteCmd::Rm { index, json } } => (CtlRequest::RouteRm { index: *index }, *json),
         Cmd::Route { cmd: RouteCmd::Ls { json } } => (CtlRequest::RouteList, *json),
         Cmd::Route { cmd: RouteCmd::Explain { target, json } } => {
@@ -902,6 +945,15 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
             _ => String::new(),
         },
+        CtlResponse::Exit { enabled } => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "exit": enabled }))
+            } else if enabled {
+                "出口已开放：名册里的设备可以经本机访问外网（不包括本机地址）\n".to_string()
+            } else {
+                "出口没有开放\n".to_string()
+            }
+        }
         CtlResponse::RouteAdded { index } => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "index": index }))
@@ -914,7 +966,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 let list: Vec<Value> = rules
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| json!({ "index": i + 1, "match": r.matcher.to_string(), "outbound": outbound_key(&r.outbound) }))
+                    .map(|(i, r)| outbound_json(&r.outbound, json!({ "index": i + 1, "match": r.matcher.to_string() })))
                     .collect();
                 doc(json!({ "schema": JSON_SCHEMA, "rules": list }))
             } else if rules.is_empty() {
@@ -935,9 +987,9 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     }
                     RouteExplanation::BadInternalName => json!({ "outbound": "invalid", "rule": null }),
                     RouteExplanation::Rule { index, rule } => {
-                        json!({ "outbound": outbound_key(&rule.outbound), "rule": index, "match": rule.matcher.to_string() })
+                        outbound_json(&rule.outbound, json!({ "rule": index, "match": rule.matcher.to_string() }))
                     }
-                    RouteExplanation::Default { outbound } => json!({ "outbound": outbound_key(outbound), "rule": null }),
+                    RouteExplanation::Default { outbound } => outbound_json(outbound, json!({ "rule": null })),
                 };
                 let mut v = v;
                 v["schema"] = json!(JSON_SCHEMA);
@@ -1580,11 +1632,19 @@ async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen
     }
 }
 
-fn outbound_key(o: &route::Outbound) -> &'static str {
-    match o {
-        route::Outbound::Direct => "direct",
-        route::Outbound::Reject => "reject",
+/// 出口在 JSON 里的样子：`outbound`，出口设备另有 `via`，上游代理另有 `upstream`。
+fn outbound_json(o: &route::Outbound, mut v: Value) -> Value {
+    let (key, extra) = match o {
+        route::Outbound::Direct => ("direct", None),
+        route::Outbound::Reject => ("reject", None),
+        route::Outbound::Exit(device) => ("exit", Some(("via", device))),
+        route::Outbound::Socks5(upstream) => ("socks5", Some(("upstream", upstream))),
+    };
+    v["outbound"] = json!(key);
+    if let Some((k, x)) = extra {
+        v[k] = json!(x);
     }
+    v
 }
 
 /// `nexus run`：为每个用到的服务在本机开一个临时端口，设置环境变量，运行程序，程序退出后关闭端口。

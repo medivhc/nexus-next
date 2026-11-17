@@ -2794,6 +2794,7 @@ name = "nexus-sys-sim"
 version = "0.0.1"
 dependencies = [
  "nexus-core-proto",
+ "nexus-net-core",
  "nexus-sys",
  "tokio",
  "turmoil",
@@ -2818,6 +2819,7 @@ dependencies = [
  "nexus-fabric",
  "nexus-fabric-iroh",
  "nexus-fabric-sim",
+ "nexus-net-core",
  "nexus-runtime",
  "nexus-sys",
  "nexus-sys-sim",

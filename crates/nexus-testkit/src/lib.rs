@@ -59,6 +59,24 @@ impl World {
         }
     }
 
+    /// 在节点上开一个从「外面」连得到的服务，返回（地址，端口）。
+    /// 仿真里只有用这个地址才连得上，而且只在这个节点上；真实后端里是这台机器的一个非本机地址。
+    pub async fn serve_public(&self, node: &str, service: Service) -> (String, u16) {
+        match &self.inner {
+            Inner::Sim { services, next_port, .. } => {
+                let port = next_port.get();
+                next_port.set(port + 1);
+                let ip = std::net::IpAddr::from([198, 51, 100, 7]);
+                services.get(node).unwrap_or_else(|| panic!("没有节点 {node}")).add_public((ip, port).into(), service);
+                (ip.to_string(), port)
+            }
+            Inner::Real(_) => {
+                let ip = public_ip();
+                (ip.to_string(), serve_on(std::net::SocketAddr::new(ip, 0), service))
+            }
+        }
+    }
+
     /// 节点的本机统一入口（SOCKS5 / HTTP 代理）。
     pub fn proxy(&self, node: &str) -> ProxyClient {
         match &self.inner {
@@ -1026,20 +1044,7 @@ impl RealWorld {
     ///
     /// 服务跑在自己的线程里：执行命令行时测试线程会同步等待子进程，服务不能依赖测试线程。
     async fn serve(&self, service: Service) -> u16 {
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("无法监听");
-        let port = std_listener.local_addr().unwrap().port();
-        std_listener.set_nonblocking(true).unwrap();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("测试服务的运行时");
-            rt.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
-                loop {
-                    let Ok((s, _)) = listener.accept().await else { return };
-                    tokio::spawn(run_test_service(service.clone(), s));
-                }
-            });
-        });
-        port
+        serve_on(([127, 0, 0, 1], 0).into(), service)
     }
 
     fn proxy_port(&self, node: &str) -> u16 {
@@ -1459,8 +1464,84 @@ pub fn http_get(port: u16, path: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
 }
 
+/// 在自己的线程里运行一个测试服务（测试的命令行是同步等待的，不能和它共用线程）。
+fn serve_on(addr: std::net::SocketAddr, service: Service) -> u16 {
+    let std_listener = std::net::TcpListener::bind(addr).expect("无法监听");
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("测试服务的运行时");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
+            loop {
+                let Ok((s, _)) = listener.accept().await else { return };
+                tokio::spawn(run_test_service(service.clone(), s));
+            }
+        });
+    });
+    port
+}
+
+/// 这台机器对外的地址（不发任何数据包：UDP 的 connect 只选路由）。
+fn public_ip() -> std::net::IpAddr {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").expect("无法打开 UDP");
+    s.connect("203.0.113.1:9").expect("这台机器没有对外的路由，无法测试出口");
+    let ip = s.local_addr().unwrap().ip();
+    assert!(!ip.is_loopback() && !ip.is_unspecified(), "这台机器没有非本机地址：{ip}");
+    ip
+}
+
 async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
     match service {
+        Service::Socks5Upstream => {
+            use nexus_net_core::socks5;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut read_more = async |s: &mut tokio::net::TcpStream, buf: &mut Vec<u8>| match s.read(&mut chunk).await {
+                Ok(0) | Err(_) => false,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    true
+                }
+            };
+            let used = loop {
+                match socks5::parse_greeting(&buf) {
+                    Ok(Some((n, _))) => break n,
+                    Ok(None) if read_more(&mut s, &mut buf).await => {}
+                    _ => return,
+                }
+            };
+            buf.drain(..used);
+            let _ = s.write_all(&socks5::NO_AUTH).await;
+            let target = loop {
+                match socks5::parse_request(&buf) {
+                    Ok(Some((n, t))) => {
+                        buf.drain(..n);
+                        break t;
+                    }
+                    Ok(None) if read_more(&mut s, &mut buf).await => {}
+                    _ => return,
+                }
+            };
+            if matches!(&target.host, nexus_net_core::Host::Name(h) if h.starts_with("refuse.")) {
+                let _ = s.write_all(&socks5::reply(socks5::Reply::ConnectionRefused)).await;
+                let _ = s.shutdown().await;
+                return;
+            }
+            let _ = s.write_all(&socks5::reply(socks5::Reply::Succeeded)).await;
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                if !read_more(&mut s, &mut buf).await {
+                    return;
+                }
+            }
+            let body = format!("via upstream to {target}");
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(reply.as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
         Service::Echo => {
             let (mut r, mut w) = s.split();
             let _ = tokio::io::copy(&mut r, &mut w).await;

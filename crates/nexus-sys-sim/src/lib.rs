@@ -45,7 +45,7 @@ pub struct SimSystem {
 
 /// 仿真节点上「本机运行着的 TCP 服务」，按端口登记。克隆后共享，测试可以随时增加。
 #[derive(Clone, Default)]
-pub struct SimServices(Rc<RefCell<BTreeMap<u16, SimService>>>);
+pub struct SimServices(Rc<RefCell<BTreeMap<u16, SimService>>>, Rc<RefCell<BTreeMap<std::net::SocketAddr, SimService>>>);
 
 /// 仿真里的本机服务。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,11 +54,19 @@ pub enum SimService {
     Echo,
     /// 读完一个 HTTP 请求头，回应 200 和这段正文，然后关闭。
     Http(String),
+    /// 一个上游 SOCKS5 代理（测试用）：不认证；目标名字以 `refuse.` 开头时回应「连接被拒绝」，
+    /// 否则回应成功，再像 `Http` 那样回应正文 `via upstream to <目标>`。
+    Socks5Upstream,
 }
 
 impl SimServices {
     pub fn add(&self, port: u16, service: SimService) {
         self.0.borrow_mut().insert(port, service);
+    }
+
+    /// 一个从「外面」连得到的服务：只有用这个地址才连得上，本机地址连不上。
+    pub fn add_public(&self, addr: std::net::SocketAddr, service: SimService) {
+        self.1.borrow_mut().insert(addr, service);
     }
 }
 
@@ -87,9 +95,13 @@ impl System for SimSystem {
     type Tcp = SimTcp;
 
     async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<SimTcp> {
-        let service = if addr.ip().is_loopback() { self.services.0.borrow().get(&addr.port()).cloned() } else { None };
+        let service = if addr.ip().is_loopback() {
+            self.services.0.borrow().get(&addr.port()).cloned()
+        } else {
+            self.services.1.borrow().get(&addr).cloned()
+        };
         match service {
-            Some(service) => Ok(SimTcp { service, inbox: Vec::new(), outbox: VecDeque::new(), closed: false, reader: None, writer: None }),
+            Some(service) => Ok(SimTcp { service, inbox: Vec::new(), outbox: VecDeque::new(), closed: false, stage: 0, reader: None, writer: None }),
             None => Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("{addr} 上没有服务"))),
         }
     }
@@ -617,6 +629,8 @@ pub struct SimTcp {
     outbox: VecDeque<u8>,
     /// 服务已经写完（回声：对方结束发送之后；HTTP：回应之后）。
     closed: bool,
+    /// 上游代理走到哪一步：0 问候，1 请求，2 之后是 HTTP。
+    stage: u8,
     reader: Option<std::task::Waker>,
     writer: Option<std::task::Waker>,
 }
@@ -648,6 +662,10 @@ impl tokio::io::AsyncRead for SimTcp {
     }
 }
 
+fn http_reply(body: &str) -> String {
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+}
+
 /// 回声在缓冲里最多攒这么多：对方不读时写入就停下（反压）。
 const SIM_TCP_BUFFER: usize = 256 * 1024;
 
@@ -669,14 +687,58 @@ impl tokio::io::AsyncWrite for SimTcp {
                 self.wake_reader();
                 std::task::Poll::Ready(Ok(n))
             }
+            SimService::Socks5Upstream if self.stage < 2 => {
+                use nexus_net_core::socks5;
+                self.inbox.extend_from_slice(data);
+                loop {
+                    if self.stage == 0 {
+                        match socks5::parse_greeting(&self.inbox) {
+                            Ok(Some((n, _))) => {
+                                self.inbox.drain(..n);
+                                self.outbox.extend(socks5::NO_AUTH);
+                                self.stage = 1;
+                            }
+                            Ok(None) => break,
+                            Err(_) => self.closed = true,
+                        }
+                    } else if self.stage == 1 {
+                        match socks5::parse_request(&self.inbox) {
+                            Ok(Some((n, target))) => {
+                                self.inbox.drain(..n);
+                                if matches!(&target.host, nexus_net_core::Host::Name(h) if h.starts_with("refuse.")) {
+                                    self.outbox.extend(socks5::reply(socks5::Reply::ConnectionRefused));
+                                    self.closed = true;
+                                } else {
+                                    self.outbox.extend(socks5::reply(socks5::Reply::Succeeded));
+                                    self.service = SimService::Http(format!("via upstream to {target}"));
+                                    self.stage = 2;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => self.closed = true,
+                        }
+                    } else {
+                        break;
+                    }
+                    if self.closed {
+                        break;
+                    }
+                }
+                // 请求后面紧跟着的 HTTP 请求头已经在缓冲里了。
+                if let (2, SimService::Http(body)) = (self.stage, self.service.clone()) {
+                    if self.inbox.windows(4).any(|w| w == b"\r\n\r\n") {
+                        self.outbox.extend(http_reply(&body).as_bytes());
+                        self.closed = true;
+                    }
+                }
+                self.wake_reader();
+                std::task::Poll::Ready(Ok(data.len()))
+            }
+            SimService::Socks5Upstream => std::task::Poll::Ready(Ok(data.len())),
             SimService::Http(body) => {
                 self.inbox.extend_from_slice(data);
                 if self.inbox.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    self.outbox.extend(reply.as_bytes());
+                    self.outbox.extend(http_reply(&body).as_bytes());
                     self.closed = true;
                     self.wake_reader();
                 }

@@ -67,6 +67,7 @@ enum Dispatch {
     Exec(ExecSpec),
     Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
     Pipe { addr: std::net::SocketAddr, name: String },
+    Exit { target: Target },
     WebEnroll { token: [u8; 16], credential: NewCredential },
 }
 
@@ -201,6 +202,8 @@ const SESSION_LINGER: Duration = Duration::from_secs(10);
 enum ProxyFail {
     /// 路由规则不允许。
     Rejected,
+    /// 出口或上游代理不允许。
+    Denied(String),
     /// 服务或主机不可达。
     Unreachable(String),
     /// 直连时对方拒绝。
@@ -227,6 +230,15 @@ impl<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin> Upstr
             Upstream::Remote(b) => go(client, b, first).await,
         }
     }
+}
+
+/// 出口设备自己的本机地址。
+fn is_own_address(ip: &std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(*ip),
+        v4 => *v4,
+    };
+    ip.is_loopback() || ip.is_unspecified()
 }
 
 /// 再读一些到 `buf` 末尾；连接结束或出错时返回 false。
@@ -261,6 +273,7 @@ const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
 const KEY_ROUTES: &str = "routes";
+const KEY_EXIT: &str = "exit";
 
 /// 统一入口上的一条连接（SOCKS5 或 HTTP 代理），由常驻程序从本机监听的端口交给节点。
 pub type ProxyStream = Box<dyn ProxyIo + Send>;
@@ -311,6 +324,12 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
             return Ok(Some(Action {
                 capability: Capability::parse("svc.connect").expect("内置能力名合法"),
                 resource: ResourcePath::parse(&format!("{node}/svc/{name}")).map_err(|_| internal("本机不在名册里"))?,
+            }));
+        }
+        Request::ExitConnect { .. } => {
+            return Ok(Some(Action {
+                capability: Capability::parse("net.exit").expect("内置能力名合法"),
+                resource: ResourcePath::parse(&format!("{node}/exit")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
         Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } | Request::WebLogin { .. } => {
@@ -454,6 +473,8 @@ pub struct Node<T, S: System> {
     web_enrolls: RefCell<HashMap<[u8; 16], PendingWebEnroll>>,
     /// 本机发布的服务（M3.1）。
     services: RefCell<Vec<PublishedService>>,
+    /// 本机是否开放出口（M3.3）。
+    exit_enabled: Cell<bool>,
     /// 本机的路由规则（M3.2）。
     routes: RefCell<RouteTable>,
     proxy_tx: mpsc::UnboundedSender<ProxyStream>,
@@ -482,9 +503,11 @@ impl<T: Transport, S: System> Node<T, S> {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         let services = load::<_, Vec<PublishedService>>(&system, KEY_SERVICES)?.unwrap_or_default();
         let routes = load::<_, RouteTable>(&system, KEY_ROUTES)?.unwrap_or_default();
+        let exit_enabled = load::<_, bool>(&system, KEY_EXIT)?.unwrap_or(false);
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         Ok(Self {
             routes: RefCell::new(routes),
+            exit_enabled: Cell::new(exit_enabled),
             proxy_tx,
             proxy_rx: RefCell::new(Some(proxy_rx)),
             services: RefCell::new(services),
@@ -668,6 +691,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 return self.serve_session(stream, &name, create, size, guard).await
             }
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
+            Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
                 Ok(label) => Response::WebEnrolled { label },
                 Err(e) => Response::Error(e),
@@ -730,6 +754,16 @@ impl<T: Transport, S: System> Node<T, S> {
                 Some(addr) => return Dispatch::Pipe { addr, name },
                 None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
             },
+            Request::ExitConnect { target } => {
+                if !self.exit_enabled.get() {
+                    Response::Error(err(ErrorCode::Denied, format!("{me} 没有开放出口（在 {me} 上执行 nexus exit on）")))
+                } else {
+                    match Target::parse(&target) {
+                        Some(target) => return Dispatch::Exit { target },
+                        None => Response::Error(err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}"))),
+                    }
+                }
+            }
             Request::SessionKill { name } => match self.session_kill(&name) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
@@ -947,6 +981,11 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             CtlRequest::RouteAdd { rule } => self.route_add(rule).map(|index| CtlResponse::RouteAdded { index }),
             CtlRequest::RouteRm { index } => self.route_rm(index).map(|()| CtlResponse::Ok),
+            CtlRequest::ExitSet { enabled } => {
+                self.exit_enabled.set(enabled);
+                save(&self.system, KEY_EXIT, &enabled).map_err(internal).map(|()| CtlResponse::Exit { enabled })
+            }
+            CtlRequest::ExitShow => Ok(CtlResponse::Exit { enabled: self.exit_enabled.get() }),
             CtlRequest::RouteList => Ok(CtlResponse::Routes(self.routes.borrow().rules.clone())),
             CtlRequest::RouteExplain { target } => self.route_explain(&target).map(CtlResponse::Explained),
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
@@ -980,6 +1019,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::Unpublish { .. }
                 | CtlRequest::RouteAdd { .. }
                 | CtlRequest::RouteRm { .. }
+                | CtlRequest::ExitSet { .. }
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -1922,6 +1962,43 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
     }
 
+    /// 出口：替别的设备连到目标。不连本机地址：本机上的程序要给别人用，应当发布成服务。
+    async fn serve_exit<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, target: Target) {
+        let result = async {
+            let ips = match &target.host {
+                Host::Ip(ip) => vec![*ip],
+                Host::Name(name) => {
+                    self.system.resolve(name).await.map_err(|e| err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}")))?
+                }
+            };
+            let ips: Vec<_> = ips.into_iter().filter(|ip| !is_own_address(ip)).collect();
+            if ips.is_empty() {
+                return Err(err(ErrorCode::Denied, format!("出口不连本机地址：{target}")));
+            }
+            let mut last = String::new();
+            for ip in ips {
+                match self.system.tcp_connect(std::net::SocketAddr::new(ip, target.port)).await {
+                    Ok(c) => return Ok(c),
+                    Err(e) => last = format!("出口连不上 {target}：{e}"),
+                }
+            }
+            Err(err(ErrorCode::Unreachable, last))
+        };
+        let mut out = match result.await {
+            Ok(c) => c,
+            Err(failure) => {
+                let _ = write_msg(&mut stream, &Response::Error(failure)).await;
+                let _ = stream.shutdown().await;
+                drain(&mut stream).await;
+                return;
+            }
+        };
+        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut stream, &mut out).await;
+    }
+
     /// `nexus connect`：调用方一侧把命令行的输入送到服务，把服务的输出送回命令行。
     async fn connect(&self, node: &str, name: &str, agent: Option<AgentCredential>, server: CtlServer) {
         let body = Request::SvcConnect { name: name.to_string() };
@@ -2013,6 +2090,19 @@ impl<T: Transport, S: System> Node<T, S> {
     // ------------------------------------------------------------ 统一入口与路由（M3.2）
 
     fn route_add(&self, rule: Rule) -> Result<u32, WireError> {
+        match &rule.outbound {
+            Outbound::Exit(device) => {
+                if self.resolve(device)?.node_id == self.me() {
+                    return Err(err(ErrorCode::InvalidInput, format!("{device} 就是本机：本机出去用 --direct")));
+                }
+            }
+            Outbound::Socks5(upstream) => {
+                if Target::parse(upstream).is_none() {
+                    return Err(err(ErrorCode::InvalidInput, format!("上游代理应当写成 主机:端口：{upstream}")));
+                }
+            }
+            Outbound::Direct | Outbound::Reject => {}
+        }
         let mut routes = self.routes.borrow_mut();
         routes.rules.push(rule);
         save(&self.system, KEY_ROUTES, &*routes).map_err(internal)?;
@@ -2094,7 +2184,7 @@ impl<T: Transport, S: System> Node<T, S> {
         match self.open_outbound(&target).await {
             Err(fail) => {
                 let reply = match fail {
-                    ProxyFail::Rejected => socks5::Reply::NotAllowed,
+                    ProxyFail::Rejected | ProxyFail::Denied(_) => socks5::Reply::NotAllowed,
                     ProxyFail::Unreachable(_) => socks5::Reply::HostUnreachable,
                     ProxyFail::Refused(_) => socks5::Reply::ConnectionRefused,
                 };
@@ -2134,6 +2224,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Err(fail) => {
                 let (status, reason, why) = match fail {
                     ProxyFail::Rejected => (403, "Forbidden", format!("路由规则不允许访问 {target}")),
+                    ProxyFail::Denied(why) => (403, "Forbidden", why),
                     ProxyFail::Unreachable(why) | ProxyFail::Refused(why) => (502, "Bad Gateway", why),
                 };
                 client.write_all(&http::response(status, reason, &why)).await?;
@@ -2174,6 +2265,78 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Err(ProxyFail::Refused(last))
             }
+            Outbound::Exit(device) => self.open_exit(&device, target).await,
+            Outbound::Socks5(upstream) => self.open_upstream(&upstream, target).await,
+        }
+    }
+
+    /// 经网络里的一台设备出去：对方判定授权、审计，再连到目标。
+    async fn open_exit(&self, device: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
+        let body = Request::ExitConnect { target: target.to_string() };
+        for attempt in 0..2 {
+            match self.open_stream(&device, body.clone(), None).await {
+                Ok(stream) => return Ok(Upstream::Remote(stream)),
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                }
+                Err(OpenError::StaleRoster) => break,
+                Err(OpenError::Remote(e)) if e.code == ErrorCode::Denied => return Err(ProxyFail::Denied(e.message)),
+                Err(OpenError::Remote(e)) => return Err(ProxyFail::Unreachable(e.message)),
+                Err(OpenError::Io(e)) => return Err(ProxyFail::Unreachable(format!("连不上出口 {}：{e}", device.name))),
+            }
+        }
+        Err(ProxyFail::Unreachable("对方的名册始终比本机旧".into()))
+    }
+
+    /// 交给上游 SOCKS5 代理：目标原样交过去，不在本机解析。
+    async fn open_upstream(&self, upstream: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let up = Target::parse(upstream).ok_or_else(|| ProxyFail::Unreachable(format!("上游代理的地址不对：{upstream}")))?;
+        let ips = match &up.host {
+            Host::Ip(ip) => vec![*ip],
+            Host::Name(name) => self.system.resolve(name).await.map_err(|e| ProxyFail::Unreachable(format!("解析不了上游代理 {name}：{e}")))?,
+        };
+        let mut conn = None;
+        for ip in ips {
+            if let Ok(c) = self.system.tcp_connect(std::net::SocketAddr::new(ip, up.port)).await {
+                conn = Some(c);
+                break;
+            }
+        }
+        let mut conn = conn.ok_or_else(|| ProxyFail::Unreachable(format!("上游代理 {upstream} 没有在运行")))?;
+        let handshake = async {
+            conn.write_all(&[5, 1, 0]).await?;
+            let mut greet = [0u8; 2];
+            conn.read_exact(&mut greet).await?;
+            if greet != socks5::NO_AUTH {
+                return Ok(Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 要求认证（还不支持）"))));
+            }
+            conn.write_all(&socks5::request(target)).await?;
+            let mut head = vec![0u8; 5];
+            conn.read_exact(&mut head).await?;
+            let total = match head[3] {
+                1 => 10,
+                4 => 22,
+                3 => 7 + head[4] as usize,
+                _ => 0,
+            };
+            if total < 5 {
+                return Ok(Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 的回应无法理解"))));
+            }
+            head.resize(total, 0);
+            conn.read_exact(&mut head[5..]).await?;
+            Ok::<_, io::Error>(match socks5::parse_reply(&head) {
+                Ok(Some((_, 0))) => Ok(()),
+                Ok(Some((_, 2))) => Err(ProxyFail::Denied(format!("上游代理 {upstream} 不允许访问 {target}"))),
+                Ok(Some((_, code))) => Err(ProxyFail::Refused(format!("上游代理 {upstream} 连不上 {target}（回应码 {code}）"))),
+                _ => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 的回应无法理解"))),
+            })
+        };
+        match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, handshake).await {
+            Ok(Ok(Ok(()))) => Ok(Upstream::Tcp(conn)),
+            Ok(Ok(Err(fail))) => Err(fail),
+            Ok(Err(e)) => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 断开了：{e}"))),
+            Err(_) => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 没有回应"))),
         }
     }
 
