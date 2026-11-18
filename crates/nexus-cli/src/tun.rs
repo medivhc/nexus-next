@@ -13,6 +13,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 /// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
+#[cfg(target_os = "android")]
+pub fn start(_: &str, _: &FakePool, _: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
+    Err(io::Error::other("Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun"))
+}
+
+/// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
+#[cfg(not(target_os = "android"))]
 pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
     let (_, prefix) = pool.network();
     let dev = tun_rs::DeviceBuilder::new()
@@ -75,7 +82,8 @@ async fn serve_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSen
     }
 }
 
-/// 让系统把 .internal 交给名字服务。有 systemd-resolved 时自动配置；否则在日志里说明。
+/// 让系统把 .internal 交给名字服务。
+#[cfg(not(target_os = "android"))]有 systemd-resolved 时自动配置；否则在日志里说明。
 fn configure_resolver(name: &str, pool: &FakePool) {
     let dns = pool.dns().to_string();
     let ok = std::process::Command::new("resolvectl")
