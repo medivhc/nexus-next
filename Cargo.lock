@@ -2884,6 +2884,8 @@ name = "nexus-android"
 version = "0.0.1"
 dependencies = [
  "jni 0.21.1",
+ "libc",
+ "log",
  "nexus-cli",
  "nexus-fabric-iroh",
  "nexus-net-core",

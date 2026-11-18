@@ -26,6 +26,7 @@ pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discov
         return Err("已经在运行".into());
     }
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("无法创建数据目录：{e}"))?;
+    redirect_stderr(&data_dir.join("daemon.log"));
     let pool = daemon::parse_tun_net(TUN_NET).ok_or("网段不合法")?;
     let (tx, rx) = oneshot::channel();
     *stop = Some(tx);
@@ -66,6 +67,33 @@ pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discov
         })
         .map_err(|e| format!("无法启动线程：{e}"))?;
     Ok(())
+}
+
+/// 应用进程没有终端：核心的日志（标准错误）写到数据目录里的 daemon.log。
+/// 数据目录里有 trace 文件时，各个库的调试日志也写进去（排查用）。
+fn redirect_stderr(path: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        // SAFETY: 把一个打开的文件复制到描述符 2；f 随后关闭不影响复制出的描述符。
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 2);
+        }
+    }
+    if std::env::var_os("NEXUS_TRACE").is_some() || path.with_file_name("trace").exists() {
+        let _ = log::set_logger(&StderrLog).map(|()| log::set_max_level(log::LevelFilter::Trace));
+    }
+}
+
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        eprintln!("{} {}: {}", r.level(), r.target(), r.args());
+    }
+    fn flush(&self) {}
 }
 
 /// 停止常驻程序（网卡由 Java 一侧关闭）。
