@@ -84,7 +84,8 @@ class E2E:
 
     def as_app(self, script):
         """以 shell 账号（普通程序，受 VPN 管理）运行一段命令。"""
-        return self.adb("shell", f"su shell sh -c \"{script}\"", check=False, timeout=30)
+        # exec-out：不经伪终端，换行不被改写。
+        return self.adb("exec-out", f"su shell sh -c \"{script}\"", check=False, timeout=30)
 
     def http_on_phone(self, host):
         """以普通程序（nc）发一个 HTTP 请求，返回正文。请求先写成文件，免得在几层 shell 里转义。"""
