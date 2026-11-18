@@ -341,11 +341,17 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
         Request::SvcList | Request::DriveInfo => ("node.info", None),
-        Request::DriveRegister { ws } | Request::DriveHave { ws, .. } | Request::DrivePush { ws, .. } | Request::DriveGet { ws, .. } => {
+        Request::DriveRegister { ws }
+        | Request::DriveHave { ws, .. }
+        | Request::DrivePush { ws, .. }
+        | Request::DriveGet { ws, .. }
+        | Request::DriveProfilePut { ws, .. }
+        | Request::DriveProfileGet { ws, .. } => {
             if !nexus_drive_core::path::valid_workspace(ws) {
                 return Err(err(ErrorCode::InvalidInput, format!("工作区名不合法：{ws}")));
             }
-            let cap = if matches!(body, Request::DriveGet { .. }) { "drive.read" } else { "drive.write" };
+            let read = matches!(body, Request::DriveGet { .. } | Request::DriveProfileGet { .. });
+            let cap = if read { "drive.read" } else { "drive.write" };
             return Ok(Some(Action {
                 capability: Capability::parse(cap).expect("内置能力名合法"),
                 resource: ResourcePath::parse(&format!("{node}/drive/{ws}")).map_err(|_| internal("本机不在名册里"))?,
@@ -831,6 +837,8 @@ impl<T: Transport, S: System> Node<T, S> {
             }),
             Request::DriveRegister { ws } => self.drive_register(&ws),
             Request::DriveHave { ws, hashes } => self.drive_have(&ws, hashes),
+            Request::DriveProfilePut { ws, name, files } => self.drive_profile_put(&ws, &name, files),
+            Request::DriveProfileGet { ws, name } => self.drive_profile_get(&ws, &name),
             Request::DriveGet { ws, hashes } => match self.ws_exists(&ws) {
                 true => return Dispatch::DriveGet { hashes },
                 false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),

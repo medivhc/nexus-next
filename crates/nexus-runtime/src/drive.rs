@@ -21,6 +21,18 @@ use std::collections::BTreeMap;
 use std::io;
 
 pub(crate) const KEY_DRIVE: &str = "drive-v2";
+/// 预读清单单独保存：工作区 → 名字 → 文件（按第一次读到的顺序）。
+pub(crate) const KEY_PROFILES: &str = "drive-profiles-v1";
+
+type Profiles = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+
+/// 正在记录的预读清单。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Recording {
+    pub name: String,
+    pub files: Vec<String>,
+    pub seen: std::collections::BTreeSet<String>,
+}
 
 /// 一次取对象、查缺少的对象最多带这么多哈希（一帧之内）。
 const BATCH: usize = 8192;
@@ -35,6 +47,11 @@ pub(crate) struct DriveState {
     pub workspaces: BTreeMap<String, WsState>,
     /// 本机是否作为存储设备（保存登记过的工作区的完整副本）。
     pub serving: bool,
+    #[serde(skip)]
+    pub profiles: Profiles,
+    /// 工作区 → 正在记录的清单（不保存：重启后不再记录）。
+    #[serde(skip)]
+    pub recording: BTreeMap<String, Recording>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,7 +66,9 @@ pub(crate) struct WsState {
 
 impl DriveState {
     pub fn load<S: System>(sys: &S) -> io::Result<Self> {
-        Ok(load(sys, KEY_DRIVE)?.unwrap_or_default())
+        let mut state: Self = load(sys, KEY_DRIVE)?.unwrap_or_default();
+        state.profiles = load(sys, KEY_PROFILES)?.unwrap_or_default();
+        Ok(state)
     }
 }
 
@@ -128,6 +147,8 @@ impl<T: Transport, S: System> Node<T, S> {
             DriveRequest::Rename { from, to } => self.drive_rename(&from, &to),
             DriveRequest::Chmod { path, exec } => self.drive_chmod(&path, exec),
             DriveRequest::Stamp { ws } => self.ws(&ws).map(|w| DriveResponse::Stamp { tree: w.work.0 }),
+            DriveRequest::Record { ws, name } => self.drive_record(&ws, name).await,
+            DriveRequest::Prefetch { ws, profile, all } => self.drive_prefetch(&ws, profile, all).await.map(DriveResponse::Prefetched),
             DriveRequest::Rm { path, recursive } => self.drive_rm(&path, recursive),
             DriveRequest::Status { ws } => self.drive_status(&ws),
             DriveRequest::Commit { ws, message } => self.drive_commit(&ws, message).await,
@@ -312,6 +333,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 return;
             }
         };
+        if at.is_none() {
+            self.note_read(path);
+        }
         // 本机没有的块从存储设备取（只取这个范围用到的）。
         let spans = manifest.spans(offset, length.unwrap_or(u64::MAX));
         let missing: Vec<Hash> = spans.iter().map(|s| s.hash).filter(|h| !self.system.cas_has(&h.0).unwrap_or(false)).collect();
@@ -497,7 +521,10 @@ impl<T: Transport, S: System> Node<T, S> {
             DriveRequest::Ls { path, .. } | DriveRequest::Cat { path, .. } | DriveRequest::Where { path } => {
                 self.drive_agent_may(agent, &ws_of(path), false)
             }
-            DriveRequest::Status { ws } | DriveRequest::Log { ws } | DriveRequest::Stamp { ws } => self.drive_agent_may(agent, ws, false),
+            DriveRequest::Status { ws } | DriveRequest::Log { ws } | DriveRequest::Stamp { ws } | DriveRequest::Prefetch { ws, .. } => {
+                self.drive_agent_may(agent, ws, false)
+            }
+            DriveRequest::Record { ws, .. } => self.drive_agent_may(agent, ws, true),
             DriveRequest::Put { path, .. }
             | DriveRequest::Symlink { path, .. }
             | DriveRequest::Rm { path, .. }
@@ -794,6 +821,98 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(DriveResponse::Merged { commit: h.to_string(), conflicts, sync })
     }
 
+    /// 正在记录时记下读到的文件。
+    fn note_read(&self, path: &str) {
+        let Ok(p) = parse(path) else { return };
+        let mut state = self.drive_state.borrow_mut();
+        if let Some(r) = state.recording.get_mut(&p.ws) {
+            let rel = p.parts.join("/");
+            if r.seen.insert(rel.clone()) {
+                r.files.push(rel);
+            }
+        }
+    }
+
+    async fn drive_record(&self, name: &str, profile: Option<String>) -> Result<DriveResponse, WireError> {
+        let ws = self.ws(name)?;
+        let Some(profile) = profile else {
+            let r = self.drive_state.borrow_mut().recording.remove(name);
+            let Some(r) = r else { return Err(err(ErrorCode::InvalidState, format!("工作区 {name} 没有在记录"))) };
+            self.save_profile(name, &r.name, r.files.clone())?;
+            // 交给存储设备，别的设备才能用；交不出去的设备不算。
+            let mut saved_to = Vec::new();
+            for replica in &ws.replicas {
+                let Ok(device) = self.resolve(replica) else { continue };
+                let body = Request::DriveProfilePut { ws: name.to_string(), name: r.name.clone(), files: r.files.clone() };
+                if let Ok((Response::Ok, _)) = self.request(&device, body, None).await {
+                    saved_to.push(replica.clone());
+                }
+            }
+            return Ok(DriveResponse::Profile { name: r.name, files: r.files, saved_to });
+        };
+        if !nexus_drive_core::path::valid_part(&profile) {
+            return Err(err(ErrorCode::InvalidInput, format!("清单名不合法：{profile}")));
+        }
+        let rec = Recording { name: profile.clone(), ..Default::default() };
+        self.drive_state.borrow_mut().recording.insert(name.to_string(), rec);
+        Ok(DriveResponse::Recording { name: profile })
+    }
+
+    fn save_profile(&self, ws: &str, name: &str, files: Vec<String>) -> Result<(), WireError> {
+        let mut state = self.drive_state.borrow_mut();
+        state.profiles.entry(ws.to_string()).or_default().insert(name.to_string(), files);
+        save(&self.system, KEY_PROFILES, &state.profiles).map_err(internal)
+    }
+
+    /// 预读清单：先问存储设备（最新），取不到用本机的。
+    async fn find_profile(&self, name: &str, ws: &WsState, profile: &str) -> Result<Vec<String>, WireError> {
+        for replica in &ws.replicas {
+            let Ok(device) = self.resolve(replica) else { continue };
+            let body = Request::DriveProfileGet { ws: name.to_string(), name: profile.to_string() };
+            if let Ok((Response::DriveProfile(Some(files)), _)) = self.request(&device, body, None).await {
+                return Ok(files);
+            }
+        }
+        let local = self.drive_state.borrow().profiles.get(name).and_then(|m| m.get(profile)).cloned();
+        local.ok_or_else(|| err(ErrorCode::NotFound, format!("工作区 {name} 没有预读清单 {profile}")))
+    }
+
+    async fn drive_prefetch(&self, name: &str, profile: Option<String>, all: bool) -> Result<nexus_wire::DrivePrefetch, WireError> {
+        let ws = self.ws(name)?;
+        let files: Vec<String> = if all {
+            tree::files(&Cas(&self.system), ws.work).map_err(|e| internal(format!("{e:?}")))?.into_keys().collect()
+        } else {
+            self.find_profile(name, &ws, profile.as_deref().unwrap_or("default")).await?
+        };
+        // 清单里的文件的清单对象（目录结构同步时已经取到；没有的先取）。
+        let mut manifests = Vec::new();
+        for f in &files {
+            let parts: Vec<String> = f.split('/').map(str::to_string).collect();
+            if let Ok(Some(Entry::File { manifest, .. })) = tree::lookup(&Cas(&self.system), ws.work, &parts) {
+                manifests.push(manifest);
+            }
+        }
+        let absent: Vec<Hash> = manifests.iter().copied().filter(|m| !self.system.cas_has(&m.0).unwrap_or(false)).collect();
+        if !absent.is_empty() {
+            self.fetch(name, &absent).await?;
+        }
+        let (mut missing, mut seen, mut total, mut fetched) = (Vec::new(), std::collections::BTreeSet::new(), 0u64, 0u64);
+        for m in &manifests {
+            let Some(m) = Cas(&self.system).get(m).and_then(|b| FileManifest::decode(&b)) else { continue };
+            for c in m.chunks {
+                total += c.len as u64;
+                if seen.insert(c.hash) && !self.system.cas_has(&c.hash.0).unwrap_or(false) {
+                    missing.push(c.hash);
+                    fetched += c.len as u64;
+                }
+            }
+        }
+        if !missing.is_empty() {
+            self.fetch(name, &missing).await?;
+        }
+        Ok(nexus_wire::DrivePrefetch { files: manifests.len() as u64, fetched_bytes: fetched, total_bytes: total, local_bytes: total })
+    }
+
     fn drive_where(&self, path: &str) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
@@ -848,6 +967,23 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(()) => Response::Ok,
             Err(e) => Response::Error(e),
         }
+    }
+
+    pub(crate) fn drive_profile_put(&self, ws: &str, name: &str, files: Vec<String>) -> Response {
+        if self.ws(ws).is_err() {
+            return Response::Error(err(ErrorCode::NotFound, format!("没有工作区 {ws}")));
+        }
+        if !nexus_drive_core::path::valid_part(name) {
+            return Response::Error(err(ErrorCode::InvalidInput, format!("清单名不合法：{name}")));
+        }
+        match self.save_profile(ws, name, files) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(e),
+        }
+    }
+
+    pub(crate) fn drive_profile_get(&self, ws: &str, name: &str) -> Response {
+        Response::DriveProfile(self.drive_state.borrow().profiles.get(ws).and_then(|m| m.get(name)).cloned())
     }
 
     pub(crate) fn drive_have(&self, ws: &str, hashes: Vec<[u8; 32]>) -> Response {

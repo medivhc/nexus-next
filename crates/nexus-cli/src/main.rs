@@ -151,8 +151,8 @@ fn main() {
                 0
             }
             #[cfg(target_os = "linux")]
-            Cmd::Drive { cmd: nexus_cli::drive::DriveCmd::Mount { path, dir } } => {
-                mount::run(path, dir, &data_dir, UnixCtl::new(&data_dir, agent.clone()), &mut Terminal).await
+            Cmd::Drive { cmd: nexus_cli::drive::DriveCmd::Mount { path, dir, record } } => {
+                mount::run(path, dir, record.as_deref(), &data_dir, UnixCtl::new(&data_dir, agent.clone()), &mut Terminal).await
             }
             cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
                 let ctl = UnixCtl::new(&data_dir, agent.clone());
@@ -220,6 +220,7 @@ fn data_dir(cli: &Cli) -> PathBuf {
 }
 
 /// 命令行一侧：通过 Unix 套接字连接常驻程序，把套接字两个方向接到会话通道上。
+#[derive(Clone)]
 pub(crate) struct UnixCtl {
     socket: PathBuf,
     agent: Option<AgentCredential>,

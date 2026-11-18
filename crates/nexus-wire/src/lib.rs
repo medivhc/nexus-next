@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 13;
+pub const WIRE_VERSION: u16 = 14;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -69,6 +69,10 @@ pub enum Request {
     DriveHave { ws: String, hashes: Vec<[u8; 32]> },
     /// 推一个新头：回应 `Ok` 之后送 `count` 帧对象（`Vec<u8>`），最后对方回应 `DrivePushed`。
     DrivePush { ws: String, head: [u8; 32], count: u32 },
+    /// 保存预读清单（同名替换）：回应 `Ok`。
+    DriveProfilePut { ws: String, name: String, files: Vec<String> },
+    /// 取预读清单：回应 `DriveProfile`。
+    DriveProfileGet { ws: String, name: String },
 }
 
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
@@ -100,7 +104,11 @@ impl Request {
             Request::SvcConnect { .. } | Request::ExitConnect { .. } | Request::DriveGet { .. } | Request::DrivePush { .. } => {
                 TrafficClass::Bulk
             }
-            Request::DriveInfo | Request::DriveRegister { .. } | Request::DriveHave { .. } => TrafficClass::Interactive,
+            Request::DriveInfo
+            | Request::DriveRegister { .. }
+            | Request::DriveHave { .. }
+            | Request::DriveProfilePut { .. }
+            | Request::DriveProfileGet { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -145,6 +153,10 @@ pub enum DriveRequest {
     Chmod { path: String, exec: bool },
     /// 工作树的根（变了说明内容变了）。挂载用它发现同步进来的修改。
     Stamp { ws: String },
+    /// 开始（`name` 有值）或结束（`None`）记录读了哪些文件。结束时得到预读清单并交给存储设备。
+    Record { ws: String, name: Option<String> },
+    /// 按预读清单（`all` 时整个工作区）把文件内容提前取到本机。
+    Prefetch { ws: String, profile: Option<String>, all: bool },
     Rm { path: String, recursive: bool },
     /// 未提交的改动。
     Status { ws: String },
@@ -162,6 +174,10 @@ pub enum DriveResponse {
     /// Mkdir、Rename、Chmod 完成。
     Done { path: String },
     Stamp { tree: [u8; 32] },
+    Recording { name: String },
+    /// 记录结束：清单（按第一次读到的顺序）和保存了它的存储设备。
+    Profile { name: String, files: Vec<String>, saved_to: Vec<String> },
+    Prefetched(DrivePrefetch),
     Changes(Vec<DriveChange>),
     /// 提交，以及随后推给存储设备的结果。
     Committed { commit: String, sync: DriveSyncReport },
@@ -202,6 +218,17 @@ pub struct WorkspaceInfo {
     pub head: Option<String>,
     /// 未提交的改动数。
     pub changes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrivePrefetch {
+    /// 清单里（或工作区里）现在存在的文件数。
+    pub files: u64,
+    /// 这次从别的设备取到的字节数。
+    pub fetched_bytes: u64,
+    /// 这些文件的内容总共多大、现在本机有多少。
+    pub total_bytes: u64,
+    pub local_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +394,7 @@ pub enum Response {
     DriveMissing(Vec<[u8; 32]>),
     /// 推送的结果：对方现在的头；`accepted` 为假时是分叉（或对方已经更新），要先同步。
     DrivePushed { accepted: bool, head: Option<[u8; 32]> },
+    DriveProfile(Option<Vec<String>>),
     Error(WireError),
 }
 

@@ -228,3 +228,29 @@ scenario! {
         assert_eq!(w.cli("laptop", &["drive", "cat", "work:/z.txt"]).await.stdout, "z");
     },
 }
+
+scenario! {
+    name: a_mount_can_record_a_prefetch_list,
+    covers: "R53, R54",
+    nodes: ["laptop", "anchor", "tablet"],
+    sim: (pending "挂载需要真实的内核"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["anchor", "tablet"]).await;
+        w.cli_ok("anchor", &["drive", "serve", "on"]).await;
+        w.cli_ok("laptop", &["drive", "create", "work"]).await;
+        let src = local_tree(&[("used.txt", b"used"), ("src/lib.rs", b"pub fn f() {}\n"), ("unused.bin", &pseudo_random(200_000, 9))]);
+        w.cli_ok("laptop", &["drive", "import", src.path().to_str().unwrap(), "work:/"]).await;
+        w.cli_ok("laptop", &["drive", "commit", "work", "-m", "base"]).await;
+
+        let dir = local_dir("rec");
+        let m = dir.path().to_str().unwrap().to_string();
+        let mut bg = mount(&w, "laptop", &["drive", "work:/", "--record", "build"], &dir).await;
+        assert_eq!(sh(&w, "laptop", &format!("cat '{m}/used.txt' '{m}/src/lib.rs' >/dev/null && ls -R '{m}' >/dev/null")).await.code, 0);
+        assert_eq!(bg.terminate(), Some(0), "{}", bg.stderr());
+
+        assert_eq!(w.cli_ok("tablet", &["drive", "sync", "work"]).await["state"], "pulled");
+        let v = w.cli_ok("tablet", &["drive", "prefetch", "work", "--profile", "build"]).await;
+        assert_eq!((v["files"].as_u64(), v["fetched_bytes"].as_u64()), (Some(2), Some(4 + 14)), "只取读过的文件：{v}");
+    },
+}

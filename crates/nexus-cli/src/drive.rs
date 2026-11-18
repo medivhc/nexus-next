@@ -107,6 +107,35 @@ pub enum DriveCmd {
         path: String,
         /// 挂载点：已经存在的空目录
         dir: String,
+        /// 挂载期间记录读了哪些文件，卸载时保存成这个名字的预读清单
+        #[arg(long, value_name = "名字")]
+        record: Option<String>,
+    },
+    /// 记录这台设备读了工作区的哪些文件，得到预读清单（交给存储设备，别的设备可以按它预读）
+    ///
+    /// 例：nexus drive record work --name build；构建；nexus drive record work --stop
+    Record {
+        ws: String,
+        /// 清单的名字
+        #[arg(long, default_value = "default", conflicts_with = "stop")]
+        name: String,
+        /// 结束记录，保存清单
+        #[arg(long)]
+        stop: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 把文件内容提前取到本机：按预读清单，或者 --all 取整个工作区
+    Prefetch {
+        ws: String,
+        /// 预读清单的名字（默认 default）
+        #[arg(long, value_name = "名字", conflicts_with = "all")]
+        profile: Option<String>,
+        /// 取整个工作区（之后可以离线用）
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// 删除文件（目录要加 -r）
     Rm {
@@ -244,6 +273,13 @@ pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &DriveCmd, c
             (ask(ctl, DriveRequest::Commit { ws: ws.clone(), message: message.clone() }).await, *json)
         }
         DriveCmd::Log { ws, json } => (ask(ctl, DriveRequest::Log { ws: ws.clone() }).await, *json),
+        DriveCmd::Record { ws, name, stop, json } => {
+            let name = (!stop).then(|| name.clone());
+            (ask(ctl, DriveRequest::Record { ws: ws.clone(), name }).await, *json)
+        }
+        DriveCmd::Prefetch { ws, profile, all, json } => {
+            (ask(ctl, DriveRequest::Prefetch { ws: ws.clone(), profile: profile.clone(), all: *all }).await, *json)
+        }
     };
     match result {
         Ok(r) => {
@@ -320,6 +356,28 @@ fn render(r: &DriveResponse, json: bool) -> String {
             json!({ "path": path })
         }
         DriveResponse::Stamp { tree } => json!({ "tree": nexus_drive_core::Hash(*tree).to_string() }),
+        DriveResponse::Recording { name } => {
+            if !json {
+                return format!("开始记录预读清单 {name}；读完后 nexus drive record <工作区> --stop\n");
+            }
+            json!({ "recording": name })
+        }
+        DriveResponse::Profile { name, files, saved_to } => {
+            if !json {
+                let place = if saved_to.is_empty() { "只在本机（没有交给存储设备）".to_string() } else { format!("已交给 {}", saved_to.join("、")) };
+                return format!("预读清单 {name}：{} 个文件，{place}\n", files.len());
+            }
+            json!({ "profile": name, "files": files, "saved_to": saved_to })
+        }
+        DriveResponse::Prefetched(p) => {
+            if !json {
+                return format!(
+                    "{} 个文件，{} 字节；这次取到 {} 字节，现在都在本机\n",
+                    p.files, p.total_bytes, p.fetched_bytes
+                );
+            }
+            json!({ "files": p.files, "fetched_bytes": p.fetched_bytes, "total_bytes": p.total_bytes, "local_bytes": p.local_bytes })
+        }
         DriveResponse::Changes(list) => {
             if !json {
                 if list.is_empty() {

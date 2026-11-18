@@ -32,7 +32,7 @@ const STAMP_EVERY: Duration = Duration::from_millis(500);
 const ROOT: u64 = 1;
 
 /// 挂载并在前台运行，直到被卸载或收到 SIGINT / SIGTERM。
-pub async fn run<K: Sink>(path: &str, dir: &str, data_dir: &Path, ctl: UnixCtl, sink: &mut K) -> i32 {
+pub async fn run<K: Sink>(path: &str, dir: &str, record: Option<&str>, data_dir: &Path, ctl: UnixCtl, sink: &mut K) -> i32 {
     let base: DrivePath = match path.parse() {
         Ok(p) => p,
         Err(m) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &m),
@@ -51,7 +51,13 @@ pub async fn run<K: Sink>(path: &str, dir: &str, data_dir: &Path, ctl: UnixCtl, 
         return fail(sink, EXIT_INTERNAL, "internal", &format!("不能创建覆盖层目录 {}：{e}", overlay.display()));
     }
 
-    let client = Client::start(ctl);
+    // 记录预读清单：挂载前开始，卸载后结束（结束时清单交给存储设备）。
+    if let Some(name) = record {
+        if let Err(e) = ask(&ctl, DriveRequest::Record { ws: base.ws.clone(), name: Some(name.to_string()) }).await {
+            return fail_wire(sink, &e);
+        }
+    }
+    let client = Client::start(ctl.clone());
     let stamp = match client.ask(DriveRequest::Stamp { ws: base.ws.clone() }) {
         Ok(DriveResponse::Stamp { tree }) => tree,
         Ok(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
@@ -79,6 +85,16 @@ pub async fn run<K: Sink>(path: &str, dir: &str, data_dir: &Path, ctl: UnixCtl, 
     }
     // 卸载（已经被 fusermount -u 卸载时什么也不做），等 FUSE 线程结束：文件系统收尾时写回没写完的文件。
     drop(session);
+    if record.is_some() {
+        match ask(&ctl, DriveRequest::Record { ws: base.ws.clone(), name: None }).await {
+            Ok(DriveResponse::Profile { name, files, saved_to }) => {
+                let place = if saved_to.is_empty() { "只在本机".to_string() } else { format!("已交给 {}", saved_to.join("、")) };
+                sink.err(format!("预读清单 {name}：{} 个文件，{place}\n", files.len()).as_bytes());
+            }
+            Ok(_) => {}
+            Err(e) => sink.err(format!("保存预读清单失败：{}\n", e.message).as_bytes()),
+        }
+    }
     // 卸载偶尔没有生效时（挂载点还在），用 fusermount 强制卸掉，不留下断开的挂载点。
     if still_mounted(dir) {
         for bin in ["fusermount3", "fusermount"] {
