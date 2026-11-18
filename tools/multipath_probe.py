@@ -65,7 +65,10 @@ class Probe:
                 pass
         for ns in self.ns.values():
             sh("ip", "netns", "del", ns, check=False)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.args.keep:
+            print(f"临时目录：{self.tmp}")
+        else:
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
     def env(self, node):
         d = os.path.join(self.tmp, node)
@@ -115,6 +118,7 @@ def main():
     ap.add_argument("--rate1", type=float, default=0)
     ap.add_argument("--rate2", type=float, default=0)
     ap.add_argument("--hold", type=float, default=15, help="断开后观察多少秒")
+    ap.add_argument("--keep", action="store_true", help="保留临时目录（常驻程序的日志在里面）")
     args = ap.parse_args()
     if os.geteuid() != 0 or not shutil.which("iptables"):
         print("需要 root 和 iptables")

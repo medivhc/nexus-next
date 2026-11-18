@@ -2127,8 +2127,6 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3689cab508af9bcef7816c1201b403595ec6aa20e7d15e1f9683bb4be4a5b17"
 dependencies = [
  "backon",
  "blake3",
@@ -2942,6 +2940,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-rustls-acme",
+ "tracing-subscriber",
  "tun-rs",
 ]
 
@@ -3198,8 +3197,6 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6249a065adc1edbc1704a95436f38dd60476064dbc3b7c47cf279e02d1590eb5"
 dependencies = [
  "bytes",
  "cfg_aliases 0.2.2",
@@ -3220,8 +3217,6 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d"
 dependencies = [
  "aes-gcm 0.10.3",
  "bytes",
@@ -3248,8 +3243,6 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d0160422832eea1cc11c34be04ee6d5a046452b0b46cfb14695d55a1f24c954"
 dependencies = [
  "cfg_aliases 0.2.2",
  "libc",

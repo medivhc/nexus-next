@@ -37,6 +37,13 @@ fn main() {
         Ok(cli) => cli,
         Err(code) => std::process::exit(code),
     };
+    // 排查问题用：NEXUS_LOG=iroh=debug 之类的过滤规则，把内部日志写到标准错误。
+    if let Ok(filter) = std::env::var("NEXUS_LOG") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(io::stderr)
+            .try_init();
+    }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
     let data_dir = data_dir(&cli);
     let agent = match cli.agent.as_deref().map(load_agent).transpose() {

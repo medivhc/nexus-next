@@ -15,6 +15,11 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::io::Join;
 
+/// 每条路径的心跳间隔。
+const PATH_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+/// 一条路径这么久没有回应就放弃它。
+const PATH_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 中继的选择。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Relay {
@@ -82,16 +87,18 @@ impl IrohTransport {
         builder = builder
             .secret_key(SecretKey::from_bytes(&seed))
             .alpns(Proto::ALL.iter().map(|p| p.alpn().to_vec()).collect());
+        // 多路径（M5.1）：每条路径每秒一次心跳，5 秒没有回应就放弃这条路径。
+        // 路径断了不靠它发现（丢的包在别的路径上重传），它让空闲的路径保持打开、让死掉的路径及时关掉。
+        let mut quic = QuicTransportConfig::builder()
+            .default_path_keep_alive_interval(PATH_KEEP_ALIVE)
+            .default_path_max_idle_timeout(PATH_IDLE_TIMEOUT);
         if config.scheduling {
             // 默认的拥塞控制（CUBIC）一直加大发送量直到丢包，排队就推到了瓶颈处的缓冲里：
             // 大下载时终端的每个字都要排在几百毫秒的队尾。BBR 按测得的带宽和最小时延发送，队列留在本端，
             // 在本端再按流的优先级发。
-            builder = builder.transport_config(
-                QuicTransportConfig::builder()
-                    .congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()))
-                    .build(),
-            );
+            quic = quic.congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()));
         }
+        builder = builder.transport_config(quic.build());
         let mut relay = None;
         builder = match &config.relay {
             Relay::Default => builder.relay_mode(RelayMode::Default),

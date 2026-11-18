@@ -28,6 +28,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls-acme = "0.9"
 
+# 排查问题用的日志（NEXUS_LOG）。
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
+
 # 挂载（M4.3）：只在 Linux 上。纯 Rust，挂载时调用系统的 fusermount3。
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.15", default-features = false }
