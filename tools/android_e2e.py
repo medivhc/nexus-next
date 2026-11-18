@@ -94,7 +94,8 @@ class E2E:
         # 发完请求后不立刻关闭写方向：协议栈（ipstack）收到对方的 FIN 就整条关掉，不支持半关闭，
         # 那样回应送不回来。浏览器和常见的 HTTP 客户端不会半关闭；这是已知的限制，见 docs/feature-points/M3.6.md。
         out = self.as_app(f"(cat {req}; sleep 3) | nc -w 10 {host} 80")
-        return out.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in out else out
+        out = out.replace("\r\n", "\n")
+        return out.split("\n\n", 1)[1] if "\n\n" in out else out
 
     # ------------------------------------------------------------ 准备
     def setup(self):
