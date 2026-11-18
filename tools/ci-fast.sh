@@ -2,12 +2,12 @@
 # 日常迭代的快车道：只跑 L0 门禁 + 纯逻辑包测试（+ 调用者指定的改动相关包）。
 #
 # 用法：
-#   tools/ci-fast.sh                  # 只跑默认的 5 个纯逻辑包
+#   tools/ci-fast.sh                  # 只跑默认的 6 个纯逻辑包
 #   tools/ci-fast.sh nexus-runtime    # 再加改动相关的包（可多个）
 #
 # 改动文件到包的映射（按 crates/<name> 目录名传 -p 参数）：
 #   crates/nexus-core-proto, nexus-wire, nexus-term-proto,
-#   nexus-sys-sim, nexus-web-core  -> 默认已包含
+#   nexus-net-core, nexus-sys-sim, nexus-web-core  -> 默认已包含
 #   crates/nexus-fabric, nexus-fabric-sim, nexus-sys, nexus-testkit,
 #   nexus-web, nexus-sys-real      -> 按需追加，例如 tools/ci-fast.sh nexus-fabric-sim
 #   crates/nexus-cli, nexus-runtime, nexus-fabric-iroh
@@ -24,7 +24,7 @@
 # 目标：暖缓存下在沙箱（1.5 核）上 10 分钟内跑完。
 # 计时方式与 tools/ci.sh 一致：每步耗时在该步结束后打印，失败退出非零并显示日志。
 # 计时用 awk（不用 bc）：沙箱没有真正的 bc，缺 bc 时旧写法会静默打印 0.0 秒。
-# 追加参数里若含默认 5 包会去重，不重复跑。
+# 追加参数里若含默认 6 包会去重，不重复跑。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,6 +37,7 @@ PURE_PKGS=(
   -p nexus-core-proto
   -p nexus-wire
   -p nexus-term-proto
+  -p nexus-net-core
   -p nexus-sys-sim
   -p nexus-web-core
 )
@@ -51,7 +52,7 @@ step() {
 echo "=== nexus-next 快车道 CI（不含全量 clippy / 全量 --no-run / L2 / L3，全量见 tools/ci.sh + GitHub Actions） ==="
 step "L0 结构、追溯、许可证"   python3 tools/check.py
 step "L0 检查脚本自检"         python3 tools/check.py --self-test
-step "快车道 clippy（5 个纯逻辑包）" cargo clippy --quiet "${PURE_PKGS[@]}" --all-targets -- -D warnings
+step "快车道 clippy（6 个纯逻辑包）" cargo clippy --quiet "${PURE_PKGS[@]}" --all-targets -- -D warnings
 step "L1 纯逻辑"               cargo test --quiet "${PURE_PKGS[@]}"
 
 if [ "$#" -gt 0 ]; then
@@ -59,8 +60,8 @@ if [ "$#" -gt 0 ]; then
   extra_names=()
   for pkg in "$@"; do
     case "$pkg" in
-      nexus-core-proto|nexus-wire|nexus-term-proto|nexus-sys-sim|nexus-web-core)
-        echo "跳过已包含的默认包：$pkg（默认 5 包里已跑过，不重复跑）" ;;
+      nexus-core-proto|nexus-wire|nexus-term-proto|nexus-net-core|nexus-sys-sim|nexus-web-core)
+        echo "跳过已包含的默认包：$pkg（默认 6 包里已跑过，不重复跑）" ;;
       *) extra_args+=(-p "$pkg"); extra_names+=("$pkg") ;;
     esac
   done
