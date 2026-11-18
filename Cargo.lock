@@ -2880,6 +2880,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-android"
+version = "0.0.1"
+dependencies = [
+ "jni 0.21.1",
+ "nexus-cli",
+ "nexus-fabric-iroh",
+ "nexus-net-core",
+ "tokio",
+ "tun-rs",
+]
+
+[[package]]
 name = "nexus-cli"
 version = "0.0.1"
 dependencies = [

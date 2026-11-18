@@ -4,6 +4,9 @@
 //! 因此仿真测试可以直接调用它，行为与真实的 `nexus` 二进制一致。
 #![forbid(unsafe_code)]
 
+pub mod daemon;
+pub mod tun;
+
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
 use nexus_core_proto::PathKind;

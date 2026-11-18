@@ -20,6 +20,13 @@ pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInboun
         .ipv4(pool.gateway(), prefix, None)
         .mtu(1500)
         .build_async()?;
+    run_stack(dev, pool, entry)?;
+    configure_resolver(name, pool);
+    Ok(())
+}
+
+/// 在别人建好的网卡上启动协议栈（Android：VpnService 建网卡、配地址和路由）。
+pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
     let mut config = ipstack::IpStackConfig::default();
     config.mtu(1500).map_err(io::Error::other)?;
     config.udp_timeout(Duration::from_secs(30));
@@ -46,7 +53,6 @@ pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInboun
             }
         }
     });
-    configure_resolver(name, pool);
     Ok(())
 }
 
