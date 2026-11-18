@@ -1,0 +1,14 @@
+[package]
+name = "drive-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "M3.0 风格的技术验证（M4.0）：FUSE 透传的开销、内容定义分块和哈希的吞吐。不属于产品代码。"
+
+[workspace]
+
+[dependencies]
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
+fastcdc = "3"
+blake3 = "1"
