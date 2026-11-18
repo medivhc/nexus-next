@@ -96,6 +96,9 @@ class E2E:
         self.adb("root", check=False)
         time.sleep(2)
         subprocess.run(["adb", "connect", self.a.serial], capture_output=True)
+        # redroid 里没有 /dev/tun（真机的 ueventd 会建它），系统的 VPN 要用它建网卡。
+        self.adb("shell", "[ -e /dev/tun ] || { mknod /dev/tun c 10 200 && chmod 666 /dev/tun && chcon u:object_r:tun_device:s0 /dev/tun; }",
+                 check=False)
         self.adb("shell", "am", "force-stop", PKG, check=False)
         self.adb("uninstall", PKG, check=False)
         self.adb("install", "-r", "-g", self.a.apk, timeout=180)
