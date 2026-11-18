@@ -638,13 +638,15 @@ impl Output {
     }
 }
 
-fn fail<K: Sink>(sink: &mut K, code: i32, kind: &str, message: &str) -> i32 {
+#[doc(hidden)]
+pub fn fail<K: Sink>(sink: &mut K, code: i32, kind: &str, message: &str) -> i32 {
     let line = json!({ "error": kind, "message": message });
     sink.err(format!("{line}\n").as_bytes());
     code
 }
 
-fn fail_wire<K: Sink>(sink: &mut K, e: &nexus_wire::WireError) -> i32 {
+#[doc(hidden)]
+pub fn fail_wire<K: Sink>(sink: &mut K, e: &nexus_wire::WireError) -> i32 {
     let (code, kind) = exit_for(e.code);
     fail(sink, code, kind, &e.message)
 }

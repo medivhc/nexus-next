@@ -90,11 +90,18 @@ fn kind_name(k: ChangeKind) -> &'static str {
 
 fn entry_info(name: String, e: &Entry) -> DriveEntryInfo {
     match e {
-        Entry::File { size, exec, .. } => DriveEntryInfo { name, kind: "file".into(), size: *size, exec: *exec, target: None },
-        Entry::Dir { .. } => DriveEntryInfo { name, kind: "dir".into(), size: 0, exec: false, target: None },
-        Entry::Symlink { target } => {
-            DriveEntryInfo { name, kind: "symlink".into(), size: target.len() as u64, exec: false, target: Some(target.clone()) }
+        Entry::File { manifest, size, exec } => {
+            DriveEntryInfo { name, kind: "file".into(), size: *size, exec: *exec, target: None, content: Some(manifest.0) }
         }
+        Entry::Dir { .. } => DriveEntryInfo { name, kind: "dir".into(), size: 0, exec: false, target: None, content: None },
+        Entry::Symlink { target } => DriveEntryInfo {
+            name,
+            kind: "symlink".into(),
+            size: target.len() as u64,
+            exec: false,
+            target: Some(target.clone()),
+            content: None,
+        },
     }
 }
 
@@ -117,6 +124,10 @@ impl<T: Transport, S: System> Node<T, S> {
             DriveRequest::Symlink { path, target } => {
                 self.drive_set(&path, Entry::Symlink { target }).map(|_| DriveResponse::Written { path, size: 0 })
             }
+            DriveRequest::Mkdir { path } => self.drive_mkdir(&path),
+            DriveRequest::Rename { from, to } => self.drive_rename(&from, &to),
+            DriveRequest::Chmod { path, exec } => self.drive_chmod(&path, exec),
+            DriveRequest::Stamp { ws } => self.ws(&ws).map(|w| DriveResponse::Stamp { tree: w.work.0 }),
             DriveRequest::Rm { path, recursive } => self.drive_rm(&path, recursive),
             DriveRequest::Status { ws } => self.drive_status(&ws),
             DriveRequest::Commit { ws, message } => self.drive_commit(&ws, message).await,
@@ -383,6 +394,58 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(DriveResponse::Removed { path: p.to_string() })
     }
 
+    fn drive_mkdir(&self, path: &str) -> Result<DriveResponse, WireError> {
+        let p = parse(path)?;
+        let ws = self.ws(&p.ws)?;
+        if tree::lookup(&Cas(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.is_some() {
+            return Err(err(ErrorCode::InvalidInput, format!("{p} 已经存在")));
+        }
+        let tree = tree::empty(&mut Cas(&self.system));
+        self.drive_set(path, Entry::Dir { tree })?;
+        Ok(DriveResponse::Done { path: p.to_string() })
+    }
+
+    fn drive_rename(&self, from: &str, to: &str) -> Result<DriveResponse, WireError> {
+        let (a, b) = (parse(from)?, parse(to)?);
+        if a.ws != b.ws {
+            return Err(err(ErrorCode::InvalidInput, "只能在同一个工作区里改名"));
+        }
+        if a.parts.is_empty() || b.parts.is_empty() {
+            return Err(err(ErrorCode::InvalidInput, "不能移动工作区的根"));
+        }
+        if b.parts.len() > a.parts.len() && b.parts[..a.parts.len()] == a.parts[..] {
+            return Err(err(ErrorCode::InvalidInput, format!("不能把 {a} 移到它自己里面")));
+        }
+        let ws = self.ws(&a.ws)?;
+        let store = &mut Cas(&self.system);
+        let entry = tree::lookup(store, ws.work, &a.parts).map_err(|e| tree_err(e, &a))?.ok_or_else(|| tree_err(DriveError::NotFound, &a))?;
+        if a.parts == b.parts {
+            return Ok(DriveResponse::Done { path: b.to_string() });
+        }
+        if let Some(Entry::Dir { tree }) = tree::lookup(store, ws.work, &b.parts).map_err(|e| tree_err(e, &b))? {
+            if !tree::load(store, tree).map_err(|e| tree_err(e, &b))?.entries.is_empty() {
+                return Err(err(ErrorCode::InvalidInput, format!("{b} 是非空目录")));
+            }
+        }
+        let work = tree::remove(store, ws.work, &a.parts, true).map_err(|e| tree_err(e, &a))?;
+        let work = tree::set(store, work, &b.parts, entry).map_err(|e| tree_err(e, &b))?;
+        self.update_ws(&a.ws, |w| w.work = work)?;
+        Ok(DriveResponse::Done { path: b.to_string() })
+    }
+
+    fn drive_chmod(&self, path: &str, exec: bool) -> Result<DriveResponse, WireError> {
+        let p = parse(path)?;
+        let ws = self.ws(&p.ws)?;
+        match tree::lookup(&Cas(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))? {
+            Some(Entry::File { manifest, size, .. }) => {
+                self.drive_set(path, Entry::File { manifest, size, exec })?;
+                Ok(DriveResponse::Done { path: p.to_string() })
+            }
+            Some(_) => Err(err(ErrorCode::InvalidInput, format!("{p} 不是文件"))),
+            None => Err(tree_err(DriveError::NotFound, &p)),
+        }
+    }
+
     fn drive_status(&self, name: &str) -> Result<DriveResponse, WireError> {
         let ws = self.ws(name)?;
         Ok(DriveResponse::Changes(self.changes(&ws)?))
@@ -434,9 +497,15 @@ impl<T: Transport, S: System> Node<T, S> {
             DriveRequest::Ls { path, .. } | DriveRequest::Cat { path, .. } | DriveRequest::Where { path } => {
                 self.drive_agent_may(agent, &ws_of(path), false)
             }
-            DriveRequest::Status { ws } | DriveRequest::Log { ws } => self.drive_agent_may(agent, ws, false),
-            DriveRequest::Put { path, .. } | DriveRequest::Symlink { path, .. } | DriveRequest::Rm { path, .. } => {
-                self.drive_agent_may(agent, &ws_of(path), true)
+            DriveRequest::Status { ws } | DriveRequest::Log { ws } | DriveRequest::Stamp { ws } => self.drive_agent_may(agent, ws, false),
+            DriveRequest::Put { path, .. }
+            | DriveRequest::Symlink { path, .. }
+            | DriveRequest::Rm { path, .. }
+            | DriveRequest::Mkdir { path }
+            | DriveRequest::Chmod { path, .. } => self.drive_agent_may(agent, &ws_of(path), true),
+            DriveRequest::Rename { from, to } => {
+                self.drive_agent_may(agent, &ws_of(from), true)?;
+                self.drive_agent_may(agent, &ws_of(to), true)
             }
             DriveRequest::Commit { ws, .. } | DriveRequest::Merge { ws } | DriveRequest::Sync { ws } => self.drive_agent_may(agent, ws, true),
         }

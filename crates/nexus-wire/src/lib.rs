@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 12;
+pub const WIRE_VERSION: u16 = 13;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -137,6 +137,14 @@ pub enum DriveRequest {
     /// 写文件：内容随后以 `Input::Stdin` 送来，`Input::CloseStdin` 结束。
     Put { path: String, exec: bool },
     Symlink { path: String, target: String },
+    /// 新建空目录。
+    Mkdir { path: String },
+    /// 改名或移动（同一个工作区里），目标是文件时被替换。
+    Rename { from: String, to: String },
+    /// 设或清文件的可执行位。
+    Chmod { path: String, exec: bool },
+    /// 工作树的根（变了说明内容变了）。挂载用它发现同步进来的修改。
+    Stamp { ws: String },
     Rm { path: String, recursive: bool },
     /// 未提交的改动。
     Status { ws: String },
@@ -151,6 +159,9 @@ pub enum DriveResponse {
     Entries { path: String, entries: Vec<DriveEntryInfo> },
     Written { path: String, size: u64 },
     Removed { path: String },
+    /// Mkdir、Rename、Chmod 完成。
+    Done { path: String },
+    Stamp { tree: [u8; 32] },
     Changes(Vec<DriveChange>),
     /// 提交，以及随后推给存储设备的结果。
     Committed { commit: String, sync: DriveSyncReport },
@@ -201,6 +212,8 @@ pub struct DriveEntryInfo {
     pub size: u64,
     pub exec: bool,
     pub target: Option<String>,
+    /// 文件内容的标识（清单的哈希）：内容相同就相同。
+    pub content: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

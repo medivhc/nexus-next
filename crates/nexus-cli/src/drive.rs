@@ -99,6 +99,15 @@ pub enum DriveCmd {
         #[arg(long)]
         json: bool,
     },
+    /// 把工作区（或其中一个目录）挂到一个空目录上（Linux）；在前台运行，fusermount -u 或 Ctrl-C 卸载
+    ///
+    /// 挂载里的写入只落本机，用 nexus drive commit 提交。
+    /// 例：nexus drive mount work:/ ~/work
+    Mount {
+        path: String,
+        /// 挂载点：已经存在的空目录
+        dir: String,
+    },
     /// 删除文件（目录要加 -r）
     Rm {
         path: String,
@@ -195,6 +204,7 @@ async fn put<C: Ctl, R: AsyncRead + Unpin>(ctl: &C, path: &str, exec: bool, mut 
 pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &DriveCmd, ctl: &C, stdin: &mut R, sink: &mut K) -> i32 {
     let (result, json) = match cmd {
         DriveCmd::Cat { path, at, offset, length } => return cat(ctl, path, at.clone(), *offset, *length, sink).await,
+        DriveCmd::Mount { .. } => return fail(sink, crate::EXIT_USAGE, "usage", "挂载只能在真实设备上运行（Linux）"),
         DriveCmd::Import { dir, dest, json } => match import(ctl, dir, dest).await {
             Ok((files, bytes)) => {
                 let text = if *json {
@@ -302,6 +312,14 @@ fn render(r: &DriveResponse, json: bool) -> String {
             }
             json!({ "removed": path })
         }
+        // 只有挂载用这两个请求。
+        DriveResponse::Done { path } => {
+            if !json {
+                return format!("{path}（还没提交）\n");
+            }
+            json!({ "path": path })
+        }
+        DriveResponse::Stamp { tree } => json!({ "tree": nexus_drive_core::Hash(*tree).to_string() }),
         DriveResponse::Changes(list) => {
             if !json {
                 if list.is_empty() {

@@ -272,16 +272,19 @@ impl World {
         let Inner::Real(real) = &self.inner else { panic!("spawn_cli 只能用于真实后端") };
         self.trace.borrow_mut().push(format!("spawn {node}$ nexus {}", args.join(" ")));
         let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let n = SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let err_path = dir.join(format!("spawn-{n}.stderr"));
+        let err = std::fs::File::create(&err_path).expect("无法创建后台命令的错误输出文件");
         let child = Command::new(&real.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
             .env("NEXUS_AGENT_SOCKET", real.agent_socket(node))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(err)
             .spawn()
             .expect("无法执行 nexus");
-        Background { child }
+        Background { child, err_path, done: None }
     }
 
     /// 某个节点的 agent 入口（套接字路径），只用于真实后端。
@@ -650,21 +653,72 @@ impl nexus_web_core::TerminalUi for FirstOutput<'_> {
 /// 后台运行的一条 nexus 命令。
 pub struct Background {
     child: Child,
+    err_path: PathBuf,
+    done: Option<i32>,
 }
+
+static SPAWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Background {
     /// 像在终端里按下 Ctrl-C 一样中断它，并等它退出。
     pub fn interrupt(mut self) {
-        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+        self.signal(nix::sys::signal::Signal::SIGINT);
         let _ = self.child.wait();
+    }
+
+    fn signal(&self, sig: nix::sys::signal::Signal) {
+        let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+        let _ = nix::sys::signal::kill(pid, sig);
+    }
+
+    /// 它已经结束时返回退出码（被信号杀掉时是 -1），否则 `None`。
+    pub fn exited(&mut self) -> Option<i32> {
+        if self.done.is_none() {
+            if let Ok(Some(st)) = self.child.try_wait() {
+                self.done = Some(st.code().unwrap_or(-1));
+            }
+        }
+        self.done
+    }
+
+    /// 等它结束，最多等 `limit`。
+    pub fn wait_within(&mut self, limit: Duration) -> Option<i32> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(code) = self.exited() {
+                return Some(code);
+            }
+            if start.elapsed() >= limit {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 发 SIGTERM，等它结束（最多 10 秒）。
+    pub fn terminate(&mut self) -> Option<i32> {
+        if self.exited().is_none() {
+            self.signal(nix::sys::signal::Signal::SIGTERM);
+        }
+        self.wait_within(Duration::from_secs(10))
+    }
+
+    /// 它写到标准错误的内容。
+    pub fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.err_path).unwrap_or_default()
     }
 }
 
 impl Drop for Background {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // 先让它自己收尾（例如卸载挂载），不行再杀掉。
+        if self.exited().is_none() {
+            self.signal(nix::sys::signal::Signal::SIGTERM);
+            if self.wait_within(Duration::from_secs(5)).is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
     }
 }
 
@@ -1571,6 +1625,15 @@ pub fn local_tree(files: &[(&str, &[u8])]) -> LocalTree {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
     }
+    std::fs::create_dir_all(&dir).unwrap();
+    LocalTree(dir)
+}
+
+/// 本机临时目录里一个空目录，名字取决于进程、测试线程和 `tag`（同一个测试里要几个时用不同的 `tag`）。
+pub fn local_dir(tag: &str) -> LocalTree {
+    let thread = std::thread::current().name().unwrap_or("main").replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let dir = std::env::temp_dir().join(format!("nexus-dir-{}-{thread}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     LocalTree(dir)
 }

@@ -11,6 +11,8 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 mod anchor;
+#[cfg(target_os = "linux")]
+mod mount;
 mod ssh_proxy;
 mod web_serve;
 
@@ -147,6 +149,10 @@ fn main() {
                     dir = dir.display(),
                 );
                 0
+            }
+            #[cfg(target_os = "linux")]
+            Cmd::Drive { cmd: nexus_cli::drive::DriveCmd::Mount { path, dir } } => {
+                mount::run(path, dir, &data_dir, UnixCtl::new(&data_dir, agent.clone()), &mut Terminal).await
             }
             cmd @ Cmd::Ssh { .. } if io::stdin().is_terminal() && io::stdout().is_terminal() => {
                 let ctl = UnixCtl::new(&data_dir, agent.clone());

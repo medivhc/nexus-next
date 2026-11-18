@@ -49,6 +49,13 @@ jobs:
           sudo apt-get clean || true
           df -h /
 
+      - name: Install FUSE
+        # M4.3: the mount scenarios mount through fusermount3 (setuid) as the runner user.
+        run: |
+          sudo apt-get install -y fuse3
+          sudo chmod 666 /dev/fuse
+          ls -l /dev/fuse "$(command -v fusermount3)"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
