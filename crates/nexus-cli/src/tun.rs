@@ -82,8 +82,8 @@ async fn serve_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSen
     }
 }
 
-/// 让系统把 .internal 交给名字服务。
-#[cfg(not(target_os = "android"))]有 systemd-resolved 时自动配置；否则在日志里说明。
+/// 让系统把 .internal 交给名字服务。有 systemd-resolved 时自动配置；否则在日志里说明。
+#[cfg(not(target_os = "android"))]
 fn configure_resolver(name: &str, pool: &FakePool) {
     let dns = pool.dns().to_string();
     let ok = std::process::Command::new("resolvectl")
