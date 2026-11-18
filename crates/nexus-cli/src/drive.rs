@@ -353,7 +353,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
                 } else {
                     format!("还没同步到 {}：最新的提交只在本机", w.replicas.join("、"))
                 };
-                let pct = if w.total_bytes == 0 { 100 } else { w.local_bytes * 100 / w.total_bytes };
+                let pct = (w.local_bytes * 100).checked_div(w.total_bytes).unwrap_or(100);
                 return format!(
                     "{}\n  {place}\n  未提交的改动 {}\n  内容 {} 字节，本机有 {} 字节（{pct}%）\n",
                     w.path, w.uncommitted, w.total_bytes, w.local_bytes
