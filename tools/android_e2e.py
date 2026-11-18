@@ -87,8 +87,10 @@ class E2E:
         return self.adb("shell", f"su shell sh -c \"{script}\"", check=False, timeout=30)
 
     def http_on_phone(self, host):
-        req = f"printf 'GET / HTTP/1.0\\\\r\\\\nHost: {host}\\\\r\\\\n\\\\r\\\\n' | nc -w 10 {host} 80"
-        out = self.as_app(req)
+        """以普通程序（nc）发一个 HTTP 请求，返回正文。请求先写成文件，免得在几层 shell 里转义。"""
+        req = f"/data/local/tmp/req-{host}"
+        self.adb("shell", f"printf 'GET / HTTP/1.0\\r\\nHost: {host}\\r\\n\\r\\n' > {req}; chmod 644 {req}")
+        out = self.as_app(f"nc -w 10 {host} 80 < {req}")
         return out.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in out else out
 
     # ------------------------------------------------------------ 准备
