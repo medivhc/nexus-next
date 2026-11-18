@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 11;
+pub const WIRE_VERSION: u16 = 12;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -59,6 +59,16 @@ pub enum Request {
     SvcList,
     /// 经对方出去：对方连到 `target`（主机:端口），之后同 `SvcConnect`。对方要先开放出口。
     ExitConnect { target: String },
+    /// Drive（M4.2）：对方是否是存储设备、它有哪些工作区和它们的头。
+    DriveInfo,
+    /// 请存储设备保存这个工作区。
+    DriveRegister { ws: String },
+    /// 对象：回应 `Ok`，然后按顺序每个哈希一帧 `Option<Vec<u8>>`（没有时为空）。
+    DriveGet { ws: String, hashes: Vec<[u8; 32]> },
+    /// 对方缺哪些对象：回应 `DriveMissing`。
+    DriveHave { ws: String, hashes: Vec<[u8; 32]> },
+    /// 推一个新头：回应 `Ok` 之后送 `count` 帧对象（`Vec<u8>`），最后对方回应 `DrivePushed`。
+    DrivePush { ws: String, head: [u8; 32], count: u32 },
 }
 
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
@@ -87,7 +97,10 @@ impl Request {
     pub fn class(&self) -> TrafficClass {
         match self {
             Request::Exec(_) => TrafficClass::Normal,
-            Request::SvcConnect { .. } | Request::ExitConnect { .. } => TrafficClass::Bulk,
+            Request::SvcConnect { .. } | Request::ExitConnect { .. } | Request::DriveGet { .. } | Request::DrivePush { .. } => {
+                TrafficClass::Bulk
+            }
+            Request::DriveInfo | Request::DriveRegister { .. } | Request::DriveHave { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -105,7 +118,16 @@ impl Request {
 /// Drive 的本机控制请求。路径写作 `<工作区>:/<路径>`；提交号是十六进制，可以是前缀。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriveRequest {
-    Create { ws: String },
+    /// `replicas` 为空时用网络里开了 serve 的设备。
+    Create { ws: String, replicas: Vec<String> },
+    /// 本机是否作为存储设备；`on` 为空时只查询。
+    Serve { on: Option<bool> },
+    /// 和存储设备同步：取头和目录结构，快进、推送或报告分叉。
+    Sync { ws: String },
+    /// 把存储设备上的头合并进来（分叉时）。
+    Merge { ws: String },
+    /// 数据在哪里。
+    Where { path: String },
     /// 本机知道的工作区。
     List,
     /// 列目录（对文件列出它自己）；`at` 为空时看工作树。
@@ -130,8 +152,37 @@ pub enum DriveResponse {
     Written { path: String, size: u64 },
     Removed { path: String },
     Changes(Vec<DriveChange>),
-    Committed { commit: String },
+    /// 提交，以及随后推给存储设备的结果。
+    Committed { commit: String, sync: DriveSyncReport },
     Log(Vec<DriveCommitInfo>),
+    Serving { on: bool },
+    Synced(DriveSyncReport),
+    Merged { commit: String, conflicts: Vec<String>, sync: DriveSyncReport },
+    Where(DriveWhere),
+}
+
+/// 一次同步的结果。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveSyncReport {
+    /// local（没有副本）、same、pulled（快进到存储设备的头）、pushed、diverged、offline（副本都连不上）。
+    pub state: String,
+    pub head: Option<String>,
+    /// 存储设备上的头（最近一次知道的）。
+    pub remote: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveWhere {
+    pub path: String,
+    pub replicas: Vec<String>,
+    /// 本机的头是否已经在存储设备上。
+    pub synced: bool,
+    /// 未提交的改动数。
+    pub uncommitted: u32,
+    /// 这个路径下的内容一共多少字节，本机有多少。
+    pub total_bytes: u64,
+    pub local_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +350,10 @@ pub enum Response {
     WebEnrolled { label: String },
     /// 登录成功：网页会话凭证，以及这个通行密钥能看到的设备。
     WebLoggedIn { session: nexus_core_proto::authz::SignedWebSession, devices: Vec<WebDevice> },
+    DriveInfo { serving: bool, workspaces: Vec<(String, Option<[u8; 32]>)> },
+    DriveMissing(Vec<[u8; 32]>),
+    /// 推送的结果：对方现在的头；`accepted` 为假时是分叉（或对方已经更新），要先同步。
+    DrivePushed { accepted: bool, head: Option<[u8; 32]> },
     Error(WireError),
 }
 

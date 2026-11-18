@@ -15,6 +15,39 @@ pub enum DriveCmd {
     Create {
         /// 工作区名：小写字母、数字、连字符
         ws: String,
+        /// 保存完整副本的设备，可以写多次；不写时用网络里开了 serve 的设备
+        #[arg(long = "replica", value_name = "设备")]
+        replicas: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 本机作为存储设备：保存登记到这里的工作区的完整副本（锚点通常开着）
+    Serve {
+        /// on、off 或 status
+        #[arg(value_parser = ["on", "off", "status"])]
+        state: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 和存储设备同步：取回新的提交和目录结构（文件内容用到时再取），推送本机的提交，或报告分叉
+    ///
+    /// 例：nexus drive sync work（新设备上第一次打开工作区也用它）
+    Sync {
+        ws: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 分叉时把存储设备上的提交合并进来：两边都改了的文件保留本机的版本，对方的另存为 <文件>.conflict-<设备>
+    Merge {
+        ws: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 数据在哪里：副本、是否已同步、未提交的改动、本机有多少内容
+    ///
+    /// 例：nexus drive where work:/data
+    Where {
+        path: String,
         #[arg(long)]
         json: bool,
     },
@@ -175,7 +208,20 @@ pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &DriveCmd, c
             Err(f) => return f.report(sink),
         },
         DriveCmd::Put { path, exec, json } => (put(ctl, path, *exec, Source::Stream(stdin)).await, *json),
-        DriveCmd::Create { ws, json } => (ask(ctl, DriveRequest::Create { ws: ws.clone() }).await, *json),
+        DriveCmd::Create { ws, replicas, json } => {
+            (ask(ctl, DriveRequest::Create { ws: ws.clone(), replicas: replicas.clone() }).await, *json)
+        }
+        DriveCmd::Serve { state, json } => {
+            let on = match state.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            };
+            (ask(ctl, DriveRequest::Serve { on }).await, *json)
+        }
+        DriveCmd::Sync { ws, json } => (ask(ctl, DriveRequest::Sync { ws: ws.clone() }).await, *json),
+        DriveCmd::Merge { ws, json } => (ask(ctl, DriveRequest::Merge { ws: ws.clone() }).await, *json),
+        DriveCmd::Where { path, json } => (ask(ctl, DriveRequest::Where { path: path.clone() }).await, *json),
         DriveCmd::Ls { path: None, json, .. } => (ask(ctl, DriveRequest::List).await, *json),
         DriveCmd::Ls { path: Some(path), at, json } => {
             (ask(ctl, DriveRequest::Ls { path: path.clone(), at: at.clone() }).await, *json)
@@ -270,11 +316,53 @@ fn render(r: &DriveResponse, json: bool) -> String {
             }
             json!({ "changes": list.iter().map(|c| json!({ "kind": c.kind, "path": c.path })).collect::<Vec<_>>() })
         }
-        DriveResponse::Committed { commit } => {
+        DriveResponse::Committed { commit, sync } => {
             if !json {
-                return format!("已提交 {}\n", &commit[..12]);
+                return format!("已提交 {}；{}", &commit[..12], sync_text(sync));
             }
-            json!({ "commit": commit })
+            json!({ "commit": commit, "sync": sync_json(sync) })
+        }
+        DriveResponse::Serving { on } => {
+            if !json {
+                return if *on { "本机是存储设备：保存登记到这里的工作区的完整副本\n".into() } else { "本机不是存储设备\n".into() };
+            }
+            json!({ "serving": on })
+        }
+        DriveResponse::Synced(r) => {
+            if !json {
+                return sync_text(r);
+            }
+            sync_json(r)
+        }
+        DriveResponse::Merged { commit, conflicts, sync } => {
+            if !json {
+                let mut t = format!("已合并 {}", &commit[..12]);
+                if !conflicts.is_empty() {
+                    t.push_str(&format!("；冲突（本机的版本保留，对方的另存为 .conflict-*）：{}", conflicts.join("、")));
+                }
+                return format!("{t}；{}", sync_text(sync));
+            }
+            json!({ "commit": commit, "conflicts": conflicts, "sync": sync_json(sync) })
+        }
+        DriveResponse::Where(w) => {
+            if !json {
+                let place = if w.replicas.is_empty() {
+                    "只在本机（没有存储设备）".to_string()
+                } else if w.synced {
+                    format!("已同步到 {}", w.replicas.join("、"))
+                } else {
+                    format!("还没同步到 {}：最新的提交只在本机", w.replicas.join("、"))
+                };
+                let pct = if w.total_bytes == 0 { 100 } else { w.local_bytes * 100 / w.total_bytes };
+                return format!(
+                    "{}\n  {place}\n  未提交的改动 {}\n  内容 {} 字节，本机有 {} 字节（{pct}%）\n",
+                    w.path, w.uncommitted, w.total_bytes, w.local_bytes
+                );
+            }
+            json!({
+                "path": w.path, "replicas": w.replicas, "synced": w.synced, "uncommitted": w.uncommitted,
+                "total_bytes": w.total_bytes, "local_bytes": w.local_bytes,
+            })
         }
         DriveResponse::Log(list) => {
             if !json {
@@ -286,6 +374,26 @@ fn render(r: &DriveResponse, json: bool) -> String {
     let mut v = v;
     v["schema"] = json!(JSON_SCHEMA);
     doc(v)
+}
+
+fn sync_json(r: &nexus_wire::DriveSyncReport) -> Value {
+    json!({ "state": r.state, "head": r.head, "remote": r.remote, "message": r.message })
+}
+
+fn sync_text(r: &nexus_wire::DriveSyncReport) -> String {
+    let what = match r.state.as_str() {
+        "local" => "只在本机（没有存储设备）",
+        "same" => "和存储设备一致",
+        "pulled" => "已取回存储设备上的提交",
+        "pushed" => "已推送到存储设备",
+        "diverged" => "分叉",
+        _ => "存储设备连不上",
+    };
+    if r.message.is_empty() {
+        format!("{what}\n")
+    } else {
+        format!("{what}：{}\n", r.message)
+    }
 }
 
 async fn cat<C: Ctl, K: Sink>(ctl: &C, path: &str, at: Option<String>, offset: u64, length: Option<u64>, sink: &mut K) -> i32 {

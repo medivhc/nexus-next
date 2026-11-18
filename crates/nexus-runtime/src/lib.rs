@@ -71,6 +71,8 @@ enum Dispatch {
     Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
     Pipe { addr: std::net::SocketAddr, name: String },
     Exit { target: Target },
+    DriveGet { hashes: Vec<[u8; 32]> },
+    DrivePush { ws: String, head: [u8; 32], count: u32 },
     WebEnroll { token: [u8; 16], credential: NewCredential },
 }
 
@@ -338,7 +340,17 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::SvcList => ("node.info", None),
+        Request::SvcList | Request::DriveInfo => ("node.info", None),
+        Request::DriveRegister { ws } | Request::DriveHave { ws, .. } | Request::DrivePush { ws, .. } | Request::DriveGet { ws, .. } => {
+            if !nexus_drive_core::path::valid_workspace(ws) {
+                return Err(err(ErrorCode::InvalidInput, format!("工作区名不合法：{ws}")));
+            }
+            let cap = if matches!(body, Request::DriveGet { .. }) { "drive.read" } else { "drive.write" };
+            return Ok(Some(Action {
+                capability: Capability::parse(cap).expect("内置能力名合法"),
+                resource: ResourcePath::parse(&format!("{node}/drive/{ws}")).map_err(|_| internal("本机不在名册里"))?,
+            }));
+        }
         Request::SvcConnect { name } => {
             if !valid_segment(name) {
                 return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
@@ -564,6 +576,10 @@ impl<T: Transport, S: System> Node<T, S> {
         })
     }
 
+    fn ws_exists(&self, ws: &str) -> bool {
+        self.drive_state.borrow().workspaces.contains_key(ws)
+    }
+
     /// 统一入口：常驻程序把本机入口上接受的连接从这里交给节点。
     pub fn proxy_entry(&self) -> mpsc::UnboundedSender<ProxyStream> {
         self.proxy_tx.clone()
@@ -743,6 +759,8 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
+            Dispatch::DriveGet { hashes } => return self.serve_drive_get(stream, hashes).await,
+            Dispatch::DrivePush { ws, head, count } => return self.serve_drive_push(stream, ws, head, count).await,
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
                 Ok(label) => Response::WebEnrolled { label },
                 Err(e) => Response::Error(e),
@@ -801,6 +819,26 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             Request::SessionList => Response::Sessions(self.session_list(|p| principal_sees(&roster, &header.principal, p))),
             Request::SvcList => Response::Services(self.service_list(&me, |a| principal_may(&roster, &header.principal, a))),
+            Request::DriveInfo => self.drive_info(|ws| {
+                let action = Action {
+                    capability: Capability::parse("drive.read").expect("内置能力名合法"),
+                    resource: match ResourcePath::parse(&format!("{me}/drive/{ws}")) {
+                        Ok(r) => r,
+                        Err(_) => return false,
+                    },
+                };
+                principal_may(&roster, &header.principal, &action)
+            }),
+            Request::DriveRegister { ws } => self.drive_register(&ws),
+            Request::DriveHave { ws, hashes } => self.drive_have(&ws, hashes),
+            Request::DriveGet { ws, hashes } => match self.ws_exists(&ws) {
+                true => return Dispatch::DriveGet { hashes },
+                false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),
+            },
+            Request::DrivePush { ws, head, count } => match self.ws_exists(&ws) {
+                true => return Dispatch::DrivePush { ws, head, count },
+                false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),
+            },
             Request::SvcConnect { name } => match self.service_addr(&name) {
                 Some(addr) => return Dispatch::Pipe { addr, name },
                 None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
@@ -999,7 +1037,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let agent_ref = agent.as_ref();
         let result = match req {
             CtlRequest::Exec { node, spec } => return self.exec(&node, spec, agent, server).await,
-            CtlRequest::Drive(req) => return self.drive(req, server).await,
+            CtlRequest::Drive(req) => return self.drive(req, agent, server).await,
             CtlRequest::Attach { node, session, size } => return self.attach(&node, session, size, agent, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
@@ -1083,7 +1121,9 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
         }
         if matches!(req, CtlRequest::Drive(_)) {
-            return Err(err(ErrorCode::Denied, "agent 还不能访问工作区"));
+            // 工作区按每个请求判定（见 drive.rs 的 drive_allowed），这里只验证凭据本身。
+            let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+            return agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason));
         }
         let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
