@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Span, error, trace};
 
 pub(crate) use self::remote_state::PathStateReceiver;
+// NEXUS: 计费的本机地址（见 `crate::nexus_set_metered_ips`）。
+pub(crate) use self::remote_state::NEXUS_METERED;
 use self::remote_state::RemoteStateActor;
 pub(super) use self::remote_state::RemoteStateMessage;
 pub use self::remote_state::{

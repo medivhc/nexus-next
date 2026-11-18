@@ -136,6 +136,23 @@ pub struct StreamsState {
     receive_window_shrink_debt: u64,
     /// Whether the locally-initiated stream limit has been hit, per direction
     pub(super) streams_blocked: [bool; 2],
+    /// NEXUS: 交互冗余：在一条路径上发过、还要在另一条路径上再发一次的流数据。
+    nexus_dups: VecDeque<NexusDup>,
+}
+
+/// NEXUS: 优先级不低于这个值的流是交互流量（Nexus 的 TrafficClass::Interactive 是 8），在每条路径上都发。
+pub(crate) const NEXUS_REDUNDANT_PRIORITY: i32 = 8;
+/// NEXUS: 待重复发送的数据最多记这么多段，更早的丢掉（另一条路径一直不发包时不无限增长）。
+const NEXUS_MAX_DUPS: usize = 512;
+
+/// NEXUS: 一段待在别的路径上重复发送的流数据。
+#[derive(Debug, Clone)]
+struct NexusDup {
+    id: StreamId,
+    offsets: core::ops::Range<u64>,
+    fin: bool,
+    /// 已经在这条路径上发过。
+    from: crate::PathId,
 }
 
 impl StreamsState {
@@ -181,7 +198,61 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             streams_blocked: [false, false],
+            nexus_dups: VecDeque::new(),
         }
+    }
+
+    /// NEXUS: 有没有要在 `path` 上重复发送的数据。
+    pub(in crate::connection) fn nexus_has_dups_for(&self, path: crate::PathId) -> bool {
+        self.nexus_dups.iter().any(|d| d.from != path)
+    }
+
+    /// NEXUS: 把在别的路径上发过的交互数据在 `path` 上再发一次（每段只再发一次）。
+    /// 已经被确认的部分不再发。
+    pub(in crate::connection) fn nexus_write_dups<'a, 'b>(
+        &mut self,
+        builder: &mut PacketBuilder<'a, 'b>,
+        path: crate::PathId,
+        stats: &mut FrameStats,
+    ) {
+        let mut keep = VecDeque::with_capacity(self.nexus_dups.len());
+        while let Some(mut dup) = self.nexus_dups.pop_front() {
+            if dup.from == path {
+                keep.push_back(dup);
+                continue;
+            }
+            let Some(stream) = self.send.get_mut(&dup.id).and_then(|s| s.as_mut()) else { continue };
+            if stream.is_reset() {
+                continue;
+            }
+            dup.offsets.start = dup.offsets.start.max(stream.pending.fully_acked_offset());
+            if dup.offsets.start >= dup.offsets.end && !dup.fin {
+                continue;
+            }
+            if dup.offsets.start > dup.offsets.end {
+                continue;
+            }
+            let max_buf_size = builder.frame_space_remaining().saturating_sub(1 + VarInt::size(dup.id.into()));
+            let len = dup.offsets.end - dup.offsets.start;
+            if builder.frame_space_remaining() <= frame::Stream::SIZE_BOUND || len as usize > max_buf_size.saturating_sub(8) {
+                // 这个包放不下：留到下一个包。
+                keep.push_back(dup);
+                keep.extend(self.nexus_dups.drain(..));
+                break;
+            }
+            let range = dup.offsets.clone();
+            let meta = frame::StreamMeta { id: dup.id, offsets: dup.offsets, fin: dup.fin };
+            builder.write_frame(meta.encoder(true), stats);
+            stream.pending.get_into(range, builder.buf);
+        }
+        self.nexus_dups = keep;
+    }
+
+    fn nexus_record_dup(&mut self, id: StreamId, offsets: core::ops::Range<u64>, fin: bool, from: crate::PathId) {
+        if self.nexus_dups.len() >= NEXUS_MAX_DUPS {
+            self.nexus_dups.pop_front();
+        }
+        self.nexus_dups.push_back(NexusDup { id, offsets, fin, from });
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -521,6 +592,9 @@ impl StreamsState {
         builder: &mut PacketBuilder<'a, 'b>,
         fair: bool,
         stats: &mut FrameStats,
+        // NEXUS: 发在哪条路径上；`redundant` 时交互流的数据还要在别的路径上再发一次。
+        path: crate::PathId,
+        redundant: bool,
     ) {
         while builder.frame_space_remaining() > frame::Stream::SIZE_BOUND {
             // Pop the stream of the highest priority that currently has pending data. If
@@ -568,9 +642,13 @@ impl StreamsState {
             }
 
             let range = offsets.clone();
+            let interactive = stream.priority >= NEXUS_REDUNDANT_PRIORITY;
             let meta = frame::StreamMeta { id, offsets, fin };
             builder.write_frame(meta.encoder(encode_length), stats);
-            stream.pending.get_into(range, builder.buf);
+            stream.pending.get_into(range.clone(), builder.buf);
+            if redundant && interactive {
+                self.nexus_record_dup(id, range, fin, path);
+            }
         }
     }
 
@@ -582,7 +660,7 @@ impl StreamsState {
         tbuf.start_new_datagram_with_size(capacity);
         let builder = &mut PacketBuilder::simple_data_buf(&mut tbuf);
         let stats = &mut FrameStats::default();
-        self.write_stream_frames(builder, fair, stats);
+        self.write_stream_frames(builder, fair, stats, crate::PathId::ZERO, false);
         builder.sent_frames().stream_frames.clone()
     }
 
@@ -605,8 +683,10 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream.ack(frame) {
+        // NEXUS: 只减新确认的字节（交互冗余时同一段数据会被确认两次）。
+        let (done, newly) = stream.ack(frame);
+        self.unacked_data = self.unacked_data.saturating_sub(newly);
+        if !done {
             // The stream is unfinished or may still need retransmits
             return;
         }

@@ -214,11 +214,14 @@ impl SendBuffer {
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    /// NEXUS: 返回这次新确认的字节数（同一段数据可能在两条路径上各发一次、各被确认一次）。
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> u64 {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
+        let already: u64 = self.acks.iter_range(range.clone()).map(|r| r.end - r.start).sum();
+        let newly = (range.end - range.start).saturating_sub(already);
 
         self.acks.insert(range);
 
@@ -233,6 +236,7 @@ impl SendBuffer {
         // We have to do this since we have just dropped the data, and asking
         // for non-present data would be an error.
         self.retransmits.remove(0..self.fully_acked_offset());
+        newly
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -327,7 +331,8 @@ impl SendBuffer {
     }
 
     /// Offset up to which all data has been acknowledged
-    fn fully_acked_offset(&self) -> u64 {
+    // NEXUS: 交互冗余要知道哪些数据已经不用再发（`pub(super)`，原来是私有的）。
+    pub(super) fn fully_acked_offset(&self) -> u64 {
         self.data.range().start
     }
 

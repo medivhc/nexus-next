@@ -48,6 +48,19 @@ mod remote_info;
 /// NEXUS: 为 true 时恢复 iroh 原来的行为（只保留并使用一条直连路径）。
 const NEXUS_SINGLE_IP_PATH: bool = false;
 
+/// NEXUS: 按流量计费的本机地址（由 Nexus 按网络接口判断后设置，见 [`crate::nexus_set_metered_ips`]）。
+/// 从这些地址出去的直连路径是 Backup：只在没有别的直连路径时承担数据；交互冗余照样用它。
+pub(crate) static NEXUS_METERED: std::sync::RwLock<BTreeSet<std::net::IpAddr>> = std::sync::RwLock::new(BTreeSet::new());
+
+fn nexus_is_metered(addr: &transports::FourTuple) -> bool {
+    match addr {
+        transports::FourTuple::Ip { local: Some(ip), .. } => {
+            NEXUS_METERED.read().map(|m| m.contains(&ip.to_canonical())).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// NEXUS: 多路径时检查连接（是否每个本机地址都有一条直连路径）的间隔。
 const NEXUS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -806,6 +819,10 @@ impl RemoteStateActor {
             is_goodenough &= is_conn_goodenough;
         }
 
+        // NEXUS: 多路径：重新设置各路径的状态（计费的接口可能变了）。
+        if !NEXUS_SINGLE_IP_PATH {
+            self.apply_selected_path();
+        }
         // NEXUS: 多路径：每个本机直连地址都应该有一条打开的直连路径；缺了（例如断过又恢复的接口）就再打洞。
         if !NEXUS_SINGLE_IP_PATH && is_goodenough {
             let local_ips: BTreeSet<std::net::IpAddr> = self.state.local_candidates().iter().map(|a| a.ip()).collect();
@@ -1144,7 +1161,11 @@ impl State {
     fn path_status_for_addr(&self, addr: &transports::FourTuple) -> PathStatus {
         // NEXUS: 多路径：所有直连路径都是 Available（noq 按各路径的发送余量排包）；
         // 中继只在被选中（没有直连）时用。
-        if Some(addr) == self.selected_path.as_ref() || (!NEXUS_SINGLE_IP_PATH && addr.is_ip()) {
+        // 按流量计费的接口上的直连路径是 Backup。
+        if !NEXUS_SINGLE_IP_PATH && addr.is_ip() {
+            return if nexus_is_metered(addr) { PathStatus::Backup } else { PathStatus::Available };
+        }
+        if Some(addr) == self.selected_path.as_ref() {
             PathStatus::Available
         } else {
             PathStatus::Backup

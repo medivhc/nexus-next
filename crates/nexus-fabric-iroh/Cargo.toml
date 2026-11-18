@@ -16,6 +16,8 @@ postcard.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 iroh = { workspace = true, features = ["metrics", "portmapper", "fast-apple-datapath"] }
+# 网络接口（M5.2：计费网络）。
+nix = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

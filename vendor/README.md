@@ -14,3 +14,7 @@
 | 第一次超时从最早一个未确认的包算起 | noq-proto `src/connection/mod.rs`（`pto_time_and_space`） | 一直在发数据的路径断了，原来要等拥塞窗口塞满才超时（秒级） |
 | 超时的路径在有别的健康路径时：在途的包立刻算丢、不再发新数据，只发探测 | 同上（`nexus_fail_over`、`scheduling_info`） | 数据马上在别的路径上重发 |
 | 多路径时确认走它所确认的路径；可疑路径照样发自己的确认 | noq-proto `src/connection/mod.rs`、`src/connection/spaces.rs` | 确认都走一条路径时，发送方会把另一条好路径误判为断了 |
+| 交互冗余：优先级 ≥ 8 的流的数据在另一条健康路径上再发一次 | noq-proto `src/connection/streams/state.rs`（`nexus_dups`）、`src/connection/mod.rs`、`src/connection/spaces.rs` | 交互流量两条路同时发，取先到的 |
+| 只减新确认的字节 | noq-proto `src/connection/send_buffer.rs`、`streams/send.rs`、`streams/state.rs` | 同一段数据被确认两次时原来会下溢 |
+| 任何一端标为 Backup 就按 Backup 调度；Available 路径可疑时 Backup 立刻接管 | noq-proto `src/connection/paths.rs`（`nexus_status`）、`mod.rs` | 计费网络（对端的接口计费时本端也不发批量） |
+| 计费的本机地址：从它们出去的直连路径是 Backup | iroh `src/lib.rs`（`nexus_set_metered_ips`）、`remote_state.rs` | 计费网络只承担交互和故障接管 |

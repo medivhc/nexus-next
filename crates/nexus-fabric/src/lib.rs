@@ -56,6 +56,20 @@ pub trait Transport {
         let _ = url;
         std::future::ready(Ok(()))
     }
+    /// 到 `node` 的连接现在的路径（M5.1）。没有连接时为空；不区分路径的传输（仿真）给出一条。
+    fn paths(&self, node: NodeId) -> Vec<nexus_wire::PathInfo> {
+        let _ = node;
+        Vec::new()
+    }
+    /// 是否知道本机的网络接口（M5.2）。仿真不知道。
+    fn has_interfaces(&self) -> bool {
+        false
+    }
+    /// 重新查看本机的网络接口，按 `overrides`（接口名 → 是否计费）和自动识别决定哪些计费，并让传输按此调度。
+    fn interfaces(&self, overrides: &std::collections::BTreeMap<String, bool>) -> Vec<nexus_wire::IfaceInfo> {
+        let _ = overrides;
+        Vec::new()
+    }
 }
 
 pub trait Connection {

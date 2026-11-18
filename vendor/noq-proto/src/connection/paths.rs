@@ -652,6 +652,14 @@ impl PathData {
         self.status.local_status
     }
 
+    /// NEXUS: 调度用的状态：任何一端把路径标为 Backup（例如对端的这个接口按流量计费）就是 Backup。
+    pub(crate) fn nexus_status(&self) -> PathStatus {
+        match (self.status.local_status, self.remote_status()) {
+            (PathStatus::Backup, _) | (_, Some(PathStatus::Backup)) => PathStatus::Backup,
+            _ => PathStatus::Available,
+        }
+    }
+
     /// Tag uniquely identifying a path in a connection.
     ///
     /// When a migration happens on the same [`PathId`] we still detect a change in the

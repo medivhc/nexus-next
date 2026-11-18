@@ -15,6 +15,9 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::io::Join;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod metered;
+
 /// 每条路径的心跳间隔。
 const PATH_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(1);
 /// 一条路径这么久没有回应就放弃它。
@@ -70,6 +73,8 @@ pub struct IrohTransport {
     /// 只经中继（浏览器）：地址提示里的 IP 地址用不上，留着反而让建立连接先在它们上面空等。
     relay_only: bool,
     scheduling: bool,
+    /// 按流量计费的本机地址（M5.2），最近一次查看接口时定下的。
+    metered_ips: RefCell<std::collections::BTreeSet<std::net::IpAddr>>,
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -128,6 +133,7 @@ impl IrohTransport {
             conns: RefCell::default(),
             relay_only: !config.direct,
             scheduling: config.scheduling,
+            metered_ips: RefCell::default(),
         })
     }
 
@@ -202,6 +208,71 @@ impl Transport for IrohTransport {
             let remote = NodeId(*conn.remote_id().as_bytes());
             return Ok((IrohConn { conn, remote, scheduling: self.scheduling }, proto));
         }
+    }
+
+    fn paths(&self, node: NodeId) -> Vec<nexus_wire::PathInfo> {
+        let Some(conn) = self.conns.borrow().get(&node).cloned() else { return Vec::new() };
+        if conn.close_reason().is_some() {
+            return Vec::new();
+        }
+        let list = conn.paths();
+        list.iter()
+            .map(|p| {
+                let stats = p.stats();
+                let local = match p.local_addr() {
+                    iroh::endpoint::LocalTransportAddr::Ip(Some(ip)) => ip.to_string(),
+                    iroh::endpoint::LocalTransportAddr::Ip(None) => "?".to_string(),
+                    iroh::endpoint::LocalTransportAddr::Relay(_) => "relay".to_string(),
+                    _ => "custom".to_string(),
+                };
+                let remote = match p.remote_addr() {
+                    iroh::TransportAddr::Ip(a) => a.to_string(),
+                    iroh::TransportAddr::Relay(u) => u.to_string(),
+                    other => other.to_string(),
+                };
+                let metered = local.parse::<std::net::IpAddr>().is_ok_and(|ip| self.metered_ips.borrow().contains(&ip));
+                nexus_wire::PathInfo {
+                    local,
+                    remote,
+                    kind: if p.is_relay() { PathKind::Relay } else { PathKind::Direct },
+                    rtt_us: p.rtt().as_micros() as u64,
+                    tx_bytes: stats.udp_tx.bytes,
+                    rx_bytes: stats.udp_rx.bytes,
+                    lost_packets: stats.lost_packets,
+                    metered,
+                }
+            })
+            .collect()
+    }
+
+    fn has_interfaces(&self) -> bool {
+        cfg!(not(target_arch = "wasm32")) && !self.relay_only
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn interfaces(&self, overrides: &std::collections::BTreeMap<String, bool>) -> Vec<nexus_wire::IfaceInfo> {
+        let list = metered::scan();
+        let mut ips = std::collections::BTreeSet::new();
+        let out = list
+            .into_iter()
+            .map(|i| {
+                let setting = overrides.get(&i.name).copied();
+                let metered = setting.unwrap_or(i.auto_metered);
+                if metered {
+                    ips.extend(i.addrs.iter().copied());
+                }
+                nexus_wire::IfaceInfo {
+                    addrs: i.addrs.iter().map(|a| a.to_string()).collect(),
+                    name: i.name,
+                    metered,
+                    auto_metered: i.auto_metered,
+                    setting,
+                }
+            })
+            .collect();
+        iroh::nexus_set_metered_ips(ips.iter().copied());
+        *self.metered_ips.borrow_mut() = ips;
+        out
     }
 
     async fn use_relay(&self, url: &str) -> io::Result<()> {

@@ -279,6 +279,10 @@ const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
 const KEY_ROUTES: &str = "routes";
 const KEY_EXIT: &str = "exit";
+/// 用户对网络接口是否计费的设置（M5.2）：接口名 → 是否计费。
+const KEY_METERED: &str = "metered-v1";
+/// 多长时间重新查看一次本机的网络接口（地址和计费的接口可能变了）。
+const INTERFACES_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 统一入口上的一条连接（SOCKS5 或 HTTP 代理），由常驻程序从本机监听的端口交给节点。
 pub type ProxyStream = Box<dyn ProxyIo + Send>;
@@ -525,6 +529,8 @@ pub struct Node<T, S: System> {
     tun_rx: RefCell<Option<mpsc::UnboundedReceiver<TunInbound>>>,
     /// 本机的工作区（M4.1）。
     drive_state: RefCell<drive::DriveState>,
+    /// 用户对网络接口是否计费的设置（M5.2）。
+    metered: RefCell<BTreeMap<String, bool>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
     roster_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -553,6 +559,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         let (tun_tx, tun_rx) = mpsc::unbounded_channel();
         let drive_state = RefCell::new(drive::DriveState::load(&system)?);
+        let metered = RefCell::new(load(&system, KEY_METERED)?.unwrap_or_default());
         Ok(Self {
             routes: RefCell::new(routes),
             exit_enabled: Cell::new(exit_enabled),
@@ -560,6 +567,7 @@ impl<T: Transport, S: System> Node<T, S> {
             proxy_rx: RefCell::new(Some(proxy_rx)),
             tun: RefCell::new(None),
             drive_state,
+            metered,
             tun_tx,
             tun_rx: RefCell::new(Some(tun_rx)),
             services: RefCell::new(services),
@@ -671,6 +679,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut tunneled = self.tun_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
         tasks.push(Box::pin(self.follow_anchor()));
+        if self.transport.has_interfaces() {
+            tasks.push(Box::pin(self.follow_interfaces()));
+        }
         // accept 不保证可以安全取消，所以让同一个 future 跨循环存活。
         let mut accept = Box::pin(self.transport.accept());
         loop {
@@ -704,6 +715,29 @@ impl<T: Transport, S: System> Node<T, S> {
                 },
             }
         }
+    }
+
+    /// 定期重新查看本机的网络接口，让传输知道哪些接口计费（M5.2）。
+    async fn follow_interfaces(&self) {
+        loop {
+            let overrides = self.metered.borrow().clone();
+            self.transport.interfaces(&overrides);
+            tokio::time::sleep(INTERFACES_EVERY).await;
+        }
+    }
+
+    /// 本机的网络接口；`set` 时先改设置（并保存）。
+    fn interfaces(&self, set: Option<(String, Option<bool>)>) -> Result<Vec<nexus_wire::IfaceInfo>, WireError> {
+        if let Some((name, value)) = set {
+            let mut m = self.metered.borrow_mut();
+            match value {
+                Some(v) => m.insert(name, v),
+                None => m.remove(&name),
+            };
+            save(&self.system, KEY_METERED, &*m).map_err(internal)?;
+        }
+        let overrides = self.metered.borrow().clone();
+        Ok(self.transport.interfaces(&overrides))
     }
 
     /// 名册里有锚点时把它用作中继；名册每次变化都检查一遍。清除锚点后，已经加入的中继保留到重启。
@@ -1048,6 +1082,8 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Drive(req) => return self.drive(req, agent, server).await,
             CtlRequest::Attach { node, session, size } => return self.attach(&node, session, size, agent, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
+            CtlRequest::Paths { device } => self.paths(device.as_deref()).map(CtlResponse::Paths),
+            CtlRequest::Interfaces { set } => self.interfaces(set).map(CtlResponse::Interfaces),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
             CtlRequest::Init { name } => self.init(name).map(CtlResponse::Init),
             CtlRequest::JoinStart => self.join_start(),
@@ -1124,6 +1160,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::RouteAdd { .. }
                 | CtlRequest::RouteRm { .. }
                 | CtlRequest::ExitSet { .. }
+                | CtlRequest::Interfaces { set: Some(_) }
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
@@ -1136,7 +1173,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
         // 执行和会话请求仍交给目标设备完整判定并审计，包括无效凭据的拒绝。
-        if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
+        if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::Paths { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
             agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason))?;
         }
         if SecretKey::from_seed(agent.secret).public() != agent.cert.cert.agent {
@@ -2542,6 +2579,21 @@ impl<T: Transport, S: System> Node<T, S> {
             Response::Ok => Ok(()),
             other => Err(internal(format!("对方的回应无法理解：{other:?}"))),
         }
+    }
+
+    /// 到其他设备的路径（M5.1）。
+    fn paths(&self, device: Option<&str>) -> Result<Vec<nexus_wire::DevicePaths>, WireError> {
+        let devices = match device {
+            Some(d) => vec![self.resolve(d)?],
+            None => {
+                let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+                roster.devices.into_iter().filter(|d| d.node_id != self.me()).collect()
+            }
+        };
+        Ok(devices
+            .into_iter()
+            .map(|d| nexus_wire::DevicePaths { paths: self.transport.paths(d.node_id), device: d.name })
+            .collect())
     }
 
     fn local_status(&self) -> StatusReport {

@@ -162,6 +162,7 @@ impl PacketSpace {
             close: false,
             space_specific,
             other,
+            nexus_dups: false,
         }
     }
 }
@@ -1054,6 +1055,8 @@ pub(super) struct SendableFrames {
     pub(super) space_specific: bool,
     /// Whether there are any other frames to send, these are ack-eliciting.
     pub(super) other: bool,
+    /// NEXUS: 有要在这条路径上重复发送的交互数据（ack-eliciting）。
+    pub(super) nexus_dups: bool,
 }
 
 impl SendableFrames {
@@ -1064,6 +1067,7 @@ impl SendableFrames {
             close: false,
             space_specific: false,
             other: false,
+            nexus_dups: false,
         }
     }
 
@@ -1074,12 +1078,13 @@ impl SendableFrames {
             close,
             space_specific,
             other,
+            nexus_dups,
         } = *self;
         if close {
             // No ack-eliciting frames are included with a CONNECTION_CLOSE, only acks.
             return false;
         }
-        space_specific || other
+        space_specific || other || nexus_dups
     }
 
     /// Whether no data is sendable.
@@ -1089,8 +1094,9 @@ impl SendableFrames {
             close,
             space_specific,
             other,
+            nexus_dups,
         } = *self;
-        !acks && !close && !space_specific && !other
+        !acks && !close && !space_specific && !other && !nexus_dups
     }
 }
 
@@ -1101,12 +1107,14 @@ impl ::core::ops::BitOrAssign for SendableFrames {
             close,
             space_specific,
             other,
+            nexus_dups,
         } = rhs;
 
         self.acks |= acks;
         self.close |= close;
         self.space_specific |= space_specific;
         self.other |= other;
+        self.nexus_dups |= nexus_dups;
     }
 }
 

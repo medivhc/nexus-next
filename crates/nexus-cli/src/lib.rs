@@ -295,6 +295,30 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 本机的网络接口，以及哪些按流量计费（蜂窝网络、手机热点）
+    ///
+    /// 计费的接口只承担交互流量（按键、终端输出、请求）和故障接管，不承担批量传输。
+    /// 默认自动识别；可以按接口手动设置。例：nexus iface wlan0 --metered on
+    Iface {
+        /// 接口名；省略时列出所有接口
+        name: Option<String>,
+        /// 设置这个接口是否计费：on、off，或 auto（按自动识别）
+        #[arg(long, value_parser = ["on", "off", "auto"], requires = "name")]
+        metered: Option<String>,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
+    /// 到其他设备的路径：经过本机哪个网络地址、直连还是中继、往返时间、收发字节数
+    ///
+    /// 有多个网络接口（例如有线和 5G）时，每个接口一条路径，同时使用；一条断了数据换到别的路径上。
+    Path {
+        /// 设备的名字或标识；省略时列出所有设备
+        device: Option<String>,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -722,6 +746,18 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             return exec(ctl, CtlRequest::Exec { node: node.clone(), spec }, *json, stdin, sink).await;
         }
         Cmd::Status { node: None, json } => (CtlRequest::Status, *json),
+        Cmd::Path { device, json } => (CtlRequest::Paths { device: device.clone() }, *json),
+        Cmd::Iface { name, metered, json } => {
+            let set = match (name, metered.as_deref()) {
+                (Some(n), Some(m)) => Some((n.clone(), match m {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                })),
+                _ => None,
+            };
+            (CtlRequest::Interfaces { set }, *json)
+        }
         Cmd::Status { node: Some(n), json } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
         Cmd::Init { name, json } => (CtlRequest::Init { name: name.clone() }, *json),
         Cmd::Join { json } => (CtlRequest::JoinStart, *json),
@@ -1068,6 +1104,89 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     out.push_str(&format!("{node}/{:<20} {}\n", s.name, s.proto));
                     for (k, v) in &s.env {
                         out.push_str(&format!("    {k}={v}\n"));
+                    }
+                }
+                out
+            }
+        }
+        CtlResponse::Interfaces(list) => {
+            let only = match cmd {
+                Cmd::Iface { name: Some(n), .. } => Some(n.clone()),
+                _ => None,
+            };
+            let list: Vec<_> = list.into_iter().filter(|i| only.as_ref().is_none_or(|n| &i.name == n)).collect();
+            if let (Some(n), true) = (&only, list.is_empty()) {
+                return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("本机没有启用的接口 {n}"));
+            }
+            if json {
+                let v: Vec<Value> = list
+                    .iter()
+                    .map(|i| json!({ "name": i.name, "addrs": i.addrs, "metered": i.metered, "auto_metered": i.auto_metered, "setting": i.setting }))
+                    .collect();
+                doc(json!({ "schema": JSON_SCHEMA, "interfaces": v }))
+            } else if list.is_empty() {
+                "没有可用的网络接口信息（这个传输不区分接口）\n".to_string()
+            } else {
+                let mut out = String::new();
+                for i in &list {
+                    let how = match i.setting {
+                        Some(_) => "手动设置",
+                        None => "自动识别",
+                    };
+                    let state = if i.metered { "计费：只承担交互和故障接管" } else { "不计费" };
+                    out.push_str(&format!("{:<12} {:<40} {state}（{how}）\n", i.name, i.addrs.join(" ")));
+                }
+                out
+            }
+        }
+        CtlResponse::Paths(devices) => {
+            if json {
+                let list: Vec<Value> = devices
+                    .iter()
+                    .map(|d| {
+                        let paths: Vec<Value> = d
+                            .paths
+                            .iter()
+                            .map(|p| {
+                                json!({
+                                    "local": p.local,
+                                    "remote": p.remote,
+                                    "kind": path_str(Some(p.kind)),
+                                    "rtt_ms": p.rtt_us as f64 / 1000.0,
+                                    "tx_bytes": p.tx_bytes,
+                                    "rx_bytes": p.rx_bytes,
+                                    "lost_packets": p.lost_packets,
+                                    "metered": p.metered,
+                                })
+                            })
+                            .collect();
+                        json!({ "device": d.device, "paths": paths })
+                    })
+                    .collect();
+                doc(json!({ "schema": JSON_SCHEMA, "devices": list }))
+            } else {
+                let mut out = String::new();
+                for d in &devices {
+                    if d.paths.is_empty() {
+                        out.push_str(&format!("{}：没有连接\n", d.device));
+                        continue;
+                    }
+                    out.push_str(&format!("{}：{} 条路径\n", d.device, d.paths.len()));
+                    for p in &d.paths {
+                        let kind = match p.kind {
+                            nexus_core_proto::PathKind::Direct => "直连",
+                            nexus_core_proto::PathKind::Relay => "中继",
+                        };
+                        let metered = if p.metered { "，计费" } else { "" };
+                        out.push_str(&format!(
+                            "  {} → {}  {kind}{metered}  往返 {:.1} 毫秒  发 {} 收 {} 字节  丢包 {}\n",
+                            p.local,
+                            p.remote,
+                            p.rtt_us as f64 / 1000.0,
+                            p.tx_bytes,
+                            p.rx_bytes,
+                            p.lost_packets
+                        ));
                     }
                 }
                 out

@@ -304,3 +304,19 @@ pub mod unstable_net_report {
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+/// NEXUS: 设置按流量计费的本机地址（整个进程）。从这些地址出去的直连路径只在没有别的直连路径时承担数据，
+/// 交互流量的冗余副本照样经过它们。几秒内（下一次检查连接时）生效。
+#[cfg(not(wasm_browser))]
+pub fn nexus_set_metered_ips(ips: impl IntoIterator<Item = std::net::IpAddr>) {
+    let set = ips.into_iter().map(|ip| ip.to_canonical()).collect();
+    if let Ok(mut m) = socket::remote_map::NEXUS_METERED.write() {
+        *m = set;
+    }
+}
+
+/// NEXUS: 现在按流量计费的本机地址。
+#[cfg(not(wasm_browser))]
+pub fn nexus_metered_ips() -> std::collections::BTreeSet<std::net::IpAddr> {
+    socket::remote_map::NEXUS_METERED.read().map(|m| m.clone()).unwrap_or_default()
+}

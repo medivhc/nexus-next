@@ -1177,7 +1177,9 @@ impl Connection {
             self.remote_cids.contains_key(path_id)
                 && !self.abandoned_paths.contains(path_id)
                 && path.data.validated
-                && path.data.local_status() == PathStatus::Available
+                && path.data.nexus_status() == PathStatus::Available
+                // NEXUS: 出现过超时（可能断了）的 Available 路径不算：这时 Backup 路径（例如计费的 5G）马上接管。
+                && (self.paths.len() < 2 || path.data.pto_count == 0)
         });
 
         // Such a space is able to send SpaceKind::Data frames.
@@ -1192,7 +1194,8 @@ impl Connection {
         let is_abandoned = self.abandoned_paths.contains(&path_id);
         let path_data = self.path_data(path_id);
         let validated = path_data.validated;
-        let status = path_data.local_status();
+        // NEXUS: 两端任何一端标为 Backup 都按 Backup 调度。
+        let status = path_data.nexus_status();
 
         // This is the core packet scheduling, whether this space ID may send
         // SpaceKind::Data frames.
@@ -1528,8 +1531,8 @@ impl Connection {
                     // We always send a loss probe or space-specific frames if the path is
                     // not abandoned.
                     true
-                } else if can_send.acks && space_id == SpaceId::Data && self.paths.len() > 1 {
-                    // NEXUS: 多路径：路径自己的确认总是在这条路径上发（见 ACK 帧的组装）。
+                } else if (can_send.acks || can_send.nexus_dups) && space_id == SpaceId::Data && self.paths.len() > 1 {
+                    // NEXUS: 多路径：路径自己的确认、要在这条路径上重复发送的交互数据，总是在这条路径上发。
                     true
                 } else {
                     // Anything else we only send if we're the best path for SpaceKind::Data
@@ -2247,6 +2250,10 @@ impl Connection {
         }
 
         can_send.close = connection_close_pending && space_has_crypto;
+        // NEXUS: 有要在这条路径上重复发送的交互数据。
+        if space_id == SpaceId::Data && self.nexus_dup_ok(path_id) && self.streams.nexus_has_dups_for(path_id) {
+            can_send.nexus_dups = true;
+        }
 
         can_send
     }
@@ -3314,7 +3321,7 @@ impl Connection {
                 && self.remote_cids.contains_key(id)
                 && !self.abandoned_paths.contains(id)
                 && path.data.validated
-                && path.data.local_status() == PathStatus::Available
+                && path.data.nexus_status() == PathStatus::Available
                 && path.data.pto_count == 0
         })
     }
@@ -6165,6 +6172,9 @@ impl Connection {
         let is_multipath_negotiated = self.is_multipath_negotiated();
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
+        // NEXUS: 交互冗余的判断要在借用路径统计之前做。
+        let nexus_dup_here = space_id == SpaceId::Data && !scheduling_info.is_abandoned && self.nexus_dup_ok(path_id);
+        let nexus_redundant = self.nexus_dup_ok_besides(path_id);
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         let space = &mut self.spaces[space_id];
         let path = &mut self.paths.get_mut(&path_id).expect("known path").data;
@@ -6641,13 +6651,30 @@ impl Connection {
         }
 
         // STREAM
+        // NEXUS: 交互冗余：先发在别的路径上发过的交互数据（这条路径健康时，计费的备用路径也发）。
+        if nexus_dup_here {
+            self.streams.nexus_write_dups(builder, path_id, stats);
+        }
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && space_id == SpaceId::Data
         {
             self.streams
-                .write_stream_frames(builder, self.config.send_fairness, stats);
+                .write_stream_frames(builder, self.config.send_fairness, stats, path_id, nexus_redundant);
         }
+    }
+
+    /// NEXUS: 路径可以承担交互冗余：多路径、已验证、没放弃、没有出现过超时。不论 Available 还是 Backup。
+    fn nexus_dup_ok(&self, path_id: PathId) -> bool {
+        self.paths.len() > 1
+            && self.remote_cids.contains_key(&path_id)
+            && !self.abandoned_paths.contains(&path_id)
+            && self.paths.get(&path_id).is_some_and(|p| p.data.validated && p.data.pto_count == 0)
+    }
+
+    /// NEXUS: 除了 `path_id` 还有能承担交互冗余的路径。
+    fn nexus_dup_ok_besides(&self, path_id: PathId) -> bool {
+        self.paths.keys().any(|id| *id != path_id && self.nexus_dup_ok(*id))
     }
 
     /// Write pending ACKs into a buffer
@@ -7055,6 +7082,7 @@ impl Connection {
             close: false,
             space_specific,
             other,
+            nexus_dups: false,
         }
     }
 

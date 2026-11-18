@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 14;
+pub const WIRE_VERSION: u16 = 16;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -429,6 +429,43 @@ impl WireError {
     }
 }
 
+/// 到一台设备的连接上的一条路径（M5.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathInfo {
+    /// 本机这一端：IP 地址，或者中继时为 `relay`。
+    pub local: String,
+    /// 对方：地址和端口，或者中继的地址。
+    pub remote: String,
+    pub kind: PathKind,
+    /// 往返时间（微秒）。
+    pub rtt_us: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub lost_packets: u64,
+    /// 这条路径经过的本机网络接口按流量计费（M5.2）。
+    pub metered: bool,
+}
+
+/// 本机的一个网络接口（M5.2）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IfaceInfo {
+    pub name: String,
+    pub addrs: Vec<String>,
+    /// 现在是否按计费网络对待。
+    pub metered: bool,
+    /// 自动识别的结果。
+    pub auto_metered: bool,
+    /// 用户的设置；`None` 时按自动识别。
+    pub setting: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePaths {
+    pub device: String,
+    /// 没有连接时为空。
+    pub paths: Vec<PathInfo>,
+}
+
 /// 本机控制通道：命令行发给常驻程序的请求。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtlRequest {
@@ -436,6 +473,10 @@ pub enum CtlRequest {
     Status,
     /// 另一个节点的状态，按名字或标识指定。
     RemoteStatus { node: String },
+    /// 到其他设备的路径（M5.1）；`device` 为空时列出所有设备。
+    Paths { device: Option<String> },
+    /// 本机的网络接口和是否计费（M5.2）；`set` 时先改某个接口的设置（`None` 为自动识别）。
+    Interfaces { set: Option<(String, Option<bool>)> },
     /// 在第一台设备上建立网络。
     Init { name: Option<String> },
     /// 准备加入一个网络，返回加入码。
@@ -496,6 +537,8 @@ pub enum CtlRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtlResponse {
     Status(StatusReport),
+    Paths(Vec<DevicePaths>),
+    Interfaces(Vec<IfaceInfo>),
     Init(InitReport),
     JoinCode { code: String, expires_at: Timestamp },
     Membership(MembershipReport),
