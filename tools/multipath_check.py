@@ -87,6 +87,14 @@ class Net:
                 p.wait(timeout=5)
             except Exception:
                 pass
+        # 命名空间里常驻程序启动的进程（远端命令、终端会话里的 shell）在常驻程序被杀后会留下来：一起杀掉。
+        for ns in self.ns.values():
+            pids = sh("ip", "netns", "pids", ns, check=False).stdout.split()
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
         for ns in self.ns.values():
             sh("ip", "netns", "del", ns, check=False)
         if self.args.keep:
