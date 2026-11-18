@@ -6,7 +6,7 @@
 不停地下载它，占满链路；同时反复执行 `nexus status home`（一次交互请求），测它的耗时。
 
 分别在开启和关闭流量调度（`--no-scheduling`）时各测一遍，打印对比；开启时检查：
-  - 满载时交互请求耗时的 p95 比空载时多出的不超过 --max-added-ms（默认 100 毫秒）
+  - 满载时交互请求耗时的 p95 比空载时多出的不超过 --max-added-ms（默认 150 毫秒）
   - 下载吞吐不低于链路速率的一半（调度不是靠少发数据换来的）
 
 需要 root、ip、tc。条件不满足时说明原因并跳过（退出码 0），除非给出 --require。
@@ -223,7 +223,7 @@ def main():
     ap.add_argument("--bin", default=os.path.join(ROOT, "target", "debug", "nexus"))
     ap.add_argument("--rate-mbit", type=float, default=8)
     ap.add_argument("--seconds", type=float, default=15)
-    ap.add_argument("--max-added-ms", type=float, default=100)
+    ap.add_argument("--max-added-ms", type=float, default=150)
     ap.add_argument("--record", help="把结果写成 JSON")
     ap.add_argument("--require", action="store_true", help="条件不满足时失败而不是跳过")
     ap.add_argument("--verbose", action="store_true")

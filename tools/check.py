@@ -50,6 +50,8 @@ FORBIDDEN_DEPS = {
     "nexus-sys": {"turmoil", "iroh"},
     "nexus-fabric": {"turmoil", "iroh"},
     "nexus-cli": {"turmoil", "nexus-sys-sim", "nexus-fabric-sim"},
+    # Android 应用里的核心：和命令行一样只用真实的驱动。
+    "nexus-android": {"turmoil", "nexus-sys-sim", "nexus-fabric-sim", "nexus-testkit"},
     # 网页节点核心要编译进浏览器：只能依赖接缝和纯逻辑。
     # 浏览器绑定：和网页节点核心一样不能碰仿真、系统驱动和运行时。
     "nexus-web": {
