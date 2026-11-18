@@ -1,7 +1,6 @@
 //! Drive：跨设备同步与授权（M4.2）。功能点见 docs/feature-points/M4.2.md。
 
 use nexus_testkit::{local_tree, pseudo_random, scenario, World};
-use std::time::Duration;
 
 async fn setup(w: &World) {
     w.network("laptop", &["anchor", "desktop"]).await;
@@ -81,8 +80,7 @@ scenario! {
         assert_eq!(wh["synced"], true);
 
         // laptop 关机：desktop 从 anchor 取。只取覆盖这一段的块。
-        w.cut("laptop", "desktop", Duration::from_secs(3600)).await;
-        w.cut("laptop", "anchor", Duration::from_secs(3600)).await;
+        w.take_offline("laptop");
         let out = w.cli("desktop", &["drive", "cat", "data:/big.bin", "--offset", "2000000", "--length", "1000"]).await;
         assert_eq!(out.code, 0, "{}", out.stderr);
         assert!(out.stdout_raw == big[2_000_000..2_001_000]);
@@ -90,7 +88,7 @@ scenario! {
         assert!(local > 0 && local <= 2 * 256 * 1024, "只应取到一两块：{local}");
         assert_eq!(w.cli("desktop", &["drive", "cat", "data:/readme.md"]).await.stdout, "# hello\n");
         // 存储设备也停了：本机已有的照样能读，没有的报告取不到。
-        w.cut("desktop", "anchor", Duration::from_secs(3600)).await;
+        w.take_offline("anchor");
         assert_eq!(w.cli("desktop", &["drive", "cat", "data:/readme.md"]).await.stdout, "# hello\n");
         assert_eq!(w.cli("desktop", &["drive", "cat", "data:/big.bin", "--offset", "0", "--length", "10"]).await.code, 108);
     },
@@ -172,7 +170,7 @@ scenario! {
                 w.cli_ok("laptop", &args).await["credential"].as_str().unwrap().to_string()
             }
         };
-        let none = issue("nobody", &[]).await;
+        let none = issue("nobody", &["drive.read@*/drive/other"]).await;
         let reader = issue("reader", &["drive.read@*/drive/work"]).await;
 
         assert_eq!(w.cli("laptop", &["--agent", &none, "drive", "cat", "work:/secret.txt"]).await.code, 105);
