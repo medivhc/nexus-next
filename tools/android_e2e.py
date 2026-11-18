@@ -191,6 +191,7 @@ def main():
     ap.add_argument("--cli", default=os.path.join(ROOT, "target/android/x86_64/nexus"))
     ap.add_argument("--home-bin", default=os.path.join(ROOT, "target/debug/nexus"))
     ap.add_argument("--far-ip", default="172.17.0.1", help="far.test 的地址：本机的一个非本机回环地址")
+    ap.add_argument("--keep", action="store_true", help="结束后不清理（调试用）")
     a = ap.parse_args()
     if not shutil.which("adb"):
         print("没有 adb")
@@ -200,7 +201,10 @@ def main():
         e.setup()
         failures = e.run()
     finally:
-        e.teardown()
+        if a.keep:
+            print(f"保留现场：home 的数据目录 {e.home_env['NEXUS_DATA_DIR']}")
+        else:
+            e.teardown()
     print("全部通过" if not failures else f"{len(failures)} 项失败")
     return 1 if failures else 0
 
