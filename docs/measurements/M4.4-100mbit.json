@@ -1,0 +1,28 @@
+{
+  "workspace": {
+    "files": 157,
+    "bytes": 1370485,
+    "import_s": 0.11,
+    "files_on_disk": 157
+  },
+  "build": "cargo check --workspace",
+  "local_s": 6.02,
+  "fresh_a": {
+    "sync_s": 0.028,
+    "usable_s": 0.045,
+    "build_s": 6.53,
+    "local_bytes_after": 881801,
+    "total_bytes": 1370485
+  },
+  "fresh_b": {
+    "sync_s": 0.038,
+    "prefetch_s": 0.079,
+    "usable_s": 0.134,
+    "build_s": 6.57,
+    "prefetch_files": 53,
+    "prefetch_bytes": 881801,
+    "local_bytes_after": 881801
+  },
+  "rate_mbit": 100,
+  "rtt_ms": 0
+}
