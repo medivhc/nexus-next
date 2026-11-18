@@ -41,6 +41,10 @@ def sh(*cmd, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
 
+class NoNetem(Exception):
+    pass
+
+
 class Net:
     def __init__(self, args):
         self.args = args
@@ -62,7 +66,15 @@ class Net:
                 sh("ip", "-n", ns, "addr", "add", f"{net}.{host}/24", "dev", dev)
                 sh("ip", "-n", ns, "link", "set", dev, "up")
                 rate = self.args.rate1 if name == "link1" else self.args.rate2
-                if rate:
+                if self.args.delay_ms:
+                    # 每个方向一半延迟（往返 = --delay-ms）；需要内核的 netem。
+                    cmd = ["ip", "netns", "exec", ns, "tc", "qdisc", "add", "dev", dev, "root", "netem",
+                           "delay", f"{self.args.delay_ms / 2}ms", "limit", "10000"]
+                    if rate:
+                        cmd += ["rate", f"{rate}mbit"]
+                    if sh(*cmd, check=False).returncode != 0:
+                        raise NoNetem()
+                elif rate:
                     sh("ip", "netns", "exec", ns, "tc", "qdisc", "add", "dev", dev, "root", "tbf",
                        "rate", f"{rate}mbit", "burst", "32kb", "latency", "100ms")
         for ns in (a, b):
@@ -203,6 +215,7 @@ def main():
     ap.add_argument("--bulk-rate", type=float, default=20, help="批量检查时两条链路的限速（Mbit/s）")
     ap.add_argument("--bulk-mb", type=float, default=16, help="批量检查取的文件大小（MB）")
     ap.add_argument("--only", default="failover,redundancy,metered,bulk", help="只做这些检查（逗号分隔）")
+    ap.add_argument("--delay-ms", type=float, default=0, help="两条链路的往返延迟（毫秒，需要 netem；没有时跳过）")
     ap.add_argument("--record", help="把结果写成 JSON")
     ap.add_argument("--require", action="store_true", help="条件不满足时失败而不是跳过")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（常驻程序的日志在里面）")
@@ -219,9 +232,14 @@ def main():
 
     failures = []
     result = {"rate1_mbit": args.rate1, "rate2_mbit": args.rate2}
+    result["rtt_ms"] = args.delay_ms
     n = Net(args)
     try:
-        n.setup()
+        try:
+            n.setup()
+        except NoNetem:
+            print("跳过多路径检查：内核没有 netem，不能加延迟")
+            return 1 if args.require else 0
         n.start("home")
         n.start("laptop")
         n.cli("home", "init", "--name", "home")

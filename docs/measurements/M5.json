@@ -1,0 +1,68 @@
+{
+  "rate1_mbit": 20,
+  "rate2_mbit": 20,
+  "paths": [
+    {
+      "kind": "direct",
+      "local": "10.81.1.1",
+      "lost_packets": 0,
+      "metered": false,
+      "remote": "10.81.1.2:38484",
+      "rtt_ms": 3.44,
+      "rx_bytes": 12627,
+      "tx_bytes": 13686
+    },
+    {
+      "kind": "direct",
+      "local": "10.81.2.1",
+      "lost_packets": 0,
+      "metered": false,
+      "remote": "10.81.2.2:38484",
+      "rtt_ms": 2.077,
+      "rx_bytes": 6927,
+      "tx_bytes": 8127
+    }
+  ],
+  "failover": [
+    {
+      "cut": "link1",
+      "max_pause_s": 0.043,
+      "alive": true
+    },
+    {
+      "cut": "link2",
+      "max_pause_s": 0.045,
+      "alive": true
+    }
+  ],
+  "redundancy": {
+    "bytes": {
+      "link1": 31595,
+      "link2": 19016
+    },
+    "term": {
+      "p99_gap_ms": 67.1,
+      "max_gap_ms": 71.1
+    },
+    "exec": {
+      "p99_gap_ms": 71.0,
+      "max_gap_ms": 103.3
+    }
+  },
+  "metered": {
+    "mbit": 16.7,
+    "bytes": {
+      "link1": 16698924,
+      "link2": 76230
+    },
+    "metered_share": 0.0045
+  },
+  "bulk": {
+    "mbit": 29.8,
+    "single_link_mbit": 20,
+    "bytes": {
+      "link1": 8363169,
+      "link2": 8445741
+    }
+  }
+}
