@@ -102,6 +102,71 @@ impl Request {
     }
 }
 
+/// Drive 的本机控制请求。路径写作 `<工作区>:/<路径>`；提交号是十六进制，可以是前缀。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriveRequest {
+    Create { ws: String },
+    /// 本机知道的工作区。
+    List,
+    /// 列目录（对文件列出它自己）；`at` 为空时看工作树。
+    Ls { path: String, at: Option<String> },
+    /// 读文件：回应 `Ok`，然后 `PipeData`，最后 `PipeEnd`。
+    Cat { path: String, at: Option<String>, offset: u64, length: Option<u64> },
+    /// 写文件：内容随后以 `Input::Stdin` 送来，`Input::CloseStdin` 结束。
+    Put { path: String, exec: bool },
+    Symlink { path: String, target: String },
+    Rm { path: String, recursive: bool },
+    /// 未提交的改动。
+    Status { ws: String },
+    Commit { ws: String, message: String },
+    Log { ws: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriveResponse {
+    Created { ws: String },
+    Workspaces(Vec<WorkspaceInfo>),
+    Entries { path: String, entries: Vec<DriveEntryInfo> },
+    Written { path: String, size: u64 },
+    Removed { path: String },
+    Changes(Vec<DriveChange>),
+    Committed { commit: String },
+    Log(Vec<DriveCommitInfo>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub head: Option<String>,
+    /// 未提交的改动数。
+    pub changes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveEntryInfo {
+    pub name: String,
+    /// file、dir 或 symlink。
+    pub kind: String,
+    pub size: u64,
+    pub exec: bool,
+    pub target: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveChange {
+    /// added、modified 或 deleted。
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriveCommitInfo {
+    pub commit: String,
+    pub message: String,
+    pub device: String,
+    pub time_ms: u64,
+}
+
 /// 完整节点的虚拟网卡。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunReport {
@@ -324,6 +389,8 @@ pub enum CtlRequest {
     ExitShow,
     /// 完整节点的虚拟网卡（不是完整节点时为空）。
     TunShow,
+    /// 文件（Drive）。
+    Drive(DriveRequest),
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     Attach { node: String, session: String, size: Size },
     SessionList { node: String },
@@ -359,6 +426,7 @@ pub enum CtlResponse {
     Explained(RouteExplanation),
     Exit { enabled: bool },
     Tun(Option<TunReport>),
+    Drive(DriveResponse),
     Ok,
     Error(WireError),
 }

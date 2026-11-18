@@ -27,6 +27,8 @@ PURE = {
     "nexus-wire": {"nexus-core-proto", "nexus-term-proto", "nexus-net-core", "serde", "postcard"},
     "nexus-term-proto": {"serde", "vt100"},
     "nexus-net-core": {"serde"},
+    # 哈希和分块是纯计算：不读系统时间、不做 I/O。
+    "nexus-drive-core": {"serde", "postcard", "blake3", "fastcdc"},
 }
 PURE_DEV_EXTRA = {"proptest"}
 

@@ -28,6 +28,8 @@ use nexus_wire::{
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, ServiceInfo, SessionInfo, Size, StatusReport,
     RouteExplanation, WireError, WIRE_VERSION,
 };
+mod drive;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -503,6 +505,8 @@ pub struct Node<T, S: System> {
     tun: RefCell<Option<(String, FakePool)>>,
     tun_tx: mpsc::UnboundedSender<TunInbound>,
     tun_rx: RefCell<Option<mpsc::UnboundedReceiver<TunInbound>>>,
+    /// 本机的工作区（M4.1）。
+    drive_state: RefCell<drive::DriveState>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
     roster_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -530,12 +534,14 @@ impl<T: Transport, S: System> Node<T, S> {
         let exit_enabled = load::<_, bool>(&system, KEY_EXIT)?.unwrap_or(false);
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         let (tun_tx, tun_rx) = mpsc::unbounded_channel();
+        let drive_state = RefCell::new(drive::DriveState::load(&system)?);
         Ok(Self {
             routes: RefCell::new(routes),
             exit_enabled: Cell::new(exit_enabled),
             proxy_tx,
             proxy_rx: RefCell::new(Some(proxy_rx)),
             tun: RefCell::new(None),
+            drive_state,
             tun_tx,
             tun_rx: RefCell::new(Some(tun_rx)),
             services: RefCell::new(services),
@@ -993,6 +999,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let agent_ref = agent.as_ref();
         let result = match req {
             CtlRequest::Exec { node, spec } => return self.exec(&node, spec, agent, server).await,
+            CtlRequest::Drive(req) => return self.drive(req, server).await,
             CtlRequest::Attach { node, session, size } => return self.attach(&node, session, size, agent, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
@@ -1074,6 +1081,9 @@ impl<T: Transport, S: System> Node<T, S> {
         );
         if admin {
             return Err(err(ErrorCode::Denied, "agent 不能执行管理操作"));
+        }
+        if matches!(req, CtlRequest::Drive(_)) {
+            return Err(err(ErrorCode::Denied, "agent 还不能访问工作区"));
         }
         let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
@@ -2825,6 +2835,15 @@ mod tests {
         }
         fn store_get(&self, _: &str) -> io::Result<Option<Vec<u8>>> {
             Ok(None)
+        }
+        fn cas_get(&self, _: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn cas_put(&self, _: &[u8; 32], _: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn cas_has(&self, _: &[u8; 32]) -> io::Result<bool> {
+            Ok(false)
         }
         fn store_put(&self, _: &str, _: &[u8]) -> io::Result<()> {
             unreachable!()

@@ -1555,6 +1555,53 @@ impl FullNode {
     }
 }
 
+/// 在本机临时目录里建一棵文件树（测试 `nexus drive import` 用）。`files` 是（相对路径，内容）。
+///
+/// 路径只取决于进程、测试线程和内容：仿真里同一个种子跑两遍时命令行参数相同，事件轨迹才能一致。
+/// 返回值被丢弃时删除目录。
+pub fn local_tree(files: &[(&str, &[u8])]) -> LocalTree {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut h);
+    let thread = std::thread::current().name().unwrap_or("main").replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let dir = std::env::temp_dir().join(format!("nexus-tree-{}-{thread}-{:016x}", std::process::id(), h.finish()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, content) in files {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    LocalTree(dir)
+}
+
+pub struct LocalTree(std::path::PathBuf);
+
+impl LocalTree {
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for LocalTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 可重复的伪随机字节（测试大文件用）。
+pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
 /// 一个 HTTP GET（Connection: close），返回正文；对方不回应就关闭时正文为空。
 pub fn http_get_at(addr: std::net::SocketAddr, path: &str) -> io::Result<String> {
     use std::io::{Read, Write};

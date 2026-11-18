@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod daemon;
+pub mod drive;
 pub mod tun;
 
 use clap::{Parser, Subcommand};
@@ -172,6 +173,11 @@ pub enum Cmd {
         /// 在本机这个地址上监听，每个连接各自接到服务
         #[arg(long, value_name = "地址:端口")]
         listen: Option<String>,
+    },
+    /// 文件：工作区（版本化的内容树）。路径写作 <工作区>:/<路径>，例如 work:/src/main.rs
+    Drive {
+        #[command(subcommand)]
+        cmd: drive::DriveCmd,
     },
     /// 本机作为出口：开放后，名册里的设备可以经本机访问外网（路由规则 --via 本机）
     ///
@@ -774,6 +780,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             (CtlRequest::RouteExplain { target: target.clone() }, *json)
         }
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
+        Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
         Cmd::Ssh { .. } => {
             let args = match ssh_args(cmd) {
                 Ok(a) => a,
@@ -830,7 +837,8 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         | CtlResponse::SshHostKey(_)
         | CtlResponse::PipeData(_)
         | CtlResponse::PipeEnd
-        | CtlResponse::Tun(_) => {
+        | CtlResponse::Tun(_)
+        | CtlResponse::Drive(_) => {
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
         CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },

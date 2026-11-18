@@ -30,6 +30,12 @@ impl RealSystem {
         }
         Ok(self.dir.join(format!("{key}.bin")))
     }
+
+    /// 对象放在 cas/<前两个十六进制字符>/<其余>。
+    fn cas_path(&self, hash: &[u8; 32]) -> PathBuf {
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        self.dir.join("cas").join(&hex[..2]).join(&hex[2..])
+    }
 }
 
 impl System for RealSystem {
@@ -131,6 +137,30 @@ impl System for RealSystem {
         let mut out = read(&path.with_extension("log.1"))?;
         out.extend(read(&path)?);
         Ok(out)
+    }
+
+    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.cas_path(hash)) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> {
+        let path = self.cas_path(hash);
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(path.parent().expect("有上级目录"))?;
+        // 先写临时文件再改名：别人看到的对象总是完整的。
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(tmp, path)
+    }
+
+    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool> {
+        Ok(self.cas_path(hash).exists())
     }
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {

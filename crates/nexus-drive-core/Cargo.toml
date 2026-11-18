@@ -1,0 +1,15 @@
+[package]
+name = "nexus-drive-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 纯逻辑：Drive 的内容模型——分块、文件清单、目录树、提交、路径、差异。不碰系统，不碰运行时。
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+blake3 = { version = "1", default-features = false, features = ["std"] }
+fastcdc = { version = "3", default-features = false }
+
+[dev-dependencies]
+proptest.workspace = true

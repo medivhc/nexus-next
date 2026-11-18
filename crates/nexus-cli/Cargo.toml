@@ -8,6 +8,7 @@ license.workspace = true
 tun-rs.workspace = true
 ipstack.workspace = true
 nexus-net-core.workspace = true
+nexus-drive-core.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true
 nexus-sys-real.workspace = true

@@ -193,6 +193,24 @@ impl System for SimSystem {
         self.disk.0.borrow_mut().insert(key.to_string(), value.to_vec());
         Ok(())
     }
+
+    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.disk.0.borrow().get(&cas_key(hash)).cloned())
+    }
+
+    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> {
+        self.disk.0.borrow_mut().entry(cas_key(hash)).or_insert_with(|| bytes.to_vec());
+        Ok(())
+    }
+
+    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool> {
+        Ok(self.disk.0.borrow().contains_key(&cas_key(hash)))
+    }
+}
+
+fn cas_key(hash: &[u8; 32]) -> String {
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("cas:{hex}")
 }
 
 // ---------------------------------------------------------------- 仿真的进程

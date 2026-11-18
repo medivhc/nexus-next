@@ -90,6 +90,11 @@ pub trait System {
     fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty>;
     /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
+    /// 按内容寻址的对象存储（Drive）：取出哈希为 `hash` 的对象。
+    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>>;
+    /// 存入一个对象；调用方保证 `hash` 是它的哈希。已有时什么也不做。
+    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()>;
+    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool>;
     /// 解析主机名（统一入口直连时用）。
     fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>>;
 }
@@ -105,6 +110,9 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> { (**self).tcp_connect(addr) }
     fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>> { (**self).resolve(host) }
     fn now(&self) -> Timestamp { (**self).now() }
+    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> { (**self).cas_get(hash) }
+    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> { (**self).cas_put(hash, bytes) }
+    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool> { (**self).cas_has(hash) }
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
