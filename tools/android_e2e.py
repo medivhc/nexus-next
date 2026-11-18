@@ -87,13 +87,13 @@ class E2E:
         # exec-out：不经伪终端，换行不被改写。
         return self.adb("exec-out", f"su shell sh -c \"{script}\"", check=False, timeout=30)
 
-    def http_on_phone(self, host):
+    def http_on_phone(self, host, port=80):
         """以普通程序（nc）发一个 HTTP 请求，返回正文。请求先写成文件，免得在几层 shell 里转义。"""
         req = f"/data/local/tmp/req-{host}"
         self.adb("shell", f"printf 'GET / HTTP/1.0\\r\\nHost: {host}\\r\\n\\r\\n' > {req}; chmod 644 {req}")
         # 发完请求后不立刻关闭写方向：协议栈（ipstack）收到对方的 FIN 就整条关掉，不支持半关闭，
         # 那样回应送不回来。浏览器和常见的 HTTP 客户端不会半关闭；这是已知的限制，见 docs/feature-points/M3.6.md。
-        out = self.as_app(f"(cat {req}; sleep 3) | nc -w 10 {host} 80")
+        out = self.as_app(f"(cat {req}; sleep 3) | nc -w 10 {host} {port}")
         out = out.replace("\r\n", "\n")
         return out.split("\n\n", 1)[1] if "\n\n" in out else out
 
@@ -177,7 +177,7 @@ class E2E:
         check("内网访问：web.home.internal 到 home 上的服务", body.strip() == "hello from home", body[-300:])
 
         before = len(self.home("audit")["events"])
-        body = self.http_on_phone("far.test")
+        body = self.http_on_phone("far.test", self.far.server_port)
         check("出口：far.test 经 home 出去", body.strip() == "far away site", body[-300:])
         events = self.home("audit")["events"][before:]
         check("home 的审计里有 net.exit",
