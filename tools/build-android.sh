@@ -34,12 +34,21 @@ for abi in "${ABIS[@]}"; do
   "$LLVM/llvm-strip" "$OUT/apk/lib/$abi/libnexus_android.so" "$OUT/$abi/nexus"
 done
 
-javac -quiet -source 8 -target 8 -bootclasspath "$JAR" -classpath "$JAR" -d "$OUT/classes" \
-  $(find android/src -name '*.java') 2>&1 | grep -v "warning: \[options\]" || true
+javac -nowarn -Xlint:-options -source 8 -target 8 -bootclasspath "$JAR" -classpath "$JAR" -d "$OUT/classes" \
+  $(find android/src -name '*.java')
 "$BT/d8" --min-api $API --lib "$JAR" --output "$OUT/apk" $(find "$OUT/classes" -name '*.class')
 "$BT/aapt2" link -o "$OUT/unsigned.apk" --manifest android/AndroidManifest.xml -I "$JAR" \
   --min-sdk-version $API --target-sdk-version 34
-(cd "$OUT/apk" && zip -q -r ../unsigned.apk classes.dex lib)
+# 把 dex 和本地库加进 aapt2 给出的包（不依赖 zip 命令）。
+python3 - "$OUT/unsigned.apk" "$OUT/apk" <<'PY'
+import os, sys, zipfile
+apk, root = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(apk, "a", zipfile.ZIP_DEFLATED) as z:
+    for d, _, files in os.walk(root):
+        for f in sorted(files):
+            path = os.path.join(d, f)
+            z.write(path, os.path.relpath(path, root))
+PY
 "$BT/zipalign" -f -p 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 KEY=$OUT/debug.keystore
 [ -f "$KEY" ] || keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias debug \
