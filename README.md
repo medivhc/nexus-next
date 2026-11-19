@@ -22,6 +22,8 @@
 
 ## 上手
 
+预编译的 Linux 二进制（x86_64、aarch64）在 Releases 页面；或者从源码构建：
+
 ```sh
 cargo build --release -p nexus-cli       # target/release/nexus
 
@@ -71,6 +73,9 @@ NEXUS_SIM_SEED=7 cargo test --test scenarios node_sees_peer_status::sim   # 复�
 
 真实网络的检查要 root（CI 里用 sudo）：`tools/sched_bench.py`（流量调度）、`tools/multipath_check.py`（多路径）、
 `tools/drive_bench.py`（文件的衡量）。浏览器端到端测试在 `tools/web-e2e`，Android 的在 `tools/android_e2e.py`。
+
+发布：改根目录 `Cargo.toml` 的 `version`，CI 通过后打标签 `v<版本>` 并推送；`.github/workflows/release.yml` 构建
+Linux 的静态二进制（x86_64、aarch64）发布到 Releases。不带标签手动运行这个工作流只构建、不发布。
 
 开发按「功能文档 → 功能点 → 验收场景 → 实现」的顺序：先在 `FEATURES.md` 写需求，在 `docs/feature-points/` 写功能点，
 再写失败的验收场景，最后实现。

@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-android"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "jni 0.21.1",
  "libc",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-core-proto"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "p256 0.13.2",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-drive-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-fabric"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nexus-core-proto",
  "nexus-wire",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-fabric-iroh"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "iroh",
  "iroh-relay",
@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-fabric-sim"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nexus-core-proto",
  "nexus-fabric",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-net-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-runtime"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "nexus-core-proto",
@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-sys"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nexus-core-proto",
  "nexus-term-proto",
@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-sys-real"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "nexus-core-proto",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-sys-sim"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nexus-core-proto",
  "nexus-net-core",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-term-proto"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -3073,7 +3073,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-testkit"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "nexus-cli",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-web"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.3.4",
@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-web-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "n0-future",
  "nexus-core-proto",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-wire"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nexus-core-proto",
  "nexus-net-core",

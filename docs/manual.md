@@ -110,7 +110,7 @@ agent 和网页登录只能用授权里写明的。经过一台设备的每次�
 - **home**：家里的台式机，也在 NAT 后面；
 - **vps**：一台云服务器，有公网地址。
 
-先在每台设备上构建或复制 `nexus`（第 4 节），然后：
+先在每台设备上装好 `nexus`（第 4 节：下载预编译版本或从源码构建），然后：
 
 ### 第一步：建立网络
 
@@ -250,14 +250,30 @@ vps 有域名（例如 `bewith.link`）时，把它设为锚点：它在 443 端
 
 ## 4. 安装、运行与维护
 
-### 构建
+### 下载预编译版本（Linux）
 
-现在没有安装包，从源码构建（需要 Rust 工具链）：
+仓库的 Releases 页面有每个版本的静态二进制：`linux-x86_64` 和 `linux-aarch64`（ARM 服务器、树莓派），
+不依赖系统库，任何发行版都能用。压缩包里有 `nexus`、本手册和许可证。
+
+```sh
+tar xzf nexus-0.1.0-linux-x86_64.tar.gz
+sudo install nexus-0.1.0-linux-x86_64/nexus /usr/local/bin/
+sha256sum -c SHA256SUMS --ignore-missing      # 和 Releases 页面上的 SHA256SUMS 一起下载时校验
+nexus --version
+```
+
+所有设备要用同一个版本（第 4 节「升级」）。
+
+### 从源码构建
+
+其他系统，或者要改代码时（需要 Rust 工具链）：
 
 ```sh
 cargo build --release -p nexus-cli      # 二进制在 target/release/nexus
 sudo install target/release/nexus /usr/local/bin/
 ```
+
+挂载和多路径只在 Linux 上可用；macOS 和 Windows 还没有试过能不能编译。
 
 ### 运行常驻程序
 
@@ -703,5 +719,5 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - 挂载只支持 Linux；没有硬链接、扩展属性、文件锁。合并结果不保留空目录。
 - 多路径和计费网络识别只支持 Linux；两条链路的批量吞吐约为一条的 1.5 倍；经中继的路径没有测过。
 - 网页节点目前只有终端和状态查看；文件浏览、打开发布的网页服务、发布摄像头等硬件能力还没做。
-- 没有安装包和自动更新；所有设备要一起升级。
+- 预编译版本只有 Linux（x86_64、aarch64）；没有安装包和自动更新；所有设备要一起升级。
 - 还没有：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。
