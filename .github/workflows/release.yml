@@ -8,6 +8,7 @@
 # - Each archive holds the binary, LICENSE, README.md and docs/manual.md;
 #   SHA256SUMS covers all archives.
 # - The full test suite is not rerun here: tag a commit whose CI already passed.
+# - Run it by hand without a tag to only build (no release): a dry run.
 name: Release
 
 on:
@@ -16,8 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build, e.g. v0.1.0"
-        required: true
+        description: "Existing tag to (re)build and publish, e.g. v0.1.0; empty = build main only, no release"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -39,16 +41,17 @@ jobs:
       - name: Resolve tag
         id: tag
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if [ "${{ github.event_name }}" = push ]; then tag="${{ github.ref_name }}"; else tag="${{ github.event.inputs.tag }}"; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then echo "version=${tag#v}" >> "$GITHUB_OUTPUT"; else echo "version=dev" >> "$GITHUB_OUTPUT"; fi
 
       - name: Check out
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: ${{ steps.tag.outputs.tag || github.sha }}
 
       - name: Tag matches Cargo.toml version
+        if: steps.tag.outputs.tag != ''
         run: |
           v=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "Cargo.toml: $v, tag: ${{ steps.tag.outputs.tag }}"
@@ -100,6 +103,7 @@ jobs:
   release:
     name: Publish release
     needs: build
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
