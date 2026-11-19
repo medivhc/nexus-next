@@ -64,6 +64,9 @@ scenario! {
         // FP-6.1-02：格式不对
         let junk = w.cli("laptop", &["device", "approve", "7KQ4M-9XZ2", "--json"]).await;
         assert_eq!(junk.code, 107);
+        // FP-6.1-03：格式对、但从没有人用过的短码（输错了）：找不到，不是连不上
+        let typo = w.cli("laptop", &["device", "approve", "7KQ4M-9XZ21", "--json"]).await;
+        assert_eq!(typo.code, 109, "stderr: {}", typo.stderr);
         let ok = w.cli_ok("laptop", &["device", "approve", &second]).await;
         assert_eq!(ok["name"], "office");
     },

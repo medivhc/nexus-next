@@ -46,16 +46,23 @@ impl Client {
         let public = SecretKey::from_bytes(&seed).public();
         match self.http.resolve(public).await {
             Ok(packet) => Ok(decode(&packet)),
-            Err(e) => {
-                let text = format!("{e:#}");
-                if text.contains("404") {
-                    Ok(None)
-                } else {
-                    Err(io_err(text))
-                }
-            }
+            Err(e) if is_not_found(&e) => Ok(None),
+            Err(e) => Err(io_err(format!("{e:#}"))),
         }
     }
+}
+
+/// 碰头服务回应 404（这个位置上从来没有记录）。状态码在错误的来源链里。
+fn is_not_found(e: &(dyn std::error::Error + 'static)) -> bool {
+    use iroh::address_lookup::pkarr::PkarrError;
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(PkarrError::HttpRequest { status, .. }) = err.downcast_ref::<PkarrError>() {
+            return status.as_u16() == 404;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 fn decode(packet: &SignedPacket) -> Option<Vec<u8>> {
