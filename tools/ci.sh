@@ -30,6 +30,7 @@ if [ "$(id -u)" != 0 ]; then
 fi
 step "L3 本机中继"             cargo test --quiet -p nexus-fabric-iroh --test relay
 step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web --test anchor --test services --test proxy --test exit $FULLNODE --test drive --test drive_sync --test drive_mount --test drive_prefetch -- real
+step "L3 用户手册"             python3 tools/manual_check.py
 # 需要 root、ip、tc；不满足时跳过（脚本自己说明原因）。
 step "L3 满载测量"             $SUDO python3 tools/sched_bench.py --only-scheduled
 step "L3 多路径"               $SUDO python3 tools/multipath_check.py

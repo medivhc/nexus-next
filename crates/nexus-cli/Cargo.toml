@@ -19,6 +19,8 @@ tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 输出里的时间用本地时区显示。
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossterm.workspace = true
 russh.workspace = true
 futures-util.workspace = true

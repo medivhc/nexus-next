@@ -40,7 +40,7 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 
 | 文档 | 内容 |
 | --- | --- |
-| [docs/manual.md](docs/manual.md) | 用户手册：所有命令和行为 |
+| [docs/manual.md](docs/manual.md) | 用户手册：怎么工作、从零开始的三台设备、所有命令、维护和排查 |
 | [FEATURES.md](FEATURES.md) | 需求（R01–R61）和实现状态 |
 | [docs/anchor.md](docs/anchor.md) | 在 VPS 上部署锚点 |
 | [docs/unified-entry.md](docs/unified-entry.md) | 统一入口、路由规则、出口、`nexus run`、完整节点的细节 |
@@ -65,6 +65,9 @@ tools/nightly.sh                  # 大量种子与变异测试
 cargo test --test scenarios sim   # 只跑仿真后端的验收场景
 NEXUS_SIM_SEED=7 cargo test --test scenarios node_sees_peer_status::sim   # 复现某个种子
 ```
+
+`tools/manual_check.py` 在本机起几台设备，照着用户手册里带设备名的代码块从上到下执行一遍（CI 的「L3 用户手册」）：
+改了命令的行为或输出，要同时改手册。
 
 真实网络的检查要 root（CI 里用 sudo）：`tools/sched_bench.py`（流量调度）、`tools/multipath_check.py`（多路径）、
 `tools/drive_bench.py`（文件的衡量）。浏览器端到端测试在 `tools/web-e2e`，Android 的在 `tools/android_e2e.py`。

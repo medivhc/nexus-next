@@ -465,7 +465,7 @@ fn sync_text(r: &nexus_wire::DriveSyncReport) -> String {
         "diverged" => "分叉",
         _ => "存储设备连不上",
     };
-    if r.message.is_empty() {
+    if r.message.is_empty() || r.state == "local" {
         format!("{what}\n")
     } else {
         format!("{what}：{}\n", r.message)

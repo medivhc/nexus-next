@@ -909,7 +909,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     Some(path) => format!("凭据已写入 {}。\n使用：NEXUS_AGENT={} nexus <命令>\n", path.display(), path.display()),
                     None => format!("凭据（含私钥，请像密码一样保管）：\n\n{}\n\n使用：NEXUS_AGENT=<凭据> nexus <命令>，或 nexus --agent <凭据> <命令>\n", r.credential),
                 };
-                format!("已签发 agent {}（{}），有效期至 {} 毫秒时间戳。\n{how}", r.label, &agent_id[..8], r.not_after.0)
+                format!("已签发 agent {}（{}），有效期至 {}。\n{how}", r.label, &agent_id[..8], local_time(r.not_after.0))
             }
         }
         CtlResponse::AgentRevoked(m) => {
@@ -1354,6 +1354,15 @@ fn audit_json(records: &[AuditRecord]) -> String {
     doc(json!({ "schema": JSON_SCHEMA, "events": events }))
 }
 
+/// 毫秒时间戳 → 本地时间，例如 `2026-11-19 23:05:48`。
+pub fn local_time(ms: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(ms as i64) {
+        chrono::LocalResult::Single(t) => t.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => format!("{ms} 毫秒时间戳"),
+    }
+}
+
 fn audit_text(records: &[AuditRecord]) -> String {
     use nexus_core_proto::authz::{Outcome, PrincipalRef};
     if records.is_empty() {
@@ -1372,7 +1381,7 @@ fn audit_text(records: &[AuditRecord]) -> String {
                 Outcome::Allow => "允许".to_string(),
                 Outcome::Deny(reason) => format!("拒绝：{}", deny_kind(reason)),
             };
-            format!("{}  {}  {} {}  {}\n", e.at.0, who, e.capability, e.resource, outcome)
+            format!("{}  {}  {} {}  {}\n", local_time(e.at.0), who, e.capability, e.resource, outcome)
         })
         .collect()
 }

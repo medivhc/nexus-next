@@ -2916,6 +2916,7 @@ dependencies = [
 name = "nexus-cli"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "clap",
  "crossterm",
  "fuser",
