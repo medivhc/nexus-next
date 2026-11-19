@@ -552,9 +552,10 @@ pub enum AgentCmd {
     ///
     /// 例：nexus agent issue --label builder --grant term.exec@home --grant 'term.session.*@home/session/build' --ttl 4h
     ///
-    /// 能力：node.info、term.exec、term.session.attach、term.session.list、term.session.kill，
-    /// 末尾的星号匹配一组能力（term.session.*）。资源：设备名，或 设备名/session/会话名；
-    /// 一段写成星号时匹配任意一段，末尾的两个星号匹配其下的一切。
+    /// 能力和资源：node.info@设备；term.exec@设备；term.session.attach、term.session.list、
+    /// term.session.kill@设备/session/会话名；svc.connect@设备/svc/服务名；net.exit@设备/exit；
+    /// drive.read、drive.write@设备/drive/工作区。末尾的星号匹配一组能力（term.session.*）；
+    /// 资源的一段写成星号时匹配任意一段（drive.read@*/drive/work），末尾的两个星号匹配其下的一切。
     ///
     /// 输出的凭据含 agent 的私钥，请像密码一样保管；agent 用 --agent 或 NEXUS_AGENT 使用它。
     Issue {
