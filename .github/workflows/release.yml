@@ -1,0 +1,132 @@
+# Prebuilt binaries: pushing a tag vX.Y.Z builds static Linux binaries of
+# `nexus` and publishes them as a GitHub release.
+#
+# - Targets: x86_64 and aarch64, musl, statically linked (runs on any Linux
+#   distribution). Both are cross-built on one x86_64 runner with
+#   cargo-zigbuild; the x86_64 binary is smoke-tested on the runner.
+# - The tag must match the workspace version in Cargo.toml (v0.1.0 <-> 0.1.0).
+# - Each archive holds the binary, LICENSE, README.md and docs/manual.md;
+#   SHA256SUMS covers all archives.
+# - The full test suite is not rerun here: tag a commit whose CI already passed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            name: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            name: linux-aarch64
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Tag matches Cargo.toml version
+        run: |
+          v=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "Cargo.toml: $v, tag: ${{ steps.tag.outputs.tag }}"
+          test "v$v" = "${{ steps.tag.outputs.tag }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install zig and cargo-zigbuild
+        run: |
+          pip install --user ziglang==0.13.0
+          cargo install --locked cargo-zigbuild@0.19.8
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo zigbuild --release --locked -p nexus-cli --bin nexus --target ${{ matrix.target }}
+
+      - name: Check the binary
+        run: |
+          bin=target/${{ matrix.target }}/release/nexus
+          file "$bin"
+          file "$bin" | grep -q "statically linked"
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            "$bin" --version
+            "$bin" --help > /dev/null
+          fi
+
+      - name: Package
+        run: |
+          d=nexus-${{ steps.tag.outputs.version }}-${{ matrix.name }}
+          mkdir -p "dist/$d"
+          cp target/${{ matrix.target }}/release/nexus LICENSE README.md "dist/$d/"
+          cp docs/manual.md "dist/$d/manual.md"
+          tar -C dist -czf "dist/$d.tar.gz" "$d"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          notes="预编译的 Linux 静态二进制（x86_64、aarch64，任何发行版都能用）。
+
+          安装：
+              tar xzf nexus-<版本>-linux-<架构>.tar.gz
+              sudo install nexus-<版本>-linux-<架构>/nexus /usr/local/bin/
+
+          用法见压缩包里的 manual.md。所有设备要用同一个版本。校验：sha256sum -c SHA256SUMS"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+              --title "Nexus $TAG" --notes "$notes"
+          fi
