@@ -23,7 +23,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # 纯逻辑层：crate 名 -> 允许的依赖
 PURE = {
-    "nexus-core-proto": {"serde", "postcard", "ed25519-dalek", "p256", "sha2", "serde_json"},
+    # argon2、blake3：短加入码的密钥派生和加密（M6.1），纯计算。
+    "nexus-core-proto": {"serde", "postcard", "ed25519-dalek", "p256", "sha2", "serde_json", "argon2", "blake3"},
     "nexus-wire": {"nexus-core-proto", "nexus-term-proto", "nexus-net-core", "serde", "postcard"},
     "nexus-term-proto": {"serde", "vt100"},
     "nexus-net-core": {"serde"},

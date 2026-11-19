@@ -66,10 +66,13 @@ fn decode(packet: &SignedPacket) -> Option<Vec<u8>> {
     nexus_core_proto::joincode::base32_decode(&text)
 }
 
+/// 公钥 → 最新的记录和存进来的时间。
+type Records = HashMap<[u8; 32], (SignedPacket, Instant)>;
+
 /// 服务端的存储，锚点和测试共用。
 #[derive(Clone, Default)]
 pub struct Store {
-    records: Arc<Mutex<HashMap<[u8; 32], (SignedPacket, Instant)>>>,
+    records: Arc<Mutex<Records>>,
 }
 
 impl Store {

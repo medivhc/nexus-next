@@ -424,6 +424,7 @@ pub struct Browser {
     label: String,
 }
 
+#[allow(clippy::large_enum_variant)] // 测试工具：每个浏览器一个，大小无所谓。
 enum BrowserState {
     Fresh(BrowserTransport),
     LoggedIn(Rc<BrowserNode>),
