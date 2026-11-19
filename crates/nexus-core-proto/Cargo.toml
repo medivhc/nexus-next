@@ -11,6 +11,9 @@ serde_json.workspace = true
 serde.workspace = true
 postcard.workspace = true
 ed25519-dalek.workspace = true
+# 短加入码（M6.1）：派生密钥、加密碰头服务上的数据。
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+blake3 = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 proptest.workspace = true

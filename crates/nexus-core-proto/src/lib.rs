@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod authz;
 pub mod crypto;
+pub mod joincode;
 pub mod path;
 pub mod roster;
 pub mod webauthn;

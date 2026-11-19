@@ -15,8 +15,8 @@
 |---|---|---|---|
 | 1 | A、B | `nexus daemon &` | 是否有报错 |
 | 2 | A | `nexus init --name a` | |
-| 3 | B | `nexus join` | 加入码 |
-| 4 | A | `nexus device approve <加入码> --name b` | 是否成功、耗时 |
+| 3 | B | `nexus join` | 是否给出短加入码（经公共的碰头服务） |
+| 4 | A | `nexus device approve <短加入码> --name b`（不行时用长码） | 是否成功、耗时；短码报错时记下原因 |
 | 5 | A | `nexus status b --json` | `online`、`path`（direct / relay）、`rtt_ms` |
 | 6 | A | `nexus ssh b`，输入几条命令，Ctrl-] 断开再连上 | 体感延迟、屏幕是否恢复 |
 | 7 | A | `nexus exec b --json -- uname -a` | 耗时 |

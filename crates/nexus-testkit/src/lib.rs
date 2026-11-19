@@ -379,6 +379,7 @@ impl World {
             bind: None,
             direct: false,
             scheduling: true,
+            rendezvous: None,
         };
         let t = nexus_fabric_iroh::IrohTransport::bind(seed, config).await.expect("浏览器的传输无法启动");
         self.trace.borrow_mut().push("browser".into());
@@ -1046,6 +1047,12 @@ where
         });
     }
 
+    // 碰头服务（短加入码，M6.1）。
+    sim.host(nexus_fabric_sim::RENDEZVOUS_HOST, || async {
+        nexus_fabric_sim::serve_rendezvous().await?;
+        Ok(())
+    });
+
     let trace = Rc::new(RefCell::new(Vec::new()));
     let world = World {
         inner: Inner::Sim { nodes: ctl, clock, services: all_services, next_port: std::cell::Cell::new(8000), proxies },
@@ -1088,6 +1095,8 @@ struct RealWorld {
     _tmp: tempfile::TempDir,
     /// 各节点的 agent 入口放在这里：其他系统账号也能进入这个目录。
     sockets: tempfile::TempDir,
+    /// 本机的碰头服务（短加入码，M6.1），所有常驻程序默认用它。
+    rendezvous: String,
 }
 
 impl RealWorld {
@@ -1098,7 +1107,16 @@ impl RealWorld {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let mut world = RealWorld { bin: bin.into(), dirs: HashMap::new(), children: RefCell::default(), proxy_ports: RefCell::default(), _tmp: tmp, sockets };
+        let rendezvous = format!("http://127.0.0.1:{}/pkarr", start_rendezvous());
+        let mut world = RealWorld {
+            bin: bin.into(),
+            dirs: HashMap::new(),
+            children: RefCell::default(),
+            proxy_ports: RefCell::default(),
+            _tmp: tmp,
+            sockets,
+            rendezvous,
+        };
         for name in nodes {
             let dir = world._tmp.path().join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1134,9 +1152,11 @@ impl RealWorld {
         }
         let _ = std::fs::remove_file(dir.join("ctl.sock"));
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
+        let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
         let child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
+            .args(&rendezvous)
             .args(&proxy)
             .arg("--agent-socket")
             .arg(self.sockets.path().join(format!("{name}.sock")))
@@ -1681,6 +1701,21 @@ pub fn http_get_at(addr: std::net::SocketAddr, path: &str) -> io::Result<String>
 }
 
 /// 在自己的线程里运行一个测试服务（测试的命令行是同步等待的，不能和它共用线程）。
+/// 在本机起一个碰头服务，返回端口。服务跑到测试进程结束。
+fn start_rendezvous() -> u16 {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("无法监听");
+    let port = std_listener.local_addr().unwrap().port();
+    std_listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().expect("碰头服务的运行时");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
+            let _ = nexus_fabric_iroh::rendezvous::serve(listener, Default::default()).await;
+        });
+    });
+    port
+}
+
 fn serve_on(addr: std::net::SocketAddr, service: Service) -> u16 {
     let std_listener = std::net::TcpListener::bind(addr).expect("无法监听");
     let port = std_listener.local_addr().unwrap().port();

@@ -17,6 +17,8 @@ use tokio::io::Join;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod metered;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rendezvous;
 
 /// 每条路径的心跳间隔。
 const PATH_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -47,18 +49,30 @@ pub struct Config {
     /// 流量调度（M3.5）：按带宽和时延控制发送量（BBR），不把排队推到网络里；
     /// 同一条连接上按流的优先级发送。关掉只用于对比测量。
     pub scheduling: bool,
+    /// 碰头服务（短加入码，M6.1）的地址；`None` 时不用。
+    pub rendezvous: Option<String>,
 }
 
 impl Config {
     /// 只在本机回环地址上通信，不连任何外部服务。用于测试。
     pub fn local_only() -> Self {
-        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true, scheduling: true }
+        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true, scheduling: true, rendezvous: None }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { relay: Relay::Default, discovery: true, bind: None, direct: true, scheduling: true }
+        Self {
+            relay: Relay::Default,
+            discovery: true,
+            bind: None,
+            direct: true,
+            scheduling: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            rendezvous: Some(rendezvous::DEFAULT_URL.to_string()),
+            #[cfg(target_arch = "wasm32")]
+            rendezvous: None,
+        }
     }
 }
 
@@ -75,6 +89,8 @@ pub struct IrohTransport {
     scheduling: bool,
     /// 按流量计费的本机地址（M5.2），最近一次查看接口时定下的。
     metered_ips: RefCell<std::collections::BTreeSet<std::net::IpAddr>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    rendezvous: Option<rendezvous::Client>,
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -125,6 +141,8 @@ impl IrohTransport {
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
+        #[cfg(not(target_arch = "wasm32"))]
+        let rendezvous = config.rendezvous.as_deref().map(|url| rendezvous::Client::new(url, &ep)).transpose()?;
         Ok(Self {
             ep,
             me,
@@ -134,6 +152,8 @@ impl IrohTransport {
             relay_only: !config.direct,
             scheduling: config.scheduling,
             metered_ips: RefCell::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            rendezvous,
         })
     }
 
@@ -161,17 +181,15 @@ impl Transport for IrohTransport {
     }
 
     fn local_hint(&self) -> String {
-        let bytes = postcard::to_allocvec(&self.current_addr()).expect("地址总能编码");
-        nexus_wire::hex_encode(&bytes)
+        encode_hint(&self.current_addr())
     }
 
     fn add_hint(&self, node: NodeId, hint: &str) {
-        let Some(bytes) = nexus_wire::hex_decode(hint) else { return };
-        let Ok(mut addr) = postcard::from_bytes::<EndpointAddr>(&bytes) else { return };
+        let Some(mut addr) = decode_hint(node, hint) else { return };
         if self.relay_only {
             addr.addrs.retain(|a| a.is_relay());
         }
-        if addr.id.as_bytes() == &node.0 && node != self.me {
+        if node != self.me {
             self.hints.borrow_mut().insert(node, addr);
         }
     }
@@ -275,6 +293,22 @@ impl Transport for IrohTransport {
         out
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn rendezvous_put(&self, seed: [u8; 32], data: Vec<u8>) -> io::Result<()> {
+        match &self.rendezvous {
+            Some(c) => c.put(seed, data).await,
+            None => Err(io::Error::new(io::ErrorKind::Unsupported, "启动时关闭了地址发现，也没有用 --rendezvous 指定")),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn rendezvous_get(&self, seed: [u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        match &self.rendezvous {
+            Some(c) => c.get(seed).await,
+            None => Err(io::Error::new(io::ErrorKind::Unsupported, "启动时关闭了地址发现，也没有用 --rendezvous 指定")),
+        }
+    }
+
     async fn use_relay(&self, url: &str) -> io::Result<()> {
         let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
         if self.relay.borrow().as_ref() == Some(&url) {
@@ -296,16 +330,47 @@ pub fn node_id_from_seed(seed: &[u8; 32]) -> NodeId {
 pub fn relay_hint(node: NodeId, relay: &str) -> Result<String, String> {
     let id = iroh::EndpointId::from_bytes(&node.0).map_err(|e| format!("设备标识无效：{e}"))?;
     let url: RelayUrl = relay.parse().map_err(|e| format!("中继地址无效：{e}"))?;
-    let addr = EndpointAddr::new(id).with_relay_url(url);
-    Ok(nexus_wire::hex_encode(&postcard::to_allocvec(&addr).expect("地址总能编码")))
+    Ok(encode_hint(&EndpointAddr::new(id).with_relay_url(url)))
 }
 
 /// 地址提示里的中继地址（有多个时取第一个）。
 pub fn hint_relay(hint: &str) -> Option<String> {
     let bytes = nexus_wire::hex_decode(hint)?;
-    let addr = postcard::from_bytes::<EndpointAddr>(&bytes).ok()?;
-    let first = addr.relay_urls().next().map(|u| u.to_string());
+    let addrs = decode_addrs(&bytes).or_else(|| postcard::from_bytes::<EndpointAddr>(&bytes).ok().map(|a| a.addrs))?;
+    let first = addrs.iter().find_map(|a| match a {
+        iroh::TransportAddr::Relay(u) => Some(u.to_string()),
+        _ => None,
+    });
     first
+}
+
+/// 地址提示的第一个字节：之后只有地址，不带设备标识（M6.1，标识在提示之外总是已知的）。
+const HINT_V2: u8 = 0xa2;
+
+fn encode_hint(addr: &EndpointAddr) -> String {
+    let mut bytes = vec![HINT_V2];
+    bytes.extend(postcard::to_allocvec(&addr.addrs).expect("地址总能编码"));
+    nexus_wire::hex_encode(&bytes)
+}
+
+fn decode_addrs(bytes: &[u8]) -> Option<std::collections::BTreeSet<iroh::TransportAddr>> {
+    let rest = bytes.strip_prefix(&[HINT_V2])?;
+    match postcard::take_from_bytes(rest) {
+        Ok((addrs, [])) => Some(addrs),
+        _ => None,
+    }
+}
+
+fn decode_hint(node: NodeId, hint: &str) -> Option<EndpointAddr> {
+    let id = iroh::EndpointId::from_bytes(&node.0).ok()?;
+    let bytes = nexus_wire::hex_decode(hint)?;
+    if let Some(addrs) = decode_addrs(&bytes) {
+        let mut addr = EndpointAddr::new(id);
+        addr.addrs = addrs;
+        return Some(addr);
+    }
+    // 旧的提示（数据目录里存着的）：完整的端点地址，标识必须对得上。
+    postcard::from_bytes::<EndpointAddr>(&bytes).ok().filter(|a| a.id == id)
 }
 
 pub struct IrohConn {
@@ -358,5 +423,23 @@ mod tests {
         assert!(relay_hint(node, "not a url").is_err());
         assert_eq!(hint_relay("zz"), None);
         assert_eq!(node_id_from_seed(&[3; 32]), node);
+    }
+
+    /// 地址提示不带设备标识（M6.1）；数据目录里存着的旧提示照样能用；标识对不上的旧提示不用。
+    #[test]
+    fn hints_omit_the_node_id() {
+        let node = NodeId(*SecretKey::from_bytes(&[3; 32]).public().as_bytes());
+        let id = iroh::EndpointId::from_bytes(&node.0).unwrap();
+        let addr = EndpointAddr::new(id)
+            .with_relay_url("https://bewith.link".parse().unwrap())
+            .with_ip_addr("192.0.2.7:4433".parse().unwrap());
+        let hint = encode_hint(&addr);
+        let legacy = nexus_wire::hex_encode(&postcard::to_allocvec(&addr).unwrap());
+        assert!(hint.len() + 2 * 31 <= legacy.len(), "{} 对 {}", hint.len(), legacy.len());
+        assert_eq!(decode_hint(node, &hint), Some(addr.clone()));
+        assert_eq!(decode_hint(node, &legacy), Some(addr));
+        let other = NodeId(*SecretKey::from_bytes(&[4; 32]).public().as_bytes());
+        assert_eq!(decode_hint(other, &legacy), None);
+        assert_eq!(hint_relay(&legacy).as_deref(), Some("https://bewith.link/"));
     }
 }

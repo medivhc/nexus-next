@@ -2949,6 +2949,8 @@ dependencies = [
 name = "nexus-core-proto"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "blake3",
  "ed25519-dalek",
  "p256 0.13.2",
  "postcard",
@@ -2983,7 +2985,9 @@ dependencies = [
 name = "nexus-fabric-iroh"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "iroh",
+ "iroh-dns",
  "iroh-relay",
  "nexus-core-proto",
  "nexus-fabric",

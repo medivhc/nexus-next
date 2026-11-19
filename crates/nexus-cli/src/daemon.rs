@@ -24,7 +24,8 @@ pub fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Co
         "disabled" => Relay::Disabled,
         url => Relay::Custom(url.to_string()),
     };
-    Config { relay, discovery: !no_discovery, bind: None, direct: true, scheduling: true }
+    let rendezvous = (!no_discovery).then(|| nexus_fabric_iroh::rendezvous::DEFAULT_URL.to_string());
+    Config { relay, discovery: !no_discovery, bind: None, direct: true, scheduling: true, rendezvous }
 }
 
 /// `--tun-net`：网段的起点加前缀。

@@ -9,7 +9,7 @@
 
 - 块里的 `nexus daemon ...` 一行不交给 bash：由本脚本在后台启动那台设备的常驻程序
   （追加 --local-only：只用本机回环地址，不用公共中继和地址发现），等它就绪再继续。
-- `<加入码>` 换成最近一次 `nexus join` 输出的加入码。手册的可执行块里不能有其他 `<…>` 占位符。
+- `<加入码>` 换成最近一次 `nexus join` 输出的（短）加入码。常驻程序用本脚本起的碰头服务（`--rendezvous`）。手册的可执行块里不能有其他 `<…>` 占位符。
 - 块里用 `&` 放到后台的程序在检查结束时全部结束。
 
 用法：tools/manual_check.py [--bin target/debug/nexus] [--manual docs/manual.md] [--keep]
@@ -28,6 +28,35 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FENCE = re.compile(r"^```sh[ \t]+([a-z][a-z0-9-]*)[ \t]*$")
 PLACEHOLDER = re.compile(r"<[^<>\s]+>")
+
+
+def start_rendezvous():
+    """本机的碰头服务（短加入码用）：按路径存最新的一条记录。返回地址。"""
+    import http.server
+    import threading
+
+    store = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            store[self.path] = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            body = store.get(self.path)
+            self.send_response(200 if body is not None else 404)
+            self.send_header("Content-Length", str(len(body or b"")))
+            self.end_headers()
+            self.wfile.write(body or b"")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}/pkarr"
 
 
 def blocks(path):
@@ -58,6 +87,7 @@ class Check:
         self.daemons = {}
         self.join_code = None
         self.keep = args.keep
+        self.rendezvous = start_rendezvous()
 
     def home(self, dev):
         d = os.path.join(self.tmp, dev)
@@ -83,7 +113,7 @@ class Check:
             raise SystemExit(f"{dev}: 常驻程序已经在运行")
         data = os.path.join(self.home(dev), "data")
         log = open(os.path.join(self.home(dev), "daemon.log"), "ab")
-        p = subprocess.Popen([self.bin] + argv[1:] + ["--local-only",
+        p = subprocess.Popen([self.bin] + argv[1:] + ["--local-only", "--rendezvous", self.rendezvous,
                               "--agent-socket", os.path.join(self.home(dev), "agent.sock")],
                              env=self.env(dev), cwd=self.home(dev), stdin=subprocess.DEVNULL,
                              stdout=log, stderr=log, start_new_session=True)
@@ -145,7 +175,7 @@ class Check:
             for d in self.daemons:
                 print(f"\n=== {d} 的常驻程序日志（末尾） ===\n{self.log(d)}")
             raise SystemExit(1)
-        m = re.search(r"加入码[^\n]*\n\s*\n(\S+)", out)
+        m = re.search(r"加入码[^\n]*\n\s*\n\s*(\S+)", out)
         if m:
             self.join_code = m.group(1)
 

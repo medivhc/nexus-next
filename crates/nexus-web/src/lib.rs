@@ -40,7 +40,7 @@ pub struct Browser {
 }
 
 async fn connect(seed: [u8; 32], relay: String) -> Result<IrohTransport, JsError> {
-    let config = Config { relay: Relay::Custom(relay), discovery: false, bind: None, direct: false, scheduling: true };
+    let config = Config { relay: Relay::Custom(relay), discovery: false, bind: None, direct: false, scheduling: true, rendezvous: None };
     IrohTransport::bind(seed, config).await.map_err(|e| JsError::new(&format!("连不上中继：{e}")))
 }
 

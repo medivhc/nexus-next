@@ -7,7 +7,7 @@
 
 ## 现在能做什么
 
-已完成路线的阶段 0–5，`FEATURES.md` 里的 62 条需求都已实现并有测试：
+已完成路线的阶段 0–5，`FEATURES.md` 里的 64 条需求都已实现并有测试：
 
 | 阶段 | 内容 |
 | --- | --- |
@@ -16,6 +16,7 @@
 | 3 | 发布和使用服务、本机统一入口（SOCKS5 / HTTP）、路由规则、出口、完整节点（虚拟网卡）、流量调度、Android |
 | 4 | 文件：版本化工作区、跨设备同步与分叉合并、Linux 挂载、预读 |
 | 5 | 多条网络：断一条不断会话、交互流量冗余、批量分摊、计费网络 |
+| 6（进行中） | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码 |
 
 还没做：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。已知限制见手册的第 15 节。
 **还没有在两台不同网络的真实设备上验证过**，步骤见 `docs/real-network-check.md`。
@@ -29,7 +30,7 @@ cargo build --release -p nexus-cli       # target/release/nexus
 
 nexus daemon &                           # 每台设备
 nexus init --name laptop                 # 第一台设备（管理设备）
-nexus join                               # 新设备：输出加入码
+nexus join                               # 新设备：输出短加入码，例如 7KQ4M-9XZ21
 nexus device approve <加入码> --name home # 管理设备：批准
 
 nexus ls                                 # 所有设备及状态
@@ -55,7 +56,7 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 
 ## 升级兼容性
 
-当前协议：RPC `nexus/rpc/4`、加入 `nexus/join/4`、网页 `nexus/web/3`，wire 版本 16。
+当前协议：RPC `nexus/rpc/4`、加入 `nexus/join/4`、网页 `nexus/web/3`，wire 版本 17。
 设备程序和网页 WASM 要一起升级；版本不一致时请求被拒绝。升级保留已有的设备密钥、名册和工作区，浏览器需要重新登录。
 
 ## 开发

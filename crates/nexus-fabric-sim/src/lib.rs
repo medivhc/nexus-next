@@ -94,6 +94,70 @@ impl Transport for SimTransport {
             return Ok((conn, proto));
         }
     }
+
+    async fn rendezvous_put(&self, seed: [u8; 32], data: Vec<u8>) -> io::Result<()> {
+        let mut s = TcpStream::connect((turmoil::lookup(RENDEZVOUS_HOST), RENDEZVOUS_PORT)).await?;
+        s.write_all(&[1]).await?;
+        s.write_all(&seed).await?;
+        s.write_all(&(data.len() as u32).to_be_bytes()).await?;
+        s.write_all(&data).await?;
+        let mut ok = [0u8; 1];
+        s.read_exact(&mut ok).await?;
+        Ok(())
+    }
+
+    async fn rendezvous_get(&self, seed: [u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        let mut s = TcpStream::connect((turmoil::lookup(RENDEZVOUS_HOST), RENDEZVOUS_PORT)).await?;
+        s.write_all(&[2]).await?;
+        s.write_all(&seed).await?;
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).await?;
+        let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut data).await?;
+        Ok((!data.is_empty()).then_some(data))
+    }
+}
+
+/// 仿真里的碰头服务所在的虚拟主机。
+pub const RENDEZVOUS_HOST: &str = "rendezvous";
+const RENDEZVOUS_PORT: u16 = 7001;
+
+/// 仿真的碰头服务：按种子存最新的一段数据。在名为 [`RENDEZVOUS_HOST`] 的 turmoil 主机里运行。
+pub async fn serve_rendezvous() -> io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", RENDEZVOUS_PORT)).await?;
+    let store: std::rc::Rc<RefCell<HashMap<[u8; 32], Vec<u8>>>> = Default::default();
+    loop {
+        let (mut s, _) = listener.accept().await?;
+        let store = store.clone();
+        tokio::task::spawn_local(async move {
+            let mut head = [0u8; 33];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&head[1..]);
+            match head[0] {
+                1 => {
+                    let mut len = [0u8; 4];
+                    if s.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut data = vec![0u8; u32::from_be_bytes(len) as usize];
+                    if s.read_exact(&mut data).await.is_err() {
+                        return;
+                    }
+                    store.borrow_mut().insert(seed, data);
+                    let _ = s.write_all(&[1]).await;
+                }
+                2 => {
+                    let data = store.borrow().get(&seed).cloned().unwrap_or_default();
+                    let _ = s.write_all(&(data.len() as u32).to_be_bytes()).await;
+                    let _ = s.write_all(&data).await;
+                }
+                _ => {}
+            }
+        });
+    }
 }
 
 impl Connection for SimConn {

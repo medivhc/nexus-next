@@ -71,6 +71,12 @@ jobs:
       - name: Run full CI
         run: bash tools/ci.sh
 
+      - name: Public rendezvous service (informational)
+        # M6.1: short join codes go through https://dns.iroh.link/pkarr by default.
+        # The sandbox cannot reach it, the runner can. An outage there must not block a commit.
+        continue-on-error: true
+        run: cargo test --quiet -p nexus-fabric-iroh --test public_rendezvous -- --ignored
+
       - name: Upload CI log on failure
         if: failure()
         uses: actions/upload-artifact@v4

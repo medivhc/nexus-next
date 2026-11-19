@@ -70,6 +70,17 @@ pub trait Transport {
         let _ = overrides;
         Vec::new()
     }
+    /// 碰头服务（短加入码，M6.1）：把 `data` 放在 `seed` 对应的位置（用它派生的签名密钥签名）。
+    /// 空的 `data` 让之前放的失效。没有碰头服务时返回 `Unsupported`，原因在错误信息里。
+    fn rendezvous_put(&self, seed: [u8; 32], data: Vec<u8>) -> impl Future<Output = io::Result<()>> {
+        let _ = (seed, data);
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这个传输没有碰头服务")))
+    }
+    /// 取回 `seed` 对应位置上的数据；没有或已失效时为 None。
+    fn rendezvous_get(&self, seed: [u8; 32]) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
+        let _ = seed;
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这个传输没有碰头服务")))
+    }
 }
 
 pub trait Connection {

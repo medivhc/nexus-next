@@ -159,6 +159,12 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
     Ok(Anchor { url, _relay: relay })
 }
 
+/// 锚点上的碰头服务的存储（整个进程一份）。
+fn rendezvous_store() -> &'static nexus_fabric_iroh::rendezvous::Store {
+    static STORE: std::sync::OnceLock<nexus_fabric_iroh::rendezvous::Store> = std::sync::OnceLock::new();
+    STORE.get_or_init(Default::default)
+}
+
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 读请求头，按路径交给中继或回应页面。
@@ -167,7 +173,10 @@ async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, page: &Path, re
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "请求头超时"))??;
     let (_, target) = web_serve::request_line(&head);
-    if is_relay_path(&target) {
+    if target.starts_with("/pkarr/") {
+        // 碰头服务（M6.1）：新设备在自建网络里用 --rendezvous https://<锚点>/pkarr。
+        nexus_fabric_iroh::rendezvous::respond(&mut stream, &head, rendezvous_store()).await
+    } else if is_relay_path(&target) {
         let mut upstream = TcpStream::connect(relay).await?;
         // 按连接上的第一个请求分流：不是协议升级的请求（探测）回应后必须关闭连接，
         // 否则浏览器复用这条连接请求页面时会落到中继那里。

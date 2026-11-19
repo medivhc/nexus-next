@@ -55,7 +55,7 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, relay, no_discovery, rendezvous, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
                 let tun = match tun {
                     None => None,
                     Some(dev) => match parse_tun_net(tun_net) {
@@ -90,6 +90,12 @@ fn main() {
                 let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
                 let mut config = transport_config(*local_only, relay, *no_discovery);
                 config.scheduling = !*no_scheduling;
+                match rendezvous.as_deref() {
+                    None => {}
+                    Some("disabled") => config.rendezvous = None,
+                    Some("default") => config.rendezvous = Some(nexus_fabric_iroh::rendezvous::DEFAULT_URL.to_string()),
+                    Some(url) => config.rendezvous = Some(url.to_string()),
+                }
                 // 锚点：先起中继和页面，本机也用自己的中继。
                 let _anchor = if anchor_args.enabled() {
                     if let Err(e) = std::fs::create_dir_all(&data_dir) {

@@ -11,11 +11,13 @@ nexus-wire.workspace = true
 iroh.workspace = true
 noq-proto.workspace = true
 # 也要编译进浏览器：只用 tokio 的读写接口。
-tokio = { version = "1", default-features = false, features = ["io-util"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "time"] }
 postcard.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 iroh = { workspace = true, features = ["metrics", "portmapper", "fast-apple-datapath"] }
+# 碰头服务（M6.1：短加入码）：pkarr 的签名记录。
+iroh-dns = "1.4.1"
 # 网络接口（M5.2：计费网络）。
 nix = { workspace = true, features = ["net"] }
 
@@ -23,3 +25,5 @@ nix = { workspace = true, features = ["net"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 nexus-core-proto.workspace = true
 iroh-relay.workspace = true
+getrandom.workspace = true
+nexus-fabric.workspace = true

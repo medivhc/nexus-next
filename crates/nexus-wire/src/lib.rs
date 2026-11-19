@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 16;
+pub const WIRE_VERSION: u16 = 17;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -540,7 +540,8 @@ pub enum CtlResponse {
     Paths(Vec<DevicePaths>),
     Interfaces(Vec<IfaceInfo>),
     Init(InitReport),
-    JoinCode { code: String, expires_at: Timestamp },
+    /// 长加入码；短加入码（M6.1）在没有碰头服务时为 None，原因在 `short_code_error`。
+    JoinCode { code: String, short_code: Option<String>, short_code_error: Option<String>, expires_at: Timestamp },
     Membership(MembershipReport),
     List(Vec<ListEntry>),
     Exec(ExecEvent),
@@ -707,17 +708,74 @@ pub struct JoinCode {
     pub addr: String,
 }
 
-const JOIN_CODE_PREFIX: &str = "nxj1-";
+const JOIN_CODE_PREFIX: &str = "nxj2-";
+
+/// 长加入码的二进制形式（R63）：地址提示是十六进制时按字节存，不再编两次。
+#[derive(Serialize, Deserialize)]
+struct JoinCodeBytes {
+    node_id: NodeId,
+    nonce: [u8; 16],
+    name: String,
+    addr: HintBytes,
+}
+
+#[derive(Serialize, Deserialize)]
+enum HintBytes {
+    Hex(Vec<u8>),
+    Text(String),
+}
+
+/// 末尾的校验：抄错一个字符时直接报格式不对，而不是去连一台不存在的设备。
+const JOIN_CODE_CHECK: usize = 3;
+
+fn join_check(bytes: &[u8]) -> [u8; JOIN_CODE_CHECK] {
+    let h = nexus_core_proto::joincode::checksum(bytes);
+    [h[0], h[1], h[2]]
+}
 
 impl JoinCode {
+    /// 二进制形式，也是短加入码在碰头服务上存放的内容。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let addr = match hex_decode(&self.addr) {
+            Some(b) if !self.addr.is_empty() && hex_encode(&b) == self.addr => HintBytes::Hex(b),
+            _ => HintBytes::Text(self.addr.clone()),
+        };
+        let body = JoinCodeBytes { node_id: self.node_id, nonce: self.nonce, name: self.name.clone(), addr };
+        let mut bytes = postcard::to_allocvec(&body).expect("内存中的值总能编码");
+        let check = join_check(&bytes);
+        bytes.extend_from_slice(&check);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (body, check) = bytes.split_at(bytes.len().checked_sub(JOIN_CODE_CHECK)?);
+        if join_check(body) != check {
+            return None;
+        }
+        let (b, rest): (JoinCodeBytes, _) = postcard::take_from_bytes(body).ok()?;
+        if !rest.is_empty() {
+            return None;
+        }
+        let addr = match b.addr {
+            HintBytes::Hex(bytes) => hex_encode(&bytes),
+            HintBytes::Text(t) => t,
+        };
+        Some(JoinCode { node_id: b.node_id, nonce: b.nonce, name: b.name, addr })
+    }
+
     pub fn encode(&self) -> String {
-        let bytes = postcard::to_allocvec(self).expect("内存中的值总能编码");
-        format!("{JOIN_CODE_PREFIX}{}", hex_encode(&bytes))
+        format!("{JOIN_CODE_PREFIX}{}", nexus_core_proto::joincode::base32_encode(&self.to_bytes()))
     }
 
     pub fn decode(s: &str) -> Option<Self> {
-        let body = s.trim().strip_prefix(JOIN_CODE_PREFIX)?;
-        postcard::from_bytes(&hex_decode(body)?).ok()
+        let s = s.trim();
+        let body = s.get(..JOIN_CODE_PREFIX.len()).filter(|p| p.eq_ignore_ascii_case(JOIN_CODE_PREFIX)).map(|_| &s[JOIN_CODE_PREFIX.len()..])?;
+        Self::from_bytes(&nexus_core_proto::joincode::base32_decode(body)?)
+    }
+
+    /// 文本看起来是长加入码（而不是短加入码）。
+    pub fn looks_like(s: &str) -> bool {
+        s.trim().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("nxj2") || p.eq_ignore_ascii_case("nxj1"))
     }
 }
 
@@ -851,11 +909,34 @@ mod tests {
     fn join_code_round_trip_and_rejects_garbage() {
         let code = JoinCode { node_id: NodeId([5; 32]), nonce: [6; 16], name: "home".into(), addr: "x".into() };
         let text = code.encode();
-        assert!(text.starts_with("nxj1-"));
+        assert!(text.starts_with("nxj2-"));
         assert_eq!(JoinCode::decode(&text), Some(code.clone()));
-        assert_eq!(JoinCode::decode(&format!("  {text}\n")), Some(code));
-        for bad in ["", "nxj1-", "nxj1-zz", "nxj1-abc", "xxxx-00", &text[..text.len() - 2]] {
+        assert_eq!(JoinCode::decode(&format!("  {text}\n")), Some(code.clone()));
+        assert_eq!(JoinCode::decode(&text.to_uppercase()), Some(code));
+        for bad in ["", "nxj2-", "nxj2-zz", "nxj2-abc", "xxxx-00", "nxj1-00", &text[..text.len() - 2]] {
             assert_eq!(JoinCode::decode(bad), None, "{bad:?}");
+        }
+    }
+
+    /// FP-6.1-06：只有小写字母和数字；不超过旧格式的 60%；改一个字符要么解不开、要么内容不同。
+    #[test]
+    fn join_code_is_compact() {
+        // 地址提示的样子和 iroh 驱动给的一样：一段十六进制（端点地址：身份、中继、两个直连地址）。
+        let hint = hex_encode(&(0..110u8).collect::<Vec<_>>());
+        let code = JoinCode { node_id: NodeId([0xab; 32]), nonce: [7; 16], name: "office-pc".into(), addr: hint.clone() };
+        let text = code.encode();
+        assert!(text[5..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{text}");
+        let old = format!("nxj1-{}", hex_encode(&postcard::to_allocvec(&code).unwrap()));
+        assert!(text.len() * 10 <= old.len() * 6, "新 {} 个字符，旧 {} 个", text.len(), old.len());
+        assert_eq!(JoinCode::decode(&text).unwrap().addr, hint);
+        // 不是十六进制的提示（仿真里的主机名）原样保留。
+        let sim = JoinCode { addr: "home".into(), ..code.clone() };
+        assert_eq!(JoinCode::decode(&sim.encode()), Some(sim));
+        for i in 5..text.len() {
+            let mut b = text.clone().into_bytes();
+            b[i] = if b[i] == b'a' { b'b' } else { b'a' };
+            let changed = String::from_utf8(b).unwrap();
+            assert_ne!(JoinCode::decode(&changed), Some(code.clone()), "改第 {i} 个字符");
         }
     }
 

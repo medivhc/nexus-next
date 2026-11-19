@@ -33,6 +33,9 @@ nexus anchor set https://bewith.link
 
 之后各设备自动把锚点加为中继；`nexus web enroll --label phone` 的链接指向 `https://bewith.link/`。
 
+锚点还在 `https://bewith.link/pkarr` 提供碰头服务（短加入码用）。不想依赖 iroh 的公共服务时，
+所有设备用 `nexus daemon --no-discovery --rendezvous https://bewith.link/pkarr` 启动。
+
 ## 检查
 
 ```sh

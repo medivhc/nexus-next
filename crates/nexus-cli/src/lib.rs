@@ -85,6 +85,10 @@ pub enum Cmd {
         /// 不使用公共地址发现服务
         #[arg(long)]
         no_discovery: bool,
+        /// 碰头服务（短加入码用）：default（公共的地址发现服务）、disabled，或自建的地址，例如锚点的
+        /// https://<锚点>/pkarr。默认：用了地址发现时是 default，否则 disabled
+        #[arg(long, value_name = "地址")]
+        rendezvous: Option<String>,
         /// 关掉流量调度（只用于对比测量）
         #[arg(long, hide = true)]
         no_scheduling: bool,
@@ -113,7 +117,8 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// 让这台设备准备加入网络：输出一段加入码，在管理设备上用 `nexus device approve` 批准
+    /// 让这台设备准备加入网络：输出短加入码（例如 7KQ4M-9XZ21）和长加入码，10 分钟内有效，
+    /// 在管理设备上用 `nexus device approve` 批准。短码要经碰头服务（见 daemon --rendezvous），长码不需要
     Join {
         #[arg(long)]
         json: bool,
@@ -325,7 +330,7 @@ pub enum Cmd {
 pub enum DeviceCmd {
     /// 批准一台设备加入
     Approve {
-        /// 新设备上 `nexus join` 输出的加入码
+        /// 新设备上 `nexus join` 输出的短加入码或长加入码（短码不区分大小写，分隔符可有可无）
         code: String,
         /// 给它起的名字（默认用它自己建议的名字）
         #[arg(long)]
@@ -1234,10 +1239,23 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 )
             }
         }
-        CtlResponse::JoinCode { code, expires_at } => if json {
-            doc(json!({ "schema": JSON_SCHEMA, "code": code, "expires_at_ms": expires_at.0 }))
+        CtlResponse::JoinCode { code, short_code, short_code_error, expires_at } => if json {
+            doc(json!({
+                "schema": JSON_SCHEMA, "code": code, "short_code": short_code, "short_code_error": short_code_error,
+                "expires_at_ms": expires_at.0,
+            }))
         } else {
-            format!("加入码（10 分钟内有效）：\n\n{code}\n\n在管理设备上运行：nexus device approve <加入码>\n")
+            match (short_code, short_code_error) {
+                (Some(short), _) => format!(
+                    "加入码（10 分钟内有效）：\n\n    {short}\n\n在管理设备上运行：nexus device approve {short}\n\n\
+                     管理设备连不上碰头服务时，改用长加入码：\n{code}\n"
+                ),
+                (None, why) => format!(
+                    "加入码（10 分钟内有效）：\n\n{code}\n\n在管理设备上运行：nexus device approve <加入码>\n\n\
+                     只能用长加入码：{}\n",
+                    why.unwrap_or_default()
+                ),
+            }
         },
         CtlResponse::Membership(m) => {
             let v = json!({

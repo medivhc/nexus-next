@@ -7,6 +7,7 @@
 
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use nexus_core_proto::joincode::{self, ShortCode};
 use nexus_core_proto::authz::{
     self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal, ReplayGuard, WebSession,
 };
@@ -493,6 +494,8 @@ struct Trust {
 struct PendingJoin {
     nonce: [u8; 16],
     expires_at: Timestamp,
+    /// 短加入码在碰头服务上的位置（M6.1）。重新开始加入时让它失效。
+    short_seed: Option<[u8; 32]>,
 }
 
 type Task<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
@@ -1086,7 +1089,7 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Interfaces { set } => self.interfaces(set).map(CtlResponse::Interfaces),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
             CtlRequest::Init { name } => self.init(name).map(CtlResponse::Init),
-            CtlRequest::JoinStart => self.join_start(),
+            CtlRequest::JoinStart => self.join_start().await,
             CtlRequest::Approve { code, name } => self.approve(&code, name).await.map(CtlResponse::Membership),
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
             CtlRequest::List => Ok(CtlResponse::List(self.list(agent_ref).await)),
@@ -2644,21 +2647,68 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(InitReport { name, node_id: self.me(), root: root.public(), recovery_code: hex_encode(&seed) })
     }
 
-    fn join_start(&self) -> Result<CtlResponse, WireError> {
+    async fn join_start(&self) -> Result<CtlResponse, WireError> {
         if self.trust.borrow().root.is_some() {
             return Err(err(ErrorCode::InvalidState, "本机已经属于一个网络"));
         }
         let mut nonce = [0u8; 16];
         self.system.random(&mut nonce);
         let expires_at = Timestamp(self.system.now().0 + JOIN_CODE_TTL_MS);
-        *self.pending_join.borrow_mut() = Some(PendingJoin { nonce, expires_at });
+        let previous = self.pending_join.borrow_mut().replace(PendingJoin { nonce, expires_at, short_seed: None });
         let code = JoinCode {
             node_id: self.me(),
             nonce,
             name: self.configured_name.clone(),
             addr: self.transport.local_hint(),
         };
-        Ok(CtlResponse::JoinCode { code: code.encode(), expires_at })
+        // 旧的短码立即失效（尽力而为：碰头服务连不上时它也会在 10 分钟后过期）。
+        if let Some(seed) = previous.and_then(|p| p.short_seed) {
+            let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(seed, Vec::new())).await;
+        }
+        // 短加入码：加密后的长加入码放到碰头服务上，位置和密钥都从短码派生。
+        let mut random = [0u8; 7];
+        self.system.random(&mut random);
+        let short = ShortCode::from_random(random);
+        let keys = short.keys();
+        let mut salt = [0u8; 16];
+        self.system.random(&mut salt);
+        let sealed = joincode::seal(&keys, salt, &code.to_bytes());
+        let put = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(keys.seed, sealed)).await;
+        let (short_code, short_code_error) = match put {
+            Ok(Ok(())) => {
+                if let Some(p) = self.pending_join.borrow_mut().as_mut().filter(|p| p.nonce == nonce) {
+                    p.short_seed = Some(keys.seed);
+                }
+                (Some(short.display()), None)
+            }
+            Ok(Err(e)) if e.kind() == io::ErrorKind::Unsupported => (None, Some(format!("没有碰头服务（{e}）"))),
+            Ok(Err(e)) => (None, Some(format!("连不上碰头服务：{e}"))),
+            Err(_) => (None, Some("连接碰头服务超时".to_string())),
+        };
+        Ok(CtlResponse::JoinCode { code: code.encode(), short_code, short_code_error, expires_at })
+    }
+
+    /// 管理设备拿到的加入码：长码直接解码；短码到碰头服务上取回、解密（M6.1）。
+    /// 返回长加入码和短码的位置（用过之后让它失效）。
+    async fn resolve_join_code(&self, text: &str) -> Result<(JoinCode, Option<[u8; 32]>), WireError> {
+        if JoinCode::looks_like(text) {
+            return JoinCode::decode(text).map(|c| (c, None)).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"));
+        }
+        let short = ShortCode::parse(text).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
+        let keys = short.keys();
+        let got = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_get(keys.seed)).await;
+        let data = match got {
+            Ok(Ok(Some(data))) if !data.is_empty() => data,
+            Ok(Ok(_)) => return Err(err(ErrorCode::NotFound, "找不到这个短加入码：已过期、已经用过，或者输错了")),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::Unsupported => {
+                return Err(err(ErrorCode::InvalidState, format!("本机没有碰头服务，只能用长加入码（{e}）")))
+            }
+            Ok(Err(e)) => return Err(err(ErrorCode::Unreachable, format!("连不上碰头服务：{e}"))),
+            Err(_) => return Err(err(ErrorCode::Unreachable, "连接碰头服务超时")),
+        };
+        let plain = joincode::open(&keys, &data).ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录无法解密"))?;
+        let code = JoinCode::from_bytes(&plain).ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录格式不对"))?;
+        Ok((code, Some(keys.seed)))
     }
 
     fn admin_key(&self) -> Result<SecretKey, WireError> {
@@ -2674,7 +2724,7 @@ impl<T: Transport, S: System> Node<T, S> {
         // 发给它的名册必须是最新的，同时发生的撤销等它确认之后再写入下一个版本。
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
-        let code = JoinCode::decode(code).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
+        let (code, short_seed) = self.resolve_join_code(code).await?;
         let name = name.unwrap_or_else(|| code.name.clone());
         if !valid_segment(&name) {
             return Err(err(ErrorCode::InvalidInput, format!("设备名 {name:?} 不合法：只能用字母、数字、- 和 _")));
@@ -2704,6 +2754,10 @@ impl<T: Transport, S: System> Node<T, S> {
         self.adopt_roster(&signed)?;
         let _ = self.learn_hints(&vec![(code.node_id, code.addr.clone())]);
         drop(_write);
+        // 用过的短码立即失效。
+        if let Some(seed) = short_seed {
+            let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(seed, Vec::new())).await;
+        }
         let (pushed, unreachable) = self.broadcast_roster(Some(code.node_id)).await;
         Ok(MembershipReport { name, node_id: code.node_id, roster_version: self.roster_version(), pushed, unreachable })
     }
