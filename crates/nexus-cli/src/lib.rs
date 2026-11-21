@@ -43,6 +43,8 @@ pub const EXIT_INVALID_STATE: i32 = 106;
 pub const EXIT_INVALID_INPUT: i32 = 107;
 pub const EXIT_UNREACHABLE: i32 = 108;
 pub const EXIT_NOT_FOUND: i32 = 109;
+/// 对方（或本机）的版本太旧，不认识这个请求或回应（M7.1）。
+pub const EXIT_VERSION: i32 = 110;
 /// `nexus exec` 的命令因超时被终止（与 timeout(1) 一致）。
 pub const EXIT_TIMED_OUT: i32 = 124;
 /// `nexus exec` 的命令因输出超过上限被终止。
@@ -698,6 +700,7 @@ fn exit_for(code: ErrorCode) -> (i32, &'static str) {
         ErrorCode::Unreachable => (EXIT_UNREACHABLE, "unreachable"),
         ErrorCode::SpawnFailed => (EXIT_SPAWN_FAILED, "spawn_failed"),
         ErrorCode::NotFound => (EXIT_NOT_FOUND, "not_found"),
+        ErrorCode::UnsupportedVersion => (EXIT_VERSION, "version"),
         _ => (EXIT_INTERNAL, "internal"),
     }
 }
@@ -2080,12 +2083,27 @@ fn status_json(r: &StatusReport) -> Value {
     Value::Object(m)
 }
 
+/// 本机常驻程序的版本：列表里本机那一项的。
+fn own_version(entries: &[ListEntry]) -> Option<&str> {
+    entries.iter().find(|e| e.is_self).and_then(|e| e.report.info.as_ref()).map(|i| i.version.as_str())
+}
+
+/// 这台设备的版本和本机不同（M7.1）。不在线、不知道版本时为 false。
+fn version_differs(e: &ListEntry, own: Option<&str>) -> bool {
+    match (e.report.info.as_ref(), own) {
+        (Some(i), Some(own)) => !e.is_self && i.version != own,
+        _ => false,
+    }
+}
+
 fn list_json(entries: &[ListEntry]) -> String {
+    let own = own_version(entries);
     let devices: Vec<Value> = entries
         .iter()
         .map(|e| {
             let mut m = report_fields(&e.report);
             m.insert("self".into(), json!(e.is_self));
+            m.insert("version_differs".into(), json!(version_differs(e, own)));
             Value::Object(m)
         })
         .collect();
@@ -2126,6 +2144,7 @@ fn status_text(r: &StatusReport) -> String {
 
 fn list_text(entries: &[ListEntry]) -> String {
     let mut out = String::new();
+    let own = own_version(entries);
     for e in entries {
         let r = &e.report;
         let state = if !r.online {
@@ -2144,7 +2163,11 @@ fn list_text(entries: &[ListEntry]) -> String {
             Some(DeviceRole::Member) => "成员",
             None => "未加入网络",
         };
-        out.push_str(&format!("{:<16} {}  {:<8} {}\n", r.name, r.node_id.short(), role, state));
+        let version = match &r.info {
+            Some(i) if version_differs(e, own) => format!("，版本 {}（和本机不同）", i.version),
+            _ => String::new(),
+        };
+        out.push_str(&format!("{:<16} {}  {:<8} {state}{version}\n", r.name, r.node_id.short(), role));
     }
     out
 }
@@ -2152,6 +2175,37 @@ fn list_text(entries: &[ListEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FP-7.1-04：版本不同的设备标出来；本机、离线的不标。
+    #[test]
+    fn list_marks_devices_on_another_version() {
+        let entry = |name: &str, version: Option<&str>, is_self: bool| ListEntry {
+            report: StatusReport {
+                name: name.into(),
+                node_id: nexus_core_proto::NodeId([name.len() as u8; 32]),
+                info: version.map(|v| nexus_core_proto::NodeInfo {
+                    node_id: nexus_core_proto::NodeId([0; 32]),
+                    name: name.into(),
+                    version: v.into(),
+                    started_at: nexus_core_proto::Timestamp(0),
+                    now: nexus_core_proto::Timestamp(0),
+                    roster_version: Some(1),
+                }),
+                online: version.is_some(),
+                rtt_ms: Some(3),
+                path: Some(PathKind::Direct),
+                role: Some(DeviceRole::Member),
+            },
+            is_self,
+        };
+        let entries = vec![entry("laptop", Some("0.2.0"), true), entry("home", Some("0.1.0"), false), entry("office", Some("0.2.0"), false), entry("nas", None, false)];
+        let text = list_text(&entries);
+        assert!(text.lines().any(|l| l.starts_with("home") && l.contains("版本 0.1.0（和本机不同）")), "{text}");
+        assert!(!text.lines().any(|l| (l.starts_with("office") || l.starts_with("laptop") || l.starts_with("nas")) && l.contains("和本机不同")), "{text}");
+        let v: Value = serde_json::from_str(&list_json(&entries)).unwrap();
+        let differs: Vec<bool> = v["devices"].as_array().unwrap().iter().map(|d| d["version_differs"].as_bool().unwrap()).collect();
+        assert_eq!(differs, [false, true, false, false]);
+    }
 
     #[test]
     fn base64_matches_rfc4648_examples() {

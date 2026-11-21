@@ -17,7 +17,7 @@ use nexus_core_proto::webauthn::{login_challenge, verify_assertion, P256Key, Web
 use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
-use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
+use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
 use nexus_net_core::http::{self, BadRequest, ProxyRequest};
 use nexus_net_core::route::{self, Decision, Outbound, Rule};
 use nexus_net_core::fakeip::FakePool;
@@ -783,12 +783,28 @@ impl<T: Transport, S: System> Node<T, S> {
 
     async fn serve_stream(&self, conn: &T::Conn, peer: NodeId, proto: Proto, mut stream: <T::Conn as Connection>::Stream) {
         let Ok(header) = read_msg::<_, RequestHeader>(&mut stream).await else { return };
+        let body = if header.version != WIRE_VERSION {
+            Err(err(ErrorCode::UnsupportedVersion, format!("协议版本不兼容：对方 {}，本机 {WIRE_VERSION}", header.version)))
+        } else {
+            header.request(&self.describe_self())
+        };
+        let body = match body {
+            Ok(body) => body,
+            Err(e) => {
+                // 旧版本不认识新请求（M7.1）：回应说明，不断开。
+                if write_response(&mut stream, &Response::Error(e)).await.is_ok() {
+                    let _ = stream.shutdown().await;
+                    drain(&mut stream).await;
+                }
+                return;
+            }
+        };
         // 回应方向的优先级由这一端定：和请求同一类。
-        conn.set_priority(&mut stream, header.body.class().priority());
+        conn.set_priority(&mut stream, body.class().priority());
         let dispatch = match proto {
-            Proto::Rpc => self.handle_rpc(peer, header),
-            Proto::Join => Dispatch::Reply(self.handle_join(header)),
-            Proto::Web => match header.body {
+            Proto::Rpc => self.handle_rpc(peer, header, body),
+            Proto::Join => Dispatch::Reply(self.handle_join(body)),
+            Proto::Web => match body {
                 Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
                 Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
                 _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
@@ -809,19 +825,22 @@ impl<T: Transport, S: System> Node<T, S> {
                 Err(e) => Response::Error(e),
             },
         };
-        if write_msg(&mut stream, &response).await.is_err() {
+        if write_response(&mut stream, &response).await.is_err() {
             return;
         }
         let _ = stream.shutdown().await;
         drain(&mut stream).await;
     }
 
-    fn handle_rpc(&self, peer: NodeId, header: RequestHeader) -> Dispatch {
-        if header.version != WIRE_VERSION {
-            return Dispatch::Reply(Response::Error(err(ErrorCode::UnsupportedVersion, format!("不支持的协议版本 {}", header.version))));
-        }
+    /// 写进版本说明里的本机：名字和软件版本。
+    fn describe_self(&self) -> String {
+        let name = self.roster().and_then(|r| r.device(self.me()).map(|d| d.name.clone())).unwrap_or_else(|| self.configured_name.clone());
+        format!("{name}（Nexus {}）", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn handle_rpc(&self, peer: NodeId, header: RequestHeader, body: Request) -> Dispatch {
         // 名册推送只靠签名证明自己，不要求发送方已经在本机的旧名册里。
-        if let Request::RosterPush { roster, addrs } = &header.body {
+        if let Request::RosterPush { roster, addrs } = &body {
             return Dispatch::Reply(match self.adopt_roster(roster) {
                 Ok(()) => {
                     let _ = self.learn_hints(addrs);
@@ -841,7 +860,7 @@ impl<T: Transport, S: System> Node<T, S> {
             return Dispatch::Reply(Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络")));
         };
         let me = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
-        let action = match required_action(&header.body, &me) {
+        let action = match required_action(&body, &me) {
             Ok(Some(action)) => action,
             Ok(None) => return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这个请求不能在此协议上使用"))),
             Err(e) => return Dispatch::Reply(Response::Error(e)),
@@ -853,7 +872,7 @@ impl<T: Transport, S: System> Node<T, S> {
             // 对方的名册旧了，稍后在后台推过去。
             let _ = self.push_tx.send(peer);
         }
-        Dispatch::Reply(match header.body {
+        Dispatch::Reply(match body {
             Request::NodeInfo => Response::NodeInfo(self.info()),
             Request::Exec(spec) => return Dispatch::Exec(spec),
             Request::SessionAttach { name, create, size } => {
@@ -911,8 +930,8 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 处理加入协议上的邀请。邀请方不在本机名册里（本机还没有名册），
     /// 能证明它有权邀请的只有一次性随机数：只有看到加入码的人才知道它。
-    fn handle_join(&self, header: RequestHeader) -> Response {
-        let Request::JoinOffer { nonce, roster, addrs } = header.body else {
+    fn handle_join(&self, body: Request) -> Response {
+        let Request::JoinOffer { nonce, roster, addrs } = body else {
             return Response::Error(err(ErrorCode::InvalidInput, "加入协议上只接受邀请"));
         };
         let result = (|| {
@@ -1030,10 +1049,10 @@ impl<T: Transport, S: System> Node<T, S> {
         let conn = self.transport.connect(to, proto).await?;
         let mut stream = conn.open_bi().await?;
         conn.set_priority(&mut stream, body.class().priority());
-        let header = RequestHeader { version: WIRE_VERSION, roster_version: self.roster_version(), principal, body };
+        let header = RequestHeader::new(self.roster_version(), principal, &body);
         write_msg(&mut stream, &header).await?;
         stream.shutdown().await?;
-        let resp = read_msg(&mut stream).await?;
+        let resp = read_response(&mut stream).await?;
         drain(&mut stream).await;
         Ok((resp, conn.path_kind()))
     }
@@ -1518,7 +1537,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let (near, far) = tokio::io::duplex(256 * 1024);
             let client = async {
                 let mut near = near;
-                match read_msg::<_, Response>(&mut near).await {
+                match read_response(&mut near).await {
                     Ok(Response::Ok) => self.pump_exec(near, server).await,
                     Ok(Response::Error(e)) => {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
@@ -1560,9 +1579,9 @@ impl<T: Transport, S: System> Node<T, S> {
             let conn = self.transport.connect(to.node_id, Proto::Rpc).await?;
             let mut stream = conn.open_bi().await?;
             conn.set_priority(&mut stream, priority);
-            let header = RequestHeader { version: WIRE_VERSION, roster_version: self.roster_version(), principal, body };
+            let header = RequestHeader::new(self.roster_version(), principal, &body);
             write_msg(&mut stream, &header).await?;
-            let resp: Response = read_msg(&mut stream).await?;
+            let resp: Response = read_response(&mut stream).await?;
             Ok::<_, io::Error>((stream, resp))
         };
         let (stream, resp) = tokio::time::timeout(REQUEST_TIMEOUT, open)
@@ -1626,7 +1645,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(p) => p,
             Err(e) => {
                 let failure = err(ErrorCode::SpawnFailed, format!("无法启动 {}：{e}", spec.program));
-                let _ = write_msg(&mut wr, &Response::Error(failure)).await;
+                let _ = write_response(&mut wr, &Response::Error(failure)).await;
                 let _ = wr.shutdown().await;
                 reader.drain().await;
                 return;
@@ -1634,7 +1653,7 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 保留写入游标：select! 取消写入时，已经发出的半帧不会被重发。
         // 每次只缓存一帧，保留输出反压；计时和取消不依赖接收方继续读取。
-        let mut pending = Some((nexus_wire::encode(&Response::Ok).expect("固定回应可编码"), 0));
+        let mut pending = Some((nexus_wire::encode(&nexus_wire::ResponseEnvelope::new(&Response::Ok)).expect("固定回应可编码"), 0));
         let started = self.system.now();
         let limit = spec.timeout_ms.map(Duration::from_millis);
         let deadline = tokio::time::sleep(limit.unwrap_or(Duration::from_secs(100 * 365 * 24 * 3600)));
@@ -1750,7 +1769,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let (near, far) = tokio::io::duplex(256 * 1024);
             let client = async {
                 let mut near = near;
-                match read_msg::<_, Response>(&mut near).await {
+                match read_response(&mut near).await {
                     Ok(Response::Ok) => self.pump_session(near, server).await,
                     Ok(Response::Error(e)) => {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
@@ -1860,7 +1879,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let cmd = match self.open_session(name, create, size) {
             Ok(cmd) => cmd,
             Err(e) => {
-                let _ = write_msg(&mut wr, &Response::Error(e)).await;
+                let _ = write_response(&mut wr, &Response::Error(e)).await;
                 let _ = wr.shutdown().await;
                 reader.drain().await;
                 return;
@@ -1869,7 +1888,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let client = self.next_client.get();
         self.next_client.set(client + 1);
         let (tx, mut out) = mpsc::unbounded_channel();
-        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_msg(&mut wr, &Response::Ok).await.is_err() {
+        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
             let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
             return;
         }
@@ -2114,13 +2133,13 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(c) => c,
             Err(e) => {
                 let failure = err(ErrorCode::Unreachable, format!("服务 {name} 的本机程序没有在运行（{e}）"));
-                let _ = write_msg(&mut stream, &Response::Error(failure)).await;
+                let _ = write_response(&mut stream, &Response::Error(failure)).await;
                 let _ = stream.shutdown().await;
                 drain(&mut stream).await;
                 return;
             }
         };
-        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
@@ -2151,13 +2170,13 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut out = match result.await {
             Ok(c) => c,
             Err(failure) => {
-                let _ = write_msg(&mut stream, &Response::Error(failure)).await;
+                let _ = write_response(&mut stream, &Response::Error(failure)).await;
                 let _ = stream.shutdown().await;
                 drain(&mut stream).await;
                 return;
             }
         };
-        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut out).await;
@@ -2187,7 +2206,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let (near, far) = tokio::io::duplex(256 * 1024);
             let client = async {
                 let mut near = near;
-                match read_msg::<_, Response>(&mut near).await {
+                match read_response(&mut near).await {
                     Ok(Response::Ok) => self.pump_pipe(near, server).await,
                     Ok(Response::Error(e)) => {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
@@ -3112,6 +3131,32 @@ mod tests {
         }
     }
 
+    /// FP-7.1-02：不认识的请求得到说明版本的回应，而不是连接被断开。
+    #[tokio::test]
+    async fn unknown_request_gets_a_version_answer() {
+        let node = Node::new(TestTransport, TestSystem(Rc::default()), "home").unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let header = RequestHeader::new(0, Principal::Device, &Request::NodeInfo);
+        let mut bytes = postcard::to_allocvec(&header).unwrap();
+        // 请求体是最后一个字段（长度 1，内容是请求的种类编号）：换成一个以后才有的编号。
+        let last = bytes.len() - 1;
+        bytes[last] = 120;
+        let future: RequestHeader = postcard::from_bytes(&bytes).unwrap();
+        let serve = node.serve_stream(&TestConnection, NodeId([2; 32]), Proto::Rpc, server);
+        let ask = async {
+            write_msg(&mut client, &future).await.unwrap();
+            read_response(&mut client).await.unwrap()
+        };
+        let ((), answer) = tokio::time::timeout(Duration::from_secs(3), futures_util::future::join(serve, ask)).await.unwrap();
+        match answer {
+            Response::Error(e) => {
+                assert_eq!(e.code, ErrorCode::UnsupportedVersion);
+                assert!(e.message.contains("home") && e.message.contains(env!("CARGO_PKG_VERSION")) && e.message.contains("升级"), "{}", e.message);
+            }
+            other => panic!("应当回应版本错误：{other:?}"),
+        }
+    }
+
     async fn stalled_exec(cancel: bool) {
         let state = Rc::new(ExecState::default());
         let node = Node::new(TestTransport, TestSystem(state.clone()), "test").unwrap();
@@ -3127,7 +3172,7 @@ mod tests {
         };
         let observer = async {
             assert!(matches!(
-                read_msg::<_, Response>(&mut client).await.unwrap(),
+                read_response(&mut client).await.unwrap(),
                 Response::Ok
             ));
             state.output_ready.notified().await;

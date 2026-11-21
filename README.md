@@ -7,7 +7,7 @@
 
 ## 现在能做什么
 
-已完成路线的阶段 0–5，`FEATURES.md` 里的 65 条需求都已实现并有测试：
+已完成路线的阶段 0–5，`FEATURES.md` 里的 66 条需求都已实现并有测试：
 
 | 阶段 | 内容 |
 | --- | --- |
@@ -16,7 +16,8 @@
 | 3 | 发布和使用服务、本机统一入口（SOCKS5 / HTTP）、路由规则、出口、完整节点（虚拟网卡）、流量调度、Android |
 | 4 | 文件：版本化工作区、跨设备同步与分叉合并、Linux 挂载、预读 |
 | 5 | 多条网络：断一条不断会话、交互流量冗余、批量分摊、计费网络 |
-| 6（进行中） | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码；用恢复码恢复管理设备 |
+| 6 | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码；用恢复码恢复管理设备 |
+| 7（进行中） | 日常可用：新旧版本互通（设备可以一台一台升级） |
 
 还没做：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。已知限制见手册的第 17 节。
 **还没有在两台不同网络的真实设备上验证过**，步骤见 `docs/real-network-check.md`。
@@ -50,6 +51,7 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 | [docs/android.md](docs/android.md) | Android 应用的构建、安装和加入 |
 | [docs/real-network-check.md](docs/real-network-check.md) | 在两台真实设备上验证的清单 |
 | [docs/roadmap.md](docs/roadmap.md) | 之后的开发计划：和产品文档的差距、阶段 7–9 |
+| [docs/protocol.md](docs/protocol.md) | 协议与版本兼容：改协议时的规则（开发者） |
 | [web/README.md](web/README.md) | 网页节点的页面：构建、本机试用、浏览器端到端测试 |
 | [vendor/README.md](vendor/README.md) | iroh 和 noq 的分支：改了什么、为什么（多路径） |
 | `docs/feature-points/` | 每个里程碑的功能点（Given / When / Then），开发时的规格 |
@@ -57,8 +59,9 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 
 ## 升级兼容性
 
-当前协议：RPC `nexus/rpc/4`、加入 `nexus/join/4`、网页 `nexus/web/3`，wire 版本 18。
-设备程序和网页 WASM 要一起升级；版本不一致时请求被拒绝。升级保留已有的设备密钥、名册和工作区，浏览器需要重新登录。
+当前协议：主版本 19、次版本 0（连接的协议名 `nexus/rpc/5`、`nexus/join/5`、`nexus/web/4`）。
+同一主版本内新旧版本互通，设备可以一台一台升级；改协议的规则见 [docs/protocol.md](docs/protocol.md)。
+升级保留已有的设备密钥、名册和工作区，浏览器需要重新登录。
 
 ## 开发
 

@@ -27,9 +27,9 @@ impl Proto {
 
     pub fn alpn(self) -> &'static [u8] {
         match self {
-            Proto::Rpc => b"nexus/rpc/4",
-            Proto::Join => b"nexus/join/4",
-            Proto::Web => b"nexus/web/3",
+            Proto::Rpc => b"nexus/rpc/5",
+            Proto::Join => b"nexus/join/5",
+            Proto::Web => b"nexus/web/4",
         }
     }
 
@@ -114,6 +114,16 @@ pub async fn read_msg<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> i
     let mut body = vec![0u8; n];
     r.read_exact(&mut body).await?;
     nexus_wire::decode_body(&body).map_err(invalid)
+}
+
+/// 写一个回应（装进信封，M7.1）。
+pub async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, response: &nexus_wire::Response) -> io::Result<()> {
+    write_msg(w, &nexus_wire::ResponseEnvelope::new(response)).await
+}
+
+/// 读一个回应：对方版本较新、本机不认识它的回应时，得到说明版本的错误回应。
+pub async fn read_response<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<nexus_wire::Response> {
+    Ok(read_msg::<_, nexus_wire::ResponseEnvelope>(r).await?.open())
 }
 
 fn invalid(e: nexus_wire::FrameError) -> io::Error {

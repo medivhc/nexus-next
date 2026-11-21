@@ -10,8 +10,11 @@ pub use nexus_term_proto::{ClientMsg, Size};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 18;
+/// 节点间协议的主版本：变了才互不兼容（连接的协议名也跟着变，见 `nexus_fabric::Proto`）。
+/// 规则见 docs/protocol.md。
+pub const WIRE_VERSION: u16 = 19;
+/// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
+pub const WIRE_MINOR: u16 = 0;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -22,11 +25,65 @@ pub type AddrHints = Vec<(NodeId, String)>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestHeader {
     pub version: u16,
+    /// 发送方的协议次版本（M7.1）。
+    pub minor: u16,
     /// 发送方持有的名册版本，没有名册时为 0。双方据此发现谁的名册更旧。
     pub roster_version: u64,
     /// 以谁的身份请求：对端设备自己，或经由它的一个 agent。
     pub principal: Principal,
-    pub body: Request,
+    /// 请求体单独编码：旧版本不认识新请求时仍能读出请求头，回应「版本较旧」而不是断开。
+    body: Vec<u8>,
+}
+
+impl RequestHeader {
+    pub fn new(roster_version: u64, principal: Principal, body: &Request) -> Self {
+        Self {
+            version: WIRE_VERSION,
+            minor: WIRE_MINOR,
+            roster_version,
+            principal,
+            body: postcard::to_allocvec(body).expect("内存中的值总能编码"),
+        }
+    }
+
+    /// 解出请求体。本机不认识时返回说明版本的错误；`me` 是本机的名字和软件版本，写进说明里。
+    pub fn request(&self, me: &str) -> Result<Request, WireError> {
+        postcard::from_bytes(&self.body).map_err(|_| {
+            WireError::new(
+                ErrorCode::UnsupportedVersion,
+                format!(
+                    "{me} 的版本较旧（协议 {WIRE_VERSION}.{WIRE_MINOR}），不认识这个请求（请求方协议 {}.{}）：请升级 {me}",
+                    self.version, self.minor
+                ),
+            )
+        })
+    }
+}
+
+/// 回应的信封（M7.1）：回应体单独编码，带回应方的次版本。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    pub minor: u16,
+    body: Vec<u8>,
+}
+
+impl ResponseEnvelope {
+    pub fn new(response: &Response) -> Self {
+        Self { minor: WIRE_MINOR, body: postcard::to_allocvec(response).expect("内存中的值总能编码") }
+    }
+
+    /// 解出回应；本机不认识时是说明对方版本较新的错误。
+    pub fn open(self) -> Response {
+        postcard::from_bytes(&self.body).unwrap_or_else(|_| {
+            Response::Error(WireError::new(
+                ErrorCode::UnsupportedVersion,
+                format!(
+                    "对方的版本较新（协议 {WIRE_VERSION}.{}），本机（协议 {WIRE_VERSION}.{WIRE_MINOR}）不认识它的回应：请升级本机",
+                    self.minor
+                ),
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +472,9 @@ pub enum ErrorCode {
     SpawnFailed,
     /// 要操作的对象不存在，例如没有这个名字的会话。
     NotFound,
+    /// 对方给的错误码本机不认识（对方版本较新，M7.1）。永远是最后一个：新的错误码加在它前面，它从不发出去。
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

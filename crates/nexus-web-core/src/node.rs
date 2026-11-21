@@ -4,7 +4,7 @@ use crate::{call, unreachable};
 use nexus_core_proto::authz::{Principal, SignedWebSession};
 use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::{NodeId, NodeInfo, Timestamp};
-use nexus_fabric::{read_msg, write_msg, Connection, FrameReader, Proto, Transport};
+use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
 use nexus_wire::{
     ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, SessionInfo, Size, WebDevice, WireError, WIRE_VERSION,
 };
@@ -91,14 +91,9 @@ impl<T: Transport> WebNode<T> {
         let to = self.device(device)?;
         let conn = self.transport.connect(to, Proto::Rpc).await.map_err(unreachable)?;
         let mut stream = conn.open_bi().await.map_err(unreachable)?;
-        let header = RequestHeader {
-            version: WIRE_VERSION,
-            roster_version: 0,
-            principal: self.principal(),
-            body: Request::SessionAttach { name: session.to_string(), create: true, size },
-        };
+        let header = RequestHeader::new(0, self.principal(), &Request::SessionAttach { name: session.to_string(), create: true, size });
         write_msg(&mut stream, &header).await.map_err(unreachable)?;
-        match read_msg::<_, Response>(&mut stream).await.map_err(unreachable)? {
+        match read_response(&mut stream).await.map_err(unreachable)? {
             Response::Ok => {
                 let (rd, writer) = tokio::io::split(stream);
                 Ok(WebTerminal { reader: FrameReader::new(rd), writer })

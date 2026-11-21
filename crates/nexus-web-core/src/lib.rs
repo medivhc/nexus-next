@@ -13,7 +13,7 @@ pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
 use nexus_core_proto::authz::Principal;
 use nexus_core_proto::NodeId;
-use nexus_fabric::{read_msg, write_msg, Connection, Proto, Transport};
+use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, Proto, Transport};
 use nexus_wire::{hex_decode, ErrorCode, NewCredential, Request, RequestHeader, Response, WireError, WIRE_VERSION};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -57,9 +57,9 @@ pub(crate) async fn call<T: Transport>(
 ) -> Result<Response, WireError> {
     let conn = transport.connect(to, proto).await.map_err(unreachable)?;
     let mut stream = conn.open_bi().await.map_err(unreachable)?;
-    let header = RequestHeader { version: WIRE_VERSION, roster_version: 0, principal, body };
+    let header = RequestHeader::new(0, principal, &body);
     write_msg(&mut stream, &header).await.map_err(unreachable)?;
-    let resp: Response = read_msg(&mut stream).await.map_err(unreachable)?;
+    let resp: Response = read_response(&mut stream).await.map_err(unreachable)?;
     let _ = stream.shutdown().await;
     // 读到对方关闭为止，再丢弃这条流。
     let mut sink = [0u8; 256];

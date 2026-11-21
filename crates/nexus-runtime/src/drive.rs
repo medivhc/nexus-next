@@ -9,7 +9,7 @@ use nexus_drive_core::path::{valid_workspace, DrivePath};
 use nexus_drive_core::tree::{self, ChangeKind, DriveError, Entry, Store};
 use nexus_drive_core::history::{self, Relation};
 use nexus_drive_core::{ChunkRef, Commit, FileManifest, Hash};
-use nexus_fabric::{read_msg, write_msg, Transport};
+use nexus_fabric::{read_msg, read_response, write_msg, write_response, Transport};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use nexus_sys::System;
 use nexus_wire::{
@@ -691,7 +691,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let bytes = self.system.cas_get(h).ok().flatten().ok_or_else(|| internal("本机缺少要推送的对象"))?;
             write_msg(&mut stream, &bytes).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?;
         }
-        read_msg::<_, Response>(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))
+        read_response(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))
     }
 
     /// 存储设备上这个工作区的头；没有存储设备或都连不上时为空。
@@ -995,7 +995,7 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 给对象。哈希就是内容的身份：拿得到哈希，说明对方读到过引用它的目录结构。
     pub(crate) async fn serve_drive_get<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, hashes: Vec<[u8; 32]>) {
-        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
         for h in hashes {
@@ -1009,7 +1009,7 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 收推送：收下对象，检查新头的历史完整、是现在的头的后代，然后更新。
     pub(crate) async fn serve_drive_push<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, ws: String, head: [u8; 32], count: u32) {
-        if write_msg(&mut stream, &Response::Ok).await.is_err() {
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
         for _ in 0..count {
@@ -1049,7 +1049,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 Err(e) => Response::Error(e),
             }
         })();
-        let _ = write_msg(&mut stream, &resp).await;
+        let _ = write_response(&mut stream, &resp).await;
         let _ = stream.shutdown().await;
     }
 }

@@ -85,3 +85,50 @@ jobs:
           path: /tmp/nexus-ci.log
           if-no-files-found: ignore
 
+  compat:
+    # M7.1 (FP-7.1-06): the newest release tag on the same wire major version
+    # must interoperate with this commit. Builds the old binary from the tag
+    # and runs tools/compat_check.py both ways. Skips (with a note) when there
+    # is no such tag yet, e.g. right after a major version bump.
+    name: Old and new versions together
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find the release to test against
+        id: old
+        run: |
+          major() { sed -n 's/^pub const WIRE_VERSION: u16 = \([0-9]*\);/\1/p' "$1"; }
+          now=$(major crates/nexus-wire/src/lib.rs)
+          tag=""
+          for t in $(git tag --list 'v*' --sort=-v:refname); do
+            if [ "$(git show "$t:crates/nexus-wire/src/lib.rs" | major /dev/stdin)" = "$now" ]; then tag=$t; break; fi
+          done
+          echo "wire major $now, release tag: ${tag:-none}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$tag" ]; then echo "::notice::No release on wire major $now yet; skipping the mixed-version check."; fi
+
+      - name: Install Rust toolchain
+        if: steps.old.outputs.tag != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: steps.old.outputs.tag != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: compat
+
+      - name: Build both versions
+        if: steps.old.outputs.tag != ''
+        run: |
+          git worktree add ../old "${{ steps.old.outputs.tag }}"
+          (cd ../old && cargo build --quiet -p nexus-cli --bin nexus --target-dir "$PWD/../old-target")
+          cargo build --quiet -p nexus-cli --bin nexus
+
+      - name: Mixed-version check
+        if: steps.old.outputs.tag != ''
+        run: python3 tools/compat_check.py --old-bin ../old-target/debug/nexus --new-bin target/debug/nexus
