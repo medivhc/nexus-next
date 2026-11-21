@@ -18,7 +18,7 @@
 | 5 | 多条网络：断一条不断会话、交互流量冗余、批量分摊、计费网络 |
 | 6（进行中） | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码；用恢复码恢复管理设备 |
 
-还没做：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。已知限制见手册的第 15 节。
+还没做：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。已知限制见手册的第 17 节。
 **还没有在两台不同网络的真实设备上验证过**，步骤见 `docs/real-network-check.md`。
 
 ## 上手
@@ -49,6 +49,7 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 | [docs/unified-entry.md](docs/unified-entry.md) | 统一入口、路由规则、出口、`nexus run`、完整节点的细节 |
 | [docs/android.md](docs/android.md) | Android 应用的构建、安装和加入 |
 | [docs/real-network-check.md](docs/real-network-check.md) | 在两台真实设备上验证的清单 |
+| [docs/roadmap.md](docs/roadmap.md) | 之后的开发计划：和产品文档的差距、阶段 7–9 |
 | [web/README.md](web/README.md) | 网页节点的页面：构建、本机试用、浏览器端到端测试 |
 | [vendor/README.md](vendor/README.md) | iroh 和 noq 的分支：改了什么、为什么（多路径） |
 | `docs/feature-points/` | 每个里程碑的功能点（Given / When / Then），开发时的规格 |
