@@ -394,7 +394,7 @@ impl World {
         // 被杀掉的常驻程序留下的控制套接字文件不代表新的已经就绪。
         let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
         real.spawn_daemon(node, args);
-        real.wait_ready(node);
+        real.wait_ready(node, args);
     }
 
     /// 把节点的常驻程序换成完整节点（虚拟网卡 + 名字服务）重新启动。只在真实后端；需要 CAP_NET_ADMIN。
@@ -1125,7 +1125,7 @@ impl RealWorld {
             world.spawn_daemon(name, &["--local-only"]);
         }
         for name in nodes {
-            world.wait_ready(name);
+            world.wait_ready(name, &["--local-only"]);
         }
         world
     }
@@ -1173,13 +1173,27 @@ impl RealWorld {
         self.children.borrow_mut().insert(name.to_string(), child);
     }
 
-    fn wait_ready(&self, name: &str) {
+    /// 等常驻程序就绪。`extra` 和启动时的相同：统一入口的端口被别的进程抢先占了时，换一个端口重启
+    /// （端口是先绑定再放开选出来的，并行的测试之间难免撞上）。
+    fn wait_ready(&self, name: &str, extra: &[&str]) {
         let dir = &self.dirs[name];
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut deadline = Instant::now() + Duration::from_secs(10);
+        let mut retries = 0;
+        let log_len = || std::fs::metadata(dir.join("daemon.log")).map(|m| m.len()).unwrap_or(0);
+        let mut log_from = 0;
         while !dir.join("ctl.sock").exists() {
             let exited = self.children.borrow_mut().get_mut(name).and_then(|c| c.try_wait().ok().flatten());
             if Instant::now() >= deadline || exited.is_some() {
                 let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
+                let this_run = log.get(log_from as usize..).unwrap_or("");
+                if exited.is_some() && retries < 5 && !extra.contains(&"--proxy") && this_run.contains("无法监听统一入口") {
+                    retries += 1;
+                    log_from = log_len();
+                    self.proxy_ports.borrow_mut().remove(name);
+                    self.spawn_daemon(name, extra);
+                    deadline = Instant::now() + Duration::from_secs(10);
+                    continue;
+                }
                 panic!("节点 {name} 没有就绪（{exited:?}）。日志：\n{log}");
             }
             std::thread::sleep(Duration::from_millis(5));
