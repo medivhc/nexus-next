@@ -117,6 +117,13 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 管理设备丢了：在网络里的另一台设备上输入建网时的恢复码，让这台设备成为管理设备
+    Recover {
+        /// `nexus init` 输出的恢复码（空格和 - 忽略，不区分大小写）
+        code: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// 让这台设备准备加入网络：输出短加入码（例如 7KQ4M-9XZ21）和长加入码，10 分钟内有效，
     /// 在管理设备上用 `nexus device approve` 批准。短码要经碰头服务（见 daemon --rendezvous），长码不需要
     Join {
@@ -766,6 +773,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         Cmd::Status { node: Some(n), json } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
         Cmd::Init { name, json } => (CtlRequest::Init { name: name.clone() }, *json),
+        Cmd::Recover { code, json } => (CtlRequest::Recover { code: code.clone() }, *json),
         Cmd::Join { json } => (CtlRequest::JoinStart, *json),
         Cmd::Device { cmd: DeviceCmd::Approve { code, name, json } } => {
             (CtlRequest::Approve { code: code.clone(), name: name.clone() }, *json)
@@ -1234,7 +1242,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 doc(v)
             } else {
                 format!(
-                    "已建立网络，本机 {} 是管理设备。\n\n恢复码（请离线保存，所有设备都丢失时用它恢复；它只显示这一次）：\n  {}\n\n在另一台设备上运行 `nexus join`，再回到这里用 `nexus device approve <加入码>` 批准它。\n",
+                    "已建立网络，本机 {} 是管理设备。\n\n恢复码（只显示这一次，请离线保存。管理设备丢了时，在任何一台还在的设备上 `nexus recover <恢复码>`）：\n  {}\n\n在另一台设备上运行 `nexus join`，再回到这里用 `nexus device approve <加入码>` 批准它。\n",
                     r.name, r.recovery_code
                 )
             }

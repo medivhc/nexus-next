@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 节点间协议版本。
-pub const WIRE_VERSION: u16 = 17;
+pub const WIRE_VERSION: u16 = 18;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -479,6 +479,8 @@ pub enum CtlRequest {
     Interfaces { set: Option<(String, Option<bool>)> },
     /// 在第一台设备上建立网络。
     Init { name: Option<String> },
+    /// 用恢复码让本机成为管理设备（M6.2）。
+    Recover { code: String },
     /// 准备加入一个网络，返回加入码。
     JoinStart,
     /// 批准一台设备加入。
@@ -595,7 +597,7 @@ pub struct InitReport {
     pub name: String,
     pub node_id: NodeId,
     pub root: nexus_core_proto::PublicKey,
-    /// 根密钥本身，用于在所有设备都丢失后恢复。只显示这一次。
+    /// 根密钥本身：管理设备丢了时用 `nexus recover` 在另一台设备上恢复（M6.2）。只显示这一次。
     pub recovery_code: String,
 }
 

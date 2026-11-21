@@ -1092,6 +1092,7 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::JoinStart => self.join_start().await,
             CtlRequest::Approve { code, name } => self.approve(&code, name).await.map(CtlResponse::Membership),
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
+            CtlRequest::Recover { code } => self.recover(&code).await.map(CtlResponse::Membership),
             CtlRequest::List => Ok(CtlResponse::List(self.list(agent_ref).await)),
             CtlRequest::SessionList { node } => self.remote_session_list(&node, agent_ref).await.map(CtlResponse::Sessions),
             CtlRequest::SessionKill { node, session } => {
@@ -1146,6 +1147,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let admin = matches!(
             req,
             CtlRequest::Init { .. }
+                | CtlRequest::Recover { .. }
                 | CtlRequest::JoinStart
                 | CtlRequest::Approve { .. }
                 | CtlRequest::Revoke { .. }
@@ -1459,22 +1461,33 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut agents = self.load_agents()?;
         let index = agents
             .iter()
-            .position(|a| !a.revoked && (a.label == who || NodeId(a.agent_id.0).to_string() == who))
-            .ok_or_else(|| err(ErrorCode::NotFound, format!("没有名为 {who} 的有效 agent")))?;
+            .position(|a| !a.revoked && (a.label == who || NodeId(a.agent_id.0).to_string() == who));
+        // 不在本机列表里的 agent（恢复管理设备之后，M6.2）：用完整标识撤销。
+        let (id, label) = match index {
+            Some(i) => (agents[i].agent_id, agents[i].label.clone()),
+            None => match who.parse::<NodeId>().ok().map(|n| PublicKey(n.0)) {
+                Some(id) => (id, NodeId(id.0).short()),
+                None => return Err(err(ErrorCode::NotFound, format!("没有名为 {who} 的有效 agent（不在本机列表里的 agent 用它的完整标识撤销）"))),
+            },
+        };
         let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
-        let id = agents[index].agent_id;
+        if roster.is_agent_revoked(&id) {
+            return Err(err(ErrorCode::InvalidState, format!("agent {label} 已经撤销过了")));
+        }
         roster.version += 1;
         roster.revoked_agents.push(RevokedAgent { agent: id, revoked_at: self.system.now() });
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
         self.roster_epoch.send_modify(|v| *v += 1);
-        agents[index].revoked = true;
-        save(&self.system, KEY_AGENTS, &agents).map_err(internal)?;
+        if let Some(i) = index {
+            agents[i].revoked = true;
+            save(&self.system, KEY_AGENTS, &agents).map_err(internal)?;
+        }
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport {
-            name: agents[index].label.clone(),
+            name: label,
             node_id: NodeId(id.0),
             roster_version: self.roster_version(),
             pushed,
@@ -2782,6 +2795,50 @@ impl<T: Transport, S: System> Node<T, S> {
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: name.to_string(), node_id: device.node_id, roster_version: self.roster_version(), pushed, unreachable })
+    }
+
+    /// 用恢复码（网络根密钥）让本机成为管理设备（M6.2）：名册里本机改为管理设备、原来的改为成员。
+    async fn recover(&self, code: &str) -> Result<MembershipReport, WireError> {
+        let _write = self.roster_write.lock().await;
+        let (root_pub, has_key) = {
+            let t = self.trust.borrow();
+            (t.root, t.root_key.is_some())
+        };
+        let root_pub = root_pub.ok_or_else(|| err(ErrorCode::InvalidState, "本机还不属于任何网络：恢复码只能在网络里的设备上用"))?;
+        if has_key {
+            return Err(err(ErrorCode::InvalidState, "本机已经是管理设备"));
+        }
+        let cleaned: String = code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_lowercase();
+        let seed: [u8; 32] = nexus_wire::hex_decode(&cleaned)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| err(ErrorCode::InvalidInput, "恢复码格式不对：应当是 64 个十六进制字符（nexus init 输出的）"))?;
+        let root = SecretKey::from_seed(seed);
+        if root.public() != root_pub {
+            return Err(err(ErrorCode::InvalidInput, "恢复码不属于这个网络"));
+        }
+        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let me = self.me();
+        for d in &mut roster.devices {
+            d.role = if d.node_id == me { DeviceRole::Admin } else { DeviceRole::Member };
+        }
+        roster.version += 1;
+        let signed = roster.sign(&root);
+        let persist = || -> io::Result<()> {
+            save(&self.system, KEY_ROOT_KEY, &seed)?;
+            save(&self.system, KEY_ROSTER, &signed)?;
+            Ok(())
+        };
+        persist().map_err(internal)?;
+        let name = signed.roster.device(me).map(|d| d.name.clone()).unwrap_or_default();
+        {
+            let mut t = self.trust.borrow_mut();
+            t.root_key = Some(seed);
+            t.roster = Some(signed);
+        }
+        self.roster_epoch.send_modify(|v| *v += 1);
+        drop(_write);
+        let (pushed, unreachable) = self.broadcast_roster(None).await;
+        Ok(MembershipReport { name, node_id: me, roster_version: self.roster_version(), pushed, unreachable })
     }
 
     /// 在名册里按名字或标识找设备。
