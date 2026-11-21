@@ -13,8 +13,8 @@ pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
 use nexus_core_proto::authz::Principal;
 use nexus_core_proto::NodeId;
-use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, Proto, Transport};
-use nexus_wire::{hex_decode, ErrorCode, NewCredential, Request, RequestHeader, Response, WireError, WIRE_VERSION};
+use nexus_fabric::{read_response, write_msg, Connection, Proto, Transport};
+use nexus_wire::{hex_decode, ErrorCode, NewCredential, Request, RequestHeader, Response, WireError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 登记链接里的信息：`…#enroll=<登记码>&node=<管理设备>&hint=<地址提示>`。

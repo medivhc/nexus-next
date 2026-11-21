@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn decoder_handles_byte_at_a_time_and_back_to_back_frames() {
         let mut bytes = encode(&sample()).unwrap();
-        bytes.extend(encode(&RequestHeader { version: WIRE_VERSION, roster_version: 0, principal: nexus_core_proto::authz::Principal::Device, body: Request::NodeInfo }).unwrap());
+        bytes.extend(encode(&RequestHeader::new(0, nexus_core_proto::authz::Principal::Device, &Request::NodeInfo)).unwrap());
         let mut dec = FrameDecoder::default();
         let mut got_first = false;
         let mut got_second = false;

@@ -311,7 +311,9 @@ fn existing_messages_keep_their_encoding() {
     let samples = encoded_samples();
     let bless = std::env::var("NEXUS_BLESS").is_ok_and(|v| v == "1");
     for (minor, name, bytes) in &fixtures {
-        assert!(*minor <= WIRE_MINOR, "fixtures 里有比当前次版本 {WIRE_MINOR} 新的文件");
+        #[allow(clippy::absurd_extreme_comparisons)] // WIRE_MINOR 现在是 0
+        let ok = *minor <= WIRE_MINOR;
+        assert!(ok, "fixtures 里有比当前次版本 {WIRE_MINOR} 新的文件");
         assert!(round_trips(name, bytes), "{WIRE_VERSION}.{minor} 的 {name} 解码不了或者再编码不一样");
         if let Some(now) = samples.get(name.as_str()) {
             assert_eq!(

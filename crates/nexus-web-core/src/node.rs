@@ -4,9 +4,9 @@ use crate::{call, unreachable};
 use nexus_core_proto::authz::{Principal, SignedWebSession};
 use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::{NodeId, NodeInfo, Timestamp};
-use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
+use nexus_fabric::{read_response, write_msg, Connection, FrameReader, Proto, Transport};
 use nexus_wire::{
-    ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, SessionInfo, Size, WebDevice, WireError, WIRE_VERSION,
+    ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, SessionInfo, Size, WebDevice, WireError,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 
