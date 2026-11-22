@@ -245,6 +245,19 @@ pub fn reexec(_exe: &Path) -> io::Error {
 mod tests {
     use super::*;
 
+    /// 测试用的临时目录，结束时删掉。
+    struct Dir(PathBuf);
+    impl Dir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn prev_is_next_to_the_binary() {
         assert_eq!(prev_path(Path::new("/usr/local/bin/nexus")), Path::new("/usr/local/bin/nexus.prev"));
@@ -252,7 +265,9 @@ mod tests {
 
     #[test]
     fn checksum_mismatch_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::temp_dir().join(format!("nexus-upgrade-test-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let dir = Dir(path);
         let file = dir.path().join("nexus-0.2.0-linux-x86_64.tar.gz");
         std::fs::write(&file, b"abc").unwrap();
         // sha256("abc")
