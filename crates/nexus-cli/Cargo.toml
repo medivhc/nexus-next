@@ -19,6 +19,10 @@ tokio.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# 升级（M7.3）：解开发布的 .tar.gz、校验 SHA256SUMS。
+tar = "0.4"
+flate2 = "1"
+sha2.workspace = true
 # 输出里的时间用本地时区显示。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossterm.workspace = true

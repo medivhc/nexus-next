@@ -90,6 +90,8 @@ pub struct IrohTransport {
     own_rx: RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<IrohConnection>>>,
     /// 只经中继（浏览器）：地址提示里的 IP 地址用不上，留着反而让建立连接先在它们上面空等。
     relay_only: bool,
+    /// 测试升级后连不上网络时的回滚（M7.3，`NEXUS_TEST_NO_NETWORK`）：端点照常建，但不连任何设备、不接受任何连接。
+    offline: bool,
     scheduling: bool,
     /// 按流量计费的本机地址（M5.2），最近一次查看接口时定下的。
     metered_ips: RefCell<std::collections::BTreeSet<std::net::IpAddr>>,
@@ -157,6 +159,7 @@ impl IrohTransport {
             own_tx,
             own_rx: RefCell::new(Some(own_rx)),
             relay_only: !config.direct,
+            offline: std::env::var_os("NEXUS_TEST_NO_NETWORK").is_some(),
             scheduling: config.scheduling,
             metered_ips: RefCell::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -202,6 +205,9 @@ impl Transport for IrohTransport {
     }
 
     async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<IrohConn> {
+        if self.offline {
+            return Err(io::Error::new(io::ErrorKind::NetworkUnreachable, "NEXUS_TEST_NO_NETWORK：不用网络"));
+        }
         if proto == Proto::Rpc {
             let cached = self.conns.borrow().get(&to).cloned();
             if let Some(conn) = cached {
@@ -241,6 +247,10 @@ impl Transport for IrohTransport {
                     let Some(incoming) = incoming else {
                         break Err(io::Error::new(io::ErrorKind::BrokenPipe, "端点已关闭"));
                     };
+                    if self.offline {
+                        incoming.refuse();
+                        continue;
+                    }
                     // 单个连接握手失败不影响继续接受其他连接。
                     let Ok(conn) = incoming.await else { continue };
                     let Some(proto) = Proto::from_alpn(conn.alpn()) else { continue };

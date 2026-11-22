@@ -66,7 +66,17 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, relay, no_discovery, rendezvous, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, preflight, relay, no_discovery, rendezvous, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+                // 升级前检查新版本（M7.3）：读得了数据目录就行，不起网络。
+                if *preflight {
+                    return match nexus_cli::daemon::preflight(&data_dir) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            Terminal.err(format!("nexus daemon --preflight: {e}\n").as_bytes());
+                            EXIT_INTERNAL
+                        }
+                    };
+                }
                 let tun = match tun {
                     None => None,
                     Some(dev) => match parse_tun_net(tun_net) {
@@ -156,6 +166,10 @@ fn main() {
             }
             // Unix 上在前面就处理了；别的系统没有持有进程。
             Cmd::SessionHold { .. } => EXIT_USAGE,
+            Cmd::ProtocolVersion => {
+                println!("{} {}", nexus_wire::WIRE_VERSION, nexus_wire::WIRE_MINOR);
+                0
+            }
             Cmd::SshProxy { host } => {
                 let ctl = UnixCtl::new(&data_dir, agent.clone());
                 ssh_proxy::run(ctl, host).await

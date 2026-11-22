@@ -6,7 +6,8 @@ use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_net_core::fakeip::FakePool;
 use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, Node};
 use nexus_sys_real::RealSystem;
-use nexus_wire::{CtlHello, CtlResponse, ErrorCode, Input, WireError};
+use nexus_wire::{CtlHello, CtlRequest, CtlResponse, ErrorCode, Input, WireError};
+use std::time::Duration;
 use std::io;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
@@ -111,14 +112,17 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
 
     let (tx, mut rx) = mpsc::channel::<CtlCall>(64);
     let agent_tx = tx.clone();
+    // 刚升级过（M7.3）：确认新版本连得上网络，连不上就换回。
+    tokio::spawn(confirm_upgrade(data_dir.to_path_buf(), tx.clone()));
+    let owner_dir = data_dir.to_path_buf();
     tokio::spawn(async move {
         while let Ok(stream) = listener.accept().await {
-            tokio::spawn(serve_ctl(stream, tx.clone(), false));
+            tokio::spawn(serve_ctl(stream, tx.clone(), false, Some(owner_dir.clone())));
         }
     });
     tokio::spawn(async move {
         while let Ok(stream) = agent_listener.accept().await {
-            tokio::spawn(serve_ctl(stream, agent_tx.clone(), true));
+            tokio::spawn(serve_ctl(stream, agent_tx.clone(), true, None));
         }
     });
 
@@ -173,13 +177,142 @@ async fn terminate() {
     }
 }
 
+/// 升级前检查新版本（`nexus daemon --preflight`，M7.3）：读得了本机的数据目录。
+pub fn preflight(data_dir: &std::path::Path) -> io::Result<()> {
+    if !data_dir.exists() {
+        return Ok(());
+    }
+    let system = RealSystem::new(data_dir)?;
+    load_or_create_device_key(&system)?;
+    Ok(())
+}
+
+/// 向节点问一个问题，取第一个回答。
+async fn ask(tx: &mpsc::Sender<CtlCall>, req: CtlRequest) -> Option<CtlResponse> {
+    let (call, mut client) = ctl_session(req, None);
+    tx.send(call).await.ok()?;
+    client.rx.recv().await
+}
+
+/// 现在在线的其他设备的名字。
+async fn online_peers(tx: &mpsc::Sender<CtlCall>) -> Vec<String> {
+    match ask(tx, CtlRequest::List).await {
+        Some(CtlResponse::List(entries)) => entries.into_iter().filter(|e| !e.is_self && e.report.online).map(|e| e.report.name).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 升级相关的本机请求（M7.3）：由这里处理，不进节点。返回回应，以及回应之后要执行的二进制。
+async fn handle_upgrade(req: &CtlRequest, data_dir: &std::path::Path, tx: &mpsc::Sender<CtlCall>) -> (CtlResponse, Option<PathBuf>) {
+    match req {
+        CtlRequest::UpgradeStatus => {
+            let report = crate::upgrade::load(data_dir).map(|s| s.report()).unwrap_or(nexus_wire::UpgradeReport {
+                state: "none".into(),
+                from: String::new(),
+                to: String::new(),
+                exe: String::new(),
+                message: String::new(),
+            });
+            (CtlResponse::Upgrade(report), None)
+        }
+        CtlRequest::UpgradeRollback => {
+            let Some(mut state) = crate::upgrade::load(data_dir).filter(|s| s.prev.exists()) else {
+                return (CtlResponse::Error(WireError::new(ErrorCode::InvalidState, "没有可以换回的上一个版本")), None);
+            };
+            if let Err(e) = crate::upgrade::restore(&mut state, data_dir, "手动换回") {
+                return (CtlResponse::Error(WireError::new(ErrorCode::Internal, format!("换不回去：{e}"))), None);
+            }
+            let exe = state.exe.clone();
+            (CtlResponse::Upgrade(state.report()), Some(exe))
+        }
+        CtlRequest::Upgrade { file, confirm_ms, force } => {
+            if !cfg!(unix) {
+                return (CtlResponse::Error(WireError::new(ErrorCode::InvalidState, "这个系统上还不支持 nexus upgrade：手动换二进制再重启服务")), None);
+            }
+            let exe = match std::env::current_exe() {
+                Ok(e) => e,
+                Err(e) => return (CtlResponse::Error(WireError::new(ErrorCode::Internal, format!("不知道本机的二进制在哪：{e}"))), None),
+            };
+            let peers = online_peers(tx).await;
+            let file = PathBuf::from(file);
+            let (exe2, dir) = (exe.clone(), data_dir.to_path_buf());
+            let (confirm_ms, force) = (*confirm_ms, *force);
+            let installed = tokio::task::spawn_blocking(move || crate::upgrade::install(&file, &exe2, &dir, peers, confirm_ms, force)).await;
+            match installed {
+                Ok(Ok(state)) => (CtlResponse::Upgrade(state.report()), Some(exe)),
+                Ok(Err(e)) => (CtlResponse::Error(e), None),
+                Err(e) => (CtlResponse::Error(WireError::new(ErrorCode::Internal, e.to_string())), None),
+            }
+        }
+        _ => (CtlResponse::Error(WireError::new(ErrorCode::Internal, "不是升级请求")), None),
+    }
+}
+
+/// 新版本启动时：按 `upgrade.json` 确认（M7.3）。
+async fn confirm_upgrade(data_dir: PathBuf, tx: mpsc::Sender<CtlCall>) {
+    use crate::upgrade;
+    let Some(mut state) = upgrade::load(&data_dir).filter(|s| s.state == "pending") else { return };
+    state.attempts += 1;
+    let _ = upgrade::save(&data_dir, &state);
+    let roll_back = |mut state: upgrade::UpgradeState, why: String| {
+        let dir = data_dir.clone();
+        async move {
+            eprintln!("nexus daemon: {why}，换回 {}", state.from);
+            if upgrade::restore(&mut state, &dir, &why).is_ok() {
+                let e = upgrade::reexec(&state.exe);
+                eprintln!("nexus daemon: 换回之后无法重新启动：{e}");
+            }
+        }
+    };
+    if state.attempts > upgrade::MAX_ATTEMPTS {
+        let why = format!("新版本 {} 启动了 {} 次都没有确认", state.to, upgrade::MAX_ATTEMPTS);
+        return roll_back(state, why).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(state.confirm_ms);
+    loop {
+        let online = online_peers(&tx).await;
+        if state.peers.is_empty() || online.iter().any(|p| state.peers.contains(p)) {
+            state.state = "confirmed".into();
+            state.message = match online.first() {
+                Some(p) => format!("新版本连上了 {p}"),
+                None => "升级前没有在线的设备，没有检查网络".into(),
+            };
+            let _ = upgrade::save(&data_dir, &state);
+            eprintln!("nexus daemon: 升级到 {} 已确认（{}）", state.to, state.message);
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let secs = state.confirm_ms / 1000;
+            let why = format!("升级到 {} 之后 {secs} 秒内连不上升级前在线的设备（{}）", state.to, state.peers.join("、"));
+            return roll_back(state, why).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
-async fn serve_ctl(mut stream: BoxedCtlStream, tx: mpsc::Sender<CtlCall>, agent_only: bool) {
+/// `owner_dir`：本人入口时是数据目录（升级请求要用）。
+async fn serve_ctl(mut stream: BoxedCtlStream, tx: mpsc::Sender<CtlCall>, agent_only: bool, owner_dir: Option<PathBuf>) {
     let Ok(hello) = read_msg::<_, CtlHello>(&mut stream).await else { return };
     if agent_only && hello.agent.is_none() {
         let e = WireError::new(ErrorCode::Denied, "agent 入口只接受 agent 凭据（--agent 或 NEXUS_AGENT）");
         let _ = write_msg(&mut stream, &CtlResponse::Error(e)).await;
         let _ = stream.shutdown().await;
+        return;
+    }
+    if matches!(hello.request, CtlRequest::Upgrade { .. } | CtlRequest::UpgradeStatus | CtlRequest::UpgradeRollback) {
+        let (resp, then) = match (&owner_dir, &hello.agent) {
+            (Some(dir), None) => handle_upgrade(&hello.request, dir, &tx).await,
+            _ => (CtlResponse::Error(WireError::new(ErrorCode::Denied, "只有本人能升级常驻程序")), None),
+        };
+        let _ = write_msg(&mut stream, &resp).await;
+        let _ = stream.shutdown().await;
+        if let Some(exe) = then {
+            // 命令行收到回答后再换：用同样的参数执行新的二进制。
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let e = crate::upgrade::reexec(&exe);
+            eprintln!("nexus daemon: 无法重新启动：{e}");
+        }
         return;
     }
     let (call, mut client) = ctl_session(hello.request, hello.agent);

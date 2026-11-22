@@ -403,6 +403,25 @@ impl World {
         real.wait_ready(node, args);
     }
 
+    /// 让节点的常驻程序用它自己的一份二进制（复制一份），并重新启动。返回那份二进制的路径。
+    /// 升级的测试（M7.3）会替换它，不会改到构建出来的那个。只在真实后端。
+    pub async fn use_own_binary(&self, node: &str, args: &[&str]) -> PathBuf {
+        let Inner::Real(real) = &self.inner else { panic!("use_own_binary 只用于真实后端") };
+        let dir = real.home(node).join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nexus");
+        std::fs::copy(&real.bin, &path).unwrap();
+        real.own_bins.borrow_mut().insert(node.to_string(), path.clone());
+        self.restart(node, args).await;
+        path
+    }
+
+    /// 构建出来的 nexus 二进制。
+    pub fn nexus_bin(&self) -> PathBuf {
+        let Inner::Real(real) = &self.inner else { panic!("nexus_bin 只用于真实后端") };
+        real.bin.clone()
+    }
+
     /// 把节点的常驻程序换成完整节点（虚拟网卡 + 名字服务）重新启动。只在真实后端；需要 CAP_NET_ADMIN。
     pub async fn full_node(&self, node: &str) -> FullNode {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1104,6 +1123,8 @@ struct RealWorld {
     sockets: tempfile::TempDir,
     /// 本机的碰头服务（短加入码，M6.1），所有常驻程序默认用它。
     rendezvous: String,
+    /// 用自己的一份二进制的节点（升级的测试，M7.3）。
+    own_bins: RefCell<HashMap<String, PathBuf>>,
 }
 
 impl RealWorld {
@@ -1123,6 +1144,7 @@ impl RealWorld {
             _tmp: tmp,
             sockets,
             rendezvous,
+            own_bins: RefCell::default(),
         };
         for name in nodes {
             let dir = world._tmp.path().join(name);
@@ -1160,7 +1182,8 @@ impl RealWorld {
         let _ = std::fs::remove_file(dir.join("ctl.sock"));
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
-        let child = Command::new(&self.bin)
+        let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
+        let child = Command::new(&bin)
             .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
             .args(&rendezvous)

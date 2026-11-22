@@ -535,6 +535,10 @@ pub enum CtlRequest {
     RemoteStatus { node: String },
     /// 到其他设备的路径（M5.1）；`device` 为空时列出所有设备。
     Paths { device: Option<String> },
+    /// 换成新版本并重新启动（M7.3）。由常驻程序的外壳处理，不进节点。
+    Upgrade { file: String, confirm_ms: u64, force: bool },
+    UpgradeStatus,
+    UpgradeRollback,
     /// 本机的网络接口和是否计费（M5.2）；`set` 时先改某个接口的设置（`None` 为自动识别）。
     Interfaces { set: Option<(String, Option<bool>)> },
     /// 在第一台设备上建立网络。
@@ -597,10 +601,22 @@ pub enum CtlRequest {
     SessionKill { node: String, session: String },
 }
 
+/// 最近一次升级（M7.3）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeReport {
+    /// pending、confirmed、rolled_back
+    pub state: String,
+    pub from: String,
+    pub to: String,
+    pub exe: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtlResponse {
     Status(StatusReport),
     Paths(Vec<DevicePaths>),
+    Upgrade(UpgradeReport),
     Interfaces(Vec<IfaceInfo>),
     Init(InitReport),
     /// 长加入码；短加入码（M6.1）在没有碰头服务时为 None，原因在 `short_code_error`。

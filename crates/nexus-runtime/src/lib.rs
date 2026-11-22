@@ -1121,6 +1121,9 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Attach { node, session, size, create } => return self.attach(&node, session, size, create, agent, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::Paths { device } => self.paths(device.as_deref()).map(CtlResponse::Paths),
+            CtlRequest::Upgrade { .. } | CtlRequest::UpgradeStatus | CtlRequest::UpgradeRollback => {
+                Err(err(ErrorCode::InvalidState, "这个常驻程序不支持升级（只有命令行的 nexus daemon 支持）"))
+            }
             CtlRequest::Interfaces { set } => self.interfaces(set).map(CtlResponse::Interfaces),
             CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
             CtlRequest::Init { name } => self.init(name).map(CtlResponse::Init),

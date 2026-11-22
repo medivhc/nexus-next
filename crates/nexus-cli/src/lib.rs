@@ -8,6 +8,7 @@ pub mod ctl_endpoint;
 pub mod daemon;
 pub mod drive;
 pub mod tun;
+pub mod upgrade;
 
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
@@ -82,6 +83,9 @@ pub enum Cmd {
         /// 只在本机回环地址上通信，不使用中继和地址发现（用于测试）
         #[arg(long)]
         local_only: bool,
+        /// 只检查能不能读数据目录，然后退出（升级时检查新版本用）
+        #[arg(long, hide = true)]
+        preflight: bool,
         /// 中继：default（公共中继）、disabled，或自建中继的地址
         #[arg(long, default_value = "default")]
         relay: String,
@@ -346,6 +350,32 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 把本机的常驻程序换成新版本，并重新启动（终端会话不断）
+    ///
+    /// 先检查新版本能运行、协议主版本相同、能读数据目录；换上之后要在 --confirm-within 内连上升级前在线的设备，
+    /// 连不上就自动换回原来的版本。原来的二进制留作 <二进制>.prev。
+    Upgrade {
+        /// 新版本：发布的 .tar.gz（旁边有 SHA256SUMS 时校验），或者 nexus 二进制
+        #[arg(long, value_name = "文件", required_unless_present_any = ["status", "rollback"])]
+        file: Option<String>,
+        /// 新版本要在这段时间内连上升级前在线的设备，例如 60s、5m
+        #[arg(long, default_value = "60s", value_name = "时长")]
+        confirm_within: String,
+        /// 协议主版本不同也换（换上之后连不上没升级的设备）
+        #[arg(long)]
+        force: bool,
+        /// 查看最近一次升级的状态
+        #[arg(long, conflicts_with_all = ["file", "rollback"])]
+        status: bool,
+        /// 换回上一个版本并重新启动
+        #[arg(long, conflicts_with_all = ["file", "status"])]
+        rollback: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 协议版本（主 次），升级时检查新版本用
+    #[command(hide = true)]
+    ProtocolVersion,
 }
 
 #[derive(Subcommand, Debug)]
@@ -776,6 +806,17 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         Cmd::Status { node: None, json } => (CtlRequest::Status, *json),
         Cmd::Path { device, json } => (CtlRequest::Paths { device: device.clone() }, *json),
+        Cmd::Upgrade { status: true, json, .. } => (CtlRequest::UpgradeStatus, *json),
+        Cmd::Upgrade { rollback: true, json, .. } => (CtlRequest::UpgradeRollback, *json),
+        Cmd::Upgrade { file, confirm_within, force, json, .. } => {
+            let Some(confirm_ms) = parse_ttl(confirm_within) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--confirm-within 的格式不对：{confirm_within}（例如 60s、5m）"));
+            };
+            let file = file.clone().unwrap_or_default();
+            // 常驻程序的工作目录不一定和这里一样：给它绝对路径。
+            let file = std::path::absolute(&file).map(|p| p.display().to_string()).unwrap_or(file);
+            (CtlRequest::Upgrade { file, confirm_ms, force: *force }, *json)
+        }
         Cmd::Iface { name, metered, json } => {
             let set = match (name, metered.as_deref()) {
                 (Some(n), Some(m)) => Some((n.clone(), match m {
@@ -863,7 +904,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
         }
         Cmd::Mcp => return mcp(ctl, stdin, sink).await,
-        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::SessionHold { .. } | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
+        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::SessionHold { .. } | Cmd::ProtocolVersion | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
             return fail(sink, EXIT_USAGE, "usage", "这条命令只能由 nexus 程序直接运行")
         }
         Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {
@@ -1167,6 +1208,22 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     out.push_str(&format!("{:<12} {:<40} {state}（{how}）\n", i.name, i.addrs.join(" ")));
                 }
                 out
+            }
+        }
+        CtlResponse::Upgrade(r) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "state": r.state, "from": r.from, "to": r.to, "exe": r.exe, "message": r.message }))
+            } else {
+                match r.state.as_str() {
+                    "pending" => format!(
+                        "{} 换成了 {}，常驻程序正在重新启动；连上其他设备后确认（nexus upgrade --status 查看）。\n",
+                        r.from, r.to
+                    ),
+                    "confirmed" => format!("已经从 {} 升级到 {}（{}）。\n", r.from, r.to, r.exe),
+                    "rolled_back" => format!("已经换回 {}：{}\n", r.from, r.message),
+                    "none" => "还没有升级过。\n".to_string(),
+                    other => format!("{other}：{}\n", r.message),
+                }
             }
         }
         CtlResponse::Paths(devices) => {
