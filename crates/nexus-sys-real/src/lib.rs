@@ -10,7 +10,8 @@
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::Timestamp;
-use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System};
+pub use nexus_sys::Size;
+use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, System};
 use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -21,7 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RealSystem {
     dir: PathBuf,
+    /// 终端会话的持有进程用的 `nexus` 二进制（M7.2）；没有时会话在本进程里运行。
+    session_holder: Option<PathBuf>,
 }
+
+#[cfg(unix)]
+pub mod holder;
 
 impl RealSystem {
     /// `dir` 是本节点的数据目录，不存在时创建。
@@ -36,7 +42,15 @@ impl RealSystem {
         {
             std::fs::create_dir_all(dir.as_ref())?;
         }
-        Ok(Self { dir: dir.as_ref().to_path_buf() })
+        Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None })
+    }
+
+    /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2）。只在 Unix 上。
+    pub fn with_session_holder(mut self, exe: PathBuf) -> Self {
+        if cfg!(unix) {
+            self.session_holder = Some(exe);
+        }
+        self
     }
 
     fn path(&self, key: &str) -> io::Result<PathBuf> {
@@ -66,7 +80,7 @@ fn default_cwd() -> PathBuf {
 
 impl System for RealSystem {
     type Proc = RealProc;
-    type Pty = RealPty;
+    type Pty = RealTerm;
     type Tcp = tokio::net::TcpStream;
 
     async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<tokio::net::TcpStream> {
@@ -79,8 +93,24 @@ impl System for RealSystem {
         Ok(tokio::net::lookup_host((host, 0)).await?.map(|a| a.ip()).collect())
     }
 
-    fn spawn_pty(&self, size: Size) -> io::Result<RealPty> {
-        RealPty::spawn(size)
+    fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
+        #[cfg(unix)]
+        if let Some(exe) = &self.session_holder {
+            return holder::spawn(exe, &self.dir, name, size, created_at).map(RealTerm::Held);
+        }
+        let _ = (name, created_at);
+        RealPty::spawn(size).map(RealTerm::Local)
+    }
+
+    async fn adopt_ptys(&self) -> Vec<nexus_sys::AdoptedPty<RealTerm>> {
+        #[cfg(unix)]
+        if self.session_holder.is_some() {
+            return holder::adopt(&self.dir)
+                .into_iter()
+                .map(|a| nexus_sys::AdoptedPty { name: a.name, size: a.size, created_at: a.created_at, pty: RealTerm::Held(a.pty) })
+                .collect();
+        }
+        Vec::new()
     }
 
     fn spawn(&self, cmd: Cmd) -> io::Result<RealProc> {
@@ -310,6 +340,44 @@ enum PtyMsg {
 }
 
 const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 终端：在本进程里，或者由持有进程管理（M7.2）。
+pub enum RealTerm {
+    Local(RealPty),
+    #[cfg(unix)]
+    Held(holder::HeldPty),
+}
+
+impl Pty for RealTerm {
+    async fn next_event(&mut self) -> PtyEvent {
+        match self {
+            RealTerm::Local(p) => p.next_event().await,
+            #[cfg(unix)]
+            RealTerm::Held(p) => p.next_event().await,
+        }
+    }
+    fn write(&mut self, data: Vec<u8>) {
+        match self {
+            RealTerm::Local(p) => p.write(data),
+            #[cfg(unix)]
+            RealTerm::Held(p) => p.write(data),
+        }
+    }
+    fn resize(&mut self, size: Size) {
+        match self {
+            RealTerm::Local(p) => p.resize(size),
+            #[cfg(unix)]
+            RealTerm::Held(p) => p.resize(size),
+        }
+    }
+    fn kill(&mut self) {
+        match self {
+            RealTerm::Local(p) => p.kill(),
+            #[cfg(unix)]
+            RealTerm::Held(p) => p.kill(),
+        }
+    }
+}
 
 pub struct RealPty {
     master: Box<dyn portable_pty::MasterPty + Send>,

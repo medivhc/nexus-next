@@ -82,8 +82,12 @@ pub struct IrohTransport {
     /// 自建中继（启动时指定的，或网络的锚点）：它总在本节点的地址提示里，哪怕还没连上它。
     relay: RefCell<Option<RelayUrl>>,
     hints: RefCell<HashMap<NodeId, EndpointAddr>>,
-    /// 复用到同一节点的连接，避免每次调用都重新握手。
+    /// 复用到同一节点的连接，避免每次调用都重新握手。对方连过来的连接也放在这里：两台设备之间一条连接，
+    /// 两个方向的请求都走它（M7.2：重启后地址变了的设备先连回来，另一边就不用再按新地址去连）。
     conns: RefCell<HashMap<NodeId, IrohConnection>>,
+    /// 本机连出去的连接：对方也会在上面发请求，交给 `accept` 一起服务。
+    own_tx: tokio::sync::mpsc::UnboundedSender<IrohConnection>,
+    own_rx: RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<IrohConnection>>>,
     /// 只经中继（浏览器）：地址提示里的 IP 地址用不上，留着反而让建立连接先在它们上面空等。
     relay_only: bool,
     scheduling: bool,
@@ -141,6 +145,7 @@ impl IrohTransport {
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
+        let (own_tx, own_rx) = tokio::sync::mpsc::unbounded_channel();
         #[cfg(not(target_arch = "wasm32"))]
         let rendezvous = config.rendezvous.as_deref().map(|url| rendezvous::Client::new(url, &ep)).transpose()?;
         Ok(Self {
@@ -149,6 +154,8 @@ impl IrohTransport {
             relay: RefCell::new(relay),
             hints: RefCell::default(),
             conns: RefCell::default(),
+            own_tx,
+            own_rx: RefCell::new(Some(own_rx)),
             relay_only: !config.direct,
             scheduling: config.scheduling,
             metered_ips: RefCell::default(),
@@ -209,22 +216,56 @@ impl Transport for IrohTransport {
         let conn = self.ep.connect(addr, proto.alpn()).await.map_err(io_err)?;
         if proto == Proto::Rpc {
             self.conns.borrow_mut().insert(to, conn.clone());
+            let _ = self.own_tx.send(conn.clone());
         }
         Ok(IrohConn { conn, remote: to, scheduling: self.scheduling })
     }
 
     async fn accept(&self) -> io::Result<(IrohConn, Proto)> {
-        loop {
-            let incoming = self
-                .ep
-                .accept()
-                .await
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "端点已关闭"))?;
-            // 单个连接握手失败不影响继续接受其他连接。
-            let Ok(conn) = incoming.await else { continue };
-            let Some(proto) = Proto::from_alpn(conn.alpn()) else { continue };
-            let remote = NodeId(*conn.remote_id().as_bytes());
-            return Ok((IrohConn { conn, remote, scheduling: self.scheduling }, proto));
+        // 同一时刻只有一个 accept 在等（运行时让同一个 future 跨循环存活）。
+        let mut own = self.own_rx.borrow_mut().take();
+        let result = loop {
+            let next = async {
+                match own.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                // 本机连出去的连接：对方在上面发的请求也要服务。
+                Some(conn) = next => {
+                    let remote = NodeId(*conn.remote_id().as_bytes());
+                    break Ok((IrohConn { conn, remote, scheduling: self.scheduling }, Proto::Rpc));
+                }
+                incoming = self.ep.accept() => {
+                    let Some(incoming) = incoming else {
+                        break Err(io::Error::new(io::ErrorKind::BrokenPipe, "端点已关闭"));
+                    };
+                    // 单个连接握手失败不影响继续接受其他连接。
+                    let Ok(conn) = incoming.await else { continue };
+                    let Some(proto) = Proto::from_alpn(conn.alpn()) else { continue };
+                    let remote = NodeId(*conn.remote_id().as_bytes());
+                    if proto == Proto::Rpc {
+                        // 对方连过来的：本机到它没有可用的连接时，之后的请求也走这条。
+                        let mut conns = self.conns.borrow_mut();
+                        if conns.get(&remote).is_none_or(|c| c.close_reason().is_some()) {
+                            conns.insert(remote, conn.clone());
+                        }
+                    }
+                    break Ok((IrohConn { conn, remote, scheduling: self.scheduling }, proto));
+                }
+            }
+        };
+        *self.own_rx.borrow_mut() = own;
+        result
+    }
+
+    fn peer_announced(&self, conn: &IrohConn) {
+        let old = self.conns.borrow_mut().insert(conn.remote, conn.conn.clone());
+        if let Some(old) = old {
+            if old.stable_id() != conn.conn.stable_id() {
+                old.close(0u32.into(), b"peer restarted");
+            }
         }
     }
 

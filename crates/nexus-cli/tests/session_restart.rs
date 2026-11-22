@@ -12,7 +12,7 @@ fn say(text: &str) -> String {
 
 fn sessions_dir_entries(w: &World, node: &str) -> Vec<String> {
     let dir = w.data_dir(node).join("sessions");
-    let mut v: Vec<String> = std::fs::read_dir(&dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    let mut v: Vec<String> = std::fs::read_dir(&dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.ends_with(".log")).collect()).unwrap_or_default();
     v.sort();
     v
 }

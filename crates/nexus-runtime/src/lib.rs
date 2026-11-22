@@ -680,8 +680,15 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut spawns = self.spawn_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut proxied = self.proxy_rx.borrow_mut().take().expect("run 只能调用一次");
         let mut tunneled = self.tun_rx.borrow_mut().take().expect("run 只能调用一次");
+        self.adopt_sessions().await;
         let mut tasks: FuturesUnordered<Task<'_>> = FuturesUnordered::new();
         tasks.push(Box::pin(self.follow_anchor()));
+        // 启动时把名册和本机现在的地址推给其他设备：重启后地址变了，它们才连得回来（M7.2）。
+        tasks.push(Box::pin(async {
+            if self.roster().is_some() {
+                let _ = self.broadcast_roster(None).await;
+            }
+        }));
         if self.transport.has_interfaces() {
             tasks.push(Box::pin(self.follow_interfaces()));
         }
@@ -801,6 +808,9 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 回应方向的优先级由这一端定：和请求同一类。
         conn.set_priority(&mut stream, body.class().priority());
+        if matches!(body, Request::RosterPush { .. }) && self.roster().is_some_and(|r| r.device(peer).is_some()) {
+            self.transport.peer_announced(conn);
+        }
         let dispatch = match proto {
             Proto::Rpc => self.handle_rpc(peer, header, body),
             Proto::Join => Dispatch::Reply(self.handle_join(body)),
@@ -846,7 +856,13 @@ impl<T: Transport, S: System> Node<T, S> {
                     let _ = self.learn_hints(addrs);
                     Response::Ok
                 }
-                Err(e) if matches!(e.code, ErrorCode::InvalidInput) => Response::Ok, // 不比本机新：无需更新
+                Err(e) if matches!(e.code, ErrorCode::InvalidInput) => {
+                    // 不比本机新：名册不用更新，但名册里的设备重启后地址可能变了（M7.2），记下它给的地址。
+                    if self.roster().is_some_and(|r| r.device(peer).is_some()) {
+                        let _ = self.learn_hints(addrs);
+                    }
+                    Response::Ok
+                }
                 Err(e) => Response::Error(e),
             });
         }
@@ -1102,7 +1118,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let result = match req {
             CtlRequest::Exec { node, spec } => return self.exec(&node, spec, agent, server).await,
             CtlRequest::Drive(req) => return self.drive(req, agent, server).await,
-            CtlRequest::Attach { node, session, size } => return self.attach(&node, session, size, agent, server).await,
+            CtlRequest::Attach { node, session, size, create } => return self.attach(&node, session, size, create, agent, server).await,
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::Paths { device } => self.paths(device.as_deref()).map(CtlResponse::Paths),
             CtlRequest::Interfaces { set } => self.interfaces(set).map(CtlResponse::Interfaces),
@@ -1741,7 +1757,7 @@ impl<T: Transport, S: System> Node<T, S> {
     // ------------------------------------------------------------ 终端会话
 
     /// 命令行请求连上某个节点上的会话：打开会话流，然后在命令行和会话之间转发。
-    async fn attach(&self, node: &str, name: String, size: Size, agent: Option<AgentCredential>, server: CtlServer) {
+    async fn attach(&self, node: &str, name: String, size: Size, create: bool, agent: Option<AgentCredential>, server: CtlServer) {
         let device = match self.resolve_for(node, agent.as_ref()) {
             Ok(d) => d,
             Err(e) => {
@@ -1750,7 +1766,7 @@ impl<T: Transport, S: System> Node<T, S> {
             }
         };
         if device.node_id == self.me() {
-            let body = Request::SessionAttach { name: name.clone(), create: true, size };
+            let body = Request::SessionAttach { name: name.clone(), create, size };
             // agent 的会话要一直接受复查：授权通过后为它建立守卫。
             let check = required_action(&body, &device.name).and_then(|action| {
                 self.authorize_local(agent.as_ref(), &body)?;
@@ -1779,10 +1795,10 @@ impl<T: Transport, S: System> Node<T, S> {
                     }
                 }
             };
-            futures_util::future::join(self.serve_session(far, &name, true, size, guard), client).await;
+            futures_util::future::join(self.serve_session(far, &name, create, size, guard), client).await;
             return;
         }
-        let body = Request::SessionAttach { name, create: true, size };
+        let body = Request::SessionAttach { name, create, size };
         for attempt in 0..2 {
             let failure = match self.open_stream(&device, body.clone(), agent.as_ref()).await {
                 Ok(stream) => return self.pump_session(stream, server).await,
@@ -1956,13 +1972,19 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _")));
         }
         let size = size.clamped();
-        let pty = self.system.spawn_pty(size).map_err(|e| err(ErrorCode::SpawnFailed, format!("无法启动终端：{e}")))?;
+        let created_at = self.system.now();
+        let pty = self.system.spawn_pty(name, size, created_at).map_err(|e| err(ErrorCode::SpawnFailed, format!("无法启动终端：{e}")))?;
+        self.start_session(name, pty, size, created_at)
+    }
+
+    /// 把一个终端交给会话任务，登记到会话列表里。
+    fn start_session(&self, name: &str, pty: S::Pty, size: Size, created_at: Timestamp) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
         let (cmd, cmds) = mpsc::unbounded_channel();
         let clients = Rc::new(Cell::new(0));
         let current_size = Rc::new(Cell::new(size));
         self.sessions.borrow_mut().insert(
             name.to_string(),
-            SessionHandle { cmd: cmd.clone(), created_at: self.system.now(), clients: clients.clone(), size: current_size.clone() },
+            SessionHandle { cmd: cmd.clone(), created_at, clients: clients.clone(), size: current_size.clone() },
         );
         let new = NewSession { name: name.to_string(), pty, size, cmds, clients, current_size };
         if self.spawn_tx.send(new).is_err() {
@@ -1970,6 +1992,16 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(internal("节点正在关闭"));
         }
         Ok(cmd)
+    }
+
+    /// 常驻程序启动时接管上一次运行留下的终端会话（M7.2）。
+    async fn adopt_sessions(&self) {
+        for a in self.system.adopt_ptys().await {
+            if self.sessions.borrow().contains_key(&a.name) || !valid_segment(&a.name) {
+                continue;
+            }
+            let _ = self.start_session(&a.name, a.pty, a.size.clamped(), a.created_at);
+        }
     }
 
     /// 驱动一个会话：终端程序的输出交给状态机，状态机的动作发给客户端和终端。
@@ -3090,7 +3122,7 @@ mod tests {
                 output_sent: false,
             })
         }
-        fn spawn_pty(&self, _: Size) -> io::Result<TestPty> {
+        fn spawn_pty(&self, _: &str, _: Size, _: Timestamp) -> io::Result<TestPty> {
             unreachable!()
         }
     }

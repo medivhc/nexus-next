@@ -44,8 +44,19 @@ fn main() {
             .with_writer(io::stderr)
             .try_init();
     }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
     let data_dir = data_dir(&cli);
+    // 终端会话的持有进程（M7.2）：自己建运行时，shell 退出才返回。
+    #[cfg(unix)]
+    if let Cmd::SessionHold { name, cols, rows, created_at_ms } = &cli.cmd {
+        let size = nexus_sys_real::Size { cols: *cols, rows: *rows };
+        let r = nexus_sys_real::holder::run(&data_dir, name, size, nexus_core_proto::Timestamp(*created_at_ms));
+        if let Err(e) = r {
+            Terminal.err(format!("nexus session-hold: {e}\n").as_bytes());
+            std::process::exit(EXIT_INTERNAL);
+        }
+        std::process::exit(0);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
     let agent = match cli.agent.as_deref().map(load_agent).transpose() {
         Ok(a) => a,
         Err(msg) => {
@@ -143,6 +154,8 @@ fn main() {
                     }
                 }
             }
+            // Unix 上在前面就处理了；别的系统没有持有进程。
+            Cmd::SessionHold { .. } => EXIT_USAGE,
             Cmd::SshProxy { host } => {
                 let ctl = UnixCtl::new(&data_dir, agent.clone());
                 ssh_proxy::run(ctl, host).await

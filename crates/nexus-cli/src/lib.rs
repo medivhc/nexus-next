@@ -297,6 +297,18 @@ pub enum Cmd {
     /// 用法：nexus ssh-config >> ~/.ssh/config，之后 ssh home.nexus、scp f home.nexus:/tmp/、
     /// git clone home.nexus:/path/repo 都能用，不需要任何密钥。交互式登录进入常驻会话 main。
     SshConfig,
+    /// 终端会话的持有进程（M7.2），由常驻程序启动，不直接运行
+    #[command(hide = true)]
+    SessionHold {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cols: u16,
+        #[arg(long)]
+        rows: u16,
+        #[arg(long)]
+        created_at_ms: u64,
+    },
     /// 供 ssh 的 ProxyCommand 调用：在标准输入输出上充当 SSH 服务端（一般不直接运行）
     SshProxy {
         /// ssh 传入的主机名，形如 home.nexus
@@ -851,7 +863,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
         }
         Cmd::Mcp => return mcp(ctl, stdin, sink).await,
-        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
+        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::SessionHold { .. } | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
             return fail(sink, EXIT_USAGE, "usage", "这条命令只能由 nexus 程序直接运行")
         }
         Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {
@@ -1535,7 +1547,8 @@ pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut buf = vec![0u8; 16 * 1024];
     let note = format!("\r\n[已断开，会话 {} 仍在运行]\r\n", args.session);
     loop {
-        let req = CtlRequest::Attach { node: args.node.clone(), session: args.session.clone(), size };
+        // 重新连上时不新建：会话已经结束（例如远端的程序在断开期间退出了）就照实说。
+        let req = CtlRequest::Attach { node: args.node.clone(), session: args.session.clone(), size, create: !connected_once };
         let mut session = ctl.open(req).await.map_err(SshError::Daemon)?;
         // 发给常驻程序的消息先进本地队列，有空位时再发：这里从不因为发送而停下，
         // 总能继续读常驻程序的回应，两边不会互相等待。确认可以合并。
@@ -1574,6 +1587,12 @@ pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     }
                     Some(CtlResponse::Error(e)) if e.code == ErrorCode::Unreachable && connected_once => break e,
+                    Some(CtlResponse::Error(e)) if e.code == ErrorCode::NotFound && connected_once => {
+                        let note = format!("\r\n[会话 {} 已经结束了：远端的程序在断开期间退出了]\r\n", args.session);
+                        let _ = output.write_all(note.as_bytes()).await;
+                        let _ = output.flush().await;
+                        return Err(SshError::Remote(e));
+                    }
                     Some(CtlResponse::Error(e)) => return Err(SshError::Remote(e)),
                     Some(_) => return Err(SshError::Remote(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解"))),
                     None => return Err(SshError::Remote(WireError::new(ErrorCode::Internal, "常驻程序提前结束了会话"))),

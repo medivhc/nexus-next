@@ -56,7 +56,11 @@ pub struct Options {
 pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> io::Result<()> {
     let Options { data_dir, agent_socket, name, config, proxy, tun } = opts;
     let (data_dir, agent_socket) = (data_dir.as_path(), agent_socket.as_path());
-    let system = RealSystem::new(data_dir)?;
+    // 终端会话交给独立的持有进程（M7.2）：常驻程序重启后会话还在。
+    let system = match std::env::current_exe() {
+        Ok(exe) => RealSystem::new(data_dir)?.with_session_holder(exe),
+        Err(_) => RealSystem::new(data_dir)?,
+    };
     let key = load_or_create_device_key(&system)?;
     let name = name
         .or_else(default_node_name)

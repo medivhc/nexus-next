@@ -1346,6 +1346,20 @@ impl Drop for RealWorld {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // 终端会话的持有进程（M7.2）不随常驻程序结束：按它们留下的 pid 文件结束它们（连同 shell）。
+        for dir in self.dirs.values() {
+            let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().is_some_and(|x| x == "pid") {
+                    if let Some(pid) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                        // 持有进程自成一个进程组，shell 在它下面：结束整个进程组和 shell 的进程组。
+                        let _ = Command::new("pkill").args(["-KILL", "-P", &pid.to_string()]).status();
+                        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -56,6 +56,11 @@ pub trait Transport {
         let _ = url;
         std::future::ready(Ok(()))
     }
+    /// 对方在这条（它连过来的）连接上推来了名册：它多半刚启动（M7.2）。之后到它的请求都走这条连接，
+    /// 本机原来缓存的、到它的连接关掉：那条连着对方已经不在的旧进程，上面的流要尽快报错、重新连。
+    fn peer_announced(&self, conn: &Self::Conn) {
+        let _ = conn;
+    }
     /// 到 `node` 的连接现在的路径（M5.1）。没有连接时为空；不区分路径的传输（仿真）给出一条。
     fn paths(&self, node: NodeId) -> Vec<nexus_wire::PathInfo> {
         let _ = node;

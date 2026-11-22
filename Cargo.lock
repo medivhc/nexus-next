@@ -3049,8 +3049,11 @@ dependencies = [
  "getrandom 0.3.4",
  "nexus-core-proto",
  "nexus-sys",
+ "nexus-term-proto",
  "nix 0.31.3",
  "portable-pty",
+ "postcard",
+ "serde",
  "tempfile",
  "tokio",
 ]

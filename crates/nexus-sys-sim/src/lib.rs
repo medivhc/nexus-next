@@ -114,7 +114,7 @@ impl System for SimSystem {
         }
     }
 
-    fn spawn_pty(&self, size: Size) -> io::Result<SimPty> {
+    fn spawn_pty(&self, _name: &str, size: Size, _created_at: Timestamp) -> io::Result<SimPty> {
         Ok(SimPty {
             size,
             line: Vec::new(),

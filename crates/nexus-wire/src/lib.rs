@@ -591,7 +591,8 @@ pub enum CtlRequest {
     /// 文件（Drive）。
     Drive(DriveRequest),
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
-    Attach { node: String, session: String, size: Size },
+    /// `create`：会话不存在时新建。重新连上时为 false（M7.2：会话已经结束时不悄悄换成一个新的）。
+    Attach { node: String, session: String, size: Size, create: bool },
     SessionList { node: String },
     SessionKill { node: String, session: String },
 }

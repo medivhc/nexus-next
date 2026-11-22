@@ -123,6 +123,12 @@ impl Session {
         self.exited.is_some()
     }
 
+    /// 直接改变屏幕尺寸（终端的持有进程用，M7.2：尺寸由常驻程序决定，这里只跟着改）。
+    pub fn set_size(&mut self, size: Size) {
+        let mut ignored = Vec::new();
+        self.resize(size.clamped(), &mut ignored);
+    }
+
     /// 当前屏幕，供测试和诊断使用。
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()

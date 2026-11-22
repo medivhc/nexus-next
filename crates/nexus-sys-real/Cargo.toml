@@ -13,6 +13,10 @@ portable-pty.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+# 终端会话的持有进程（M7.2）：自己保持当前屏幕，和常驻程序之间的协议。
+nexus-term-proto.workspace = true
+serde.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

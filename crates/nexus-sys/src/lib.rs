@@ -52,6 +52,14 @@ pub enum PtyEvent {
     Exited(ExitStatus),
 }
 
+/// 上一次运行留下的终端会话（M7.2）。
+pub struct AdoptedPty<P> {
+    pub name: String,
+    pub size: Size,
+    pub created_at: Timestamp,
+    pub pty: P,
+}
+
 /// 一个运行在伪终端里的程序（用户的 shell）。
 pub trait Pty {
     /// 下一个事件。必须可以安全地被取消（放进 `select!`）。
@@ -86,8 +94,13 @@ pub trait System {
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>>;
     /// 启动一个进程，标准输入、输出、错误都通过管道连接。
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc>;
-    /// 在一个新的伪终端里启动当前用户的登录 shell。
-    fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty>;
+    /// 在一个新的伪终端里启动当前用户的登录 shell。`name` 是会话名，`created_at` 是会话的创建时间：
+    /// 有独立持有进程的实现（M7.2）用它们标识会话，常驻程序重启后由 [`System::adopt_ptys`] 交回。
+    fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<Self::Pty>;
+    /// 常驻程序启动时：上一次运行留下的、还活着的终端会话（M7.2）。没有独立持有进程的实现总是空的。
+    fn adopt_ptys(&self) -> impl Future<Output = Vec<AdoptedPty<Self::Pty>>> {
+        std::future::ready(Vec::new())
+    }
     /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
     /// 按内容寻址的对象存储（Drive）：取出哈希为 `hash` 的对象。
@@ -119,7 +132,8 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> { (**self).append_log(name, record, max_bytes) }
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }
-    fn spawn_pty(&self, size: Size) -> io::Result<Self::Pty> { (**self).spawn_pty(size) }
+    fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<Self::Pty> { (**self).spawn_pty(name, size, created_at) }
+    fn adopt_ptys(&self) -> impl Future<Output = Vec<AdoptedPty<Self::Pty>>> { (**self).adopt_ptys() }
 }
 
 /// 尚未实现进程支持时使用的占位类型。
