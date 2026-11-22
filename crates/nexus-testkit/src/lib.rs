@@ -298,6 +298,12 @@ impl World {
         let Inner::Real(real) = &self.inner else { panic!("home_dir 只能用于真实后端") };
         real.home(node)
     }
+
+    /// 节点常驻程序的数据目录（只用于真实后端）。
+    pub fn data_dir(&self, node: &str) -> PathBuf {
+        let Inner::Real(real) = &self.inner else { panic!("data_dir 只能用于真实后端") };
+        real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone()
+    }
 }
 
 impl World {
