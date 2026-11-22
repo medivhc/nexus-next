@@ -7,8 +7,8 @@ use nexus_wire::{AgentCredential, CtlHello, CtlRequest, CtlResponse, Input};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use nexus_cli::ctl_endpoint;
 
 mod anchor;
 #[cfg(target_os = "linux")]
@@ -197,6 +197,7 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
     }
     let (tx, mut resizes) = mpsc::channel(4);
     if !args.size_given {
+        #[cfg(unix)]
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let Ok(mut winch) = signal(SignalKind::window_change()) else { return };
@@ -208,6 +209,10 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
                 }
             }
         });
+        #[cfg(windows)]
+        {
+            // Windows 没有 SIGWINCH，不做窗口大小跟踪。
+        }
     }
     if crossterm::terminal::enable_raw_mode().is_err() {
         Terminal.err("nexus ssh: 无法把终端切换到原始模式\n".as_bytes());
@@ -252,9 +257,9 @@ impl UnixCtl {
 
 impl Ctl for UnixCtl {
     async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
-        let mut stream = UnixStream::connect(&self.socket).await?;
+        let mut stream = ctl_endpoint::connect(&self.socket).await?;
         write_msg(&mut stream, &CtlHello { agent: self.agent.clone(), request: req }).await?;
-        let (rd, mut wr) = stream.into_split();
+        let (rd, mut wr) = tokio::io::split(stream);
         let (in_tx, mut in_rx) = mpsc::channel::<Input>(16);
         let (resp_tx, resp_rx) = mpsc::channel::<CtlResponse>(16);
         tokio::spawn(async move {

@@ -511,10 +511,19 @@ async fn import<C: Ctl>(ctl: &C, dir: &str, dest: &str) -> Result<(u64, u64), Fa
             let to = std::fs::read_link(&local).map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", e.to_string()))?;
             ask(ctl, DriveRequest::Symlink { path, target: to.to_string_lossy().into_owned() }).await?;
         } else {
-            use std::os::unix::fs::PermissionsExt;
-            let exec = md.permissions().mode() & 0o111 != 0;
+            let exec = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    md.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(windows)]
+                {
+                    false
+                }
+            };
             let f = std::fs::File::open(&local)
-                .map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("{}：{e}", local.display())))?;
+                .map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("{}: {e}", local.display())))?;
             put::<C, tokio::io::Empty>(ctl, &path, exec, Source::File(f)).await?;
             bytes += md.len();
         }

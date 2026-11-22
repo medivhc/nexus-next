@@ -1,4 +1,12 @@
 //! 驱动：`System` 的真实实现。
+//!
+//! Windows 与 Unix 版本通过 `cfg` 分叉：
+//! - 进程树终止：Unix 用 `killpg`，Windows 用 `taskkill /T`。
+//! - 目录与文件权限：Unix 显式 `mode(0o700)/0o600`，Windows 靠默认 ACL。
+//! - Shell 与环境变量：Unix 用 `$SHELL`、`$HOME`；Windows 用 `ComSpec`/`powershell`、`USERPROFILE`。
+//! - 伪终端：Unix 用 `/bin/sh`，Windows 用 `powershell.exe`/`cmd.exe`（`portable-pty` 选对实现）。
+//!
+//! 以上分叉均不引入 `unsafe`，保持 `#![forbid(unsafe_code)]`。
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::Timestamp;
@@ -18,9 +26,16 @@ pub struct RealSystem {
 impl RealSystem {
     /// `dir` 是本节点的数据目录，不存在时创建。
     pub fn new(dir: impl AsRef<Path>) -> io::Result<Self> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.as_ref())?;
-        std::fs::set_permissions(dir.as_ref(), std::fs::Permissions::from_mode(0o700))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.as_ref())?;
+            std::fs::set_permissions(dir.as_ref(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(windows)]
+        {
+            std::fs::create_dir_all(dir.as_ref())?;
+        }
         Ok(Self { dir: dir.as_ref().to_path_buf() })
     }
 
@@ -35,6 +50,17 @@ impl RealSystem {
     fn cas_path(&self, hash: &[u8; 32]) -> PathBuf {
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         self.dir.join("cas").join(&hex[..2]).join(&hex[2..])
+    }
+}
+
+fn default_cwd() -> PathBuf {
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| ".".into())
     }
 }
 
@@ -63,19 +89,21 @@ impl System for RealSystem {
             .envs(cmd.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // 自成一个进程组，终止时连同它派生的进程一起终止。
-            .process_group(0)
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        c.process_group(0);
+        c.kill_on_drop(true);
         match cmd.cwd {
             Some(dir) => c.current_dir(dir),
-            None => c.current_dir(std::env::var_os("HOME").unwrap_or_else(|| "/".into())),
+            None => c.current_dir(default_cwd()),
         };
         let mut child = c.spawn()?;
+        #[cfg(unix)]
         let pgid = child.id().map(|id| id as i32);
+        #[cfg(windows)]
+        let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        // 标准输入由单独的任务写入：命令不读输入时，不会卡住输出的转发。
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         if let Some(mut stdin) = child.stdin.take() {
             tokio::spawn(async move {
@@ -88,7 +116,10 @@ impl System for RealSystem {
         }
         Ok(RealProc {
             child,
+            #[cfg(unix)]
             pgid,
+            #[cfg(windows)]
+            pid,
             stdout,
             stderr,
             stdin: Some(stdin_tx),
@@ -119,11 +150,9 @@ impl System for RealSystem {
         let path = self.path(name)?.with_extension("log");
         let current = std::fs::metadata(&path).map_or(0, |m| m.len());
         if current > 0 && current + record.len() as u64 > max_bytes {
-            // rename 是原子的：读的人看到的要么是轮转前，要么是轮转后。
             std::fs::rename(&path, path.with_extension("log.1"))?;
         }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        // 一次写入整条记录，避免并发追加时交错。
         f.write_all(record)
     }
 
@@ -153,7 +182,6 @@ impl System for RealSystem {
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().expect("有上级目录"))?;
-        // 先写临时文件再改名：别人看到的对象总是完整的。
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)
@@ -167,25 +195,35 @@ impl System for RealSystem {
         let path = self.path(key)?;
         let tmp = path.with_extension("tmp");
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(value)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(value)?;
+        }
+        #[cfg(windows)]
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+            file.write_all(value)?;
+        }
         std::fs::rename(tmp, path)
     }
 }
 
 pub struct RealProc {
     child: Child,
-    pgid: Option<i32>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     stdin: Option<mpsc::UnboundedSender<Vec<u8>>>,
     out_buf: Vec<u8>,
     err_buf: Vec<u8>,
+    #[cfg(unix)]
+    pgid: Option<i32>,
+    #[cfg(windows)]
+    pid: Option<u32>,
 }
 
-/// 从一个可能已经关闭的管道读；已关闭时永远不返回。
 async fn read_some<R: AsyncRead + Unpin>(pipe: &mut Option<R>, buf: &mut [u8]) -> io::Result<usize> {
     match pipe {
         Some(p) => p.read(buf).await,
@@ -198,11 +236,21 @@ impl Proc for RealProc {
         loop {
             if self.stdout.is_none() && self.stderr.is_none() {
                 let status = self.child.wait().await;
-                use std::os::unix::process::ExitStatusExt;
-                return ProcEvent::Exited(match status {
-                    Ok(s) => ExitStatus { code: s.code(), signal: s.signal() },
-                    Err(_) => ExitStatus { code: None, signal: None },
-                });
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    return ProcEvent::Exited(match status {
+                        Ok(s) => ExitStatus { code: s.code(), signal: s.signal() },
+                        Err(_) => ExitStatus { code: None, signal: None },
+                    });
+                }
+                #[cfg(windows)]
+                {
+                    return ProcEvent::Exited(match status {
+                        Ok(s) => ExitStatus { code: s.code(), signal: None },
+                        Err(_) => ExitStatus { code: None, signal: None },
+                    });
+                }
             }
             tokio::select! {
                 r = read_some(&mut self.stdout, &mut self.out_buf) => match r {
@@ -224,13 +272,26 @@ impl Proc for RealProc {
     }
 
     fn close_stdin(&mut self) {
-        // 发送端关闭后，写入任务写完已排队的数据就退出，管道随之关闭。
         self.stdin = None;
     }
 
     fn kill(&mut self) {
-        if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGKILL);
+        #[cfg(unix)]
+        {
+            if let Some(pgid) = self.pgid {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(pid) = self.pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID"])
+                    .arg(pid.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
         let _ = self.child.start_kill();
     }
@@ -244,17 +305,18 @@ fn pty_size(size: Size) -> portable_pty::PtySize {
 
 enum PtyMsg {
     Output(Vec<u8>),
-    /// 读到了终端的结束：程序和它派生的进程都已关闭终端。
     Eof,
     Exited(ExitStatus),
 }
 
-/// 程序退出后，最多再等这么久把剩下的输出读完（后台进程可能一直占着终端）。
 const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub struct RealPty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    #[cfg(unix)]
+    pid: Option<u32>,
+    #[cfg(windows)]
     pid: Option<u32>,
     events: mpsc::UnboundedReceiver<PtyMsg>,
     input: std::sync::mpsc::Sender<Vec<u8>>,
@@ -268,10 +330,31 @@ impl RealPty {
             io::Error::other(e.to_string())
         }
         let pair = portable_pty::native_pty_system().openpty(pty_size(size)).map_err(other)?;
+
+        #[cfg(unix)]
         let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+        #[cfg(windows)]
+        let shell = std::env::var("ComSpec")
+            .ok()
+            .and_then(|p| {
+                if std::path::Path::new(&p).file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe")) {
+                    Some(p)
+                } else if std::path::Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+                    Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into())
+                } else {
+                    Some(p)
+                }
+            })
+            .unwrap_or_else(|| "cmd.exe".into());
+
         let mut cmd = portable_pty::CommandBuilder::new(shell);
+        #[cfg(unix)]
         cmd.env("TERM", "xterm-256color");
+        #[cfg(unix)]
         cmd.cwd(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
+        #[cfg(windows)]
+        cmd.cwd(std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into()));
+
         let mut child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
         let pid = child.process_id();
@@ -280,7 +363,6 @@ impl RealPty {
         let mut writer = pair.master.take_writer().map_err(other)?;
 
         let (tx, events) = mpsc::unbounded_channel();
-        // 读写终端都是阻塞调用，各用一个线程。
         let out = tx.clone();
         std::thread::spawn(move || {
             use std::io::Read;
@@ -299,9 +381,14 @@ impl RealPty {
         });
         std::thread::spawn(move || {
             let status = match child.wait() {
+                #[cfg(unix)]
                 Ok(s) => {
                     let signal = s.signal().map(|_| 0);
                     ExitStatus { code: if signal.is_some() { None } else { Some(s.exit_code() as i32) }, signal }
+                }
+                #[cfg(windows)]
+                Ok(s) => {
+                    ExitStatus { code: Some(s.exit_code() as i32), signal: None }
                 }
                 Err(_) => ExitStatus { code: None, signal: None },
             };
@@ -327,7 +414,6 @@ impl Pty for RealPty {
                 return PtyEvent::Exited(status);
             }
             let msg = match self.status {
-                // 程序已经退出：剩下的输出限时读完。
                 Some(status) => match tokio::time::timeout(DRAIN_AFTER_EXIT, self.events.recv()).await {
                     Ok(m) => m,
                     Err(_) => return PtyEvent::Exited(status),
@@ -352,9 +438,22 @@ impl Pty for RealPty {
     }
 
     fn kill(&mut self) {
-        // shell 是它自己的会话和进程组的首进程：连同它派生的进程一起终止。
-        if let Some(pid) = self.pid {
-            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.pid {
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(pid) = self.pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID"])
+                    .arg(pid.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
         let _ = self.killer.kill();
     }
@@ -366,22 +465,25 @@ mod tests {
 
     #[test]
     fn data_and_key_files_are_private_even_with_existing_permissive_paths() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data");
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let tmp = path.join("device_key.tmp");
-        std::fs::write(&tmp, b"old").unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let sys = RealSystem::new(&path).unwrap();
-        sys.store_put("device_key", &[42; 32]).unwrap();
-        sys.store_put("root_key", &[43; 32]).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
-        for key in ["device_key", "root_key"] {
-            assert_eq!(std::fs::metadata(sys.path(key).unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("data");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let tmp = path.join("device_key.tmp");
+            std::fs::write(&tmp, b"old").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let sys = RealSystem::new(&path).unwrap();
+            sys.store_put("device_key", &[42; 32]).unwrap();
+            sys.store_put("root_key", &[43; 32]).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+            for key in ["device_key", "root_key"] {
+                assert_eq!(std::fs::metadata(sys.path(key).unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            assert_eq!(sys.store_get("device_key").unwrap().unwrap(), [42; 32]);
         }
-        assert_eq!(sys.store_get("device_key").unwrap().unwrap(), [42; 32]);
     }
 
     #[test]

@@ -8,11 +8,11 @@ use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, Node};
 use nexus_sys_real::RealSystem;
 use nexus_wire::{CtlHello, CtlResponse, ErrorCode, Input, WireError};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+
+use crate::ctl_endpoint::{self, BoxedCtlStream, CtlKind};
 
 /// 命令行参数对应的传输设置。
 pub fn transport_config(local_only: bool, relay: &str, no_discovery: bool) -> Config {
@@ -59,7 +59,7 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     let system = RealSystem::new(data_dir)?;
     let key = load_or_create_device_key(&system)?;
     let name = name
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+        .or_else(default_node_name)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "node".to_string());
     let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
@@ -83,15 +83,12 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
         }
     }
 
+    // 本人入口：只有数据目录的主人能连。
     let socket = data_dir.join("ctl.sock");
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let mut listener = ctl_endpoint::bind(&socket, CtlKind::Owner).await?;
 
-    // agent 入口：本机任何账号都能连上，但只接受 agent 凭据，因此给以独立账号运行的 agent 用。
-    let _ = std::fs::remove_file(agent_socket);
-    let agent_listener = UnixListener::bind(agent_socket)?;
-    std::fs::set_permissions(agent_socket, std::fs::Permissions::from_mode(0o666))?;
+    // agent 入口：本机任何账号都能连上，但只接受 agent 凭据。
+    let mut agent_listener = ctl_endpoint::bind(agent_socket, CtlKind::Agent).await?;
 
     if let Some(listener) = proxy {
         let entry = node.proxy_entry();
@@ -111,12 +108,12 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     let (tx, mut rx) = mpsc::channel::<CtlCall>(64);
     let agent_tx = tx.clone();
     tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok(stream) = listener.accept().await {
             tokio::spawn(serve_ctl(stream, tx.clone(), false));
         }
     });
     tokio::spawn(async move {
-        while let Ok((stream, _)) = agent_listener.accept().await {
+        while let Ok(stream) = agent_listener.accept().await {
             tokio::spawn(serve_ctl(stream, agent_tx.clone(), true));
         }
     });
@@ -130,6 +127,22 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     result
 }
 
+/// 没有指定名字时用主机名。Windows 上没有 /etc/hostname，用 COMPUTERNAME。
+fn default_node_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
 /// 等到收到 SIGINT 或 SIGTERM。
 pub async fn signalled() {
     tokio::select! {
@@ -139,17 +152,25 @@ pub async fn signalled() {
 }
 
 async fn terminate() {
-    use tokio::signal::unix::{signal, SignalKind};
-    match signal(SignalKind::terminate()) {
-        Ok(mut s) => {
-            s.recv().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
         }
-        Err(_) => std::future::pending().await,
+    }
+    // Windows 只支持 Ctrl+C（控制台控制事件），上面的 select 已经覆盖。
+    #[cfg(windows)]
+    {
+        std::future::pending().await
     }
 }
 
 /// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
-async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>, agent_only: bool) {
+async fn serve_ctl(mut stream: BoxedCtlStream, tx: mpsc::Sender<CtlCall>, agent_only: bool) {
     let Ok(hello) = read_msg::<_, CtlHello>(&mut stream).await else { return };
     if agent_only && hello.agent.is_none() {
         let e = WireError::new(ErrorCode::Denied, "agent 入口只接受 agent 凭据（--agent 或 NEXUS_AGENT）");
@@ -161,7 +182,7 @@ async fn serve_ctl(mut stream: UnixStream, tx: mpsc::Sender<CtlCall>, agent_only
     if tx.send(call).await.is_err() {
         return;
     }
-    let (rd, mut wr) = stream.into_split();
+    let (rd, mut wr) = tokio::io::split(stream);
     let inputs = client.tx;
     let forward_inputs = async move {
         let mut reader = FrameReader::new(rd);

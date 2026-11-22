@@ -3,7 +3,9 @@ name = "nexus-android"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Android 应用里的 Nexus 核心：经 JNI 启动和停止常驻程序，网卡来自 VpnService。"
+description = "Android 应用里的 Nexus 核心：经 JNI 启动和停止常驻程序，网卡来自 VpnService."
+
+target = "cfg(unix)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

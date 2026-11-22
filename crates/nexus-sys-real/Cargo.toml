@@ -9,8 +9,10 @@ nexus-core-proto.workspace = true
 nexus-sys.workspace = true
 getrandom.workspace = true
 tokio.workspace = true
-nix.workspace = true
 portable-pty.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

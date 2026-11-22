@@ -4,6 +4,7 @@
 //! 因此仿真测试可以直接调用它，行为与真实的 `nexus` 二进制一致。
 #![forbid(unsafe_code)]
 
+pub mod ctl_endpoint;
 pub mod daemon;
 pub mod drive;
 pub mod tun;
@@ -1295,10 +1296,19 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
 /// 只有当前用户能读写的文件。
 fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(text.as_bytes())?;
-    f.write_all(b"\n")
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(text.as_bytes())?;
+        f.write_all(b"\n")
+    }
+    #[cfg(windows)]
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+        f.write_all(text.as_bytes())?;
+        f.write_all(b"\n")
+    }
 }
 
 fn agents_json(list: &[AgentInfo]) -> String {
@@ -1916,8 +1926,15 @@ async fn run_with_services<C: Ctl, K: Sink>(ctl: &C, uses: &[String], command: &
     tokio::select! {
         status = child.wait() => match status {
             Ok(s) => {
-                use std::os::unix::process::ExitStatusExt;
-                s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+                }
+                #[cfg(windows)]
+                {
+                    s.code().unwrap_or(1)
+                }
             }
             Err(e) => fail(sink, EXIT_INTERNAL, "internal", &format!("等待程序结束时出错：{e}")),
         },
