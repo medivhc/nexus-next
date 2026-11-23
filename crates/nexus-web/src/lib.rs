@@ -9,7 +9,7 @@ use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
-use nexus_web_core::{EnrollLink, EntryHandle, Notice, TerminalEnd, TerminalUi, UiEvent, WebNode};
+use nexus_web_core::{EnrollLink, EntryHandle, HardwareKind, HardwareState, Notice, TerminalEnd, TerminalUi, UiEvent, WebNode};
 use nexus_wire::{NewCredential, Size, WireError};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -106,7 +106,7 @@ impl Browser {
             t.add_hint(entry.node, &hint);
             let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
             let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
-            Ok(JsValue::from(Session { node: Rc::new(node) }))
+            Ok(JsValue::from(Session { node: Rc::new(node), hardware: HardwareState::new() }))
         })
     }
 }
@@ -127,6 +127,7 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), JsError> {
 #[wasm_bindgen]
 pub struct Session {
     node: Rc<WebNode<IrohTransport>>,
+    hardware: HardwareState,
 }
 
 #[wasm_bindgen]
@@ -139,6 +140,42 @@ impl Session {
     /// 登录到期的时间（毫秒）。
     pub fn expires_at_ms(&self) -> f64 {
         self.node.expires_at().0 as f64
+    }
+
+    /// 显式开启一项硬件能力（M8.3：camera / microphone / location）。
+    pub fn hardware_enable(&self, kind: String) -> Result<(), JsError> {
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        self.hardware.enable(k);
+        Ok(())
+    }
+
+    /// 关闭一项硬件能力（M8.3）。
+    pub fn hardware_disable(&self, kind: String) -> Result<(), JsError> {
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        self.hardware.disable(k);
+        Ok(())
+    }
+
+    /// 清空全部硬件授权（离开或关闭页面时调用，R32）。
+    pub fn hardware_clear(&self) {
+        self.hardware.clear();
+    }
+
+    /// 返回当前已显式同意开放的硬件能力（JSON 数组）。
+    pub fn hardware_enabled(&self) -> String {
+        let list: Vec<&str> = self.hardware.enabled_list().into_iter().map(HardwareKind::as_str).collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// 返回当前正在使用硬件的调用方（JSON 数组，每项有 caller、kind）。
+    pub fn hardware_active(&self) -> String {
+        let list: Vec<_> = self
+            .hardware
+            .active_users()
+            .into_iter()
+            .map(|(caller, k)| serde_json::json!({ "caller": caller, "kind": k.as_str() }))
+            .collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
     }
 
     /// 能看到的设备的名字（JSON 数组）。

@@ -6,6 +6,8 @@
 //! 场景只通过命令行这一层操作节点，和用户、agent 看到的完全一样。
 #![forbid(unsafe_code)]
 
+pub use nexus_web_core;
+
 pub use nexus_cli::Output;
 
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
@@ -125,7 +127,7 @@ impl World {
                 };
                 Output::from_captured(code, sink)
             }
-            Inner::Real(real) => real.cli(node, args, stdin),
+            Inner::Real(real) => real.cli_async(node, args, stdin).await,
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
         self.trace
@@ -368,7 +370,7 @@ impl World {
             Inner::Sim { .. } => {
                 // 仿真里身份由种子决定，保持可复现。
                 let key = nexus_core_proto::SecretKey::from_seed([(n % 200) as u8 + 50; 32]);
-                BrowserTransport::Sim(SimTransport::client(nexus_core_proto::NodeId(key.public().0)))
+                BrowserTransport::Sim(SimTransport::bind_port(nexus_core_proto::NodeId(key.public().0), SCENARIO_HOST, 19100 + (n as u16)).await.expect("仿真浏览器监听端口失败"))
             }
             Inner::Real(_) => {
                 let mut seed = [0u8; 32];
@@ -608,6 +610,29 @@ impl Browser {
     pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_read(ws, path, max).await)
+    }
+
+    /// 网页节点的临时标识与地址提示（M8.3）。
+    pub fn node_id(&self) -> nexus_core_proto::NodeId {
+        let node = self.node();
+        on_node!(node, n => n.node_id())
+    }
+
+    pub fn hint(&self) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hint())
+    }
+
+    /// 启动网页节点的硬件能力服务循环（M8.3）。
+    pub async fn serve_hardware<P: nexus_web_core::HardwareProvider>(
+        &self,
+        state: nexus_web_core::HardwareState,
+        provider: P,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        on_usage: impl FnMut(nexus_web_core::HardwareUsageEvent),
+    ) {
+        let node = self.node();
+        on_node!(node, n => n.serve_hardware(state, provider, stop, on_usage).await)
     }
 
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
@@ -1371,6 +1396,42 @@ impl RealWorld {
         RealTerm { child: RefCell::new(child), stdin: RefCell::new(stdin), stderr }
     }
 
+    async fn cli_async(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
+        let bin = self.bin.clone();
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
+        let agent_socket = self.agent_socket(node);
+        let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let data = stdin.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = Command::new(&bin)
+                .args(["--data-dir", dir.to_str().unwrap()])
+                .args(&args)
+                .env("NEXUS_AGENT_SOCKET", agent_socket)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("无法执行 nexus");
+            let mut pipe = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+            });
+            let out = child.wait_with_output().expect("无法等待 nexus");
+            let _ = writer.join();
+            let code = out.status.code().unwrap_or(1);
+            Output {
+                code,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stdout_raw: out.stdout,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }
+        })
+        .await
+        .expect("后台执行 nexus 失败")
+    }
+
+    #[allow(dead_code)]
     fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
         let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));

@@ -76,7 +76,70 @@ function devices(session) {
     li.append(open);
     list.append(li);
   }
+  hardwareControls(session);
   workspaces(session);
+}
+
+// ---- 本机硬件能力发布（M8.3）：默认关闭、逐项在浏览器中明确同意、页面显示谁在用、关闭即停止。 ----
+
+const hwStreams = { camera: null, microphone: null };
+
+function stopHardwareAll(session) {
+  for (const key of ["camera", "microphone"]) {
+    if (hwStreams[key]) {
+      for (const t of hwStreams[key].getTracks()) t.stop();
+      hwStreams[key] = null;
+    }
+  }
+  try { session.hardware_clear(); } catch {}
+}
+
+function renderHardwareStatus(session) {
+  const enabled = new Set(JSON.parse(session.hardware_enabled()));
+  for (const [kind, id] of [["camera", "hw-camera"], ["microphone", "hw-microphone"], ["location", "hw-location"]]) {
+    const btn = $(id);
+    if (btn) btn.textContent = enabled.has(kind) ? "关闭" : "开启";
+  }
+  const active = JSON.parse(session.hardware_active());
+  const banner = $("hw-active");
+  if (banner) {
+    banner.textContent = active.length
+      ? `正在使用：${active.map((a) => `${a.caller}（${a.kind}）`).join("、")}`
+      : "当前无人使用本机硬件。";
+  }
+}
+
+function hardwareControls(session) {
+  renderHardwareStatus(session);
+  const toggle = async (kind) => {
+    $("error").textContent = "";
+    const enabled = new Set(JSON.parse(session.hardware_enabled()));
+    try {
+      if (enabled.has(kind)) {
+        if (hwStreams[kind]) {
+          for (const t of hwStreams[kind].getTracks()) t.stop();
+          hwStreams[kind] = null;
+        }
+        session.hardware_disable(kind);
+      } else {
+        if (kind === "camera") {
+          hwStreams.camera = await navigator.mediaDevices.getUserMedia({ video: true });
+        } else if (kind === "microphone") {
+          hwStreams.microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else if (kind === "location") {
+          await new Promise((resolve, reject) =>
+            navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000 }),
+          );
+        }
+        session.hardware_enable(kind);
+      }
+      renderHardwareStatus(session);
+    } catch (e) { fail(e); }
+  };
+  $("hw-camera").onclick = () => toggle("camera");
+  $("hw-microphone").onclick = () => toggle("microphone");
+  $("hw-location").onclick = () => toggle("location");
+  addEventListener("pagehide", () => stopHardwareAll(session), { once: true });
 }
 
 // ---- 工作区（M8.1）：只读浏览、预览、下载。内容只在内存里。 ----

@@ -29,6 +29,13 @@
   <section id="devices" hidden>
     <h1>设备</h1>
     <ul id="device-list"></ul>
+    <h1>本机硬件（需逐项明确同意）</h1>
+    <p id="hw-active" class="muted">当前无人使用本机硬件。</p>
+    <ul id="hw-list">
+      <li><span>摄像头</span><button id="hw-camera">开启</button></li>
+      <li><span>麦克风</span><button id="hw-microphone">开启</button></li>
+      <li><span>位置</span><button id="hw-location">开启</button></li>
+    </ul>
     <h1>工作区</h1>
     <ul id="ws-list"></ul>
     <p id="ws-none" class="muted" hidden>没有能读的工作区。工作区要保存在存储设备上（nexus drive serve on），

@@ -122,6 +122,8 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::DrivePush { ws: "work".into(), head: [4; 32], count: 3 },
         Request::DriveProfilePut { ws: "work".into(), name: "build".into(), files: vec!["/a".into()] },
         Request::DriveProfileGet { ws: "work".into(), name: "build".into() },
+        Request::HardwareList,
+        Request::HardwareCapture { kind: HardwareKind::Location },
     ];
     all.into_iter()
         .map(|r| {
@@ -146,6 +148,8 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::DrivePush { .. } => "request.drive_push",
                 Request::DriveProfilePut { .. } => "request.drive_profile_put",
                 Request::DriveProfileGet { .. } => "request.drive_profile_get",
+                Request::HardwareList => "request.hardware_list",
+                Request::HardwareCapture { .. } => "request.hardware_capture",
             };
             (name, r)
         })
@@ -180,6 +184,8 @@ fn response_samples() -> Vec<(&'static str, Response)> {
         Response::DrivePushed { accepted: false, head: Some([7; 32]) },
         Response::DriveProfile(Some(vec!["/a".into()])),
         Response::Error(WireError::new(ErrorCode::Denied, "不行")),
+        Response::HardwareList(vec![HardwareKind::Camera, HardwareKind::Location]),
+        Response::HardwareCapture(HardwareCapture::Location { lat_e7: 312_304_000, lon_e7: 1_214_737_000, accuracy_cm: 1250, timestamp_ms: 100 }),
     ];
     all.into_iter()
         .map(|r| {
@@ -196,6 +202,8 @@ fn response_samples() -> Vec<(&'static str, Response)> {
                 Response::DrivePushed { .. } => "response.drive_pushed",
                 Response::DriveProfile(_) => "response.drive_profile",
                 Response::Error(_) => "response.error",
+                Response::HardwareList(_) => "response.hardware_list",
+                Response::HardwareCapture(_) => "response.hardware_capture",
             };
             (name, r)
         })

@@ -67,6 +67,16 @@ impl<T: Transport> WebNode<T> {
         }
     }
 
+    /// 网页节点自身的临时标识（M8.3）。
+    pub fn node_id(&self) -> NodeId {
+        self.transport.node_id()
+    }
+
+    /// 网页节点自身的地址提示（M8.3）。
+    pub fn hint(&self) -> String {
+        self.transport.local_hint()
+    }
+
     /// 通行密钥在网络里的名字。
     pub fn label(&self) -> &str {
         &self.session.session.label
