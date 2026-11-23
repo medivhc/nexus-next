@@ -20,6 +20,8 @@ iroh = { workspace = true, features = ["metrics", "portmapper", "fast-apple-data
 iroh-dns = "1.4.1"
 # 网络接口（M5.2：计费网络）。
 nix = { workspace = true, features = ["net"] }
+# 系统根证书 / SSL_CERT_FILE 加载（企业代理与沙箱环境）。
+rustls-pki-types = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

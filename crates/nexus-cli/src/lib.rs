@@ -90,6 +90,9 @@ pub enum Cmd {
         /// 中继：default（公共中继）、disabled，或自建中继的地址
         #[arg(long, default_value = "default")]
         relay: String,
+        /// 只经中继通信，不打开 UDP 直连套接字（适用于禁用 UDP 的沙箱或受限网络）
+        #[arg(long)]
+        relay_only: bool,
         /// 不使用公共地址发现服务
         #[arg(long)]
         no_discovery: bool,

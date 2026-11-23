@@ -145,6 +145,13 @@ impl IrohTransport {
         } else if let Some(addr) = config.bind {
             builder = builder.clear_ip_transports().bind_addr(addr).map_err(io_err)?;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let extra_roots = load_extra_ca_roots();
+            if !extra_roots.is_empty() {
+                builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::embedded().with_extra_roots(extra_roots));
+            }
+        }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
         let (own_tx, own_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -460,6 +467,84 @@ impl Connection for IrohConn {
             Err(_) => Ok(None),
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_extra_ca_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        if !path.trim().is_empty() {
+            paths.push(std::path::PathBuf::from(path));
+        }
+    }
+    for fallback in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ] {
+        let pb = std::path::PathBuf::from(fallback);
+        if !paths.contains(&pb) {
+            paths.push(pb);
+        }
+    }
+    for path in paths {
+        if let Ok(pem) = std::fs::read_to_string(&path) {
+            let certs = parse_pem_certs(&pem);
+            if !certs.is_empty() {
+                return certs;
+            }
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_pem_certs(pem: &str) -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    let mut certs = Vec::new();
+    let mut in_cert = false;
+    let mut b64 = String::new();
+    for line in pem.lines() {
+        let trimmed = line.trim();
+        if trimmed == "-----BEGIN CERTIFICATE-----" {
+            in_cert = true;
+            b64.clear();
+        } else if trimmed == "-----END CERTIFICATE-----" && in_cert {
+            in_cert = false;
+            if let Some(der) = decode_base64(&b64) {
+                certs.push(rustls_pki_types::CertificateDer::from(der));
+            }
+            b64.clear();
+        } else if in_cert {
+            b64.push_str(trimmed);
+        }
+    }
+    certs
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b if b.is_ascii_whitespace() => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
