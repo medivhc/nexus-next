@@ -8,10 +8,22 @@ step() {
   "$@" > /tmp/nexus-ci.log 2>&1 || { cat /tmp/nexus-ci.log; echo "失败：$name"; exit 1; }
   printf '%-28s %6.1f 秒\n' "$name" "$(awk -v a="$(date +%s.%N)" -v b="$start" 'BEGIN { print a - b }')"
 }
-step "L0 结构、追溯、许可证"   python3 tools/check.py
-step "L0 检查脚本自检"         python3 tools/check.py --self-test
+# PR checks run L0 in the mandatory independent sanity job.
+# Standalone, nightly and main-branch runs retain the entire L0-L3 suite.
+if [ "${NEXUS_CI_PR_MODE:-0}" = "1" ]; then
+  echo "PR mode: L0 static checks are covered by the mandatory sanity job"
+else
+  step "L0 结构、追溯、许可证" python3 tools/check.py
+  step "L0 检查脚本自检"       python3 tools/check.py --self-test
+fi
 step "L0 clippy"               cargo clippy --all-targets --quiet -- -D warnings
-step "编译测试"                cargo test --no-run --quiet
+# cargo test --no-run also compiles tests not executed by L1-L3.
+# Keep compile-only coverage nightly/on main; PR compiles the actually executed suites.
+if [ "${NEXUS_CI_PR_MODE:-0}" = "1" ]; then
+  echo "PR mode: skip compile-only targets (nightly/main still compiles all)"
+else
+  step "编译测试"              cargo test --no-run --quiet
+fi
 step "L1 纯逻辑"               cargo test --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core
 step "L1 命令行与运行时单元"   cargo test --quiet -p nexus-cli -p nexus-runtime -p nexus-fabric-iroh --lib --bins
 step "L2 仿真场景"             cargo test --quiet --test scenarios --test terminal --test agent --test web --test anchor --test services --test proxy --test exit --test fullnode --test drive --test drive_sync --test drive_mount --test drive_prefetch --test join_short --test recover --test versions --test session_restart --test upgrade --test open --test web_drive -- sim
