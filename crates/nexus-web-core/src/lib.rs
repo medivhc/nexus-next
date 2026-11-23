@@ -7,10 +7,17 @@
 mod drive;
 mod handle;
 mod node;
+mod service;
+mod share;
 mod terminal;
 pub use drive::{DriveEntry, DriveFile, DriveWorkspace};
 pub use handle::{EntryHandle, MAX_USER_HANDLE};
 pub use node::{challenge, WebNode, WebTerminal};
+pub use service::{
+    encode_http_request, parse_http_response, rewrite_location, rewrite_response_headers, rewrite_set_cookie,
+    WebHttpRequest, WebHttpResponse, MAX_HTTP_RESPONSE_BYTES,
+};
+pub use share::{GuestShare, ShareLink};
 pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
 use nexus_core_proto::authz::Principal;

@@ -130,6 +130,83 @@ pub enum Request {
     DriveProfilePut { ws: String, name: String, files: Vec<String> },
     /// 取预读清单：回应 `DriveProfile`。
     DriveProfileGet { ws: String, name: String },
+    /// 临时分享（M9.1）：访客打开分享链接，校验令牌并扣减一次可用次数。
+    ShareOpen { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客列出被分享目录下的相对子路径。
+    ShareDriveList { token: [u8; 16], path: String },
+    /// 临时分享（M9.1）：访客读取被分享文件（或被分享目录下的相对子路径）最多 `max` 字节。
+    ShareDriveRead { token: [u8; 16], path: String, max: u64 },
+    /// 临时分享（M9.1）：访客连接被分享的 HTTP 服务。
+    ShareServiceConnect { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客只读观看被分享的终端会话。
+    ShareSessionWatch { token: [u8; 16], size: Size },
+}
+
+/// 临时分享的目标（M9.1）：全部为只读访问。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareTarget {
+    Drive { ws: String, path: String },
+    Service { name: String },
+    Terminal { session: String },
+}
+
+impl ShareTarget {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ShareTarget::Drive { .. } => "drive",
+            ShareTarget::Service { .. } => "service",
+            ShareTarget::Terminal { .. } => "terminal",
+        }
+    }
+
+    pub fn describe(&self, device: &str) -> String {
+        match self {
+            ShareTarget::Drive { ws, path } => format!("{device}/drive/{ws}:{path}"),
+            ShareTarget::Service { name } => format!("{device}/svc/{name}"),
+            ShareTarget::Terminal { session } => format!("{device}/session/{session}"),
+        }
+    }
+}
+
+/// 访客打开临时分享后看到的元信息（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub id: String,
+    pub device: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub remaining_uses: Option<u32>,
+}
+
+/// 临时分享目录里的一项（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDriveEntry {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub target: Option<String>,
+}
+
+/// 本机创建的一条临时分享记录（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub id: String,
+    pub target: ShareTarget,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    pub revoked: bool,
+}
+
+/// 创建临时分享的结果（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCreatedReport {
+    pub id: String,
+    pub url: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
 }
 
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
@@ -158,14 +235,22 @@ impl Request {
     pub fn class(&self) -> TrafficClass {
         match self {
             Request::Exec(_) => TrafficClass::Normal,
-            Request::SvcConnect { .. } | Request::ExitConnect { .. } | Request::DriveGet { .. } | Request::DrivePush { .. } => {
+            Request::SvcConnect { .. }
+            | Request::ExitConnect { .. }
+            | Request::DriveGet { .. }
+            | Request::DrivePush { .. }
+            | Request::ShareServiceConnect { .. } => {
                 TrafficClass::Bulk
             }
             Request::DriveInfo
             | Request::DriveRegister { .. }
             | Request::DriveHave { .. }
             | Request::DriveProfilePut { .. }
-            | Request::DriveProfileGet { .. } => TrafficClass::Interactive,
+            | Request::DriveProfileGet { .. }
+            | Request::ShareOpen { .. }
+            | Request::ShareDriveList { .. }
+            | Request::ShareDriveRead { .. }
+            | Request::ShareSessionWatch { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -453,6 +538,9 @@ pub enum Response {
     DrivePushed { accepted: bool, head: Option<[u8; 32]> },
     DriveProfile(Option<Vec<String>>),
     Error(WireError),
+    ShareOpened(ShareInfo),
+    ShareDriveEntries(Vec<ShareDriveEntry>),
+    ShareDriveFile { size: u64, bytes: Vec<u8>, truncated: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,6 +657,9 @@ pub enum CtlRequest {
     WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
     WebList,
     WebRevoke { label: String },
+    ShareCreate { target: ShareTarget, ttl_ms: u64, max_uses: Option<u32>, page: Option<String> },
+    ShareList,
+    ShareRevoke { id: String },
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
@@ -634,6 +725,9 @@ pub enum CtlResponse {
     Audit(Vec<AuditRecord>),
     SshHostKey([u8; 32]),
     WebEnroll(WebEnrollReport),
+    ShareCreated(ShareCreatedReport),
+    Shares(Vec<ShareRecord>),
+    ShareRevoked(ShareRecord),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),

@@ -9,7 +9,9 @@ use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
-use nexus_web_core::{EnrollLink, EntryHandle, Notice, TerminalEnd, TerminalUi, UiEvent, WebNode};
+use nexus_web_core::{
+    EnrollLink, EntryHandle, GuestShare, Notice, ShareLink, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest, WebNode,
+};
 use nexus_wire::{NewCredential, Size, WireError};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -79,6 +81,20 @@ impl Browser {
             let t = connect(seed, relay).await?;
             let label = nexus_web_core::enroll(&t, &link, NewCredential { credential_id, spki, rp_id }).await.map_err(js_err)?;
             Ok(JsValue::from(label))
+        })
+    }
+
+    /// 打开一条临时分享链接（M9.1）：不需要通行密钥，校验令牌后返回 GuestSession。
+    pub fn open_share(&self, link: String) -> js_sys::Promise {
+        let (seed, default_relay, used) = (self.seed, self.default_relay.clone(), self.used.clone());
+        future_to_promise(async move {
+            if used.replace(true) {
+                return Err(JsError::new("这个浏览器实例已经使用过").into());
+            }
+            let parsed = ShareLink::parse(&link).map_err(|e| JsError::new(&e))?;
+            let t = connect(seed, default_relay).await?;
+            let guest = GuestShare::open(t, &parsed).await.map_err(js_err)?;
+            Ok(JsValue::from(GuestSession { guest: Rc::new(guest) }))
         })
     }
 
@@ -252,6 +268,57 @@ impl Terminal {
     /// 离开：会话继续运行。
     pub fn leave(&self) {
         let _ = self.tx.send(UiEvent::Leave);
+    }
+}
+
+/// 访客临时分享会话（M9.1）。
+#[wasm_bindgen]
+pub struct GuestSession {
+    guest: Rc<GuestShare<IrohTransport>>,
+}
+
+#[wasm_bindgen]
+impl GuestSession {
+    /// 分享元信息（JSON）。
+    pub fn info(&self) -> String {
+        let i = self.guest.info();
+        serde_json::to_string(i).unwrap_or_else(|_| "{}".into())
+    }
+
+    /// 列出分享目录下的内容（JSON 数组）。
+    pub fn drive_list(&self, path: String) -> js_sys::Promise {
+        let g = self.guest.clone();
+        future_to_promise(async move {
+            let list = g.drive_list(&path).await.map_err(js_err)?;
+            Ok(JsValue::from(serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
+        })
+    }
+
+    /// 读取分享文件。
+    pub fn drive_read(&self, path: String, max: f64) -> js_sys::Promise {
+        let g = self.guest.clone();
+        future_to_promise(async move {
+            let (size, bytes, truncated) = g.drive_read(&path, max as u64).await.map_err(js_err)?;
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("size"), &JsValue::from(size as f64));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("truncated"), &JsValue::from(truncated));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice()));
+            Ok(obj.into())
+        })
+    }
+
+    /// 访问被分享的 HTTP 服务。
+    pub fn http_fetch(&self, method: String, path: String, headers_json: String, body: Vec<u8>) -> js_sys::Promise {
+        let g = self.guest.clone();
+        future_to_promise(async move {
+            let headers: Vec<(String, String)> =
+                serde_json::from_str(&headers_json).map_err(|e| JsError::new(&format!("请求头 JSON 无效：{e}")))?;
+            let resp = g.http_fetch(&WebHttpRequest { method, path, headers, body }).await.map_err(js_err)?;
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("status"), &JsValue::from(resp.status));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("body"), &js_sys::Uint8Array::from(resp.body.as_slice()));
+            Ok(obj.into())
+        })
     }
 }
 

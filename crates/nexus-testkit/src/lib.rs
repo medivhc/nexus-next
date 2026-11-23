@@ -6,6 +6,8 @@
 //! 场景只通过命令行这一层操作节点，和用户、agent 看到的完全一样。
 #![forbid(unsafe_code)]
 
+pub use nexus_web_core;
+
 pub use nexus_cli::Output;
 
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
@@ -461,8 +463,23 @@ pub struct Browser {
 enum BrowserState {
     Fresh(BrowserTransport),
     LoggedIn(Rc<BrowserNode>),
+    Guest(Rc<BrowserGuest>),
     /// 登录失败：临时身份已经用掉，换一个浏览器重来。
     Spent,
+}
+
+enum BrowserGuest {
+    Sim(nexus_web_core::GuestShare<SimTransport>),
+    Real(nexus_web_core::GuestShare<nexus_fabric_iroh::IrohTransport>),
+}
+
+macro_rules! on_guest {
+    ($g:expr, $n:ident => $body:expr) => {
+        match &*$g {
+            BrowserGuest::Sim($n) => $body,
+            BrowserGuest::Real($n) => $body,
+        }
+    };
 }
 
 enum BrowserTransport {
@@ -569,6 +586,83 @@ impl Browser {
             BrowserState::LoggedIn(n) => n.clone(),
             _ => panic!("{}：还没有登录", self.label),
         }
+    }
+
+    fn guest(&self) -> Rc<BrowserGuest> {
+        match &*self.state.borrow() {
+            BrowserState::Guest(g) => g.clone(),
+            _ => panic!("{}：还没有打开分享链接", self.label),
+        }
+    }
+
+    /// 访客打开临时分享链接（M9.1）。
+    pub async fn share_open(&self, link: &str) -> Result<nexus_wire::ShareInfo, nexus_wire::WireError> {
+        let parsed = nexus_web_core::ShareLink::parse(link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
+        let BrowserState::Fresh(t) = state else { panic!("{}：每个浏览器只能打开一次分享", self.label) };
+        let guest = match t {
+            BrowserTransport::Sim(t) => BrowserGuest::Sim(nexus_web_core::GuestShare::open(t, &parsed).await?),
+            BrowserTransport::Real(t) => BrowserGuest::Real(nexus_web_core::GuestShare::open(t, &parsed).await?),
+        };
+        let info = on_guest!(&guest, g => g.info().clone());
+        *self.state.borrow_mut() = BrowserState::Guest(Rc::new(guest));
+        Ok(info)
+    }
+
+    /// 访客列出分享目录（M9.1）。
+    pub async fn share_drive_ls(&self, sub_path: &str) -> Result<Vec<nexus_wire::ShareDriveEntry>, nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.drive_list(sub_path).await)
+    }
+
+    /// 访客读取分享文件（M9.1）。
+    pub async fn share_drive_read(&self, sub_path: &str, max: u64) -> Result<(u64, Vec<u8>, bool), nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.drive_read(sub_path, max).await)
+    }
+
+    /// 访客访问分享的 HTTP 服务（M9.1）。
+    pub async fn share_http_fetch(
+        &self,
+        req: &nexus_web_core::WebHttpRequest,
+    ) -> Result<nexus_web_core::WebHttpResponse, nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.http_fetch(req).await)
+    }
+
+    /// 访客只读观看分享的终端会话（M9.1）。
+    pub async fn share_term(&self) -> Result<Term, nexus_wire::WireError> {
+        let g = self.guest();
+        let size = nexus_wire::Size::DEFAULT;
+        let state = Arc::new(TermState::new(size));
+        let label = format!("{}（访客只读终端）", self.label);
+        let (input, keys) = tokio::io::duplex(4096);
+        let (resize_tx, resizes) = mpsc::channel(8);
+        let mut ui = PageUi { state: state.clone(), keys, resizes, buf: vec![0u8; 4096] };
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let st = state.clone();
+        tokio::task::spawn_local(async move {
+            let mut first = Some(first_tx);
+            let result = on_guest!(g, n => n.watch_terminal(size, &mut FirstOutput(&mut ui, &mut first)).await);
+            let code = match result {
+                Ok(nexus_web_core::TerminalEnd::Exited(code)) => code.unwrap_or(0),
+                Ok(nexus_web_core::TerminalEnd::Left) => 0,
+                Err(e) => {
+                    if let Some(tx) = first.take() {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    st.feed(format!("\r\n[{}]\r\n", e.message).as_bytes());
+                    -1
+                }
+            };
+            if let Some(tx) = first.take() {
+                let _ = tx.send(Ok(()));
+            }
+            *st.exit.lock().unwrap() = Some(code);
+        });
+        first_rx.await.expect("访客终端任务提前结束")?;
+        Ok(Term { io: TermIo::Sim(SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: Some(resize_tx) }), state, label })
     }
 
     /// 能看到的设备的名字，按字母排序。

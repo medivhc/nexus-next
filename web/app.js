@@ -3,7 +3,7 @@
 import init, { Browser } from "./pkg/nexus_web.js";
 
 const $ = (id) => document.getElementById(id);
-const show = (id) => { for (const s of ["enroll", "login", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
+const show = (id) => { for (const s of ["enroll", "login", "share-view", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
 const status = (text) => { $("status").textContent = text; };
 const fail = (e) => { $("error").textContent = String(e && e.message ? e.message : e); };
 const bytes = (buf) => new Uint8Array(buf);
@@ -236,5 +236,19 @@ function escapeHtml(s) {
 }
 
 await init();
+async function openShare(link) {
+  show("share-view");
+  status("正在打开分享…");
+  try {
+    const browser = new Browser(relay);
+    const guest = await browser.open_share(link);
+    status("");
+    const info = JSON.parse(guest.info());
+    $("share-meta").textContent = `设备 ${info.device} · 编号 ${info.id} · 只读分享`;
+  } catch (e) { status(""); fail(e); }
+}
+
 const hash = location.hash.slice(1);
-if (hash.startsWith("enroll=")) enroll(hash); else login();
+if (hash.startsWith("enroll=")) enroll(hash);
+else if (hash.startsWith("share=")) openShare(hash);
+else login();

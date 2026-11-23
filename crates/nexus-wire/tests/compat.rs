@@ -122,6 +122,11 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::DrivePush { ws: "work".into(), head: [4; 32], count: 3 },
         Request::DriveProfilePut { ws: "work".into(), name: "build".into(), files: vec!["/a".into()] },
         Request::DriveProfileGet { ws: "work".into(), name: "build".into() },
+        Request::ShareOpen { token: [8; 16] },
+        Request::ShareDriveList { token: [8; 16], path: "/sub".into() },
+        Request::ShareDriveRead { token: [8; 16], path: "/a.txt".into(), max: 1024 },
+        Request::ShareServiceConnect { token: [8; 16] },
+        Request::ShareSessionWatch { token: [8; 16], size: Size { cols: 80, rows: 24 } },
     ];
     all.into_iter()
         .map(|r| {
@@ -146,6 +151,11 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::DrivePush { .. } => "request.drive_push",
                 Request::DriveProfilePut { .. } => "request.drive_profile_put",
                 Request::DriveProfileGet { .. } => "request.drive_profile_get",
+                Request::ShareOpen { .. } => "request.share_open",
+                Request::ShareDriveList { .. } => "request.share_drive_list",
+                Request::ShareDriveRead { .. } => "request.share_drive_read",
+                Request::ShareServiceConnect { .. } => "request.share_service_connect",
+                Request::ShareSessionWatch { .. } => "request.share_session_watch",
             };
             (name, r)
         })
@@ -180,6 +190,15 @@ fn response_samples() -> Vec<(&'static str, Response)> {
         Response::DrivePushed { accepted: false, head: Some([7; 32]) },
         Response::DriveProfile(Some(vec!["/a".into()])),
         Response::Error(WireError::new(ErrorCode::Denied, "不行")),
+        Response::ShareOpened(ShareInfo {
+            id: "01020304".into(),
+            device: "home".into(),
+            target: ShareTarget::Service { name: "web".into() },
+            expires_at: Timestamp(500),
+            remaining_uses: Some(3),
+        }),
+        Response::ShareDriveEntries(vec![ShareDriveEntry { name: "a.txt".into(), kind: "file".into(), size: 5, target: None }]),
+        Response::ShareDriveFile { size: 5, bytes: b"hello".to_vec(), truncated: false },
     ];
     all.into_iter()
         .map(|r| {
@@ -196,6 +215,9 @@ fn response_samples() -> Vec<(&'static str, Response)> {
                 Response::DrivePushed { .. } => "response.drive_pushed",
                 Response::DriveProfile(_) => "response.drive_profile",
                 Response::Error(_) => "response.error",
+                Response::ShareOpened(_) => "response.share_opened",
+                Response::ShareDriveEntries(_) => "response.share_drive_entries",
+                Response::ShareDriveFile { .. } => "response.share_drive_file",
             };
             (name, r)
         })
