@@ -9,7 +9,10 @@ use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
-use nexus_web_core::{EnrollLink, EntryHandle, Notice, TerminalEnd, TerminalUi, UiEvent, WebNode};
+use nexus_web_core::{
+    rewrite_response_headers, EnrollLink, EntryHandle, Notice, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest,
+    WebNode,
+};
 use nexus_wire::{NewCredential, Size, WireError};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -145,6 +148,51 @@ impl Session {
     pub fn devices(&self) -> String {
         let names: Vec<&str> = self.node.devices().iter().map(|d| d.name.as_str()).collect();
         serde_json::to_string(&names).expect("名字总能编码")
+    }
+
+    /// 一台设备上已发布且当前通行密钥可访问的服务（M8.2）：JSON 数组，每项有 name、proto、env。
+    pub fn services(&self, device: String) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.services(&device).await.map_err(js_err)?;
+            let list: Vec<_> = list
+                .iter()
+                .map(|s| {
+                    let env: serde_json::Map<String, serde_json::Value> =
+                        s.env.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+                    serde_json::json!({ "name": s.name, "proto": s.proto, "env": env })
+                })
+                .collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 通过 `SvcConnect` 向已发布的 HTTP 服务转发一条 HTTP/1.1 请求（M8.2）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn http_fetch(
+        &self,
+        device: String,
+        service: String,
+        method: String,
+        path: String,
+        headers_json: String,
+        body: Vec<u8>,
+    ) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let headers: Vec<(String, String)> =
+                serde_json::from_str(&headers_json).map_err(|e| JsError::new(&format!("请求头 JSON 无效：{e}")))?;
+            let req = WebHttpRequest { method, path, headers, body };
+            let mut resp = node.http_fetch(&device, &service, &req).await.map_err(js_err)?;
+            rewrite_response_headers(&mut resp, &device, &service);
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("status"), &JsValue::from(resp.status));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("statusText"), &JsValue::from_str(&resp.status_text));
+            let headers_str = serde_json::to_string(&resp.headers).unwrap_or_else(|_| "[]".into());
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("headers"), &JsValue::from_str(&headers_str));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("body"), &js_sys::Uint8Array::from(resp.body.as_slice()));
+            Ok(obj.into())
+        })
     }
 
     /// 一台设备上的会话：Promise 的结果是 JSON 数组，每项有 name、clients。

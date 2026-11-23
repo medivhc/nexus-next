@@ -6,6 +6,8 @@
 //! 场景只通过命令行这一层操作节点，和用户、agent 看到的完全一样。
 #![forbid(unsafe_code)]
 
+pub use nexus_web_core;
+
 pub use nexus_cli::Output;
 
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
@@ -608,6 +610,23 @@ impl Browser {
     pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_read(ws, path, max).await)
+    }
+
+    /// 列出目标设备上当前通行密钥可见的服务（M8.2）。
+    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.services(device).await)
+    }
+
+    /// 通过 `SvcConnect` 向目标设备的 HTTP 服务转发一条 HTTP/1.1 请求（M8.2）。
+    pub async fn http_fetch(
+        &self,
+        device: &str,
+        service: &str,
+        req: &nexus_web_core::WebHttpRequest,
+    ) -> Result<nexus_web_core::WebHttpResponse, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.http_fetch(device, service, req).await)
     }
 
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。

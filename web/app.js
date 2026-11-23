@@ -3,7 +3,7 @@
 import init, { Browser } from "./pkg/nexus_web.js";
 
 const $ = (id) => document.getElementById(id);
-const show = (id) => { for (const s of ["enroll", "login", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
+const show = (id) => { for (const s of ["enroll", "login", "devices", "files", "service", "terminal"]) $(s).hidden = s !== id; };
 const status = (text) => { $("status").textContent = text; };
 const fail = (e) => { $("error").textContent = String(e && e.message ? e.message : e); };
 const bytes = (buf) => new Uint8Array(buf);
@@ -73,7 +73,10 @@ function devices(session) {
     const open = document.createElement("button");
     open.textContent = "终端";
     open.onclick = () => terminal(session, name, "main");
-    li.append(open);
+    const svcs = document.createElement("button");
+    svcs.textContent = "服务";
+    svcs.onclick = () => servicesView(session, name);
+    li.append(open, svcs);
     list.append(li);
   }
   workspaces(session);
@@ -229,6 +232,116 @@ function terminal(session, device, name) {
   addEventListener("pagehide", leave);
   $("term-leave").onclick = leave;
   term.focus();
+}
+
+// ---- 网页服务（M8.2）：按需注册零存储 Service Worker，离开即注销（R32）。 ----
+
+let activeSvcReg = null;
+let activeSvcHandler = null;
+
+async function teardownServiceWorker() {
+  if (activeSvcHandler && navigator.serviceWorker) {
+    navigator.serviceWorker.removeEventListener("message", activeSvcHandler);
+    activeSvcHandler = null;
+  }
+  if (activeSvcReg) {
+    try { activeSvcReg.active?.postMessage({ type: "nexus-unregister" }); } catch {}
+    try { await activeSvcReg.unregister(); } catch {}
+    activeSvcReg = null;
+  }
+}
+
+async function ensureServiceWorker(session) {
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("当前浏览器不支持 Service Worker，无法内嵌打开网页服务");
+  }
+  if (!activeSvcReg) {
+    activeSvcReg = await navigator.serviceWorker.register("./sw.js", { scope: "./" });
+    await navigator.serviceWorker.ready;
+  }
+  if (!activeSvcHandler) {
+    activeSvcHandler = async (event) => {
+      const msg = event.data;
+      if (!msg || msg.type !== "nexus-http-fetch" || !event.ports || !event.ports[0]) return;
+      const port = event.ports[0];
+      try {
+        const body = msg.body ? new Uint8Array(msg.body) : new Uint8Array(0);
+        const resp = await session.http_fetch(
+          msg.device,
+          msg.service,
+          msg.method || "GET",
+          msg.path || "/",
+          JSON.stringify(msg.headers || []),
+          body,
+        );
+        const raw = resp.body ? new Uint8Array(resp.body) : new Uint8Array(0);
+        const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+        port.postMessage(
+          {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: JSON.parse(resp.headers || "[]"),
+            body: buf,
+          },
+          [buf],
+        );
+      } catch (e) {
+        port.postMessage({ error: String(e && e.message ? e.message : e) });
+      }
+    };
+    navigator.serviceWorker.addEventListener("message", activeSvcHandler);
+  }
+}
+
+async function servicesView(session, device) {
+  $("error").textContent = "";
+  show("service");
+  $("svc-title").textContent = `${device} · 服务`;
+  const listEl = $("svc-list");
+  const frame = $("svc-frame");
+  frame.hidden = true;
+  frame.src = "about:blank";
+  listEl.innerHTML = "";
+  const leave = async () => {
+    removeEventListener("pagehide", onHide);
+    frame.src = "about:blank";
+    frame.hidden = true;
+    await teardownServiceWorker();
+    devices(session);
+  };
+  const onHide = () => { teardownServiceWorker(); };
+  addEventListener("pagehide", onHide);
+  $("svc-leave").onclick = leave;
+  $("svc-reload").onclick = () => { if (!frame.hidden) frame.contentWindow?.location.reload(); };
+  try {
+    status("加载服务列表…");
+    const items = JSON.parse(await session.services(device));
+    status("");
+    const httpItems = items.filter((s) => s.proto === "http");
+    if (httpItems.length === 0) {
+      listEl.innerHTML = `<li class="muted">没有可打开的 HTTP 服务（需要 --proto http 及 svc.connect 授权）。</li>`;
+      return;
+    }
+    for (const svc of httpItems) {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="name">${escapeHtml(svc.name)}</span><span class="muted">${escapeHtml(svc.proto)}</span>`;
+      const btn = document.createElement("button");
+      btn.textContent = "打开";
+      btn.onclick = async () => {
+        $("error").textContent = "";
+        try {
+          status("准备服务通道…");
+          await ensureServiceWorker(session);
+          status("");
+          $("svc-title").textContent = `${device} / ${svc.name}`;
+          frame.hidden = false;
+          frame.src = `/_svc/${encodeURIComponent(device)}/${encodeURIComponent(svc.name)}/`;
+        } catch (e) { status(""); fail(e); }
+      };
+      li.append(btn);
+      listEl.append(li);
+    }
+  } catch (e) { status(""); fail(e); }
 }
 
 function escapeHtml(s) {
