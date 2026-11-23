@@ -610,6 +610,26 @@ impl Browser {
         on_node!(node, n => n.drive_read(ws, path, max).await)
     }
 
+    /// 设备上能用的服务（M8.2）。
+    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.services(device).await)
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求（M8.2）。
+    pub async fn http(
+        &self,
+        device: &str,
+        service: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.http(device, service, method, path, headers, body).await)
+    }
+
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
     pub async fn term(&self, device: &str, session: &str) -> Result<Term, nexus_wire::WireError> {
         let node = self.node();
@@ -1888,6 +1908,21 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
             let (mut r, mut w) = s.split();
             let _ = tokio::io::copy(&mut r, &mut w).await;
             let _ = w.shutdown().await;
+        }
+        Service::HttpEcho => {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            let reply = loop {
+                if let Some(r) = nexus_sys_sim::http_echo_reply(&req) {
+                    break r;
+                }
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            };
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
         }
         Service::Http(body) => {
             let mut head = Vec::new();

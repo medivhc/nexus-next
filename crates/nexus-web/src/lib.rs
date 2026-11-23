@@ -187,6 +187,27 @@ impl Session {
         })
     }
 
+    /// 设备上能用的服务（M8.2）：Promise 的结果是 JSON 数组，每项有 name、proto。
+    pub fn services(&self, device: String) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.services(&device).await.map_err(js_err)?;
+            let list: Vec<_> = list.iter().map(|s| serde_json::json!({ "name": s.name, "proto": s.proto })).collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求：`headers` 是 JSON 的 [[名字, 值], ...]。
+    /// Promise 的结果是 [`HttpResult`]。
+    pub fn http(&self, device: String, service: String, method: String, path: String, headers: String, body: Vec<u8>) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let headers: Vec<(String, String)> = serde_json::from_str(&headers).map_err(|e| JsValue::from_str(&format!("请求头不合法：{e}")))?;
+            let r = node.http(&device, &service, &method, &path, &headers, &body).await.map_err(js_err)?;
+            Ok(JsValue::from(HttpResult { status: r.status, reason: r.reason, headers: r.headers, body: r.body }))
+        })
+    }
+
     /// 打开一台设备上的终端会话（不存在时创建）。
     ///
     /// `on_output(Uint8Array)` 显示输出；`on_notice(string)` 在连接中断（"reconnecting"）和恢复（"reconnected"）时调用；
@@ -206,6 +227,35 @@ impl Session {
             let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
+    }
+}
+
+/// 网页服务的回应。
+#[wasm_bindgen]
+pub struct HttpResult {
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl HttpResult {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn reason(&self) -> String {
+        self.reason.clone()
+    }
+
+    /// JSON 的 [[名字, 值], ...]。
+    pub fn headers(&self) -> String {
+        serde_json::to_string(&self.headers).unwrap_or_else(|_| "[]".into())
+    }
+
+    pub fn body(&self) -> Vec<u8> {
+        self.body.clone()
     }
 }
 

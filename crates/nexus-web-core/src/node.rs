@@ -21,6 +21,8 @@ pub struct WebNode<T> {
     devices: Vec<WebDevice>,
     /// 工作区的对象（提交、目录、文件清单）：按哈希寻址，取过的不用再取（M8.1）。
     drive_cache: std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>>,
+    /// 服务的协议，按（设备，服务）（M8.2）。
+    svc_protos: std::cell::RefCell<std::collections::HashMap<(String, String), String>>,
 }
 
 impl<T: Transport> WebNode<T> {
@@ -32,7 +34,7 @@ impl<T: Transport> WebNode<T> {
                 for d in &devices {
                     transport.add_hint(d.node_id, &d.hint);
                 }
-                Ok(Self { transport, session, devices, drive_cache: Default::default() })
+                Ok(Self { transport, session, devices, drive_cache: Default::default(), svc_protos: Default::default() })
             }
             Response::Error(e) => Err(e),
             other => Err(WireError::new(ErrorCode::Internal, format!("入口设备的回应无法理解：{other:?}"))),
@@ -45,6 +47,10 @@ impl<T: Transport> WebNode<T> {
 
     pub(crate) fn transport(&self) -> &T {
         &self.transport
+    }
+
+    pub(crate) fn svc_protos(&self) -> &std::cell::RefCell<std::collections::HashMap<(String, String), String>> {
+        &self.svc_protos
     }
 
     pub(crate) fn drive_cache(&self) -> &std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>> {

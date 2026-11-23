@@ -54,6 +54,9 @@ pub enum SimService {
     Echo,
     /// 读完一个 HTTP 请求头，回应 200 和这段正文，然后关闭。
     Http(String),
+    /// 读完一个 HTTP 请求（头和正文），回显方法、路径、Cookie、正文（分块传输，带 `Set-Cookie: visited=yes`）；
+    /// 路径 `/go` 回应 302 到 `/landed`。见 [`http_echo_reply`]。
+    HttpEcho,
     /// 一个上游 SOCKS5 代理（测试用）：不认证；目标名字以 `refuse.` 开头时回应「连接被拒绝」，
     /// 否则回应成功，再像 `Http` 那样回应正文 `via upstream to <目标>`。
     Socks5Upstream,
@@ -680,6 +683,41 @@ impl tokio::io::AsyncRead for SimTcp {
     }
 }
 
+/// [`SimService::HttpEcho`] 的回应：请求（头和 `Content-Length` 的正文）还没到齐时为 `None`。
+pub fn http_echo_reply(req: &[u8]) -> Option<Vec<u8>> {
+    let end = req.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let head = std::str::from_utf8(&req[..end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next()?.split(' ');
+    let (method, path) = (first.next()?, first.next()?);
+    let (mut len, mut cookie) = (0usize, String::new());
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "content-length" => len = v.trim().parse().ok()?,
+                "cookie" => cookie = v.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+    if req.len() < end + len {
+        return None;
+    }
+    if path == "/go" {
+        return Some(b"HTTP/1.1 302 Found\r\nLocation: /landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
+    }
+    let text = format!("{method} {path}\ncookie: {cookie}\nbody: {}\n", String::from_utf8_lossy(&req[end..end + len]));
+    let (a, b) = text.as_bytes().split_at(text.len() / 2);
+    let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: visited=yes; Path=/\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    for part in [a, b] {
+        out.extend(format!("{:x}\r\n", part.len()).as_bytes());
+        out.extend(part);
+        out.extend(b"\r\n");
+    }
+    out.extend(b"0\r\n\r\n");
+    Some(out)
+}
+
 fn http_reply(body: &str) -> String {
     format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
 }
@@ -753,6 +791,15 @@ impl tokio::io::AsyncWrite for SimTcp {
                 std::task::Poll::Ready(Ok(data.len()))
             }
             SimService::Socks5Upstream => std::task::Poll::Ready(Ok(data.len())),
+            SimService::HttpEcho => {
+                self.inbox.extend_from_slice(data);
+                if let Some(reply) = http_echo_reply(&self.inbox) {
+                    self.outbox.extend(reply);
+                    self.closed = true;
+                    self.wake_reader();
+                }
+                std::task::Poll::Ready(Ok(data.len()))
+            }
             SimService::Http(body) => {
                 self.inbox.extend_from_slice(data);
                 if self.inbox.windows(4).any(|w| w == b"\r\n\r\n") {
