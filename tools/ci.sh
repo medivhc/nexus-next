@@ -14,7 +14,7 @@ step "L0 clippy"               cargo clippy --all-targets --quiet -- -D warnings
 step "编译测试"                cargo test --no-run --quiet
 step "L1 纯逻辑"               cargo test --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core
 step "L1 命令行与运行时单元"   cargo test --quiet -p nexus-cli -p nexus-runtime -p nexus-fabric-iroh --lib --bins
-step "L2 仿真场景"             cargo test --quiet --test scenarios --test terminal --test agent --test web --test anchor --test services --test proxy --test exit --test fullnode --test drive --test drive_sync --test drive_mount --test drive_prefetch --test join_short --test recover --test versions --test session_restart --test upgrade --test open -- sim
+step "L2 仿真场景"             cargo test --quiet --test scenarios --test terminal --test agent --test web --test anchor --test services --test proxy --test exit --test fullnode --test drive --test drive_sync --test drive_mount --test drive_prefetch --test join_short --test recover --test versions --test session_restart --test upgrade --test open --test web_drive -- sim
 # 完整节点的场景要建虚拟网卡（CAP_NET_ADMIN）：不是 root 但能免密 sudo 时（例如 GitHub 的 runner），
 # 给测试用的二进制加上这项能力；都不行时跳过这些场景并说明。
 FULLNODE="--test fullnode"
@@ -29,7 +29,7 @@ if [ "$(id -u)" != 0 ]; then
   fi
 fi
 step "L3 本机中继"             cargo test --quiet -p nexus-fabric-iroh --test relay
-step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web --test anchor --test services --test proxy --test exit $FULLNODE --test drive --test drive_sync --test drive_mount --test drive_prefetch --test join_short --test recover --test versions --test session_restart --test upgrade --test open -- real
+step "L3 真实场景"             cargo test --quiet --test scenarios --test terminal --test agent --test ssh --test web --test anchor --test services --test proxy --test exit $FULLNODE --test drive --test drive_sync --test drive_mount --test drive_prefetch --test join_short --test recover --test versions --test session_restart --test upgrade --test open --test web_drive -- real
 step "L3 用户手册"             python3 tools/manual_check.py
 step "L3 新旧混跑（自检）"     python3 tools/compat_check.py --old-bin target/debug/nexus
 # 需要 root、ip、tc；不满足时跳过（脚本自己说明原因）。

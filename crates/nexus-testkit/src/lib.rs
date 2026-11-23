@@ -591,6 +591,25 @@ impl Browser {
         Ok(list.into_iter().map(|s| s.name).collect())
     }
 
+    /// 能读的工作区：（名字，存储设备），按名字排序（M8.1）。
+    pub async fn drive_workspaces(&self) -> Result<Vec<(String, String)>, nexus_wire::WireError> {
+        let node = self.node();
+        let list = on_node!(node, n => n.drive_workspaces().await)?;
+        Ok(list.into_iter().map(|w| (w.name, w.device)).collect())
+    }
+
+    /// 列出工作区里的目录（M8.1）。
+    pub async fn drive_ls(&self, ws: &str, path: &str) -> Result<Vec<nexus_web_core::DriveEntry>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.drive_list(ws, path).await)
+    }
+
+    /// 读工作区里文件开头的最多 `max` 字节（M8.1）。
+    pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.drive_read(ws, path, max).await)
+    }
+
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
     pub async fn term(&self, device: &str, session: &str) -> Result<Term, nexus_wire::WireError> {
         let node = self.node();

@@ -19,6 +19,8 @@ pub struct WebNode<T> {
     transport: T,
     session: SignedWebSession,
     devices: Vec<WebDevice>,
+    /// 工作区的对象（提交、目录、文件清单）：按哈希寻址，取过的不用再取（M8.1）。
+    drive_cache: std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>>,
 }
 
 impl<T: Transport> WebNode<T> {
@@ -30,18 +32,26 @@ impl<T: Transport> WebNode<T> {
                 for d in &devices {
                     transport.add_hint(d.node_id, &d.hint);
                 }
-                Ok(Self { transport, session, devices })
+                Ok(Self { transport, session, devices, drive_cache: Default::default() })
             }
             Response::Error(e) => Err(e),
             other => Err(WireError::new(ErrorCode::Internal, format!("入口设备的回应无法理解：{other:?}"))),
         }
     }
 
-    fn principal(&self) -> Principal {
+    pub(crate) fn principal(&self) -> Principal {
         Principal::Web { session: self.session.clone() }
     }
 
-    fn device(&self, name: &str) -> Result<NodeId, WireError> {
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub(crate) fn drive_cache(&self) -> &std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>> {
+        &self.drive_cache
+    }
+
+    pub(crate) fn device(&self, name: &str) -> Result<NodeId, WireError> {
         self.devices
             .iter()
             .find(|d| d.name == name)
@@ -49,7 +59,7 @@ impl<T: Transport> WebNode<T> {
             .ok_or_else(|| WireError::new(ErrorCode::UnknownNode, format!("不认识设备 {name}")))
     }
 
-    async fn rpc(&self, device: &str, body: Request) -> Result<Response, WireError> {
+    pub(crate) async fn rpc(&self, device: &str, body: Request) -> Result<Response, WireError> {
         let to = self.device(device)?;
         match call(&self.transport, to, Proto::Rpc, self.principal(), body).await? {
             Response::Error(e) => Err(e),

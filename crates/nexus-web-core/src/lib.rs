@@ -4,9 +4,11 @@
 //! 通行密钥由软件认证器扮演。这里只做协议，不碰浏览器 API：通行密钥的创建和签名由调用方完成。
 #![forbid(unsafe_code)]
 
+mod drive;
 mod handle;
 mod node;
 mod terminal;
+pub use drive::{DriveEntry, DriveFile, DriveWorkspace};
 pub use handle::{EntryHandle, MAX_USER_HANDLE};
 pub use node::{challenge, WebNode, WebTerminal};
 pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};

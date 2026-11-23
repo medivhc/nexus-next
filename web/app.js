@@ -3,7 +3,7 @@
 import init, { Browser } from "./pkg/nexus_web.js";
 
 const $ = (id) => document.getElementById(id);
-const show = (id) => { for (const s of ["enroll", "login", "devices", "terminal"]) $(s).hidden = s !== id; };
+const show = (id) => { for (const s of ["enroll", "login", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
 const status = (text) => { $("status").textContent = text; };
 const fail = (e) => { $("error").textContent = String(e && e.message ? e.message : e); };
 const bytes = (buf) => new Uint8Array(buf);
@@ -76,6 +76,126 @@ function devices(session) {
     li.append(open);
     list.append(li);
   }
+  workspaces(session);
+}
+
+// ---- 工作区（M8.1）：只读浏览、预览、下载。内容只在内存里。 ----
+
+const PREVIEW_MAX = 1 << 20;
+const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml" };
+
+function humanSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1 << 20) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1 << 30) return `${(n / (1 << 20)).toFixed(1)} MB`;
+  return `${(n / (1 << 30)).toFixed(1)} GB`;
+}
+
+function typeOf(name) {
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  return IMAGE_TYPES[ext] || "application/octet-stream";
+}
+
+async function workspaces(session) {
+  const list = $("ws-list");
+  list.innerHTML = "";
+  $("ws-none").hidden = true;
+  try {
+    const all = JSON.parse(await session.workspaces());
+    $("ws-none").hidden = all.length > 0;
+    for (const w of all) {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="name">${escapeHtml(w.name)}</span><span class="muted">${escapeHtml(w.device)}</span>`;
+      const open = document.createElement("button");
+      open.textContent = "浏览";
+      open.onclick = () => browse(session, w.name, "");
+      li.append(open);
+      list.append(li);
+    }
+  } catch (e) { fail(e); }
+}
+
+async function browse(session, ws, path) {
+  $("error").textContent = "";
+  show("files");
+  $("preview").hidden = true;
+  $("files-path").textContent = `${ws}:/${path}`;
+  const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  $("files-back").onclick = () => (path ? browse(session, ws, parent) : devices(session));
+  const list = $("file-list");
+  list.innerHTML = "";
+  let entries;
+  try { entries = JSON.parse(await session.list(ws, path)); } catch (e) { return fail(e); }
+  if (entries.length === 0) list.innerHTML = `<li class="muted">（空）</li>`;
+  for (const e of entries) {
+    const li = document.createElement("li");
+    const full = path ? `${path}/${e.name}` : e.name;
+    const a = document.createElement("a");
+    a.href = "#";
+    a.dataset.kind = e.kind;
+    a.textContent = e.kind === "dir" ? `${e.name}/` : e.name;
+    const info = document.createElement("span");
+    info.className = "muted";
+    info.textContent = e.kind === "file" ? humanSize(e.size) : e.kind === "symlink" ? `→ ${e.target}` : "";
+    if (e.kind === "dir") a.onclick = (ev) => { ev.preventDefault(); browse(session, ws, full); };
+    else if (e.kind === "file") a.onclick = (ev) => { ev.preventDefault(); preview(session, ws, full, e.name); };
+    else a.onclick = (ev) => ev.preventDefault();
+    li.append(a, info);
+    list.append(li);
+  }
+}
+
+let previewUrl = null;
+async function preview(session, ws, path, name) {
+  $("error").textContent = "";
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+  const [text, img, note] = [$("preview-text"), $("preview-image"), $("preview-note")];
+  text.hidden = img.hidden = true;
+  text.textContent = note.textContent = "";
+  $("preview").hidden = false;
+  $("preview-name").textContent = name;
+  $("preview-size").textContent = "";
+  $("preview-download").onclick = () => download(session, ws, path, name);
+  status("读取中…");
+  let f;
+  try { f = await session.read(ws, path, PREVIEW_MAX); } catch (e) { status(""); return fail(e); }
+  status("");
+  const data = f.bytes();
+  $("preview-size").textContent = humanSize(f.size());
+  const type = typeOf(name);
+  if (type.startsWith("image/")) {
+    if (f.truncated()) { note.textContent = "图片太大，没有预览；可以下载。"; return; }
+    previewUrl = URL.createObjectURL(new Blob([data], { type }));
+    img.src = previewUrl;
+    img.hidden = false;
+    return;
+  }
+  let decoded = null;
+  if (!data.includes(0)) {
+    // 只读了开头时，最后一个字符可能被截断：那时不要求严格。
+    try { decoded = new TextDecoder("utf-8", { fatal: !f.truncated() }).decode(data); } catch { decoded = null; }
+  }
+  if (decoded === null) { note.textContent = "不是文本或图片，没有预览；可以下载。"; return; }
+  text.textContent = decoded;
+  text.hidden = false;
+  if (f.truncated()) note.textContent = `只显示了开头的 ${humanSize(data.length)}；完整的文件可以下载。`;
+}
+
+async function download(session, ws, path, name) {
+  $("error").textContent = "";
+  status("下载中…");
+  try {
+    const f = await session.read(ws, path, Number.MAX_SAFE_INTEGER);
+    const url = URL.createObjectURL(new Blob([f.bytes()], { type: typeOf(name) }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    status("");
+  } catch (e) { status(""); fail(e); }
 }
 
 function terminal(session, device, name) {

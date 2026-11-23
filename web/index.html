@@ -29,6 +29,20 @@
   <section id="devices" hidden>
     <h1>设备</h1>
     <ul id="device-list"></ul>
+    <h1>工作区</h1>
+    <ul id="ws-list"></ul>
+    <p id="ws-none" class="muted" hidden>没有能读的工作区。工作区要保存在存储设备上（nexus drive serve on），
+      通行密钥要有读它的授权：在管理设备上登记时加 <code>--grant drive.read@**</code>（另外给出终端和状态的授权）。</p>
+  </section>
+  <section id="files" hidden>
+    <div class="bar"><button id="files-back">返回</button><span id="files-path"></span></div>
+    <ul id="file-list"></ul>
+    <div id="preview" hidden>
+      <div class="bar"><span id="preview-name"></span><span id="preview-size" class="muted"></span><button id="preview-download">下载</button></div>
+      <p id="preview-note" class="muted"></p>
+      <pre id="preview-text" hidden></pre>
+      <img id="preview-image" alt="" hidden>
+    </div>
   </section>
   <section id="terminal" hidden>
     <div class="bar"><button id="term-leave">离开</button><span id="term-title"></span></div>

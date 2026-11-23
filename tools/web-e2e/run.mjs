@@ -1,10 +1,10 @@
 // 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
 // laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
-// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览器里不留存储。
+// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、浏览器里不留存储。
 //
 // 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 //
-// covers: R28, R29, R30, R32, R34, R35, R36
+// covers: R28, R29, R30, R32, R34, R35, R36, R70
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync } from "node:fs";
@@ -39,10 +39,11 @@ function background(cmd, args, env = {}) {
 }
 
 const dataDir = (n) => join(root, n, "data");
-function nexus(node, args) {
+function nexus(node, args, input) {
   const out = execFileSync(opt.nexus, ["--data-dir", dataDir(node), ...args], {
     env: { ...process.env, NEXUS_AGENT_SOCKET: join(root, node, "agent.sock"), HOME: join(root, node) },
     encoding: "utf8",
+    input,
   });
   return out.trim().startsWith("{") ? JSON.parse(out) : out;
 }
@@ -79,6 +80,13 @@ try {
   const { code } = nexus("home", ["join", "--json"]);
   nexus("laptop", ["device", "approve", code, "--name", "home", "--json"]);
   nexus("laptop", ["anchor", "set", pageUrl, "--json"]);
+  // 工作区（R70）：laptop 同时是存储设备。
+  nexus("laptop", ["drive", "serve", "on", "--json"]);
+  nexus("laptop", ["drive", "create", "work", "--json"]);
+  nexus("laptop", ["drive", "put", "work:/notes/hello.txt", "--json"], "hello from the workspace\n");
+  nexus("laptop", ["drive", "put", "work:/dot.svg", "--json"],
+    '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><circle cx="4" cy="4" r="4"/></svg>');
+  nexus("laptop", ["drive", "commit", "work", "-m", "e2e", "--json"]);
   log("网络就绪");
 
   browser = await chromium.launch({ executablePath: opt.chrome, args: ["--no-sandbox"] });
@@ -95,7 +103,8 @@ try {
 
   // 登记（R29）。
   // 不给 --page：登记链接指向名册里的锚点。
-  const { url } = nexus("laptop", ["web", "enroll", "--label", "phone", "--json"]);
+  const { url } = nexus("laptop", ["web", "enroll", "--label", "phone", "--grant", "term.session.*@**",
+    "--grant", "node.info@**", "--grant", "drive.read@**", "--json"]);
   if (!url.startsWith(`${pageUrl}/#enroll=`)) throw new Error(`登记链接没有指向锚点：${url}`);
   await page.goto(url);
   await page.click("#enroll-go");
@@ -144,6 +153,28 @@ try {
   await page.keyboard.type("echo back-$((40+2))\n");
   await waitFor("冻结后恢复", async () => (await screen()).includes("back-42"), 20000);
   log("冻结 20 秒后恢复");
+
+  // 浏览工作区、预览、下载（R70，FP-8.1-01、02）。
+  await page.click("#term-leave");
+  await page.waitForSelector("#ws-list li:has-text('work')", { timeout: 20000 });
+  await page.click("#ws-list li:has-text('work') button");
+  await page.click("#file-list a[data-kind='dir']:has-text('notes')");
+  await page.click("#file-list a:has-text('hello.txt')");
+  await waitFor("文本预览", async () => (await page.textContent("#preview-text")).includes("hello from the workspace"));
+  const [download] = await Promise.all([page.waitForEvent("download"), page.click("#preview-download")]);
+  const { readFileSync } = await import("node:fs");
+  const saved = join(root, "downloaded.txt");
+  await download.saveAs(saved);
+  if (readFileSync(saved, "utf8") !== "hello from the workspace\n") throw new Error("下载的内容不对");
+  await page.click("#files-back");
+  await page.click("#file-list a:has-text('dot.svg')");
+  await page.waitForSelector("#preview-image:not([hidden])");
+  await waitFor("图片预览", () => page.$eval("#preview-image", (i) => i.complete && i.naturalWidth === 8));
+  await page.click("#files-back");
+  await page.waitForSelector("#device-list li");
+  log("浏览工作区、预览、下载");
+  await page.click("#device-list li:has-text('home') button");
+  await waitFor("提示符", async () => (await screen()).includes("$"), 20000);
 
   // 关闭即离开（R32，FP-2.5-02）：关掉页面，同一个浏览器里不留任何东西，home 上的客户端离开。
   await waitFor("会话有客户端", () => clientsOf("main")?.clients === 1);

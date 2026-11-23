@@ -10,6 +10,7 @@ license.workspace = true
 nexus-core-proto.workspace = true
 nexus-wire.workspace = true
 nexus-fabric.workspace = true
+nexus-drive-core.workspace = true
 # 浏览器里没有操作系统的网络和线程：只用 tokio 的读写接口。
 tokio = { version = "1", default-features = false, features = ["io-util", "macros"] }
 # 计时：原生环境下就是 tokio 的计时（仿真时钟同样适用），浏览器里用浏览器的定时器。

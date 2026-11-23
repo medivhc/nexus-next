@@ -13,6 +13,8 @@
 
 ## 浏览器端到端测试（L4）
 
+GitHub 的 CI 里有同样的一步（`web` 任务：构建页面，在无头 Chrome 里跑一遍）。
+
 ```sh
 tools/build-web.sh
 cargo build --release -p nexus-cli
@@ -21,7 +23,7 @@ node run.mjs --nexus ../../target/release/nexus --dist ../../web/dist
 ```
 
 laptop 以开发用的锚点运行，浏览器经它取页面、经它的中继连 laptop 和 home。
-覆盖：登记、登录、进会话、离开后会话还在、页面冻结 20 秒后自动恢复、关闭后不留存储且设备上的客户端离开、
+覆盖：登记、登录、进会话、离开后会话还在、浏览工作区（目录、文本和图片预览、下载）、页面冻结 20 秒后自动恢复、关闭后不留存储且设备上的客户端离开、
 WebAssembly 体积预算（gzip ≤ 1.2 MB）、上手步骤和耗时。
 
 | 日期 | 结果（云端机器 Ubuntu 24.04，Chrome 无头模式，每次连续 3 次） |

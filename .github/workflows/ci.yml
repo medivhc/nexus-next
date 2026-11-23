@@ -132,3 +132,47 @@ jobs:
       - name: Mixed-version check
         if: steps.old.outputs.tag != ''
         run: python3 tools/compat_check.py --old-bin ../old-target/debug/nexus --new-bin target/debug/nexus
+
+  web:
+    # M8.1: build the web page (WebAssembly) and run the browser end-to-end test
+    # (tools/web-e2e, test plan L4) in real headless Chrome. The sandbox cannot
+    # download the wasm32 target, so this is where the page itself is checked.
+    name: Web page in a real browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      - name: Install wasm-bindgen (same version as Cargo.lock)
+        run: |
+          v=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/version = |"/,""); print; exit}' Cargo.lock)
+          echo "wasm-bindgen $v"
+          cargo install --locked --quiet wasm-bindgen-cli --version "$v"
+
+      - name: Install binaryen (wasm-opt >= 123)
+        run: |
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_123/binaryen-version_123-x86_64-linux.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "WASM_OPT=$RUNNER_TEMP/binaryen-version_123/bin/wasm-opt" >> "$GITHUB_ENV"
+
+      - name: Build the page
+        run: bash tools/build-web.sh
+
+      - name: Build nexus
+        run: cargo build --release -p nexus-cli
+
+      - name: Browser end-to-end test
+        working-directory: tools/web-e2e
+        run: |
+          npm install --no-audit --no-fund
+          node run.mjs --nexus ../../target/release/nexus --dist ../../web/dist --chrome "$(command -v google-chrome)"

@@ -157,6 +157,36 @@ impl Session {
         })
     }
 
+    /// 能读的工作区（M8.1）：Promise 的结果是 JSON 数组，每项有 name、device（保存它的存储设备）。
+    pub fn workspaces(&self) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.drive_workspaces().await.map_err(js_err)?;
+            let list: Vec<_> = list.iter().map(|w| serde_json::json!({ "name": w.name, "device": w.device })).collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 工作区里的一个目录：Promise 的结果是 JSON 数组，每项有 name、kind（file、dir、symlink）、size、target。
+    pub fn list(&self, ws: String, path: String) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.drive_list(&ws, &path).await.map_err(js_err)?;
+            let list: Vec<_> =
+                list.iter().map(|e| serde_json::json!({ "name": e.name, "kind": e.kind, "size": e.size, "target": e.target })).collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 读工作区里文件开头的最多 `max` 字节：Promise 的结果是 [`FileData`]。
+    pub fn read(&self, ws: String, path: String, max: f64) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let f = node.drive_read(&ws, &path, max as u64).await.map_err(js_err)?;
+            Ok(JsValue::from(FileData { size: f.size, truncated: f.truncated, bytes: f.bytes }))
+        })
+    }
+
     /// 打开一台设备上的终端会话（不存在时创建）。
     ///
     /// `on_output(Uint8Array)` 显示输出；`on_notice(string)` 在连接中断（"reconnecting"）和恢复（"reconnected"）时调用；
@@ -176,6 +206,29 @@ impl Session {
             let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
+    }
+}
+
+/// 读到的文件：总大小、是否没读完、读到的内容。
+#[wasm_bindgen]
+pub struct FileData {
+    size: u64,
+    truncated: bool,
+    bytes: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl FileData {
+    pub fn size(&self) -> f64 {
+        self.size as f64
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
     }
 }
 

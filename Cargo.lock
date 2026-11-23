@@ -3176,6 +3176,7 @@ version = "0.1.0"
 dependencies = [
  "n0-future",
  "nexus-core-proto",
+ "nexus-drive-core",
  "nexus-fabric",
  "nexus-wire",
  "tokio",
