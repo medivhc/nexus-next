@@ -2,8 +2,8 @@
 #
 # Why this exists: the sandbox only has 1.5 shared cores, so a full local
 # run takes well over half an hour (clippy alone took 603s on 2026-11-16).
-# GitHub-hosted ubuntu-24.04 runners have 4 vCPUs and 16 GiB, plus a
-# persistent cargo cache, so the same script runs much faster there.
+# The hosted runner is ephemeral: Cargo target cache restores are helpful but
+# incomplete after source/lockfile changes. Sccache helps reuse rustc outputs.
 # Locally, run only the fast lane (cargo check / the crate you changed);
 # run the full script here on every push and pull request.
 #
@@ -13,6 +13,7 @@
 # (e.g. freeing disk) is the exception: it lives here, before the build.
 name: CI
 
+# Early checks report independently of expensive Rust builds; full coverage remains.
 on:
   push:
     branches: [main]
@@ -27,10 +28,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  sanity:
+    # First feedback without a compiler. A failure here is visible while Rust builds run.
+    name: Fast sanity (no compilation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Structure and scripts
+        run: |
+          python3 tools/check.py
+          python3 tools/check.py --self-test
+          bash -n tools/ci.sh tools/ci-fast.sh
+
+  smoke:
+    # Smaller Rust signal, parallel to Full CI; this is not a substitute for L0–L3.
+    name: Rust core smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache core build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+      - name: Unit tests for core protocol and network logic
+        run: cargo test --locked --quiet -p nexus-wire -p nexus-net-core
+
   ci:
     name: Full CI (tools/ci.sh)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      # Compilation-object cache across commits; complements existing Cargo target cache.
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -68,8 +105,15 @@ jobs:
           # (rust-cache prunes workspace crates from the cached target dir).
           cache-all-crates: true
 
+      - name: Install compiler object cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Run full CI
         run: bash tools/ci.sh
+
+      - name: Compiler cache statistics
+        if: always()
+        run: sccache --show-stats || true
 
       - name: Public rendezvous service (informational)
         # M6.1: short join codes go through https://dns.iroh.link/pkarr by default.
