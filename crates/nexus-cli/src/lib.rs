@@ -194,6 +194,20 @@ pub enum Cmd {
         #[arg(long, value_name = "地址:端口")]
         listen: Option<String>,
     },
+    /// 在本机浏览器里打开一个设备发布的网页服务，直到按 Ctrl-C
+    ///
+    /// 在 127.0.0.1 上开一个端口接到服务，用 $BROWSER（没有时用系统默认的浏览器）打开。
+    /// 例：nexus open home/web、nexus open home/web/admin?tab=2
+    Open {
+        /// <设备>/<服务>，后面可以接路径
+        target: String,
+        /// 本机端口；默认挑一个空闲的
+        #[arg(long)]
+        port: Option<u16>,
+        /// 不打开浏览器，只显示网址
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// 文件：工作区（版本化的内容树）。路径写作 <工作区>:/<路径>，例如 work:/src/main.rs
     Drive {
         #[command(subcommand)]
@@ -901,6 +915,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             (CtlRequest::RouteExplain { target: target.clone() }, *json)
         }
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
+        Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
         Cmd::Ssh { .. } => {
             let args = match ssh_args(cmd) {
@@ -1939,6 +1954,94 @@ async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen
     }
 }
 
+/// `nexus open`：服务的网址。给了路径就用它；否则用服务说明里第一个 `http://{addr}` 开头的值；都没有就是根路径。
+fn open_url(addr: &str, path: Option<&str>, env: &[(String, String)]) -> String {
+    if let Some(p) = path {
+        return format!("http://{addr}/{p}");
+    }
+    env.iter()
+        .find(|(_, v)| v.starts_with("http://{addr}"))
+        .map(|(_, v)| v.replace("{addr}", addr))
+        .unwrap_or_else(|| format!("http://{addr}/"))
+}
+
+/// 用 `$BROWSER` 或系统默认的浏览器打开网址。
+fn launch_browser(url: &str) -> io::Result<()> {
+    let mut cmd = match std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
+        Some(b) => std::process::Command::new(b),
+        None if cfg!(target_os = "macos") => std::process::Command::new("open"),
+        None if cfg!(windows) => {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "start", ""]);
+            c
+        }
+        None => std::process::Command::new("xdg-open"),
+    };
+    cmd.arg(url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn()?;
+    // 不等它：有的浏览器一直不退出。退出了就收尾，避免留下僵尸进程。
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `nexus open <设备>/<服务>[/<路径>]`：本机开端口接到网页服务，打开浏览器，直到被中断。
+async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u16>, browser: bool, sink: &mut K) -> i32 {
+    let mut parts = target.splitn(3, '/');
+    let (node, name, path) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next());
+    if node.is_empty() || name.is_empty() {
+        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("要打开的应当写成 <设备>/<服务>[/<路径>]：{target}"));
+    }
+    match open_connect(ctl, node, name).await {
+        Ok(probe) => drop(probe.tx.try_send(Input::CloseStdin)),
+        Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
+    }
+    let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
+        Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
+        Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
+        _ => None,
+    };
+    let Some(info) = info else {
+        return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("{node} 上没有你能用的服务 {name}"));
+    };
+    if info.proto != "http" {
+        let msg = format!("{node}/{name} 不是网页服务（协议 {}）：用 nexus connect {node}/{name} 连接它", info.proto);
+        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
+    }
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
+        Ok(l) => l,
+        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法在本机开端口 {}：{e}", port.unwrap_or(0))),
+    };
+    let addr = match listener.local_addr() {
+        Ok(a) => a.to_string(),
+        Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+    };
+    let url = open_url(&addr, path, &info.env);
+    sink.out(format!("{node}/{name} → {url}（按 Ctrl-C 停止）\n").as_bytes());
+    if browser {
+        if let Err(e) = launch_browser(&url) {
+            sink.err(format!("打不开浏览器（{e}）：在浏览器里手动打开上面的网址\n").as_bytes());
+        }
+    }
+    let conns = futures_util::stream::FuturesUnordered::new();
+    tokio::pin!(conns);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((socket, _)) = accepted else { continue };
+                let (node, name) = (node.to_string(), name.to_string());
+                conns.push(async move {
+                    let Ok(mut session) = open_connect(ctl, &node, &name).await else { return };
+                    let (mut rd, mut wr) = socket.into_split();
+                    pipe(&mut session, &mut rd, &mut wr).await;
+                });
+            }
+            Some(()) = futures_util::StreamExt::next(&mut conns), if !conns.is_empty() => {}
+        }
+    }
+}
+
 /// 出口在 JSON 里的样子：`outbound`，出口设备另有 `via`，上游代理另有 `upstream`。
 fn outbound_json(o: &route::Outbound, mut v: Value) -> Value {
     let (key, extra) = match o {
@@ -2279,6 +2382,14 @@ fn list_text(entries: &[ListEntry]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_url_prefers_path_then_template_then_root() {
+        let env = vec![("TOKEN".to_string(), "x".to_string()), ("BASE_URL".to_string(), "http://{addr}/v1".to_string())];
+        assert_eq!(super::open_url("127.0.0.1:9", Some("admin?tab=2"), &env), "http://127.0.0.1:9/admin?tab=2");
+        assert_eq!(super::open_url("127.0.0.1:9", None, &env), "http://127.0.0.1:9/v1");
+        assert_eq!(super::open_url("127.0.0.1:9", None, &[]), "http://127.0.0.1:9/");
+    }
+
     use super::*;
 
     /// FP-7.1-04：版本不同的设备标出来；本机、离线的不标。

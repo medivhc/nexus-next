@@ -269,22 +269,30 @@ impl World {
 
     /// 在后台启动一条 nexus 命令，不等它结束，只用于真实后端。用来模拟调用方中途离开。
     pub fn spawn_cli(&self, node: &str, args: &[&str]) -> Background {
+        self.spawn_cli_env(node, args, &[])
+    }
+
+    /// 同 [`World::spawn_cli`]，另外设置环境变量；标准输出可以用 [`Background::stdout`] 读。
+    pub fn spawn_cli_env(&self, node: &str, args: &[&str], env: &[(&str, &str)]) -> Background {
         let Inner::Real(real) = &self.inner else { panic!("spawn_cli 只能用于真实后端") };
         self.trace.borrow_mut().push(format!("spawn {node}$ nexus {}", args.join(" ")));
         let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         let n = SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let err_path = dir.join(format!("spawn-{n}.stderr"));
         let err = std::fs::File::create(&err_path).expect("无法创建后台命令的错误输出文件");
+        let out_path = dir.join(format!("spawn-{n}.stdout"));
+        let out = std::fs::File::create(&out_path).expect("无法创建后台命令的输出文件");
         let child = Command::new(&real.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
             .env("NEXUS_AGENT_SOCKET", real.agent_socket(node))
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(out)
             .stderr(err)
             .spawn()
             .expect("无法执行 nexus");
-        Background { child, err_path, done: None }
+        Background { child, err_path, out_path, done: None }
     }
 
     /// 某个节点的 agent 入口（套接字路径），只用于真实后端。
@@ -681,6 +689,7 @@ impl nexus_web_core::TerminalUi for FirstOutput<'_> {
 pub struct Background {
     child: Child,
     err_path: PathBuf,
+    out_path: PathBuf,
     done: Option<i32>,
 }
 
@@ -733,6 +742,11 @@ impl Background {
     /// 它写到标准错误的内容。
     pub fn stderr(&self) -> String {
         std::fs::read_to_string(&self.err_path).unwrap_or_default()
+    }
+
+    /// 它写到标准输出的内容。
+    pub fn stdout(&self) -> String {
+        std::fs::read_to_string(&self.out_path).unwrap_or_default()
     }
 }
 

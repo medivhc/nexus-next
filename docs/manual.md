@@ -524,9 +524,17 @@ nexus ls home                            # home 上你能用的服务，以及�
 在任何设备上使用：
 
 ```sh
+nexus open home/web                              # 在本机浏览器里打开网页服务（前台运行，Ctrl-C 停止）
+nexus open home/web/admin?tab=2                  # 打开服务上的某个页面
 nexus connect home/web --listen 127.0.0.1:8080   # 本机开一个端口转发过去（前台运行）
 nexus connect home/db                            # 标准输入输出直接接到服务上
 ```
+
+`nexus open` 只用于 `--proto http` 发布的服务：在 `127.0.0.1` 上开一个端口（`--port` 指定，默认挑空闲的），
+用 `$BROWSER`（没有时用系统默认的浏览器）打开网址，并把网址显示出来。没给路径时，服务的说明里有
+`http://{addr}...` 形式的环境变量就打开那个网址（例如上面的 llm 打开 `/v1`），否则打开根路径。
+在服务器上用 `--no-browser` 只显示网址；浏览器打不开时也照样服务。浏览器发的 `Host` 是 `127.0.0.1:<端口>`，
+只认自己域名的服务可能拒绝，这时用统一入口（`web.home.internal`，第 9 节）。
 
 ```sh laptop
 nexus run --use home/llm -- sh -c 'echo $OPENAI_BASE_URL'   # 开好端口、按服务的说明设好环境变量，再运行程序
