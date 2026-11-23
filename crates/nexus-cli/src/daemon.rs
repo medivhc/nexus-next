@@ -58,9 +58,15 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     let Options { data_dir, agent_socket, name, config, proxy, tun } = opts;
     let (data_dir, agent_socket) = (data_dir.as_path(), agent_socket.as_path());
     // 终端会话交给独立的持有进程（M7.2）：常驻程序重启后会话还在。
+    // 执行的命令带着本机的二进制和数据目录（M7.3b）：在这台设备上执行的 `nexus` 找得到这里的常驻程序。
+    let abs_dir = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let mut exec_env = vec![("NEXUS_DATA_DIR".to_string(), abs_dir.display().to_string())];
     let system = match std::env::current_exe() {
-        Ok(exe) => RealSystem::new(data_dir)?.with_session_holder(exe),
-        Err(_) => RealSystem::new(data_dir)?,
+        Ok(exe) => {
+            exec_env.push(("NEXUS_EXE".to_string(), exe.display().to_string()));
+            RealSystem::new(data_dir)?.with_session_holder(exe).with_exec_env(exec_env)
+        }
+        Err(_) => RealSystem::new(data_dir)?.with_exec_env(exec_env),
     };
     let key = load_or_create_device_key(&system)?;
     let name = name
@@ -212,6 +218,7 @@ async fn handle_upgrade(req: &CtlRequest, data_dir: &std::path::Path, tx: &mpsc:
                 to: String::new(),
                 exe: String::new(),
                 message: String::new(),
+                id: 0,
             });
             (CtlResponse::Upgrade(report), None)
         }

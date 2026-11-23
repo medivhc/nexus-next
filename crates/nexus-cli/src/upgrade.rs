@@ -28,6 +28,9 @@ pub struct UpgradeState {
     pub confirm_ms: u64,
     pub attempts: u32,
     pub message: String,
+    /// 换上时的毫秒时间，用作这次升级的编号。
+    #[serde(default)]
+    pub id: u64,
 }
 
 impl UpgradeState {
@@ -38,6 +41,7 @@ impl UpgradeState {
             to: self.to.clone(),
             exe: self.exe.display().to_string(),
             message: self.message.clone(),
+            id: self.id,
         }
     }
 }
@@ -99,7 +103,7 @@ fn stage(file: &Path, exe: &Path) -> Result<PathBuf, WireError> {
 }
 
 /// 压缩包旁边有 `SHA256SUMS`（发布流程生成的）就校验。
-fn verify_checksum(file: &Path, bytes: &[u8]) -> Result<(), WireError> {
+pub fn verify_checksum(file: &Path, bytes: &[u8]) -> Result<(), WireError> {
     let Some(sums) = file.parent().map(|d| d.join("SHA256SUMS")) else { return Ok(()) };
     let Ok(text) = std::fs::read_to_string(&sums) else { return Ok(()) };
     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
@@ -214,6 +218,7 @@ pub fn install(file: &Path, exe: &Path, data_dir: &Path, peers: Vec<String>, con
         confirm_ms,
         attempts: 0,
         message: String::new(),
+        id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64),
     };
     save(data_dir, &state).map_err(|e| WireError::new(ErrorCode::Internal, format!("写不了 upgrade.json：{e}")))?;
     Ok(state)

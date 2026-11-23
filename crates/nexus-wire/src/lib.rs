@@ -610,6 +610,8 @@ pub struct UpgradeReport {
     pub to: String,
     pub exe: String,
     pub message: String,
+    /// 这次升级的编号（换上时的毫秒时间）；没有升级过为 0。用来区分前后两次升级（M7.3b）。
+    pub id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

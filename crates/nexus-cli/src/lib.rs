@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod drive;
 pub mod tun;
 pub mod upgrade;
+mod push;
 
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
@@ -364,11 +365,17 @@ pub enum Cmd {
         /// 协议主版本不同也换（换上之后连不上没升级的设备）
         #[arg(long)]
         force: bool,
+        /// 不升级本机，经 Nexus 把新版本送到这些设备并升级它们，一台一台地（逗号分隔或重复）
+        #[arg(long, value_name = "设备", value_delimiter = ',', conflicts_with = "all")]
+        to: Vec<String>,
+        /// 不升级本机，升级其他所有在线的设备（按名字顺序，一台换回了就停）
+        #[arg(long)]
+        all: bool,
         /// 查看最近一次升级的状态
-        #[arg(long, conflicts_with_all = ["file", "rollback"])]
+        #[arg(long, conflicts_with_all = ["file", "rollback", "to", "all"])]
         status: bool,
         /// 换回上一个版本并重新启动
-        #[arg(long, conflicts_with_all = ["file", "status"])]
+        #[arg(long, conflicts_with_all = ["file", "status", "to", "all"])]
         rollback: bool,
         #[arg(long)]
         json: bool,
@@ -808,10 +815,15 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         Cmd::Path { device, json } => (CtlRequest::Paths { device: device.clone() }, *json),
         Cmd::Upgrade { status: true, json, .. } => (CtlRequest::UpgradeStatus, *json),
         Cmd::Upgrade { rollback: true, json, .. } => (CtlRequest::UpgradeRollback, *json),
-        Cmd::Upgrade { file, confirm_within, force, json, .. } => {
+        Cmd::Upgrade { file, confirm_within, force, json, to, all, .. } => {
             let Some(confirm_ms) = parse_ttl(confirm_within) else {
                 return fail(sink, EXIT_USAGE, "usage", &format!("--confirm-within 的格式不对：{confirm_within}（例如 60s、5m）"));
             };
+            if *all || !to.is_empty() {
+                let file = std::path::PathBuf::from(file.clone().unwrap_or_default());
+                let opts = push::Options { file, confirm_ms, force: *force, to: to.clone(), all: *all, json: *json };
+                return push::run(ctl, &opts, sink).await;
+            }
             let file = file.clone().unwrap_or_default();
             // 常驻程序的工作目录不一定和这里一样：给它绝对路径。
             let file = std::path::absolute(&file).map(|p| p.display().to_string()).unwrap_or(file);
@@ -1212,7 +1224,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         CtlResponse::Upgrade(r) => {
             if json {
-                doc(json!({ "schema": JSON_SCHEMA, "state": r.state, "from": r.from, "to": r.to, "exe": r.exe, "message": r.message }))
+                doc(json!({ "schema": JSON_SCHEMA, "state": r.state, "from": r.from, "to": r.to, "exe": r.exe, "message": r.message, "id": r.id }))
             } else {
                 match r.state.as_str() {
                     "pending" => format!(

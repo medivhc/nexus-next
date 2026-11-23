@@ -24,6 +24,8 @@ pub struct RealSystem {
     dir: PathBuf,
     /// 终端会话的持有进程用的 `nexus` 二进制（M7.2）；没有时会话在本进程里运行。
     session_holder: Option<PathBuf>,
+    /// 执行的每条命令都带上的环境变量（例如 `NEXUS_EXE`，M7.3b）。命令自己给的同名变量优先。
+    exec_env: Vec<(String, String)>,
 }
 
 #[cfg(unix)]
@@ -42,7 +44,7 @@ impl RealSystem {
         {
             std::fs::create_dir_all(dir.as_ref())?;
         }
-        Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None })
+        Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None, exec_env: Vec::new() })
     }
 
     /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2）。只在 Unix 上。
@@ -50,6 +52,12 @@ impl RealSystem {
         if cfg!(unix) {
             self.session_holder = Some(exe);
         }
+        self
+    }
+
+    /// 执行的每条命令都带上这些环境变量。
+    pub fn with_exec_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.exec_env = env;
         self
     }
 
@@ -116,6 +124,7 @@ impl System for RealSystem {
     fn spawn(&self, cmd: Cmd) -> io::Result<RealProc> {
         let mut c = tokio::process::Command::new(&cmd.program);
         c.args(&cmd.args)
+            .envs(self.exec_env.iter().map(|(k, v)| (k, v)))
             .envs(cmd.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
