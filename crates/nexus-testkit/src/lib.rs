@@ -1236,8 +1236,8 @@ impl RealWorld {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
         let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
-        let child = Command::new(&bin)
-            .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
             .args(&rendezvous)
             .args(&proxy)
@@ -1249,9 +1249,19 @@ impl RealWorld {
             .env_remove("ENV")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("无法启动 nexus daemon");
+            .stderr(log);
+        // 刚复制出来的二进制（use_own_binary）：并行的测试里别的线程 fork 出的子进程在 exec 之前还持有它的写句柄，
+        // 这时执行会得到 ETXTBSY。等一下再试。
+        let mut tries = 0;
+        let child = loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.expect("无法启动 nexus daemon"),
+            }
+        };
         self.children.borrow_mut().insert(name.to_string(), child);
     }
 
