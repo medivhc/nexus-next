@@ -90,6 +90,10 @@ self.addEventListener("fetch", (event) => {
   event.respondWith((async () => {
     const target = await targetOf(event);
     if (!target) return fetch(event.request);
+    // 服务的页面里点了绝对路径的链接：地址换到 /svc/<令牌>/ 下面，之后刷新、再点链接都还在这个服务里。
+    if (event.request.mode === "navigate" && !split(event.request.url)) {
+      return Response.redirect(new URL(`${PREFIX}${target.token}${target.path}`, self.location.origin).href, 302);
+    }
     try { return await forward(event, target); } catch (e) { return plain(502, String(e && e.message ? e.message : e)); }
   })());
 });

@@ -212,14 +212,6 @@ jobs:
       - name: Build the page
         run: bash tools/build-web.sh
 
-      - name: Keep the built page
-        # Lets the sandbox (which cannot build WebAssembly) run tools/web-e2e against this exact page.
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-dist
-          path: web/dist
-          retention-days: 7
-
       - name: Build nexus
         run: cargo build --release -p nexus-cli
 
