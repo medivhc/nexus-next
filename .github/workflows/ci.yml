@@ -5,7 +5,7 @@
 # The hosted runner is ephemeral: Cargo target cache restores are helpful but
 # incomplete after source/lockfile changes. Sccache helps reuse rustc outputs.
 # Locally, run only the fast lane (cargo check / the crate you changed);
-# run the full script here on every push and pull request.
+# run all suites on main/nightly; PR changes select suites by risk.
 #
 # The workflow intentionally calls tools/ci.sh instead of duplicating its
 # steps, so local CI and Actions CI can never drift apart. If a step needs
@@ -13,12 +13,15 @@
 # (e.g. freeing disk) is the exception: it lives here, before the build.
 name: CI
 
-# Early checks report independently of expensive Rust builds; full coverage remains.
+# Always run sanity and a required gate. Native full coverage remains on main, nightly,
+# manual runs, and safety-critical PR changes; browser/compat use conservative impact planning.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * *' # nightly UTC, all lanes
 
 permissions:
   contents: read
@@ -28,6 +31,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    name: Test impact plan
+    runs-on: ubuntu-24.04
+    outputs:
+      smoke: ${{ steps.select.outputs.smoke }}
+      full: ${{ steps.select.outputs.full }}
+      compat: ${{ steps.select.outputs.compat }}
+      web: ${{ steps.select.outputs.web }}
+    steps:
+      - name: Check out with full history for PR merge-base diff
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classify changes, fail closed on unknown paths
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 tools/ci_plan.py --event "$GITHUB_EVENT_NAME" --base "$BASE_SHA" --head "$HEAD_SHA"
+
   sanity:
     # First feedback without a compiler. A failure here is visible while Rust builds run.
     name: Fast sanity (no compilation)
@@ -41,10 +64,13 @@ jobs:
           python3 tools/check.py
           python3 tools/check.py --self-test
           bash -n tools/ci.sh tools/ci-fast.sh
+          python3 -m unittest discover -s tools -p 'test_ci_plan.py' -q
 
   smoke:
     # Smaller Rust signal, parallel to Full CI; this is not a substitute for L0–L3.
     name: Rust core smoke
+    needs: plan
+    if: ${{ needs.plan.outputs.smoke == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -57,13 +83,16 @@ jobs:
         with:
           key: smoke
       - name: Unit tests for core protocol and network logic
-        run: cargo test --locked --quiet -p nexus-wire -p nexus-net-core
+        run: cargo test --locked --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core
 
   ci:
     name: Full CI (tools/ci.sh)
+    needs: plan
+    if: ${{ needs.plan.outputs.full == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
+      NEXUS_CI_PR_MODE: ${{ github.event_name == 'pull_request' && '1' || '0' }}
       # Compilation-object cache across commits; complements existing Cargo target cache.
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
@@ -135,6 +164,8 @@ jobs:
     # and runs tools/compat_check.py both ways. Skips (with a note) when there
     # is no such tag yet, e.g. right after a major version bump.
     name: Old and new versions together
+    needs: plan
+    if: ${{ needs.plan.outputs.compat == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -182,6 +213,8 @@ jobs:
     # (tools/web-e2e, test plan L4) in real headless Chrome. The sandbox cannot
     # download the wasm32 target, so this is where the page itself is checked.
     name: Web page in a real browser
+    needs: plan
+    if: ${{ needs.plan.outputs.web == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -220,3 +253,17 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           node run.mjs --nexus ../../target/release/nexus --dist ../../web/dist --chrome "$(command -v google-chrome)"
+
+  gate:
+    name: Required CI gate
+    needs: [plan, sanity, smoke, ci, compat, web]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Verify all expected jobs succeeded
+        env:
+          CI_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 tools/ci_gate.py
