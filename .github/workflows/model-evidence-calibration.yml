@@ -1,0 +1,59 @@
+name: Model evidence calibration
+on:
+  push:
+    branches: [experiment/model-evidence-calibration]
+permissions:
+  contents: read
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compare original and independent oracle
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin dd2fb2cf2fa12c06e42b722c0e4626f44ffa5a00 d3ee611b140f45c2c4357fa09a45f29535316601
+          python3 -m unittest discover -s tools -p test_ci_plan.py -v
+          git show dd2fb2cf2fa12c06e42b722c0e4626f44ffa5a00:tools/test_ci_plan.py > tools/test_ci_plan.py
+          cd tools
+          set +e
+          python3 -m unittest test_ci_plan.PolicyTests.test_web_build_dependencies_are_never_skipped -v > /tmp/policy-negative.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/policy-negative.log
+          test "$rc" = 1
+          grep -F 'counterexample: crates/nexus-drive-core/Cargo.toml affects a Web build' /tmp/policy-negative.log
+          git show d3ee611b140f45c2c4357fa09a45f29535316601:tools/ci_plan.py > ci_plan.py
+          python3 -m unittest test_ci_plan -v
+          echo 'CALIBRATED: baseline suite green, independent oracle red, patched suite green'
+  drive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+      - name: Test original code, then independent oracle, then fixed code
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin ef0b80e7cdf59b603c5d8ef435e8a28a1adfec28 49bc7e134b98b9a9f1510d67adb48e1b2b7f668d
+          cargo test --locked -p nexus-drive-core
+          git show ef0b80e7cdf59b603c5d8ef435e8a28a1adfec28:crates/nexus-drive-core/tests/merge_model.rs > crates/nexus-drive-core/tests/merge_model.rs
+          set +e
+          cargo test --locked -p nexus-drive-core --test merge_model -- --nocapture > /tmp/drive-negative.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/drive-negative.log
+          test "$rc" = 101
+          grep -F 'counterexample: directory=false, count=1' /tmp/drive-negative.log
+          grep -F 'test result: FAILED' /tmp/drive-negative.log
+          git show 49bc7e134b98b9a9f1510d67adb48e1b2b7f668d:crates/nexus-drive-core/src/lib.rs > crates/nexus-drive-core/src/lib.rs
+          cargo test --locked -p nexus-drive-core
+          echo 'CALIBRATED: baseline suite green, independent oracle red, patched suite green'
