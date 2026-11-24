@@ -6,11 +6,20 @@ import json
 import os
 import sys
 
+# The exact set of jobs the gate job declares in needs:. Anything else means
+# the workflow changed without updating this gate, which must fail closed.
+EXPECTED_JOBS = {"plan", "sanity", "smoke", "ci", "compat", "web"}
+
 
 def check(needs: dict) -> list[str]:
     errors: list[str] = []
+    if set(needs.keys()) != EXPECTED_JOBS:
+        errors.append(
+            f"unexpected needs keys: {sorted(needs.keys())!r}, "
+            f"expected {sorted(EXPECTED_JOBS)!r}"
+        )
     if needs.get("plan", {}).get("result") != "success":
-        return ["CI plan failed; cannot trust selective skips"]
+        return errors + ["CI plan failed; cannot trust selective skips"]
     for job, key in (
         ("sanity", None), ("smoke", "smoke"), ("ci", "full"),
         ("compat", "compat"), ("web", "web")

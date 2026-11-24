@@ -31,6 +31,15 @@ WIRE_CRATES = {
     "nexus-cli", "nexus-runtime", "nexus-fabric", "nexus-fabric-iroh",
     "nexus-fabric-sim",
 }
+# Crates whose change reaches the real nexus binary (compat job) and the
+# browser end-to-end test (web job) even though they are not wire crates:
+# nexus-cli depends on nexus-drive-core and nexus-sys-real, nexus-sys-real
+# depends on nexus-sys, and nexus-web-core (run directly by the web_drive
+# scenarios) depends on nexus-drive-core.
+NATIVE_CRATES = {"nexus-drive-core", "nexus-sys-real", "nexus-sys"}
+# Crates that only need the full lane: test-only or platform-only code that
+# neither the compat binaries nor the browser page exercise.
+FULL_ONLY_CRATES = {"nexus-sys-sim", "nexus-testkit", "nexus-android"}
 
 
 def is_document(path: str) -> bool:
@@ -39,7 +48,10 @@ def is_document(path: str) -> bool:
     if path.startswith(DOC_DIRS) and path.lower().endswith(DOC_SUFFIXES):
         return True
     if path.endswith(".md"):
-        return True
+        # Only root-level docs and docs/ count as documentation. A .md file
+        # inside a crate may be embedded (include_str!) or otherwise
+        # load-bearing, so it must not skip the build.
+        return "/" not in path or path.startswith("docs/")
     return path in {"LICENSE", "LICENSE-APACHE", "LICENSE-MIT", ".gitignore"}
 
 
@@ -74,6 +86,10 @@ def classify(paths: list[str], event: str) -> Plan:
                 compat = web = True
             elif path == "tools/compat_check.py":
                 compat = True
+            else:
+                # Any other tools/ script is unknown to the planner: fail
+                # closed instead of silently skipping compat/web.
+                compat = web = True
             continue
         if path.startswith("crates/"):
             parts = PurePosixPath(path).parts
@@ -89,6 +105,13 @@ def classify(paths: list[str], event: str) -> Plan:
                 compat = True
             if crate in WIRE_CRATES or crate in {"nexus-sys-real", "nexus-sys"}:
                 web = True
+            if crate in NATIVE_CRATES:
+                compat = web = True
+            elif crate not in WIRE_CRATES and crate != "nexus-web-core" and crate not in FULL_ONLY_CRATES:
+                # New/unknown crate: fail closed. A crate added without
+                # updating the lists above runs every lane instead of
+                # silently skipping compat/web.
+                compat = web = True
             continue
         # Unknown/new directory: fail closed by running everything.
         full = compat = web = True
