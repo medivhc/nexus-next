@@ -1343,7 +1343,7 @@ impl<T: Transport, S: System> Node<T, S> {
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
         // 执行和会话请求仍交给目标设备完整判定并审计，包括无效凭据的拒绝。
         if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::Paths { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
-            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason));
+            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason))?;
         }
         if SecretKey::from_seed(agent.secret).public() != agent.cert.cert.agent {
             return Err(denied(&DenyReason::AssertionBadSignature));
