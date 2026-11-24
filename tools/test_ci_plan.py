@@ -14,7 +14,12 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(classify(["web/index.html", "crates/nexus-web/src/lib.rs"], "pull_request"), Plan(smoke=True, web=True))
 
     def test_web_core(self):
-        self.assertEqual(classify(["crates/nexus-web-core/src/lib.rs"], "pull_request"), Plan(smoke=True, web=True))
+        # testkit 的浏览器场景在 L2/L3 里直接跑网页节点核心。
+        self.assertEqual(classify(["crates/nexus-web-core/src/lib.rs"], "pull_request"), Plan(smoke=True, full=True, web=True))
+
+    def test_manual_is_executed(self):
+        # L3 用户手册照着 docs/manual.md 做一遍：改手册要跑 Full。
+        self.assertEqual(classify(["docs/manual.md"], "pull_request"), Plan(smoke=True, full=True))
 
     def test_rust_wire(self):
         self.assertEqual(classify(["crates/nexus-wire/src/lib.rs"], "pull_request"), Plan(True, True, True, True))

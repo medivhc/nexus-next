@@ -21,7 +21,11 @@ class Plan:
 
 DOC_DIRS = ("docs/", "tasks/")
 DOC_SUFFIXES = (".md", ".rst", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".webp")
-WEB_DIRS = ("web/", "tools/web-e2e/", "crates/nexus-web/", "crates/nexus-web-core/")
+# 只有浏览器才用的部分：不影响原生的 L2/L3。nexus-web-core 不在这里：testkit 的浏览器场景
+# （web、web_drive、web_service，在 L2/L3 里）直接跑它。
+WEB_DIRS = ("web/", "tools/web-e2e/", "crates/nexus-web/")
+# 被测试当作输入执行的文档：tools/manual_check.py 照着用户手册做一遍（L3 用户手册）。
+EXECUTED_DOCS = {"docs/manual.md"}
 WIRE_CRATES = {
     "nexus-core-proto", "nexus-wire", "nexus-term-proto", "nexus-net-core",
     "nexus-cli", "nexus-runtime", "nexus-fabric", "nexus-fabric-iroh",
@@ -30,6 +34,8 @@ WIRE_CRATES = {
 
 
 def is_document(path: str) -> bool:
+    if path in EXECUTED_DOCS:
+        return False
     if path.startswith(DOC_DIRS) and path.lower().endswith(DOC_SUFFIXES):
         return True
     if path.endswith(".md"):
@@ -49,6 +55,9 @@ def classify(paths: list[str], event: str) -> Plan:
         if is_document(path):
             continue
         smoke = True
+        if path in EXECUTED_DOCS:
+            full = True
+            continue
         if path.startswith(WEB_DIRS) or path == "tools/build-web.sh":
             web = True
             continue
@@ -74,6 +83,8 @@ def classify(paths: list[str], event: str) -> Plan:
             crate = parts[1]
             # Only browser-specific crates can bypass native L2/L3.
             full = True
+            if crate == "nexus-web-core":
+                web = True
             if crate in WIRE_CRATES:
                 compat = True
             if crate in WIRE_CRATES or crate in {"nexus-sys-real", "nexus-sys"}:

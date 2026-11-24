@@ -23,8 +23,10 @@ Clippy + compile-only 共 1616.5 秒，占脚本步骤总耗时 2533.1 秒的 63
 
 | 修改范围 | Smoke | Full L0–L3 | 真实跨版本 | 浏览器 |
 | --- | --- | --- | --- | --- |
-| 仅文档（Markdown、docs/tasks 下常见文档与图片） | – | – | – | – |
-| Web UI、web E2E、nexus-web、nexus-web-core | ✓ | – | – | ✓ |
+| 仅文档（Markdown、docs/tasks 下常见文档与图片；`docs/manual.md` 除外） | – | – | – | – |
+| `docs/manual.md`（L3 用户手册照着执行） | ✓ | ✓ | – | – |
+| Web UI、web E2E、nexus-web | ✓ | – | – | ✓ |
+| nexus-web-core（L2/L3 的浏览器场景直接跑它） | ✓ | ✓ | – | ✓ |
 | nexus-drive-core 与非协议 native crate | ✓ | ✓ | 受影响时 ✓ | 受影响时 ✓ |
 | Wire、协议、CLI、Runtime、Fabric 与核心网络 | ✓ | ✓ | ✓ | ✓ |
 | Cargo.lock / vendor / CI 配置与计划 | ✓ | ✓ | ✓ | ✓ |
