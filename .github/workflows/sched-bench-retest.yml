@@ -1,0 +1,57 @@
+name: Experimental scheduling benchmark
+on:
+  push:
+    branches: [experiment/sched-bench-retest]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sched-retest
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Verify baseline and candidate have identical Rust sources and lockfile
+        run: |
+          git fetch --no-tags origin a54db991393645db5e9f13888fcc79b4a2d5cf3f
+          git diff --exit-code a54db991393645db5e9f13888fcc79b4a2d5cf3f HEAD -- crates Cargo.toml Cargo.lock vendor tools/sched_bench.py
+      - name: Build identical runtime once
+        run: cargo build --locked -p nexus-cli --bin nexus
+      - name: Run five independent samples sequentially
+        run: |
+          mkdir -p sched-results
+          for i in 1 2 3 4 5; do
+            set +e
+            sudo -n python3 tools/sched_bench.py --require --only-scheduled --attempts 1 --record "sched-results/run-$i.json" > "sched-results/run-$i.log" 2>&1
+            rc=$?
+            set -e
+            echo "$rc" > "sched-results/run-$i.exit"
+            cat "sched-results/run-$i.log"
+          done
+          python3 - <<'PY'
+          import json, pathlib
+          rows=[]
+          for p in sorted(pathlib.Path("sched-results").glob("*.exit")):
+              j=p.with_suffix(".json")
+              if not j.exists():
+                  raise SystemExit(f"invalid measurement: {p}")
+              r=json.loads(j.read_text())["results"][0]
+              rows.append(dict(sample=p.stem, added_ms=round(r["loaded"]["p95_ms"]-r["idle"]["p95_ms"],1), throughput_mbit=r["throughput_mbit"], exit=int(p.read_text())))
+          print(json.dumps(rows,indent=2))
+          if len(rows)!=5: raise SystemExit("missing samples")
+          pathlib.Path("sched-results/summary.json").write_text(json.dumps(rows,indent=2))
+          if all(r["exit"]!=0 for r in rows): raise SystemExit("all samples failed")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scheduling-retest
+          path: sched-results/
