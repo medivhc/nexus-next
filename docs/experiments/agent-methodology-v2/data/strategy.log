@@ -1,0 +1,10 @@
+test_ambiguity_and_timeout (test_strategy.Strategy.test_ambiguity_and_timeout) ... ok
+test_cargo_and_git_interactions_require_independent_evidence (test_strategy.Strategy.test_cargo_and_git_interactions_require_independent_evidence) ... ok
+test_do_not_reuse_mismatched_ci_evidence (test_strategy.Strategy.test_do_not_reuse_mismatched_ci_evidence) ... ok
+test_local_cli_contract (test_strategy.Strategy.test_local_cli_contract) ... ok
+test_timing_trace_preserves_real_measurement_requirement (test_strategy.Strategy.test_timing_trace_preserves_real_measurement_requirement) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK

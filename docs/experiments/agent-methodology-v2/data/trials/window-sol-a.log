@@ -1,0 +1,9 @@
+test_control_normal_start_fast_probes (test_window_loopback.LoopbackWindow.test_control_normal_start_fast_probes) ... ok
+test_delayed_handshake_still_yields_contained_samples (test_window_loopback.LoopbackWindow.test_delayed_handshake_still_yields_contained_samples) ... ok
+test_empty_transfer_fails_cleanly (test_window_loopback.LoopbackWindow.test_empty_transfer_fails_cleanly) ... ok
+test_slow_probes_straddle_end (test_window_loopback.LoopbackWindow.test_slow_probes_straddle_end) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 37.345s
+
+OK

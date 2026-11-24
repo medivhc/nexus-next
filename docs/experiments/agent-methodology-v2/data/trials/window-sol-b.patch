@@ -1,0 +1,118 @@
+--- a/tools/sched_bench.py
++++ b/tools/sched_bench.py
+@@ -17,10 +17,12 @@
+ import argparse
+ import json
+ import os
++import select
+ import shutil
+ import signal
+ import socket
+ import statistics
++import struct
+ import subprocess
+ import sys
+ import tempfile
+@@ -42,7 +44,7 @@
+     c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+ """
+ 
+-# 经 SOCKS5 连到 bulk.home.internal，读 argv[2] 秒，打印读到的字节数。
++# 经 SOCKS5 连到 bulk.home.internal，报告读取的时间窗口和字节数。
+ DOWNLOAD = r"""
+ import socket, struct, sys, time
+ s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+@@ -50,19 +52,27 @@
+ host = b"bulk.home.internal"
+ s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", 80))
+ reply = s.recv(10); assert reply[1] == 0, reply
+-end = time.time() + float(sys.argv[2]); total = 0; first = None
+ s.settimeout(1)
+-while time.time() < end:
++start = time.monotonic()
++end = start + float(sys.argv[2])
++sys.stdout.buffer.write(struct.pack("d", start))
++sys.stdout.buffer.flush()
++total = 0
++while time.monotonic() < end:
+     try: n = len(s.recv(1 << 16))
+     except socket.timeout: continue
+     if n == 0: break
+     total += n
+-print(total)
++print(time.monotonic(), total, flush=True)
+ """
+ 
+ 
+ def sh(*cmd, check=True, **kw):
+     return subprocess.run(cmd, check=check, capture_output=True, text=True, **kw)
++
++
++class MeasurementError(RuntimeError):
++    pass
+ 
+ 
+ class Bench:
+@@ -184,12 +194,47 @@
+         idle = self.probes(15, 0.1)
+         seconds = self.args.seconds
+         dl = self.in_ns("laptop", DOWNLOAD, 1080, seconds)
+-        time.sleep(3)  # 让下载先占满链路
+-        loaded = self.probes(int((seconds - 5) / 0.25), 0.15)
+-        out, err = dl.communicate(timeout=seconds + 30)
++        start_marker = struct.Struct("d")
++        if select.select([dl.stdout], [], [], 30)[0]:
++            # 只读启动标记，剩下的输出由 communicate 收集。
++            marker = os.read(dl.stdout.fileno(), start_marker.size)
++        else:
++            raise MeasurementError("等待下载开始超时")
++
++        samples = []
++        if len(marker) == start_marker.size:
++            start, = start_marker.unpack(marker)
++            deadline = start + seconds
++            time.sleep(max(0, min(start + 3, deadline) - time.monotonic()))  # 让下载先占满链路
++            while not select.select([dl.stdout], [], [], 0)[0]:
++                if time.monotonic() >= deadline:
++                    break
++                latency = self.probe()
++                finished = time.monotonic()
++                samples.append((finished, latency))
++                if finished >= deadline:
++                    break
++                time.sleep(min(0.15, deadline - finished))
++
++        try:
++            out, err = dl.communicate(timeout=seconds + 30)
++        except subprocess.TimeoutExpired as exc:
++            raise MeasurementError("等待下载结束超时") from exc
+         if dl.returncode != 0:
+-            raise RuntimeError(f"下载失败：{err}")
+-        mbit = int(out.strip()) * 8 / seconds / 1e6
++            raise MeasurementError(f"下载失败：{err}")
++        if len(marker) != start_marker.size:
++            raise MeasurementError("下载未报告测量开始时间")
++        try:
++            ended, downloaded = out.split()
++            end = min(float(ended), deadline)
++            total = int(downloaded)
++        except ValueError as exc:
++            raise MeasurementError("下载未报告有效的测量结果") from exc
++
++        loaded = [latency for finished, latency in samples if finished < end]
++        if not loaded:
++            raise MeasurementError("下载期间没有完整的满载延迟样本")
++        mbit = total * 8 / seconds / 1e6
+         self.stop_daemon("laptop")
+         self.stop_daemon("home")
+         return {"scheduling": scheduling, "idle": stats(idle), "loaded": stats(loaded), "throughput_mbit": round(mbit, 2)}
+@@ -258,6 +303,9 @@
+             bench.start_daemon("laptop", scheduling)
+             bench.build_network()
+             results.append(bench.run(scheduling))
++        except MeasurementError as exc:
++            print(f"失败：{exc}")
++            return 1
+         finally:
+             bench.teardown()
+ 

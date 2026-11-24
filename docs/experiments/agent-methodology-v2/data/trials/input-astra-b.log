@@ -1,0 +1,7 @@
+test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) ... ok
+test_valid_parameters_keep_optional_skip (test_input.InputContract.test_valid_parameters_keep_optional_skip) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 1.594s
+
+OK

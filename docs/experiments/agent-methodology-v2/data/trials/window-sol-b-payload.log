@@ -1,0 +1,16 @@
+test_connected_but_idle_period_does_not_count_as_loaded (test_delayed_payload.PayloadOnly.test_connected_but_idle_period_does_not_count_as_loaded) ... FAIL
+
+======================================================================
+FAIL: test_connected_but_idle_period_does_not_count_as_loaded (test_delayed_payload.PayloadOnly.test_connected_but_idle_period_does_not_count_as_loaded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_delayed_payload.py", line 35, in test_connected_but_idle_period_does_not_count_as_loaded
+    fixture.check_contained(0.0, 0.25, 2)
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 108, in check_contained
+    self.assertEqual(result["loaded"]["max_ms"], 30.0)
+AssertionError: 7777.0 != 30.0
+
+----------------------------------------------------------------------
+Ran 1 test in 9.620s
+
+FAILED (failures=1)

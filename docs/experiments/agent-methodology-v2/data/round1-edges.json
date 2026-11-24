@@ -1,0 +1,85 @@
+{
+  "a": {
+    "sha": "bacc642a821571ad981f350037b57a0c125bb120",
+    "possible_embedded_markdown": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-web-core/src/embedded-note.md"
+      ],
+      "plan": {
+        "smoke": false,
+        "full": false,
+        "compat": false,
+        "web": false
+      }
+    },
+    "rename": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-testkit/src/renamed_drive.rs",
+        "crates/nexus-web-core/src/drive.rs"
+      ],
+      "plan": {
+        "smoke": true,
+        "full": true,
+        "compat": false,
+        "web": true
+      }
+    }
+  },
+  "b": {
+    "sha": "3c96e640389021564b4b7921397be33ca4d82c38",
+    "possible_embedded_markdown": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-web-core/src/embedded-note.md"
+      ],
+      "plan": {
+        "smoke": false,
+        "full": false,
+        "compat": false,
+        "web": false
+      }
+    },
+    "rename": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-testkit/src/renamed_drive.rs",
+        "crates/nexus-web-core/src/drive.rs"
+      ],
+      "plan": {
+        "smoke": true,
+        "full": true,
+        "compat": false,
+        "web": true
+      }
+    }
+  },
+  "main": {
+    "sha": "2b75c737122b32e3b81a6d493d5a87f146372560",
+    "possible_embedded_markdown": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-web-core/src/embedded-note.md"
+      ],
+      "plan": {
+        "smoke": true,
+        "full": true,
+        "compat": false,
+        "web": true
+      }
+    },
+    "rename": {
+      "event": "pull_request",
+      "paths": [
+        "crates/nexus-testkit/src/renamed_drive.rs"
+      ],
+      "plan": {
+        "smoke": true,
+        "full": true,
+        "compat": false,
+        "web": false
+      }
+    }
+  }
+}

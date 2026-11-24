@@ -1,0 +1,101 @@
+{
+  "cargo": "cargo 1.100.0 (3acc79c0c 2026-11-05)",
+  "python": "3.12.14",
+  "git": "git version 2.56.1",
+  "model_sha256": "a8b2c2a20b9ae900de8f5691108b2ddd9b7cbd5c80afda8f3b224eacc09bc0a5",
+  "contract_sha256": "e1408f6b98a6ea5f90a4d62a9fd3fc9dfcf5366ed659faecda5371a44f547384",
+  "revisions": {
+    "base": {
+      "sha": "a54db991393645db5e9f13888fcc79b4a2d5cf3f",
+      "model": {
+        "cases": 1197,
+        "counterexamples": 32,
+        "exit": 1,
+        "stdout": "Build inputs and dependency witnesses:\n  nexus-cli\n  nexus-web -> nexus-core-proto\n  nexus-cli -> nexus-drive-core\n  nexus-web -> nexus-fabric\n  nexus-web -> nexus-fabric-iroh\n  nexus-cli -> nexus-net-core\n  nexus-cli -> nexus-runtime\n  nexus-cli -> nexus-sys-real -> nexus-sys\n  nexus-cli -> nexus-sys-real\n  nexus-web -> nexus-wire -> nexus-term-proto\n  nexus-web\n  nexus-web -> nexus-web-core\n  nexus-web -> nexus-wire\nMinimal case: [\"crates/nexus-drive-core/Cargo.toml\"] expected web=True, got web=False\nMinimal case: [\"crates/nexus-drive-core/src/lib.rs\"] expected web=True, got web=False\nChecked 1197 cases, found 32 counterexamples.\n"
+      },
+      "tests": "test_all_skipped_intentionally (test_ci_plan.GateTests.test_all_skipped_intentionally) ... ok\ntest_failed_plan_fails (test_ci_plan.GateTests.test_failed_plan_fails) ... ok\ntest_failure_or_cancel_fails (test_ci_plan.GateTests.test_failure_or_cancel_fails) ... ok\ntest_full_runs_successfully (test_ci_plan.GateTests.test_full_runs_successfully) ... ok\ntest_unexpected_skip_fails (test_ci_plan.GateTests.test_unexpected_skip_fails) ... ok\ntest_unknown_plan_value_does_not_pass (test_ci_plan.GateTests.test_unknown_plan_value_does_not_pass) ... ok\ntest_ci_change_triggers_all (test_ci_plan.PolicyTests.test_ci_change_triggers_all) ... ok\ntest_docs_do_not_build (test_ci_plan.PolicyTests.test_docs_do_not_build) ... ok\ntest_drive_core (test_ci_plan.PolicyTests.test_drive_core) ... ok\ntest_executable_under_tasks_is_not_skipped (test_ci_plan.PolicyTests.test_executable_under_tasks_is_not_skipped) ... ok\ntest_invalid_path (test_ci_plan.PolicyTests.test_invalid_path) ... ok\ntest_lockfile_triggers_all (test_ci_plan.PolicyTests.test_lockfile_triggers_all) ... ok\ntest_manual_is_executed (test_ci_plan.PolicyTests.test_manual_is_executed) ... ok\ntest_runtime (test_ci_plan.PolicyTests.test_runtime) ... ok\ntest_rust_wire (test_ci_plan.PolicyTests.test_rust_wire) ... ok\ntest_scheduled_and_main_full (test_ci_plan.PolicyTests.test_scheduled_and_main_full) ... ok\ntest_unknown_fails_closed (test_ci_plan.PolicyTests.test_unknown_fails_closed) ... ok\ntest_web_core (test_ci_plan.PolicyTests.test_web_core) ... ok\ntest_web_only (test_ci_plan.PolicyTests.test_web_only) ... ok\n\n----------------------------------------------------------------------\nRan 19 tests in 0.003s\n\nOK\n",
+      "rename": {
+        "event": "pull_request",
+        "paths": [
+          "crates/nexus-testkit/src/renamed_drive.rs"
+        ],
+        "plan": {
+          "smoke": true,
+          "full": true,
+          "compat": false,
+          "web": false
+        }
+      },
+      "web_skipped": {
+        "exit": 0,
+        "output": "CI gate passed: all planned jobs succeeded; only intentionally excluded jobs were skipped\n"
+      },
+      "web_success": {
+        "exit": 1,
+        "output": "CI gate FAILED: web: expected skipped, got success\n"
+      }
+    },
+    "a": {
+      "sha": "bacc642a821571ad981f350037b57a0c125bb120",
+      "model": {
+        "cases": 1197,
+        "counterexamples": 0,
+        "exit": 0,
+        "stdout": "Build inputs and dependency witnesses:\n  nexus-cli\n  nexus-web -> nexus-core-proto\n  nexus-cli -> nexus-drive-core\n  nexus-web -> nexus-fabric\n  nexus-web -> nexus-fabric-iroh\n  nexus-cli -> nexus-net-core\n  nexus-cli -> nexus-runtime\n  nexus-cli -> nexus-sys-real -> nexus-sys\n  nexus-cli -> nexus-sys-real\n  nexus-web -> nexus-wire -> nexus-term-proto\n  nexus-web\n  nexus-web -> nexus-web-core\n  nexus-web -> nexus-wire\nChecked 1197 cases, found 0 counterexamples.\n"
+      },
+      "tests": "test_all_skipped_intentionally (test_ci_plan.GateTests.test_all_skipped_intentionally) ... ok\ntest_failed_plan_fails (test_ci_plan.GateTests.test_failed_plan_fails) ... ok\ntest_failure_or_cancel_fails (test_ci_plan.GateTests.test_failure_or_cancel_fails) ... ok\ntest_full_runs_successfully (test_ci_plan.GateTests.test_full_runs_successfully) ... ok\ntest_unexpected_skip_fails (test_ci_plan.GateTests.test_unexpected_skip_fails) ... ok\ntest_unknown_plan_value_does_not_pass (test_ci_plan.GateTests.test_unknown_plan_value_does_not_pass) ... ok\ntest_ci_change_triggers_all (test_ci_plan.PolicyTests.test_ci_change_triggers_all) ... ok\ntest_crates_outside_web_build (test_ci_plan.PolicyTests.test_crates_outside_web_build) ... ok\ntest_docs_do_not_build (test_ci_plan.PolicyTests.test_docs_do_not_build) ... ok\ntest_drive_core (test_ci_plan.PolicyTests.test_drive_core) ... ok\ntest_executable_under_tasks_is_not_skipped (test_ci_plan.PolicyTests.test_executable_under_tasks_is_not_skipped) ... ok\ntest_invalid_path (test_ci_plan.PolicyTests.test_invalid_path) ... ok\ntest_lockfile_triggers_all (test_ci_plan.PolicyTests.test_lockfile_triggers_all) ... ok\ntest_manual_is_executed (test_ci_plan.PolicyTests.test_manual_is_executed) ... ok\ntest_runtime (test_ci_plan.PolicyTests.test_runtime) ... ok\ntest_rust_wire (test_ci_plan.PolicyTests.test_rust_wire) ... ok\ntest_scheduled_and_main_full (test_ci_plan.PolicyTests.test_scheduled_and_main_full) ... ok\ntest_unknown_fails_closed (test_ci_plan.PolicyTests.test_unknown_fails_closed) ... ok\ntest_web_build_tracks_new_path_dependencies (test_ci_plan.PolicyTests.test_web_build_tracks_new_path_dependencies) ... ok\ntest_web_core (test_ci_plan.PolicyTests.test_web_core) ... ok\ntest_web_only (test_ci_plan.PolicyTests.test_web_only) ... ok\n\n----------------------------------------------------------------------\nRan 21 tests in 0.071s\n\nOK\n",
+      "rename": {
+        "event": "pull_request",
+        "paths": [
+          "crates/nexus-testkit/src/renamed_drive.rs",
+          "crates/nexus-web-core/src/drive.rs"
+        ],
+        "plan": {
+          "smoke": true,
+          "full": true,
+          "compat": false,
+          "web": true
+        }
+      },
+      "web_skipped": {
+        "exit": 1,
+        "output": "CI gate FAILED: web: expected success, got skipped\n"
+      },
+      "web_success": {
+        "exit": 0,
+        "output": "CI gate passed: all planned jobs succeeded; only intentionally excluded jobs were skipped\n"
+      }
+    },
+    "b": {
+      "sha": "3c96e640389021564b4b7921397be33ca4d82c38",
+      "model": {
+        "cases": 1197,
+        "counterexamples": 0,
+        "exit": 0,
+        "stdout": "Build inputs and dependency witnesses:\n  nexus-cli\n  nexus-web -> nexus-core-proto\n  nexus-cli -> nexus-drive-core\n  nexus-web -> nexus-fabric\n  nexus-web -> nexus-fabric-iroh\n  nexus-cli -> nexus-net-core\n  nexus-cli -> nexus-runtime\n  nexus-cli -> nexus-sys-real -> nexus-sys\n  nexus-cli -> nexus-sys-real\n  nexus-web -> nexus-wire -> nexus-term-proto\n  nexus-web\n  nexus-web -> nexus-web-core\n  nexus-web -> nexus-wire\nChecked 1197 cases, found 0 counterexamples.\n"
+      },
+      "tests": "test_all_skipped_intentionally (test_ci_plan.GateTests.test_all_skipped_intentionally) ... ok\ntest_failed_plan_fails (test_ci_plan.GateTests.test_failed_plan_fails) ... ok\ntest_failure_or_cancel_fails (test_ci_plan.GateTests.test_failure_or_cancel_fails) ... ok\ntest_full_runs_successfully (test_ci_plan.GateTests.test_full_runs_successfully) ... ok\ntest_unexpected_skip_fails (test_ci_plan.GateTests.test_unexpected_skip_fails) ... ok\ntest_unknown_plan_value_does_not_pass (test_ci_plan.GateTests.test_unknown_plan_value_does_not_pass) ... ok\ntest_ci_change_triggers_all (test_ci_plan.PolicyTests.test_ci_change_triggers_all) ... ok\ntest_docs_do_not_build (test_ci_plan.PolicyTests.test_docs_do_not_build) ... ok\ntest_drive_core (test_ci_plan.PolicyTests.test_drive_core) ... ok\ntest_executable_under_tasks_is_not_skipped (test_ci_plan.PolicyTests.test_executable_under_tasks_is_not_skipped) ... ok\ntest_invalid_path (test_ci_plan.PolicyTests.test_invalid_path) ... ok\ntest_lockfile_triggers_all (test_ci_plan.PolicyTests.test_lockfile_triggers_all) ... ok\ntest_manual_is_executed (test_ci_plan.PolicyTests.test_manual_is_executed) ... ok\ntest_move_out_of_web_dependency_selects_web (test_ci_plan.PolicyTests.test_move_out_of_web_dependency_selects_web) ... ok\ntest_new_transitive_build_dependencies_select_web (test_ci_plan.PolicyTests.test_new_transitive_build_dependencies_select_web) ... ok\ntest_runtime (test_ci_plan.PolicyTests.test_runtime) ... ok\ntest_rust_wire (test_ci_plan.PolicyTests.test_rust_wire) ... ok\ntest_scheduled_and_main_full (test_ci_plan.PolicyTests.test_scheduled_and_main_full) ... ok\ntest_unknown_fails_closed (test_ci_plan.PolicyTests.test_unknown_fails_closed) ... ok\ntest_web_core (test_ci_plan.PolicyTests.test_web_core) ... ok\ntest_web_only (test_ci_plan.PolicyTests.test_web_only) ... ok\n\n----------------------------------------------------------------------\nRan 21 tests in 0.220s\n\nOK\n",
+      "rename": {
+        "event": "pull_request",
+        "paths": [
+          "crates/nexus-testkit/src/renamed_drive.rs",
+          "crates/nexus-web-core/src/drive.rs"
+        ],
+        "plan": {
+          "smoke": true,
+          "full": true,
+          "compat": false,
+          "web": true
+        }
+      },
+      "web_skipped": {
+        "exit": 1,
+        "output": "CI gate FAILED: web: expected success, got skipped\n"
+      },
+      "web_success": {
+        "exit": 0,
+        "output": "CI gate passed: all planned jobs succeeded; only intentionally excluded jobs were skipped\n"
+      }
+    }
+  }
+}

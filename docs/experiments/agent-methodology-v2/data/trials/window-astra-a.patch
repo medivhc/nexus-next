@@ -1,0 +1,92 @@
+--- a/tools/sched_bench.py
++++ b/tools/sched_bench.py
+@@ -42,27 +42,33 @@
+     c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+ """
+ 
+-# 经 SOCKS5 连到 bulk.home.internal，读 argv[2] 秒，打印读到的字节数。
++# 经 SOCKS5 连到 bulk.home.internal，读 argv[2] 秒，打印字节数和首末两次收到数据的时间。
+ DOWNLOAD = r"""
+-import socket, struct, sys, time
++import json, socket, struct, sys, time
+ s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+ s.sendall(b"\x05\x01\x00"); assert s.recv(2) == b"\x05\x00"
+ host = b"bulk.home.internal"
+ s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", 80))
+ reply = s.recv(10); assert reply[1] == 0, reply
+-end = time.time() + float(sys.argv[2]); total = 0; first = None
++end = time.monotonic() + float(sys.argv[2]); total = 0; first = last = None
+ s.settimeout(1)
+-while time.time() < end:
++while time.monotonic() < end:
+     try: n = len(s.recv(1 << 16))
+     except socket.timeout: continue
+     if n == 0: break
++    last = time.monotonic()
++    if first is None: first = last
+     total += n
+-print(total)
++print(json.dumps([total, first, last]))
+ """
+ 
+ 
+ def sh(*cmd, check=True, **kw):
+     return subprocess.run(cmd, check=check, capture_output=True, text=True, **kw)
++
++
++class MeasurementError(RuntimeError):
++    pass
+ 
+ 
+ class Bench:
+@@ -183,13 +189,33 @@
+             self.probe()
+         idle = self.probes(15, 0.1)
+         seconds = self.args.seconds
++        deadline = time.monotonic() + seconds
+         dl = self.in_ns("laptop", DOWNLOAD, 1080, seconds)
+         time.sleep(3)  # 让下载先占满链路
+-        loaded = self.probes(int((seconds - 5) / 0.25), 0.15)
+-        out, err = dl.communicate(timeout=seconds + 30)
++        probes = []
++        while dl.poll() is None:
++            start = time.monotonic()
++            if start >= deadline:
++                break
++            ms = self.probe()
++            finish = time.monotonic()
++            # 下载或测量窗口可能在这次请求期间结束。
++            if dl.poll() is not None or finish > deadline:
++                break
++            probes.append((start, finish, ms))
++            time.sleep(0.15)
++        try:
++            out, err = dl.communicate(timeout=seconds + 30)
++        except subprocess.TimeoutExpired as err:
++            raise MeasurementError("等待下载结束超时") from err
+         if dl.returncode != 0:
+-            raise RuntimeError(f"下载失败：{err}")
+-        mbit = int(out.strip()) * 8 / seconds / 1e6
++            raise MeasurementError(f"下载失败：{err}")
++        total, first, last = json.loads(out)
++        loaded = [ms for start, finish, ms in probes
++                  if first is not None and first <= start and finish <= last]
++        if not loaded:
++            raise MeasurementError("下载期间没有完成的满载探测")
++        mbit = total * 8 / seconds / 1e6
+         self.stop_daemon("laptop")
+         self.stop_daemon("home")
+         return {"scheduling": scheduling, "idle": stats(idle), "loaded": stats(loaded), "throughput_mbit": round(mbit, 2)}
+@@ -241,7 +267,11 @@
+     for attempt in range(1, args.attempts + 1):
+         if args.attempts > 1:
+             print(f"── 第 {attempt} 次（最多 {args.attempts} 次）")
+-        code = measure_once(args)
++        try:
++            code = measure_once(args)
++        except MeasurementError as err:
++            print(f"失败：{err}", file=sys.stderr)
++            return 1
+         if code == 0:
+             return 0
+     return 1

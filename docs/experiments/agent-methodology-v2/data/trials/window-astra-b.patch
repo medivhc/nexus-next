@@ -1,0 +1,74 @@
+--- a/tools/sched_bench.py
++++ b/tools/sched_bench.py
+@@ -17,6 +17,7 @@
+ import argparse
+ import json
+ import os
++import select
+ import shutil
+ import signal
+ import socket
+@@ -42,22 +43,24 @@
+     c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
+ """
+ 
+-# 经 SOCKS5 连到 bulk.home.internal，读 argv[2] 秒，打印读到的字节数。
++# 经 SOCKS5 连到 bulk.home.internal，读 argv[2] 秒，报告字节数和首末数据到达的单调时钟时间。
+ DOWNLOAD = r"""
+-import socket, struct, sys, time
++import json, socket, struct, sys, time
+ s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+ s.sendall(b"\x05\x01\x00"); assert s.recv(2) == b"\x05\x00"
+ host = b"bulk.home.internal"
+ s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", 80))
+ reply = s.recv(10); assert reply[1] == 0, reply
+-end = time.time() + float(sys.argv[2]); total = 0; first = None
++end = time.monotonic() + float(sys.argv[2]); total = 0; first = last = None
+ s.settimeout(1)
+-while time.time() < end:
++while time.monotonic() < end:
+     try: n = len(s.recv(1 << 16))
+     except socket.timeout: continue
+     if n == 0: break
++    last = time.monotonic()
++    if first is None: first = last
+     total += n
+-print(total)
++print(json.dumps([total, first, last]), flush=True)
+ """
+ 
+ 
+@@ -183,13 +186,31 @@
+             self.probe()
+         idle = self.probes(15, 0.1)
+         seconds = self.args.seconds
++        deadline = time.monotonic() + seconds
+         dl = self.in_ns("laptop", DOWNLOAD, 1080, seconds)
+         time.sleep(3)  # 让下载先占满链路
+-        loaded = self.probes(int((seconds - 5) / 0.25), 0.15)
++        probes = []
++        # 子进程写出结果后下载已结束，即使它尚未退出。
++        while not select.select([dl.stdout], [], [], 0)[0]:
++            begin = time.monotonic()
++            if begin >= deadline:
++                break
++            ms = self.probe()
++            finish = time.monotonic()
++            remaining = deadline - finish
++            if remaining < 0:
++                break
++            probes.append((begin, finish, ms))
++            time.sleep(min(0.15, remaining))
+         out, err = dl.communicate(timeout=seconds + 30)
+         if dl.returncode != 0:
+             raise RuntimeError(f"下载失败：{err}")
+-        mbit = int(out.strip()) * 8 / seconds / 1e6
++        total, first, last = json.loads(out)
++        loaded = [ms for begin, finish, ms in probes
++                  if first is not None and first <= begin and finish <= last]
++        if not loaded:
++            raise RuntimeError("下载期间没有完成任何满载探测")
++        mbit = total * 8 / seconds / 1e6
+         self.stop_daemon("laptop")
+         self.stop_daemon("home")
+         return {"scheduling": scheduling, "idle": stats(idle), "loaded": stats(loaded), "throughput_mbit": round(mbit, 2)}

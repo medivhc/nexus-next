@@ -1,0 +1,97 @@
+test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) ...
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='5') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='nan') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='inf') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='0') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='-1') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='inf') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--max-added-ms', value='-0.1') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--max-added-ms', value='nan') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--attempts', value='0') ... FAIL
+  test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--attempts', value='-1') ... FAIL
+test_valid_parameters_keep_optional_skip (test_input.InputContract.test_valid_parameters_keep_optional_skip) ... ok
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='5')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--seconds', '5'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='nan')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--seconds', 'nan'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--seconds', value='inf')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--seconds', 'inf'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--rate-mbit', '0'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='-1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--rate-mbit', '-1'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--rate-mbit', value='inf')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--rate-mbit', 'inf'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--max-added-ms', value='-0.1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--max-added-ms', '-0.1'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--max-added-ms', value='nan')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--max-added-ms', 'nan'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--attempts', value='0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--attempts', '0'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+======================================================================
+FAIL: test_bad_parameters_rejected_before_environment_check (test_input.InputContract.test_bad_parameters_rejected_before_environment_check) (option='--attempts', value='-1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_input.py", line 46, in test_bad_parameters_rejected_before_environment_check
+    self.assertEqual(result.returncode, 2, result)
+AssertionError: 0 != 2 : CompletedProcess(args=['python3', '-c', '\nimport runpy\nimport sys\nmodule = runpy.run_path(sys.argv[1])\ndef unavailable():\n    print("ENVIRONMENT CHECK REACHED")\n    return "controlled unavailable host"\nmodule["main"].__globals__["missing_requirements"] = unavailable\nsys.argv = sys.argv[1:]\nsys.exit(module["main"]())\n', 'nexus-next/tools/sched_bench.py', '--attempts', '-1'], returncode=0, stdout='ENVIRONMENT CHECK REACHED\n跳过满载测量：controlled unavailable host\n', stderr='')
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.993s
+
+FAILED (failures=10)

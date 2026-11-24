@@ -1,0 +1,26 @@
+--- a/tools/sched_bench.py
++++ b/tools/sched_bench.py
+@@ -16,6 +16,7 @@
+ # covers: R44
+ import argparse
+ import json
++import math
+ import os
+ import shutil
+ import signal
+@@ -233,6 +234,15 @@
+                          "改动前后的版本都会出现，见 docs/measurements/M3.5.md；真的退步时每次都不达标）")
+     args = ap.parse_args()
+ 
++    if not math.isfinite(args.seconds) or args.seconds <= 5:
++        ap.error("--seconds 必须是大于 5 的有限数值")
++    if not math.isfinite(args.rate_mbit) or args.rate_mbit <= 0:
++        ap.error("--rate-mbit 必须是大于 0 的有限数值")
++    if not math.isfinite(args.max_added_ms) or args.max_added_ms < 0:
++        ap.error("--max-added-ms 必须是大于或等于 0 的有限数值")
++    if args.attempts < 1:
++        ap.error("--attempts 必须是大于或等于 1 的整数")
++
+     why = missing_requirements()
+     if why:
+         print(f"跳过满载测量：{why}")

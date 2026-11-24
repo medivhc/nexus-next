@@ -1,0 +1,6 @@
+test_connected_but_idle_period_does_not_count_as_loaded (test_delayed_payload.PayloadOnly.test_connected_but_idle_period_does_not_count_as_loaded) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 9.598s
+
+OK

@@ -1,0 +1,38 @@
+test_control_normal_start_fast_probes (test_window_loopback.LoopbackWindow.test_control_normal_start_fast_probes) ... ok
+test_delayed_handshake_still_yields_contained_samples (test_window_loopback.LoopbackWindow.test_delayed_handshake_still_yields_contained_samples) ... FAIL
+test_empty_transfer_fails_cleanly (test_window_loopback.LoopbackWindow.test_empty_transfer_fails_cleanly) ... FAIL
+test_slow_probes_straddle_end (test_window_loopback.LoopbackWindow.test_slow_probes_straddle_end) ... FAIL
+
+======================================================================
+FAIL: test_delayed_handshake_still_yields_contained_samples (test_window_loopback.LoopbackWindow.test_delayed_handshake_still_yields_contained_samples)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 119, in test_delayed_handshake_still_yields_contained_samples
+    self.check_contained(3.6, 0.25, 2)
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 108, in check_contained
+    self.assertEqual(result["loaded"]["max_ms"], 30.0)
+AssertionError: 7777.0 != 30.0
+
+======================================================================
+FAIL: test_empty_transfer_fails_cleanly (test_window_loopback.LoopbackWindow.test_empty_transfer_fails_cleanly)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 123, in test_empty_transfer_fails_cleanly
+    with self.assertRaises(RuntimeError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: RuntimeError not raised
+
+======================================================================
+FAIL: test_slow_probes_straddle_end (test_window_loopback.LoopbackWindow.test_slow_probes_straddle_end)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 116, in test_slow_probes_straddle_end
+    self.check_contained(0.0, 0.62, 2)
+  File "nexus-next/docs/experiments/agent-methodology-v2/judges/test_window_loopback.py", line 108, in check_contained
+    self.assertEqual(result["loaded"]["max_ms"], 30.0)
+AssertionError: 7777.0 != 30.0
+
+----------------------------------------------------------------------
+Ran 4 tests in 44.726s
+
+FAILED (failures=3)
