@@ -76,34 +76,74 @@ fn decode(packet: &SignedPacket) -> Option<Vec<u8>> {
 /// 公钥 → 最新的记录和存进来的时间。
 type Records = HashMap<[u8; 32], (SignedPacket, Instant)>;
 
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const PUT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_PUTS_PER_IP_PER_WINDOW: u32 = 30;
+
+struct StoreInner {
+    records: Records,
+    last_sweep: Option<Instant>,
+    /// 按来源 IP 限制 PUT 频率，防止未鉴权客户端打满 `MAX_RECORDS`。
+    put_rates: HashMap<std::net::IpAddr, (Instant, u32)>,
+}
+
+impl Default for StoreInner {
+    fn default() -> Self {
+        Self { records: HashMap::new(), last_sweep: None, put_rates: HashMap::new() }
+    }
+}
+
 /// 服务端的存储，锚点和测试共用。
 #[derive(Clone, Default)]
 pub struct Store {
-    records: Arc<Mutex<Records>>,
+    inner: Arc<Mutex<StoreInner>>,
 }
 
 impl Store {
     /// 处理一个请求：`path` 是 `/pkarr/<公钥>` 之后的公钥部分。返回状态码和回应体。
     pub fn handle(&self, method: &str, key: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        self.handle_with_ip(None, method, key, body)
+    }
+
+    /// 带来源 IP 限流的请求处理（锚点公网入口调用）。
+    pub fn handle_with_ip(&self, peer_ip: Option<std::net::IpAddr>, method: &str, key: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let Ok(public) = PublicKey::from_z32(key) else { return (400, b"bad key".to_vec()) };
-        let mut records = self.records.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        records.retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
+        let should_sweep = inner.last_sweep.is_none_or(|t| now.duration_since(t) >= SWEEP_INTERVAL);
+        if should_sweep {
+            inner.records.retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
+            inner.put_rates.retain(|_, (start, _)| now.duration_since(*start) < PUT_WINDOW);
+            inner.last_sweep = Some(now);
+        }
         match method {
-            "GET" => match records.get(public.as_bytes()) {
-                Some((packet, _)) => (200, packet.to_relay_payload()),
-                None => (404, Vec::new()),
+            "GET" => match inner.records.get(public.as_bytes()) {
+                Some((packet, at)) if now.duration_since(*at) < RECORD_TTL => (200, packet.to_relay_payload()),
+                _ => (404, Vec::new()),
             },
             "PUT" => {
+                if let Some(ip) = peer_ip {
+                    let entry = inner.put_rates.entry(ip).or_insert((now, 0));
+                    if now.duration_since(entry.0) >= PUT_WINDOW {
+                        *entry = (now, 0);
+                    }
+                    if entry.1 >= MAX_PUTS_PER_IP_PER_WINDOW {
+                        return (429, b"rate limited".to_vec());
+                    }
+                    entry.1 += 1;
+                }
                 let Ok(packet) = SignedPacket::from_relay_payload(&public, body) else { return (400, b"bad signature".to_vec()) };
-                if let Some((old, _)) = records.get(public.as_bytes()) {
-                    if !packet.more_recent_than(old) {
+                if let Some((old, at)) = inner.records.get(public.as_bytes()) {
+                    if now.duration_since(*at) < RECORD_TTL && !packet.more_recent_than(old) {
                         return (409, b"not newer".to_vec());
                     }
-                } else if records.len() >= MAX_RECORDS {
-                    return (429, b"full".to_vec());
+                } else if inner.records.len() >= MAX_RECORDS {
+                    inner.records.retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
+                    if inner.records.len() >= MAX_RECORDS {
+                        return (429, b"full".to_vec());
+                    }
                 }
-                records.insert(*public.as_bytes(), (packet, now));
+                inner.records.insert(*public.as_bytes(), (packet, now));
                 (200, Vec::new())
             }
             _ => (405, Vec::new()),
@@ -113,6 +153,16 @@ impl Store {
 
 /// 请求头和已经读到的部分之后，读完请求体、回应、关闭。`head` 是 [`read_head`] 的结果。
 pub async fn respond<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, head: &[u8], store: &Store) -> io::Result<()> {
+    respond_with_ip(stream, head, store, None).await
+}
+
+/// 带来源 IP 限流的碰头服务响应。
+pub async fn respond_with_ip<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    head: &[u8],
+    store: &Store,
+    peer_ip: Option<std::net::IpAddr>,
+) -> io::Result<()> {
     let end = head.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io_err("请求头不完整"))?;
     let text = String::from_utf8_lossy(&head[..end]);
     let mut lines = text.split("\r\n");
@@ -134,7 +184,7 @@ pub async fn respond<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, head: &[
             body.extend_from_slice(&rest);
         }
         let key = target.split('?').next().unwrap_or("").trim_start_matches('/').strip_prefix("pkarr/").unwrap_or("");
-        store.handle(&method, key, &body)
+        store.handle_with_ip(peer_ip, &method, key, &body)
     };
     let reason = match status {
         200 => "OK",
