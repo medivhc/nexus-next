@@ -302,6 +302,16 @@ pub enum Cmd {
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
     /// 登记、列出、撤销用于网页登录的通行密钥
+    /// 访问网页节点发布的硬件能力（摄像头、麦克风、位置，M8.3）
+    Hw {
+        #[command(subcommand)]
+        cmd: HwCmd,
+    },
+    /// 临时分享（M9.1）：把文件/目录、网页服务或只读终端用限时/限次链接分享给访客
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     /// Vault（M9.2）：加密保存秘密并按条目同步到授权设备，每次取用记入审计
     Vault {
         #[command(subcommand)]
@@ -436,6 +446,71 @@ pub enum SessionCmd {
     Kill {
         node: String,
         session: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HwCmd {
+    /// 列出网页节点当前已显式同意开放的硬件能力
+    Ls {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从网页节点采集一项硬件能力（camera、microphone、location）
+    Capture {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 硬件能力：camera、microphone 或 location
+        kind: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShareCmd {
+    /// 创建一条只读临时分享链接（文件/目录、已发布网页服务或只读终端）
+    Create {
+        /// 分享工作区里的文件或目录，格式 <工作区>:/<路径>
+        #[arg(long, value_name = "工作区:/路径")]
+        drive: Option<String>,
+        /// 分享本机已发布的网页服务（--proto http）
+        #[arg(long, value_name = "服务名")]
+        service: Option<String>,
+        /// 分享本机正在运行的终端会话（访客只读观看）
+        #[arg(long, value_name = "会话名")]
+        terminal: Option<String>,
+        /// 有效期，例如 30m、1h、24h
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// 最多允许打开的次数（不设则不限次数）
+        #[arg(long, value_name = "次数")]
+        max_uses: Option<u32>,
+        /// 网页入口地址（默认用网络的锚点）
+        #[arg(long, value_name = "网址")]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本机的所有临时分享及其剩余次数/撤销状态
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 立即撤销一条临时分享
+    Revoke {
+        /// 分享编号（8 位十六进制）
+        id: String,
         #[arg(long)]
         json: bool,
     },
@@ -1003,6 +1078,40 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
             (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
         }
+        Cmd::Hw { cmd: HwCmd::Ls { node_id, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            (CtlRequest::HardwareList { node_id: id, hint: hint.clone() }, *json)
+        }
+        Cmd::Hw { cmd: HwCmd::Capture { node_id, kind, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            let Some(k) = nexus_wire::HardwareKind::parse(kind) else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("硬件能力应为 camera、microphone 或 location：{kind}"));
+            };
+            (CtlRequest::HardwareCapture { node_id: id, hint: hint.clone(), kind: k }, *json)
+        }
+        Cmd::Share { cmd: ShareCmd::Create { drive, service, terminal, ttl, max_uses, page, json } } => {
+            let Some(ttl_ms) = parse_ttl(ttl) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"));
+            };
+            let target = match (drive, service, terminal) {
+                (Some(d), None, None) => {
+                    let Some((ws, p)) = d.split_once(":/") else {
+                        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("工作区路径应写成 <工作区>:/<路径>：{d}"));
+                    };
+                    nexus_wire::ShareTarget::Drive { ws: ws.to_string(), path: format!("/{p}") }
+                }
+                (None, Some(s), None) => nexus_wire::ShareTarget::Service { name: s.clone() },
+                (None, None, Some(t)) => nexus_wire::ShareTarget::Terminal { session: t.clone() },
+                _ => return fail(sink, EXIT_USAGE, "usage", "必须且只能指定 --drive、--service 或 --terminal 之一"),
+            };
+            (CtlRequest::ShareCreate { target, ttl_ms, max_uses: *max_uses, page: page.clone() }, *json)
+        }
+        Cmd::Share { cmd: ShareCmd::Ls { json } } => (CtlRequest::ShareList, *json),
+        Cmd::Share { cmd: ShareCmd::Revoke { id, json } } => (CtlRequest::ShareRevoke { id: id.clone() }, *json),
         Cmd::Vault { cmd: VaultCmd::Put { name, value, devices, json } } => {
             let bytes = match value {
                 Some(v) => v.as_bytes().to_vec(),
@@ -1111,6 +1220,95 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
         }
         CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::HardwareList(list) => {
+            let names: Vec<&str> = list.iter().map(|k| k.as_str()).collect();
+            if json {
+                format!("{}\n", json!({ "capabilities": names }))
+            } else if names.is_empty() {
+                "没有开放的硬件能力。\n".into()
+            } else {
+                format!("{}\n", names.join("\n"))
+            }
+        }
+        CtlResponse::HardwareCapture(cap) => {
+            if json {
+                let v = match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        json!({ "kind": "camera", "mime": mime, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        json!({ "kind": "microphone", "mime": mime, "duration_ms": duration_ms, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, timestamp_ms } => {
+                        json!({ "kind": "location", "lat_e7": lat_e7, "lon_e7": lon_e7, "accuracy_cm": accuracy_cm, "timestamp_ms": timestamp_ms })
+                    }
+                };
+                format!("{v}\n")
+            } else {
+                match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        format!("camera ({mime}, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        format!("microphone ({mime}, {duration_ms}ms, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, .. } => {
+                        format!("location ({:.6}, {:.6}, ±{:.2}m)\n", lat_e7 as f64 / 1e7, lon_e7 as f64 / 1e7, accuracy_cm as f64 / 100.0)
+                    }
+                }
+            }
+        }
+        CtlResponse::ShareCreated(r) => {
+            if json {
+                format!(
+                    "{}\n",
+                    json!({
+                        "id": r.id,
+                        "url": r.url,
+                        "kind": r.target.kind_str(),
+                        "expires_at_ms": r.expires_at.0,
+                        "max_uses": r.max_uses,
+                    })
+                )
+            } else {
+                format!("分享已创建（编号 {}）：\n  {}\n", r.id, r.url)
+            }
+        }
+        CtlResponse::Shares(list) => {
+            if json {
+                let items: Vec<Value> = list
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "kind": s.target.kind_str(),
+                            "created_at_ms": s.created_at.0,
+                            "expires_at_ms": s.expires_at.0,
+                            "max_uses": s.max_uses,
+                            "uses": s.uses,
+                            "revoked": s.revoked,
+                        })
+                    })
+                    .collect();
+                format!("{}\n", json!({ "shares": items }))
+            } else if list.is_empty() {
+                "没有临时分享。\n".into()
+            } else {
+                list.iter()
+                    .map(|s| {
+                        let status = if s.revoked { "已撤销" } else { "有效" };
+                        format!("{}  {}  已用 {}/{:?}  {status}\n", s.id, s.target.kind_str(), s.uses, s.max_uses)
+                    })
+                    .collect()
+            }
+        }
+        CtlResponse::ShareRevoked(s) => {
+            if json {
+                format!("{}\n", json!({ "id": s.id, "revoked": s.revoked }))
+            } else {
+                format!("已撤销分享 {}\n", s.id)
+            }
+        }
         CtlResponse::VaultPut(info) => {
             if json {
                 format!(

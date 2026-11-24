@@ -21,6 +21,11 @@
     <p>创建之后，在任何浏览器里都可以用它登录你的 Nexus。</p>
     <button id="enroll-go">创建通行密钥</button>
   </section>
+  <section id="share-view" hidden>
+    <h1 id="share-title">临时分享（只读）</h1>
+    <p id="share-meta" class="muted"></p>
+    <div id="share-body"></div>
+  </section>
   <section id="login" hidden>
     <h1>登录</h1>
     <p>用你登记过的通行密钥登录。关掉页面后，这台电脑上不留下任何东西。</p>
@@ -29,6 +34,13 @@
   <section id="devices" hidden>
     <h1>设备</h1>
     <ul id="device-list"></ul>
+    <h1>本机硬件（需逐项明确同意）</h1>
+    <p id="hw-active" class="muted">当前无人使用本机硬件。</p>
+    <ul id="hw-list">
+      <li><span>摄像头</span><button id="hw-camera">开启</button></li>
+      <li><span>麦克风</span><button id="hw-microphone">开启</button></li>
+      <li><span>位置</span><button id="hw-location">开启</button></li>
+    </ul>
     <h1>工作区</h1>
     <ul id="ws-list"></ul>
     <p id="ws-none" class="muted" hidden>没有能读的工作区。工作区要保存在存储设备上（nexus drive serve on），
