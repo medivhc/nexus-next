@@ -469,87 +469,58 @@ impl Connection for IrohConn {
     }
 }
 
+/// 额外信任的根证书：`SSL_CERT_FILE` 指的文件，没有就用系统的证书包。
+///
+/// iroh 默认只信任编译进去的 Mozilla 根证书，企业代理、沙箱里的出站代理会用自己的根证书重新签发
+/// 中继和地址发现服务的证书，不加这些就连不上中继。它们只用来验证这些外部服务的 TLS 证书，
+/// 设备之间的连接仍靠设备密钥认证。
 #[cfg(not(target_arch = "wasm32"))]
 fn load_extra_ca_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
-        if !path.trim().is_empty() {
-            paths.push(std::path::PathBuf::from(path));
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) {
+        paths.push(std::path::PathBuf::from(path));
+    }
+    for fallback in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"] {
+        let path = std::path::PathBuf::from(fallback);
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
-    for fallback in [
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/cert.pem",
-    ] {
-        let pb = std::path::PathBuf::from(fallback);
-        if !paths.contains(&pb) {
-            paths.push(pb);
-        }
-    }
-    for path in paths {
-        if let Ok(pem) = std::fs::read_to_string(&path) {
-            let certs = parse_pem_certs(&pem);
-            if !certs.is_empty() {
-                return certs;
-            }
-        }
-    }
-    Vec::new()
+    paths
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .map(|pem| parse_pem_certs(&pem))
+        .find(|certs| !certs.is_empty())
+        .unwrap_or_default()
 }
 
+/// PEM 里的所有证书；坏掉的条目跳过，不让一张坏证书拖累整个证书包。
 #[cfg(not(target_arch = "wasm32"))]
-fn parse_pem_certs(pem: &str) -> Vec<rustls_pki_types::CertificateDer<'static>> {
-    let mut certs = Vec::new();
-    let mut in_cert = false;
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let trimmed = line.trim();
-        if trimmed == "-----BEGIN CERTIFICATE-----" {
-            in_cert = true;
-            b64.clear();
-        } else if trimmed == "-----END CERTIFICATE-----" && in_cert {
-            in_cert = false;
-            if let Some(der) = decode_base64(&b64) {
-                certs.push(rustls_pki_types::CertificateDer::from(der));
-            }
-            b64.clear();
-        } else if in_cert {
-            b64.push_str(trimmed);
-        }
-    }
-    certs
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf = 0u32;
-    let mut bits = 0u8;
-    for b in input.bytes() {
-        let val = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b if b.is_ascii_whitespace() => continue,
-            _ => return None,
-        };
-        buf = (buf << 6) | u32::from(val);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
+fn parse_pem_certs(pem: &[u8]) -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    use rustls_pki_types::pem::PemObject;
+    rustls_pki_types::CertificateDer::pem_slice_iter(pem).filter_map(Result::ok).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 两张证书（内容不必是真的证书，PEM 解析只管 base64），中间夹着别的 PEM 块和注释。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parse_pem_certs_reads_every_certificate() {
+        let pem = b"# bundle\n-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n\
+-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n\
+-----BEGIN CERTIFICATE-----\nAwQF\nBgc=\n-----END CERTIFICATE-----\n";
+        let certs = parse_pem_certs(pem);
+        assert_eq!(certs.iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>(), vec![vec![0, 1, 2], vec![3, 4, 5, 6, 7]]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parse_pem_certs_without_certificates_is_empty() {
+        assert!(parse_pem_certs(b"not a pem file").is_empty());
+    }
 
     #[test]
     fn relay_hints_round_trip() {
