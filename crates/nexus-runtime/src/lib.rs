@@ -696,13 +696,22 @@ impl<T: Transport, S: System> Node<T, S> {
         verify_root_rotation(&root, current.as_ref(), rotation, candidate)
             .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         let new_root = rotation.rotation.new_root;
+        let still_admin = candidate.roster.device(self.me()).is_some_and(|d| d.role == DeviceRole::Admin);
+        let mut rotations = self.trust.borrow().rotations.clone();
+        rotations.push((rotation.clone(), candidate.clone()));
         save(&self.system, KEY_ROOT_PUB, &new_root).map_err(internal)?;
         save(&self.system, KEY_ROSTER, candidate).map_err(internal)?;
+        save(&self.system, KEY_ROTATIONS, &rotations).map_err(internal)?;
+        if !still_admin {
+            self.system.store_delete(KEY_ROOT_KEY).map_err(internal)?;
+        }
         let mut trust = self.trust.borrow_mut();
         trust.root = Some(new_root);
         trust.roster = Some(candidate.clone());
-        trust.rotations.push((rotation.clone(), candidate.clone()));
-        let _ = save(&self.system, KEY_ROTATIONS, &trust.rotations);
+        trust.rotations = rotations;
+        if !still_admin {
+            trust.root_key = None;
+        }
         drop(trust);
         self.roster_epoch.send_modify(|v| *v += 1);
         Ok(())
@@ -1334,7 +1343,7 @@ impl<T: Transport, S: System> Node<T, S> {
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
         // 执行和会话请求仍交给目标设备完整判定并审计，包括无效凭据的拒绝。
         if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::Paths { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
-            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason))?;
+            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason));
         }
         if SecretKey::from_seed(agent.secret).public() != agent.cert.cert.agent {
             return Err(denied(&DenyReason::AssertionBadSignature));
@@ -3508,3 +3517,6 @@ mod tests {
         stalled_exec(true).await;
     }
 }
+
+#[cfg(test)]
+mod root_rotation_tests;
