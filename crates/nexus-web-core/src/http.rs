@@ -10,6 +10,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// 回应最大多少。
 pub const MAX_RESPONSE: usize = 64 << 20;
 
+/// 一个 HTTP 请求（临时分享的访客用，M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebHttpRequest {
+    pub method: String,
+    /// 以 `/` 开头，含 `?` 后面的部分。
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 /// 一个 HTTP 回应。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpResponse {
@@ -162,6 +172,33 @@ pub fn parse_response(mut buf: &[u8], eof: bool, head_only: bool) -> Result<Opti
     }
 }
 
+/// 在已经接到服务的流上发出请求、读完回应（网页节点和临时分享的访客共用）。
+pub(crate) async fn exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    req: &WebHttpRequest,
+    what: &str,
+) -> Result<HttpResponse, WireError> {
+    let request = encode_request(&req.method, &req.path, &req.headers, &req.body)?;
+    stream.write_all(&request).await.map_err(unreachable)?;
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let head_only = req.method.eq_ignore_ascii_case("HEAD");
+    loop {
+        let n = stream.read(&mut chunk).await.map_err(unreachable)?;
+        buf.extend_from_slice(&chunk[..n]);
+        match parse_response(&buf, n == 0, head_only) {
+            Ok(Some(r)) => {
+                let _ = stream.shutdown().await;
+                return Ok(r);
+            }
+            Ok(None) if buf.len() > MAX_RESPONSE + 64 * 1024 => return Err(invalid(too_big())),
+            Ok(None) => {}
+            Err(m) if m == too_big() => return Err(invalid(m)),
+            Err(m) => return Err(WireError::new(ErrorCode::Unreachable, format!("{what} 的回应：{m}"))),
+        }
+    }
+}
+
 impl<T: Transport> WebNode<T> {
     /// 设备上它能用的服务。
     pub async fn services(&self, device: &str) -> Result<Vec<ServiceInfo>, WireError> {
@@ -173,7 +210,8 @@ impl<T: Transport> WebNode<T> {
 
     /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求，读完回应。不跟随跳转。
     pub async fn http(&self, device: &str, service: &str, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Result<HttpResponse, WireError> {
-        let request = encode_request(method, path, headers, body)?;
+        // 先检查请求本身：不合法的不用连接。
+        encode_request(method, path, headers, body)?;
         // 只对网页服务：说明里的协议不是 http 的不发（没有授权时列表里没有它，下面连接时由设备判定）。
         // 协议记下来，同一个服务的后续请求不用再问。
         let key = (device.to_string(), service.to_string());
@@ -204,25 +242,8 @@ impl<T: Transport> WebNode<T> {
             Response::Error(e) => return Err(e),
             other => return Err(WireError::new(ErrorCode::Internal, format!("回应无法理解：{other:?}"))),
         }
-        stream.write_all(&request).await.map_err(unreachable)?;
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        let head_only = method.eq_ignore_ascii_case("HEAD");
-        let bad = |m: String| WireError::new(ErrorCode::Unreachable, format!("{device}/{service} 的回应：{m}"));
-        loop {
-            let n = stream.read(&mut chunk).await.map_err(unreachable)?;
-            buf.extend_from_slice(&chunk[..n]);
-            match parse_response(&buf, n == 0, head_only) {
-                Ok(Some(r)) => {
-                    let _ = stream.shutdown().await;
-                    return Ok(r);
-                }
-                Ok(None) if buf.len() > MAX_RESPONSE + 64 * 1024 => return Err(invalid(too_big())),
-                Ok(None) => {}
-                Err(m) if m == too_big() => return Err(invalid(m)),
-                Err(m) => return Err(bad(m)),
-            }
-        }
+        let req = WebHttpRequest { method: method.to_string(), path: path.to_string(), headers: headers.to_vec(), body: body.to_vec() };
+        exchange(&mut stream, &req, &format!("{device}/{service}")).await
     }
 }
 

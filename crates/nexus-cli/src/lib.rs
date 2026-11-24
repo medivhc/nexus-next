@@ -307,6 +307,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: HwCmd,
     },
+    /// 临时分享（M9.1）：把文件/目录、网页服务或只读终端用限时/限次链接分享给访客
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     Web {
         #[command(subcommand)]
         cmd: WebCmd,
@@ -462,6 +467,45 @@ pub enum HwCmd {
         /// 网页节点的地址提示
         #[arg(long, default_value = "")]
         hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShareCmd {
+    /// 创建一条只读临时分享链接（文件/目录、已发布网页服务或只读终端）
+    Create {
+        /// 分享工作区里的文件或目录，格式 <工作区>:/<路径>
+        #[arg(long, value_name = "工作区:/路径")]
+        drive: Option<String>,
+        /// 分享本机已发布的网页服务（--proto http）
+        #[arg(long, value_name = "服务名")]
+        service: Option<String>,
+        /// 分享本机正在运行的终端会话（访客只读观看）
+        #[arg(long, value_name = "会话名")]
+        terminal: Option<String>,
+        /// 有效期，例如 30m、1h、24h
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// 最多允许打开的次数（不设则不限次数）
+        #[arg(long, value_name = "次数")]
+        max_uses: Option<u32>,
+        /// 网页入口地址（默认用网络的锚点）
+        #[arg(long, value_name = "网址")]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本机的所有临时分享及其剩余次数/撤销状态
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 立即撤销一条临时分享
+    Revoke {
+        /// 分享编号（8 位十六进制）
+        id: String,
         #[arg(long)]
         json: bool,
     },
@@ -995,6 +1039,25 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
             (CtlRequest::HardwareCapture { node_id: id, hint: hint.clone(), kind: k }, *json)
         }
+        Cmd::Share { cmd: ShareCmd::Create { drive, service, terminal, ttl, max_uses, page, json } } => {
+            let Some(ttl_ms) = parse_ttl(ttl) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"));
+            };
+            let target = match (drive, service, terminal) {
+                (Some(d), None, None) => {
+                    let Some((ws, p)) = d.split_once(":/") else {
+                        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("工作区路径应写成 <工作区>:/<路径>：{d}"));
+                    };
+                    nexus_wire::ShareTarget::Drive { ws: ws.to_string(), path: format!("/{p}") }
+                }
+                (None, Some(s), None) => nexus_wire::ShareTarget::Service { name: s.clone() },
+                (None, None, Some(t)) => nexus_wire::ShareTarget::Terminal { session: t.clone() },
+                _ => return fail(sink, EXIT_USAGE, "usage", "必须且只能指定 --drive、--service 或 --terminal 之一"),
+            };
+            (CtlRequest::ShareCreate { target, ttl_ms, max_uses: *max_uses, page: page.clone() }, *json)
+        }
+        Cmd::Share { cmd: ShareCmd::Ls { json } } => (CtlRequest::ShareList, *json),
+        Cmd::Share { cmd: ShareCmd::Revoke { id, json } } => (CtlRequest::ShareRevoke { id: id.clone() }, *json),
         Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
         Cmd::Anchor { cmd: AnchorCmd::Set { url, clear, json } } => {
             (CtlRequest::AnchorSet { url: if *clear { None } else { url.clone() } }, *json)
@@ -1110,6 +1173,57 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                         format!("location ({:.6}, {:.6}, ±{:.2}m)\n", lat_e7 as f64 / 1e7, lon_e7 as f64 / 1e7, accuracy_cm as f64 / 100.0)
                     }
                 }
+            }
+        }
+        CtlResponse::ShareCreated(r) => {
+            if json {
+                format!(
+                    "{}\n",
+                    json!({
+                        "id": r.id,
+                        "url": r.url,
+                        "kind": r.target.kind_str(),
+                        "expires_at_ms": r.expires_at.0,
+                        "max_uses": r.max_uses,
+                    })
+                )
+            } else {
+                format!("分享已创建（编号 {}）：\n  {}\n", r.id, r.url)
+            }
+        }
+        CtlResponse::Shares(list) => {
+            if json {
+                let items: Vec<Value> = list
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "kind": s.target.kind_str(),
+                            "created_at_ms": s.created_at.0,
+                            "expires_at_ms": s.expires_at.0,
+                            "max_uses": s.max_uses,
+                            "uses": s.uses,
+                            "revoked": s.revoked,
+                        })
+                    })
+                    .collect();
+                format!("{}\n", json!({ "shares": items }))
+            } else if list.is_empty() {
+                "没有临时分享。\n".into()
+            } else {
+                list.iter()
+                    .map(|s| {
+                        let status = if s.revoked { "已撤销" } else { "有效" };
+                        format!("{}  {}  已用 {}/{:?}  {status}\n", s.id, s.target.kind_str(), s.uses, s.max_uses)
+                    })
+                    .collect()
+            }
+        }
+        CtlResponse::ShareRevoked(s) => {
+            if json {
+                format!("{}\n", json!({ "id": s.id, "revoked": s.revoked }))
+            } else {
+                format!("已撤销分享 {}\n", s.id)
             }
         }
         CtlResponse::WebEnroll(r) => {

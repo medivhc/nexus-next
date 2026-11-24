@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 1;
+pub const WIRE_MINOR: u16 = 2;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -134,6 +134,42 @@ pub enum Request {
     HardwareList,
     /// 网页节点硬件能力（M8.3）：采集一项硬件能力（摄像头/麦克风/位置）。
     HardwareCapture { kind: HardwareKind },
+    /// 临时分享（M9.1）：访客打开分享链接，校验令牌并扣减一次可用次数。
+    ShareOpen { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客列出被分享目录下的相对子路径。
+    ShareDriveList { token: [u8; 16], path: String },
+    /// 临时分享（M9.1）：访客读取被分享文件（或被分享目录下的相对子路径）最多 `max` 字节。
+    ShareDriveRead { token: [u8; 16], path: String, max: u64 },
+    /// 临时分享（M9.1）：访客连接被分享的 HTTP 服务。
+    ShareServiceConnect { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客只读观看被分享的终端会话。
+    ShareSessionWatch { token: [u8; 16], size: Size },
+}
+
+/// 临时分享的目标（M9.1）：全部为只读访问。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareTarget {
+    Drive { ws: String, path: String },
+    Service { name: String },
+    Terminal { session: String },
+}
+
+impl ShareTarget {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ShareTarget::Drive { .. } => "drive",
+            ShareTarget::Service { .. } => "service",
+            ShareTarget::Terminal { .. } => "terminal",
+        }
+    }
+
+    pub fn describe(&self, device: &str) -> String {
+        match self {
+            ShareTarget::Drive { ws, path } => format!("{device}/drive/{ws}:{path}"),
+            ShareTarget::Service { name } => format!("{device}/svc/{name}"),
+            ShareTarget::Terminal { session } => format!("{device}/session/{session}"),
+        }
+    }
 }
 
 /// 网页节点可发布的硬件能力类别（M8.3）。
@@ -161,6 +197,47 @@ impl HardwareKind {
             _ => None,
         }
     }
+}
+
+/// 访客打开临时分享后看到的元信息（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub id: String,
+    pub device: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub remaining_uses: Option<u32>,
+}
+
+/// 临时分享目录里的一项（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDriveEntry {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub target: Option<String>,
+}
+
+/// 本机创建的一条临时分享记录（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub id: String,
+    pub target: ShareTarget,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    pub revoked: bool,
+}
+
+/// 创建临时分享的结果（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCreatedReport {
+    pub id: String,
+    pub url: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
 }
 
 /// 网页节点返回的一次硬件采集结果（M8.3）。
@@ -198,7 +275,11 @@ impl Request {
     pub fn class(&self) -> TrafficClass {
         match self {
             Request::Exec(_) => TrafficClass::Normal,
-            Request::SvcConnect { .. } | Request::ExitConnect { .. } | Request::DriveGet { .. } | Request::DrivePush { .. } => {
+            Request::SvcConnect { .. }
+            | Request::ExitConnect { .. }
+            | Request::DriveGet { .. }
+            | Request::DrivePush { .. }
+            | Request::ShareServiceConnect { .. } => {
                 TrafficClass::Bulk
             }
             Request::DriveInfo
@@ -207,7 +288,11 @@ impl Request {
             | Request::DriveProfilePut { .. }
             | Request::DriveProfileGet { .. }
             | Request::HardwareList
-            | Request::HardwareCapture { .. } => TrafficClass::Interactive,
+            | Request::HardwareCapture { .. }
+            | Request::ShareOpen { .. }
+            | Request::ShareDriveList { .. }
+            | Request::ShareDriveRead { .. }
+            | Request::ShareSessionWatch { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -497,6 +582,9 @@ pub enum Response {
     Error(WireError),
     HardwareList(Vec<HardwareKind>),
     HardwareCapture(HardwareCapture),
+    ShareOpened(ShareInfo),
+    ShareDriveEntries(Vec<ShareDriveEntry>),
+    ShareDriveFile { size: u64, bytes: Vec<u8>, truncated: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,6 +705,9 @@ pub enum CtlRequest {
     HardwareList { node_id: NodeId, hint: String },
     /// 从网页节点采集一项硬件能力（M8.3）。
     HardwareCapture { node_id: NodeId, hint: String, kind: HardwareKind },
+    ShareCreate { target: ShareTarget, ttl_ms: u64, max_uses: Option<u32>, page: Option<String> },
+    ShareList,
+    ShareRevoke { id: String },
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
@@ -684,6 +775,9 @@ pub enum CtlResponse {
     WebEnroll(WebEnrollReport),
     HardwareList(Vec<HardwareKind>),
     HardwareCapture(HardwareCapture),
+    ShareCreated(ShareCreatedReport),
+    Shares(Vec<ShareRecord>),
+    ShareRevoked(ShareRecord),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),
