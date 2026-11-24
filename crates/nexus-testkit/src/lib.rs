@@ -127,7 +127,7 @@ impl World {
                 };
                 Output::from_captured(code, sink)
             }
-            Inner::Real(real) => real.cli(node, args, stdin),
+            Inner::Real(real) => real.cli_async(node, args, stdin).await,
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
         self.trace
@@ -370,7 +370,7 @@ impl World {
             Inner::Sim { .. } => {
                 // 仿真里身份由种子决定，保持可复现。
                 let key = nexus_core_proto::SecretKey::from_seed([(n % 200) as u8 + 50; 32]);
-                BrowserTransport::Sim(SimTransport::client(nexus_core_proto::NodeId(key.public().0)))
+                BrowserTransport::Sim(SimTransport::bind_port(nexus_core_proto::NodeId(key.public().0), SCENARIO_HOST, 19100 + (n as u16)).await.expect("仿真浏览器监听端口失败"))
             }
             Inner::Real(_) => {
                 let mut seed = [0u8; 32];
@@ -625,7 +625,7 @@ impl Browser {
     pub async fn share_http_fetch(
         &self,
         req: &nexus_web_core::WebHttpRequest,
-    ) -> Result<nexus_web_core::WebHttpResponse, nexus_wire::WireError> {
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
         let g = self.guest();
         on_guest!(g, n => n.http_fetch(req).await)
     }
@@ -702,6 +702,49 @@ impl Browser {
     pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_read(ws, path, max).await)
+    }
+
+    /// 网页节点的临时标识与地址提示（M8.3）。
+    pub fn node_id(&self) -> nexus_core_proto::NodeId {
+        let node = self.node();
+        on_node!(node, n => n.node_id())
+    }
+
+    pub fn hint(&self) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hint())
+    }
+
+    /// 启动网页节点的硬件能力服务循环（M8.3）。
+    pub async fn serve_hardware<P: nexus_web_core::HardwareProvider>(
+        &self,
+        state: nexus_web_core::HardwareState,
+        provider: P,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        on_usage: impl FnMut(nexus_web_core::HardwareUsageEvent),
+    ) {
+        let node = self.node();
+        on_node!(node, n => n.serve_hardware(state, provider, stop, on_usage).await)
+    }
+
+    /// 设备上能用的服务（M8.2）。
+    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.services(device).await)
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求（M8.2）。
+    pub async fn http(
+        &self,
+        device: &str,
+        service: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.http(device, service, method, path, headers, body).await)
     }
 
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
@@ -1310,8 +1353,8 @@ impl RealWorld {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
         let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
-        let child = Command::new(&bin)
-            .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
             .args(&rendezvous)
             .args(&proxy)
@@ -1323,9 +1366,19 @@ impl RealWorld {
             .env_remove("ENV")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("无法启动 nexus daemon");
+            .stderr(log);
+        // 刚复制出来的二进制（use_own_binary）：并行的测试里别的线程 fork 出的子进程在 exec 之前还持有它的写句柄，
+        // 这时执行会得到 ETXTBSY。等一下再试。
+        let mut tries = 0;
+        let child = loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.expect("无法启动 nexus daemon"),
+            }
+        };
         self.children.borrow_mut().insert(name.to_string(), child);
     }
 
@@ -1465,6 +1518,42 @@ impl RealWorld {
         RealTerm { child: RefCell::new(child), stdin: RefCell::new(stdin), stderr }
     }
 
+    async fn cli_async(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
+        let bin = self.bin.clone();
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
+        let agent_socket = self.agent_socket(node);
+        let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let data = stdin.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = Command::new(&bin)
+                .args(["--data-dir", dir.to_str().unwrap()])
+                .args(&args)
+                .env("NEXUS_AGENT_SOCKET", agent_socket)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("无法执行 nexus");
+            let mut pipe = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+            });
+            let out = child.wait_with_output().expect("无法等待 nexus");
+            let _ = writer.join();
+            let code = out.status.code().unwrap_or(1);
+            Output {
+                code,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stdout_raw: out.stdout,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }
+        })
+        .await
+        .expect("后台执行 nexus 失败")
+    }
+
+    #[allow(dead_code)]
     fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
         let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
@@ -1982,6 +2071,21 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
             let (mut r, mut w) = s.split();
             let _ = tokio::io::copy(&mut r, &mut w).await;
             let _ = w.shutdown().await;
+        }
+        Service::HttpEcho => {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            let reply = loop {
+                if let Some(r) = nexus_sys_sim::http_echo_reply(&req) {
+                    break r;
+                }
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            };
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
         }
         Service::Http(body) => {
             let mut head = Vec::new();

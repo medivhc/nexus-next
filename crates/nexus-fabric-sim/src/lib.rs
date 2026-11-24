@@ -31,6 +31,12 @@ impl SimTransport {
         Ok(Self { me, host: host.to_string(), hints: RefCell::default(), listener: Some(listener) })
     }
 
+    /// 绑定到指定端口（用于同一仿真主机上的多个可接收连接的节点，例如浏览器发布硬件能力）。
+    pub async fn bind_port(me: NodeId, host: &str, port: u16) -> io::Result<Self> {
+        let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+        Ok(Self { me, host: format!("{host}:{port}"), hints: RefCell::default(), listener: Some(listener) })
+    }
+
     /// 只发起连接、不接受连接的一方，例如浏览器。同一台仿真主机上可以有任意多个。
     pub fn client(me: NodeId) -> Self {
         Self { me, host: String::new(), hints: RefCell::default(), listener: None }
@@ -176,7 +182,13 @@ impl Connection for SimConn {
     async fn open_bi(&self) -> io::Result<TcpStream> {
         match self {
             SimConn::Outgoing { me, host, proto, .. } => {
-                let mut s = TcpStream::connect((turmoil::lookup(host.as_str()), PORT)).await?;
+                let mut s = {
+                    let (h, p) = match host.rsplit_once(':') {
+                        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(PORT)),
+                        None => (host.as_str(), PORT),
+                    };
+                    TcpStream::connect((turmoil::lookup(h), p)).await?
+                };
                 let mut head = [0u8; 33];
                 head[..32].copy_from_slice(&me.0);
                 head[32] = proto_byte(*proto);

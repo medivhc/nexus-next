@@ -138,14 +138,23 @@ fn extract(gz: &[u8]) -> Result<Vec<u8>, WireError> {
 
 /// 运行新二进制的一条命令，限时，返回标准输出。
 fn probe(bin: &Path, args: &[&str], data_dir: &Path) -> Result<String, String> {
-    let mut child = std::process::Command::new(bin)
-        .args(args)
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args)
         .env("NEXUS_DATA_DIR", data_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("运行不了（{e}）"))?;
+        .stderr(std::process::Stdio::piped());
+    // 刚写好的文件：别的线程同时 fork 出的子进程在 exec 之前还持有它的写句柄时，执行会得到 ETXTBSY，等一下再试。
+    let mut tries = 0;
+    let mut child = loop {
+        match cmd.spawn() {
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => break other.map_err(|e| format!("运行不了（{e}）"))?,
+        }
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         match child.try_wait() {

@@ -302,6 +302,11 @@ pub enum Cmd {
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
     /// 登记、列出、撤销用于网页登录的通行密钥
+    /// 访问网页节点发布的硬件能力（摄像头、麦克风、位置，M8.3）
+    Hw {
+        #[command(subcommand)]
+        cmd: HwCmd,
+    },
     /// 临时分享（M9.1）：把文件/目录、网页服务或只读终端用限时/限次链接分享给访客
     Share {
         #[command(subcommand)]
@@ -436,6 +441,32 @@ pub enum SessionCmd {
     Kill {
         node: String,
         session: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HwCmd {
+    /// 列出网页节点当前已显式同意开放的硬件能力
+    Ls {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从网页节点采集一项硬件能力（camera、microphone、location）
+    Capture {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 硬件能力：camera、microphone 或 location
+        kind: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
         #[arg(long)]
         json: bool,
     },
@@ -993,6 +1024,21 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
             (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
         }
+        Cmd::Hw { cmd: HwCmd::Ls { node_id, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            (CtlRequest::HardwareList { node_id: id, hint: hint.clone() }, *json)
+        }
+        Cmd::Hw { cmd: HwCmd::Capture { node_id, kind, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            let Some(k) = nexus_wire::HardwareKind::parse(kind) else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("硬件能力应为 camera、microphone 或 location：{kind}"));
+            };
+            (CtlRequest::HardwareCapture { node_id: id, hint: hint.clone(), kind: k }, *json)
+        }
         Cmd::Share { cmd: ShareCmd::Create { drive, service, terminal, ttl, max_uses, page, json } } => {
             let Some(ttl_ms) = parse_ttl(ttl) else {
                 return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"));
@@ -1091,6 +1137,44 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
         }
         CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::HardwareList(list) => {
+            let names: Vec<&str> = list.iter().map(|k| k.as_str()).collect();
+            if json {
+                format!("{}\n", json!({ "capabilities": names }))
+            } else if names.is_empty() {
+                "没有开放的硬件能力。\n".into()
+            } else {
+                format!("{}\n", names.join("\n"))
+            }
+        }
+        CtlResponse::HardwareCapture(cap) => {
+            if json {
+                let v = match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        json!({ "kind": "camera", "mime": mime, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        json!({ "kind": "microphone", "mime": mime, "duration_ms": duration_ms, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, timestamp_ms } => {
+                        json!({ "kind": "location", "lat_e7": lat_e7, "lon_e7": lon_e7, "accuracy_cm": accuracy_cm, "timestamp_ms": timestamp_ms })
+                    }
+                };
+                format!("{v}\n")
+            } else {
+                match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        format!("camera ({mime}, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        format!("microphone ({mime}, {duration_ms}ms, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, .. } => {
+                        format!("location ({:.6}, {:.6}, ±{:.2}m)\n", lat_e7 as f64 / 1e7, lon_e7 as f64 / 1e7, accuracy_cm as f64 / 100.0)
+                    }
+                }
+            }
+        }
         CtlResponse::ShareCreated(r) => {
             if json {
                 format!(

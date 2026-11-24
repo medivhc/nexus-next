@@ -364,6 +364,9 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
                 resource: ResourcePath::parse(&format!("{node}/drive/{ws}")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
+        Request::HardwareList | Request::HardwareCapture { .. } => {
+            return Err(err(ErrorCode::Denied, "常驻设备不提供网页硬件能力"));
+        }
         Request::SvcConnect { name } => {
             if !valid_segment(name) {
                 return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
@@ -933,6 +936,9 @@ impl<T: Transport, S: System> Node<T, S> {
             Request::DriveHave { ws, hashes } => self.drive_have(&ws, hashes),
             Request::DriveProfilePut { ws, name, files } => self.drive_profile_put(&ws, &name, files),
             Request::DriveProfileGet { ws, name } => self.drive_profile_get(&ws, &name),
+            Request::HardwareList | Request::HardwareCapture { .. } => {
+                Response::Error(err(ErrorCode::Denied, "常驻设备不提供网页硬件能力"))
+            }
             Request::ShareOpen { .. }
             | Request::ShareDriveList { .. }
             | Request::ShareDriveRead { .. }
@@ -1178,6 +1184,20 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
             CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
+            CtlRequest::HardwareList { node_id, hint } => {
+                self.hardware_rpc(node_id, &hint, Request::HardwareList).await.and_then(|r| match r {
+                    Response::HardwareList(list) => Ok(CtlResponse::HardwareList(list)),
+                    Response::Error(e) => Err(e),
+                    other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
+                })
+            }
+            CtlRequest::HardwareCapture { node_id, hint, kind } => {
+                self.hardware_rpc(node_id, &hint, Request::HardwareCapture { kind }).await.and_then(|r| match r {
+                    Response::HardwareCapture(cap) => Ok(CtlResponse::HardwareCapture(cap)),
+                    Response::Error(e) => Err(e),
+                    other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
+                })
+            }
             CtlRequest::ShareCreate { target, ttl_ms, max_uses, page } => {
                 self.share_create(target, ttl_ms, max_uses, page).map(CtlResponse::ShareCreated)
             }
@@ -1230,6 +1250,8 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::WebEnroll { .. }
                 | CtlRequest::WebList
                 | CtlRequest::WebRevoke { .. }
+                | CtlRequest::HardwareList { .. }
+                | CtlRequest::HardwareCapture { .. }
                 | CtlRequest::ShareCreate { .. }
                 | CtlRequest::ShareList
                 | CtlRequest::ShareRevoke { .. }
@@ -1450,6 +1472,20 @@ impl<T: Transport, S: System> Node<T, S> {
                 added_at: k.added_at,
             })
             .collect())
+    }
+
+    /// 向网页节点发起一次硬件能力 RPC（M8.3）。
+    async fn hardware_rpc(&self, node_id: NodeId, hint: &str, body: Request) -> Result<Response, WireError> {
+        if !hint.is_empty() {
+            self.transport.add_hint(node_id, hint);
+        }
+        let conn = self.transport.connect(node_id, Proto::Rpc).await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let mut stream = conn.open_bi().await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let header = RequestHeader::new(0, Principal::Device, &body);
+        write_msg(&mut stream, &header).await.map_err(|e| err(ErrorCode::Unreachable, format!("发送请求失败：{e}")))?;
+        let resp: Response = read_response(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, format!("读取回应失败：{e}")))?;
+        let _ = stream.shutdown().await;
+        Ok(resp)
     }
 
     async fn web_revoke(&self, label: &str) -> Result<MembershipReport, WireError> {

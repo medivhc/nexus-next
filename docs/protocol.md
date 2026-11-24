@@ -8,6 +8,8 @@ M7.1 起，同一协议主版本内的任何两个版本互相连得上（R65）
   连接的协议名（ALPN，`crates/nexus-fabric/src/lib.rs` 的 `Proto::alpn`）也一起改，旧版本的设备根本连不上，
   而不是连上之后读到看不懂的数据。
 - **次版本** `WIRE_MINOR`：同一主版本内单调增加，只能**增加**东西。
+  19.1（M8.3）：加了 `HardwareList`、`HardwareCapture` 请求和回应。
+  19.2（M9.1）：加了临时分享的 `Share*` 请求和回应。
 - 软件版本（`Cargo.toml` 的 `version`，`nexus --version`）和协议版本是两回事：
   不改协议的发布不动 `WIRE_MINOR`。
 

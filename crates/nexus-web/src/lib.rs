@@ -10,7 +10,8 @@ use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_web_core::{
-    EnrollLink, EntryHandle, GuestShare, Notice, ShareLink, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest, WebNode,
+    EnrollLink, EntryHandle, GuestShare, HardwareKind, HardwareState, Notice, ShareLink, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest,
+    WebNode,
 };
 use nexus_wire::{NewCredential, Size, WireError};
 use std::cell::RefCell;
@@ -122,7 +123,7 @@ impl Browser {
             t.add_hint(entry.node, &hint);
             let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
             let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
-            Ok(JsValue::from(Session { node: Rc::new(node) }))
+            Ok(JsValue::from(Session { node: Rc::new(node), hardware: HardwareState::new() }))
         })
     }
 }
@@ -143,6 +144,7 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), JsError> {
 #[wasm_bindgen]
 pub struct Session {
     node: Rc<WebNode<IrohTransport>>,
+    hardware: HardwareState,
 }
 
 #[wasm_bindgen]
@@ -155,6 +157,42 @@ impl Session {
     /// 登录到期的时间（毫秒）。
     pub fn expires_at_ms(&self) -> f64 {
         self.node.expires_at().0 as f64
+    }
+
+    /// 显式开启一项硬件能力（M8.3：camera / microphone / location）。
+    pub fn hardware_enable(&self, kind: String) -> Result<(), JsError> {
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        self.hardware.enable(k);
+        Ok(())
+    }
+
+    /// 关闭一项硬件能力（M8.3）。
+    pub fn hardware_disable(&self, kind: String) -> Result<(), JsError> {
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        self.hardware.disable(k);
+        Ok(())
+    }
+
+    /// 清空全部硬件授权（离开或关闭页面时调用，R32）。
+    pub fn hardware_clear(&self) {
+        self.hardware.clear();
+    }
+
+    /// 返回当前已显式同意开放的硬件能力（JSON 数组）。
+    pub fn hardware_enabled(&self) -> String {
+        let list: Vec<&str> = self.hardware.enabled_list().into_iter().map(HardwareKind::as_str).collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// 返回当前正在使用硬件的调用方（JSON 数组，每项有 caller、kind）。
+    pub fn hardware_active(&self) -> String {
+        let list: Vec<_> = self
+            .hardware
+            .active_users()
+            .into_iter()
+            .map(|(caller, k)| serde_json::json!({ "caller": caller, "kind": k.as_str() }))
+            .collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
     }
 
     /// 能看到的设备的名字（JSON 数组）。
@@ -203,6 +241,27 @@ impl Session {
         })
     }
 
+    /// 设备上能用的服务（M8.2）：Promise 的结果是 JSON 数组，每项有 name、proto。
+    pub fn services(&self, device: String) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let list = node.services(&device).await.map_err(js_err)?;
+            let list: Vec<_> = list.iter().map(|s| serde_json::json!({ "name": s.name, "proto": s.proto })).collect();
+            Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
+        })
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求：`headers` 是 JSON 的 [[名字, 值], ...]。
+    /// Promise 的结果是 [`HttpResult`]。
+    pub fn http(&self, device: String, service: String, method: String, path: String, headers: String, body: Vec<u8>) -> js_sys::Promise {
+        let node = self.node.clone();
+        future_to_promise(async move {
+            let headers: Vec<(String, String)> = serde_json::from_str(&headers).map_err(|e| JsValue::from_str(&format!("请求头不合法：{e}")))?;
+            let r = node.http(&device, &service, &method, &path, &headers, &body).await.map_err(js_err)?;
+            Ok(JsValue::from(HttpResult { status: r.status, reason: r.reason, headers: r.headers, body: r.body }))
+        })
+    }
+
     /// 打开一台设备上的终端会话（不存在时创建）。
     ///
     /// `on_output(Uint8Array)` 显示输出；`on_notice(string)` 在连接中断（"reconnecting"）和恢复（"reconnected"）时调用；
@@ -222,6 +281,35 @@ impl Session {
             let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
+    }
+}
+
+/// 网页服务的回应。
+#[wasm_bindgen]
+pub struct HttpResult {
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl HttpResult {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn reason(&self) -> String {
+        self.reason.clone()
+    }
+
+    /// JSON 的 [[名字, 值], ...]。
+    pub fn headers(&self) -> String {
+        serde_json::to_string(&self.headers).unwrap_or_else(|_| "[]".into())
+    }
+
+    pub fn body(&self) -> Vec<u8> {
+        self.body.clone()
     }
 }
 

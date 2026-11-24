@@ -1,7 +1,7 @@
 //! 临时分享的访客客户端（M9.1）：凭分享链接 `#share=<token>&node=<node_id>&hint=<hint>`
 //! 直接在浏览器里只读查看文件/目录、使用已发布的网页服务或只读观看终端，不需要通行密钥。
 
-use crate::service::{encode_http_request, parse_http_response, WebHttpRequest, WebHttpResponse, MAX_HTTP_RESPONSE_BYTES};
+use crate::http::{exchange, HttpResponse, WebHttpRequest};
 use crate::terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 use crate::{call, unreachable};
 use nexus_core_proto::authz::Principal;
@@ -11,7 +11,7 @@ use nexus_wire::{
     hex_decode, ClientMsg, ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, ShareDriveEntry, ShareInfo,
     Size, WireError,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 /// 分享链接里的信息：`…#share=<16字节hex>&node=<设备标识>&hint=<地址提示>`。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,8 +83,7 @@ impl<T: Transport> GuestShare<T> {
     }
 
     /// 通过分享令牌向被分享的 HTTP 服务发送一条 HTTP/1.1 请求。
-    pub async fn http_fetch(&self, req: &WebHttpRequest) -> Result<WebHttpResponse, WireError> {
-        let encoded = encode_http_request(req, &self.info.device)?;
+    pub async fn http_fetch(&self, req: &WebHttpRequest) -> Result<HttpResponse, WireError> {
         let conn = self.transport.connect(self.node, Proto::Web).await.map_err(unreachable)?;
         let mut stream = conn.open_bi().await.map_err(unreachable)?;
         let body = Request::ShareServiceConnect { token: self.token };
@@ -95,18 +94,7 @@ impl<T: Transport> GuestShare<T> {
             Response::Error(e) => return Err(e),
             other => return Err(WireError::new(ErrorCode::Internal, format!("回应无法理解：{other:?}"))),
         }
-        stream.write_all(&encoded).await.map_err(unreachable)?;
-        let _ = stream.shutdown().await;
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            let n = stream.read(&mut buf).await.map_err(unreachable)?;
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&buf[..n]);
-        }
-        parse_http_response(&raw, MAX_HTTP_RESPONSE_BYTES)
+        exchange(&mut stream, req, &format!("分享 {}", self.info.id)).await
     }
 
     /// 只读观看被分享的终端会话：输出喂给 `ui`，忽略本地按键输入。

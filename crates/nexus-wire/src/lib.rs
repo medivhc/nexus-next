@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 0;
+pub const WIRE_MINOR: u16 = 2;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -130,6 +130,10 @@ pub enum Request {
     DriveProfilePut { ws: String, name: String, files: Vec<String> },
     /// 取预读清单：回应 `DriveProfile`。
     DriveProfileGet { ws: String, name: String },
+    /// 网页节点硬件能力（M8.3）：列出浏览器当前已显式同意开放的硬件能力。
+    HardwareList,
+    /// 网页节点硬件能力（M8.3）：采集一项硬件能力（摄像头/麦克风/位置）。
+    HardwareCapture { kind: HardwareKind },
     /// 临时分享（M9.1）：访客打开分享链接，校验令牌并扣减一次可用次数。
     ShareOpen { token: [u8; 16] },
     /// 临时分享（M9.1）：访客列出被分享目录下的相对子路径。
@@ -164,6 +168,33 @@ impl ShareTarget {
             ShareTarget::Drive { ws, path } => format!("{device}/drive/{ws}:{path}"),
             ShareTarget::Service { name } => format!("{device}/svc/{name}"),
             ShareTarget::Terminal { session } => format!("{device}/session/{session}"),
+        }
+    }
+}
+
+/// 网页节点可发布的硬件能力类别（M8.3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HardwareKind {
+    Camera,
+    Microphone,
+    Location,
+}
+
+impl HardwareKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HardwareKind::Camera => "camera",
+            HardwareKind::Microphone => "microphone",
+            HardwareKind::Location => "location",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "camera" => Some(HardwareKind::Camera),
+            "microphone" => Some(HardwareKind::Microphone),
+            "location" => Some(HardwareKind::Location),
+            _ => None,
         }
     }
 }
@@ -209,6 +240,15 @@ pub struct ShareCreatedReport {
     pub max_uses: Option<u32>,
 }
 
+/// 网页节点返回的一次硬件采集结果（M8.3）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HardwareCapture {
+    Camera { mime: String, data: Vec<u8> },
+    Microphone { mime: String, duration_ms: u32, data: Vec<u8> },
+    /// 经纬度采用 1e-7 度整数（精度约 1.1 cm），精度采用厘米整数，保持确定性与 Eq。
+    Location { lat_e7: i64, lon_e7: i64, accuracy_cm: u32, timestamp_ms: u64 },
+}
+
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrafficClass {
@@ -247,6 +287,8 @@ impl Request {
             | Request::DriveHave { .. }
             | Request::DriveProfilePut { .. }
             | Request::DriveProfileGet { .. }
+            | Request::HardwareList
+            | Request::HardwareCapture { .. }
             | Request::ShareOpen { .. }
             | Request::ShareDriveList { .. }
             | Request::ShareDriveRead { .. }
@@ -538,6 +580,8 @@ pub enum Response {
     DrivePushed { accepted: bool, head: Option<[u8; 32]> },
     DriveProfile(Option<Vec<String>>),
     Error(WireError),
+    HardwareList(Vec<HardwareKind>),
+    HardwareCapture(HardwareCapture),
     ShareOpened(ShareInfo),
     ShareDriveEntries(Vec<ShareDriveEntry>),
     ShareDriveFile { size: u64, bytes: Vec<u8>, truncated: bool },
@@ -657,6 +701,10 @@ pub enum CtlRequest {
     WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
     WebList,
     WebRevoke { label: String },
+    /// 列出网页节点当前开放的硬件能力（M8.3）。
+    HardwareList { node_id: NodeId, hint: String },
+    /// 从网页节点采集一项硬件能力（M8.3）。
+    HardwareCapture { node_id: NodeId, hint: String, kind: HardwareKind },
     ShareCreate { target: ShareTarget, ttl_ms: u64, max_uses: Option<u32>, page: Option<String> },
     ShareList,
     ShareRevoke { id: String },
@@ -725,6 +773,8 @@ pub enum CtlResponse {
     Audit(Vec<AuditRecord>),
     SshHostKey([u8; 32]),
     WebEnroll(WebEnrollReport),
+    HardwareList(Vec<HardwareKind>),
+    HardwareCapture(HardwareCapture),
     ShareCreated(ShareCreatedReport),
     Shares(Vec<ShareRecord>),
     ShareRevoked(ShareRecord),

@@ -1,13 +1,13 @@
 // 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
 // laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
-// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、浏览器里不留存储。
+// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、浏览器里不留存储。
 //
 // 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 //
-// covers: R28, R29, R30, R32, R34, R35, R36, R70
+// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -87,6 +87,19 @@ try {
   nexus("laptop", ["drive", "put", "work:/dot.svg", "--json"],
     '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><circle cx="4" cy="4" r="4"/></svg>');
   nexus("laptop", ["drive", "commit", "work", "-m", "e2e", "--json"]);
+  // 网页服务（R71）：home 上一个普通的 HTTP 服务器托管的小网站。
+  const site = join(root, "site");
+  mkdirSync(join(site, "static"), { recursive: true });
+  writeFileSync(join(site, "index.html"), `<!doctype html><title>home web</title>
+<p id="msg">waiting</p><img id="pic" src="dot.svg"><a id="about" href="/about.html">about</a>
+<script src="/static/app.js"></script>`);
+  writeFileSync(join(site, "static", "app.js"), `document.getElementById("msg").textContent = "script ran";`);
+  writeFileSync(join(site, "dot.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><circle cx="4" cy="4" r="4"/></svg>');
+  writeFileSync(join(site, "about.html"), `<!doctype html><title>about</title><p id="about-text">about page</p>`);
+  const sitePort = String(Number(opt["page-port"]) + 1);
+  background("python3", ["-m", "http.server", sitePort, "--bind", "127.0.0.1", "--directory", site]);
+  await waitFor("网站", () => fetch(`http://127.0.0.1:${sitePort}/`).then((r) => r.ok));
+  nexus("home", ["publish", "web", "--port", sitePort, "--proto", "http", "--json"]);
   log("网络就绪");
 
   browser = await chromium.launch({ executablePath: opt.chrome, args: ["--no-sandbox"] });
@@ -104,7 +117,7 @@ try {
   // 登记（R29）。
   // 不给 --page：登记链接指向名册里的锚点。
   const { url } = nexus("laptop", ["web", "enroll", "--label", "phone", "--grant", "term.session.*@**",
-    "--grant", "node.info@**", "--grant", "drive.read@**", "--json"]);
+    "--grant", "node.info@**", "--grant", "drive.read@**", "--grant", "svc.connect@**", "--json"]);
   if (!url.startsWith(`${pageUrl}/#enroll=`)) throw new Error(`登记链接没有指向锚点：${url}`);
   await page.goto(url);
   await page.click("#enroll-go");
@@ -173,6 +186,24 @@ try {
   await page.click("#files-back");
   await page.waitForSelector("#device-list li");
   log("浏览工作区、预览、下载");
+
+  // 打开网页服务（R71，FP-8.2-03）：新标签页，相对路径的图片、绝对路径的脚本、绝对路径的链接都经 Nexus 到 home。
+  const link = await page.waitForSelector("#device-list li:has-text('home') a.svc:has-text('web')", { timeout: 20000 });
+  const [svcPage] = await Promise.all([context.waitForEvent("page"), link.click()]);
+  svcPage.on("pageerror", (e) => console.log("服务页面异常：", e.message));
+  await svcPage.waitForSelector("#msg:has-text('script ran')", { timeout: 20000 });
+  await waitFor("服务页面的图片", () => svcPage.$eval("#pic", (i) => i.complete && i.naturalWidth === 8));
+  if (!new URL(svcPage.url()).pathname.match(/^\/svc\/[0-9a-f]{32}\/$/)) throw new Error(`服务页面的地址：${svcPage.url()}`);
+  await svcPage.click("#about");
+  await svcPage.waitForSelector("#about-text", { timeout: 20000 });
+  if (!svcPage.url().includes("/svc/") || !svcPage.url().endsWith("/about.html")) throw new Error(`绝对路径的链接没有留在服务里：${svcPage.url()}`);
+  // 不认得的令牌：不转发。
+  const stranger = await context.newPage();
+  const resp = await stranger.goto(`${pageUrl}/svc/${"0".repeat(32)}/`);
+  if (resp.status() !== 503) throw new Error(`不认得的令牌应当是 503，实际 ${resp.status()}`);
+  await stranger.close();
+  await svcPage.close();
+  log("打开网页服务");
   await page.click("#device-list li:has-text('home') button");
   await waitFor("提示符", async () => (await screen()).includes("$"), 20000);
 
@@ -183,6 +214,8 @@ try {
   await waitFor("关闭页面后客户端离开", () => clientsOf("main")?.clients === 0, 30000);
   const after = await context.newPage();
   await after.goto(pageUrl);
+  // 页面打开时先清掉残留的（转发程序等），然后才显示登录。
+  await after.waitForSelector("#login-go", { state: "visible", timeout: 10000 });
   const stored = await after.evaluate(async () => ({
     local: localStorage.length, session: sessionStorage.length, cookies: document.cookie,
     idb: (await indexedDB.databases()).length, caches: (await caches.keys()).length,
@@ -190,7 +223,6 @@ try {
   }));
   if (Object.values(stored).some((v) => v)) throw new Error(`关闭后浏览器里有存储：${JSON.stringify(stored)}`);
   // 重新打开后是登录界面：没有任何东西能恢复之前的登录。
-  await after.waitForSelector("#login-go", { state: "visible", timeout: 10000 });
   if (await after.isVisible("#device-list li")) throw new Error("重新打开页面后不应当直接看到设备");
   log("关闭后不留存储");
 

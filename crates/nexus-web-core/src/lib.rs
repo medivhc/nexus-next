@@ -6,17 +6,17 @@
 
 mod drive;
 mod handle;
+mod hardware;
+mod http;
 mod node;
-mod service;
 mod share;
 mod terminal;
 pub use drive::{DriveEntry, DriveFile, DriveWorkspace};
+pub use http::{encode_request, parse_response, HttpResponse, WebHttpRequest, MAX_RESPONSE};
 pub use handle::{EntryHandle, MAX_USER_HANDLE};
+pub use hardware::{HardwareProvider, HardwareState, HardwareUsageEvent};
 pub use node::{challenge, WebNode, WebTerminal};
-pub use service::{
-    encode_http_request, parse_http_response, rewrite_location, rewrite_response_headers, rewrite_set_cookie,
-    WebHttpRequest, WebHttpResponse, MAX_HTTP_RESPONSE_BYTES,
-};
+pub use nexus_wire::{HardwareCapture, HardwareKind};
 pub use share::{GuestShare, ShareLink};
 pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
