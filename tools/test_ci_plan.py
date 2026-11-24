@@ -1,9 +1,47 @@
 #!/usr/bin/env python3
 """No-network, no-compiler tests for CI selection and its required gate."""
 import unittest
+from pathlib import Path
+import tomllib
 
 from ci_gate import check
 from ci_plan import Plan, classify
+
+
+# Executable model of the Web lane's build-time dependencies. Derive the
+# graph from Cargo manifests, not from the planner's manually maintained sets.
+# Include every target's normal/build dependencies conservatively; dev-only
+# dependencies are not part of the two cargo builds in the Web lane.
+def web_build_closure():
+    root = Path(__file__).resolve().parents[1]
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    inherited = workspace.get("workspace", {}).get("dependencies", {})
+    manifests = {}
+    for manifest in (root / "crates").glob("*/Cargo.toml"):
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        manifests[data["package"]["name"]] = (manifest.parent.name, data)
+
+    def dependencies(data):
+        for scope in [data, *data.get("target", {}).values()]:
+            for section in ("dependencies", "build-dependencies"):
+                for alias, spec in scope.get(section, {}).items():
+                    if isinstance(spec, dict) and spec.get("workspace"):
+                        spec = inherited[alias]
+                    name = spec.get("package", alias) if isinstance(spec, dict) else alias
+                    if name in manifests:
+                        yield name
+
+    # The Web job builds both the WASM frontend and the native nexus CLI.
+    pending = ["nexus-web", "nexus-cli"]
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        _, data = manifests[name]  # missing root is a hard failure, not a skip
+        pending.extend(dependencies(data))
+    return {manifests[name][0] for name in visited}
 
 
 class PolicyTests(unittest.TestCase):
@@ -28,7 +66,18 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(classify(["crates/nexus-runtime/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
 
     def test_drive_core(self):
-        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, False, False))
+        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, False, True))
+
+    def test_web_build_dependencies_are_never_skipped(self):
+        # The contract is independent of the classifier: modifying any crate
+        # used to build the browser or its native peer requires the Web lane.
+        closure = web_build_closure()
+        self.assertIn("nexus-drive-core", closure)
+        for crate in sorted(closure):
+            path = f"crates/{crate}/Cargo.toml"
+            with self.subTest(crate=crate):
+                self.assertTrue(classify([path], "pull_request").web,
+                                f"counterexample: {path} affects a Web build")
 
     def test_ci_change_triggers_all(self):
         self.assertEqual(classify([".github/workflows/ci.yml"], "pull_request"), Plan(True, True, True, True))
