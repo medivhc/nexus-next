@@ -58,7 +58,6 @@ async function login() {
       );
       status("");
       $("who").textContent = `${session.label()} · ${new Date(session.expires_at_ms()).toLocaleTimeString()} 前有效`;
-      currentSession = session;
       devices(session);
     } catch (e) { status(""); fail(e); }
   };
@@ -145,10 +144,10 @@ function hardwareControls(session) {
 }
 
 // ---- 网页服务（M8.2）：在新标签页里打开，请求经转发程序（sw.js）交回这里，由网页节点核心发出。 ----
-// 令牌 → { device, service, jar }：令牌只在内存里，cookie 也只在内存里。
+// 令牌 → { label, fetch, jar }：令牌只在内存里，cookie 也只在内存里。
+// fetch(method, path, headersJson, body) 发出请求：登录后经 session.http，临时分享的访客经分享令牌。
 
 const services = new Map();
-let currentSession = null;
 
 function randomToken() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -195,17 +194,17 @@ async function onForward(event) {
   const port = event.ports[0];
   if (!m || m.type !== "nexus-http" || !port) return;
   const svc = services.get(m.token);
-  if (!svc || !currentSession) { port.postMessage({ unknown: true }); return; }
+  if (!svc) { port.postMessage({ unknown: true }); return; }
   const headers = m.headers.filter(([k]) => k.toLowerCase() !== "cookie");
   if (svc.jar.size) headers.push(["Cookie", [...svc.jar].map(([k, v]) => `${k}=${v}`).join("; ")]);
   try {
-    const r = await currentSession.http(svc.device, svc.service, m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
+    const r = await svc.fetch(m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
     const replyHeaders = JSON.parse(r.headers());
     for (const [k, v] of replyHeaders) if (k.toLowerCase() === "set-cookie") remember(svc.jar, v);
     const body = r.body().buffer;
     port.postMessage({ status: r.status(), reason: r.reason(), headers: replyHeaders, body }, [body]);
   } catch (e) {
-    port.postMessage({ error: `${svc.device}/${svc.service}：${e && e.message ? e.message : e}`, status: 502 });
+    port.postMessage({ error: `${svc.label}：${e && e.message ? e.message : e}`, status: 502 });
   }
 }
 if (navigator.serviceWorker) navigator.serviceWorker.onmessage = onForward;
@@ -218,7 +217,10 @@ async function webServices(session, device, li) {
   try { await ensureForwarder(); } catch (e) { return fail(e); }
   for (const s of list) {
     const token = randomToken();
-    services.set(token, { device, service: s.name, jar: new Map() });
+    services.set(token, {
+      label: `${device}/${s.name}`, jar: new Map(),
+      fetch: (method, path, headers, body) => session.http(device, s.name, method, path, headers, body),
+    });
     const a = document.createElement("a");
     a.className = "svc";
     a.href = `svc/${token}/`;
@@ -259,24 +261,36 @@ async function workspaces(session) {
       li.innerHTML = `<span class="name">${escapeHtml(w.name)}</span><span class="muted">${escapeHtml(w.device)}</span>`;
       const open = document.createElement("button");
       open.textContent = "浏览";
-      open.onclick = () => browse(session, w.name, "");
+      open.onclick = () => browse(workspaceSource(session, w.name), "");
       li.append(open);
       list.append(li);
     }
   } catch (e) { fail(e); }
 }
 
-async function browse(session, ws, path) {
+// 可浏览的文件来源：工作区（登录后）或临时分享的文件/目录（访客）。
+// { label, list(path) → JSON 字符串, read(path, max) → FileData, home() 返回上一级界面（没有时为 null） }
+function workspaceSource(session, ws) {
+  return {
+    label: `${ws}:/`,
+    list: (path) => session.list(ws, path),
+    read: (path, max) => session.read(ws, path, max),
+    home: () => devices(session),
+  };
+}
+
+async function browse(src, path) {
   $("error").textContent = "";
   show("files");
   $("preview").hidden = true;
-  $("files-path").textContent = `${ws}:/${path}`;
+  $("files-path").textContent = `${src.label}${path}`;
   const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
-  $("files-back").onclick = () => (path ? browse(session, ws, parent) : devices(session));
+  $("files-back").hidden = !path && !src.home;
+  $("files-back").onclick = () => (path ? browse(src, parent) : src.home && src.home());
   const list = $("file-list");
   list.innerHTML = "";
   let entries;
-  try { entries = JSON.parse(await session.list(ws, path)); } catch (e) { return fail(e); }
+  try { entries = JSON.parse(await src.list(path)); } catch (e) { return fail(e); }
   if (entries.length === 0) list.innerHTML = `<li class="muted">（空）</li>`;
   for (const e of entries) {
     const li = document.createElement("li");
@@ -288,8 +302,8 @@ async function browse(session, ws, path) {
     const info = document.createElement("span");
     info.className = "muted";
     info.textContent = e.kind === "file" ? humanSize(e.size) : e.kind === "symlink" ? `→ ${e.target}` : "";
-    if (e.kind === "dir") a.onclick = (ev) => { ev.preventDefault(); browse(session, ws, full); };
-    else if (e.kind === "file") a.onclick = (ev) => { ev.preventDefault(); preview(session, ws, full, e.name); };
+    if (e.kind === "dir") a.onclick = (ev) => { ev.preventDefault(); browse(src, full); };
+    else if (e.kind === "file") a.onclick = (ev) => { ev.preventDefault(); preview(src, full, e.name); };
     else a.onclick = (ev) => ev.preventDefault();
     li.append(a, info);
     list.append(li);
@@ -297,7 +311,7 @@ async function browse(session, ws, path) {
 }
 
 let previewUrl = null;
-async function preview(session, ws, path, name) {
+async function preview(src, path, name) {
   $("error").textContent = "";
   if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
   const [text, img, note] = [$("preview-text"), $("preview-image"), $("preview-note")];
@@ -306,10 +320,10 @@ async function preview(session, ws, path, name) {
   $("preview").hidden = false;
   $("preview-name").textContent = name;
   $("preview-size").textContent = "";
-  $("preview-download").onclick = () => download(session, ws, path, name);
+  $("preview-download").onclick = () => download(src, path, name);
   status("读取中…");
   let f;
-  try { f = await session.read(ws, path, PREVIEW_MAX); } catch (e) { status(""); return fail(e); }
+  try { f = await src.read(path, PREVIEW_MAX); } catch (e) { status(""); return fail(e); }
   status("");
   const data = f.bytes();
   $("preview-size").textContent = humanSize(f.size());
@@ -332,11 +346,12 @@ async function preview(session, ws, path, name) {
   if (f.truncated()) note.textContent = `只显示了开头的 ${humanSize(data.length)}；完整的文件可以下载。`;
 }
 
-async function download(session, ws, path, name) {
+async function download(src, path, name) {
   $("error").textContent = "";
   status("下载中…");
   try {
-    const f = await session.read(ws, path, Number.MAX_SAFE_INTEGER);
+    const f = await src.read(path, Number.MAX_SAFE_INTEGER);
+    if (f.truncated()) throw new Error(`只能读到开头的 ${humanSize(f.bytes().length)}（共 ${humanSize(f.size())}），没有下载`);
     const url = URL.createObjectURL(new Blob([f.bytes()], { type: typeOf(name) }));
     const a = document.createElement("a");
     a.href = url;
@@ -387,19 +402,81 @@ function escapeHtml(s) {
 }
 
 // 关闭页面：注销转发程序，清掉网页服务的页面可能留下的存储（R32）。
-addEventListener("pagehide", () => { currentSession = null; services.clear(); wipe(); });
+addEventListener("pagehide", () => { services.clear(); wipe(); });
 await wipe();
 await init();
+// ---- 临时分享（M9.1）：访客凭链接只读使用，不需要通行密钥；什么也不存，关掉页面即结束。 ----
+
 async function openShare(link) {
   show("share-view");
   status("正在打开分享…");
+  let guest;
   try {
-    const browser = new Browser(relay);
-    const guest = await browser.open_share(link);
-    status("");
-    const info = JSON.parse(guest.info());
-    $("share-meta").textContent = `设备 ${info.device} · 编号 ${info.id} · 只读分享`;
-  } catch (e) { status(""); fail(e); }
+    guest = await new Browser(relay).open_share(link);
+  } catch (e) { status(""); return fail(e); }
+  // 链接里的分享码不留在地址栏和浏览记录里。
+  history.replaceState(null, "", location.pathname + location.search);
+  status("");
+  const info = JSON.parse(guest.info());
+  const until = new Date(info.expires_at).toLocaleString();
+  const left = info.remaining_uses == null ? "" : ` · 还能打开 ${info.remaining_uses} 次`;
+  $("who").textContent = `${info.device} 的只读分享 · ${until} 前有效${left}`;
+  const body = $("share-body");
+  body.innerHTML = "";
+  const t = info.target;
+  if (t.Drive) {
+    const label = `${t.Drive.ws}:${t.Drive.path === "/" ? "/" : t.Drive.path + "/"}`;
+    return browse({ label, list: (p) => guest.drive_list(p), read: (p, max) => guest.drive_read(p, max), home: null }, "");
+  }
+  if (t.Service) {
+    $("share-title").textContent = `网页服务 ${t.Service.name}`;
+    try { await ensureForwarder(); } catch (e) { return fail(e); }
+    const token = randomToken();
+    services.set(token, { label: `${info.device}/${t.Service.name}`, jar: new Map(), fetch: (...a) => guest.http(...a) });
+    const a = document.createElement("a");
+    a.id = "share-open";
+    a.className = "svc";
+    a.href = `svc/${token}/`;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = `打开 ${t.Service.name} ↗`;
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "在新标签页打开；这个页面要一直开着。";
+    body.append(a, p);
+    return;
+  }
+  if (t.Terminal) return watchShare(guest, info.device, t.Terminal.session);
+}
+
+// 只读观看终端：按键不送出（页面和设备两边都丢弃），窗口大小也不影响原会话。
+function watchShare(guest, device, name) {
+  show("terminal");
+  $("term-title").textContent = `${device} / ${name}（只读观看）`;
+  const host = $("xterm");
+  host.innerHTML = "";
+  const term = new window.Terminal({ disableStdin: true, cursorBlink: false, fontSize: 14, scrollback: 2000 });
+  const fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(host);
+  fit.fit();
+  const t = guest.watch(term.cols, term.rows,
+    (data) => term.write(data),
+    (code, message) => {
+      removeEventListener("resize", onResize);
+      removeEventListener("pagehide", leave);
+      term.dispose();
+      show("share-view");
+      $("share-body").innerHTML = "";
+      $("share-title").textContent = "观看已结束";
+      if (message) fail(message);
+      else $("share-body").textContent = "终端已结束，或分享已被撤销、已过期。";
+    });
+  const onResize = () => fit.fit();
+  const leave = () => t.leave();
+  addEventListener("resize", onResize);
+  addEventListener("pagehide", leave);
+  $("term-leave").onclick = leave;
 }
 
 const hash = location.hash.slice(1);

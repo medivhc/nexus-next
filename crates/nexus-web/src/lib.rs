@@ -382,31 +382,41 @@ impl GuestSession {
         })
     }
 
-    /// 读取分享文件。
+    /// 读取分享文件（或分享目录下的相对子路径）开头的最多 `max` 字节：Promise 的结果是 [`FileData`]。
     pub fn drive_read(&self, path: String, max: f64) -> js_sys::Promise {
         let g = self.guest.clone();
         future_to_promise(async move {
             let (size, bytes, truncated) = g.drive_read(&path, max as u64).await.map_err(js_err)?;
-            let obj = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("size"), &JsValue::from(size as f64));
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("truncated"), &JsValue::from(truncated));
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice()));
-            Ok(obj.into())
+            Ok(JsValue::from(FileData { size, truncated, bytes }))
         })
     }
 
-    /// 访问被分享的 HTTP 服务。
-    pub fn http_fetch(&self, method: String, path: String, headers_json: String, body: Vec<u8>) -> js_sys::Promise {
+    /// 访问被分享的 HTTP 服务：`headers` 是 JSON 的 [[名字, 值], ...]。Promise 的结果是 [`HttpResult`]。
+    pub fn http(&self, method: String, path: String, headers: String, body: Vec<u8>) -> js_sys::Promise {
         let g = self.guest.clone();
         future_to_promise(async move {
-            let headers: Vec<(String, String)> =
-                serde_json::from_str(&headers_json).map_err(|e| JsError::new(&format!("请求头 JSON 无效：{e}")))?;
-            let resp = g.http_fetch(&WebHttpRequest { method, path, headers, body }).await.map_err(js_err)?;
-            let obj = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("status"), &JsValue::from(resp.status));
-            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("body"), &js_sys::Uint8Array::from(resp.body.as_slice()));
-            Ok(obj.into())
+            let headers: Vec<(String, String)> = serde_json::from_str(&headers).map_err(|e| JsValue::from_str(&format!("请求头不合法：{e}")))?;
+            let r = g.http_fetch(&WebHttpRequest { method, path, headers, body }).await.map_err(js_err)?;
+            Ok(JsValue::from(HttpResult { status: r.status, reason: r.reason, headers: r.headers, body: r.body }))
         })
+    }
+
+    /// 只读观看被分享的终端：只显示输出，按键和窗口大小都不送出。
+    /// `on_output(Uint8Array)` 显示输出；`on_end(code, message)` 在结束时调用一次（同 [`Session::open`]）。
+    /// 返回的 [`Terminal`] 只有 `leave` 有作用。
+    pub fn watch(&self, cols: u16, rows: u16, on_output: Function, on_end: Function) -> Terminal {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let g = self.guest.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut ui = JsUi { on_output, on_notice: Function::new_no_args(""), rx };
+            let (code, message) = match g.watch_terminal(Size { cols, rows }, &mut ui).await {
+                Ok(TerminalEnd::Exited(code)) => (code.unwrap_or(0), String::new()),
+                Ok(TerminalEnd::Left) => (0, String::new()),
+                Err(e) => (-1, e.message),
+            };
+            let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
+        });
+        Terminal { tx }
     }
 }
 

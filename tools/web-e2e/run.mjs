@@ -1,10 +1,11 @@
 // 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
 // laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
-// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、浏览器里不留存储。
+// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、
+// 访客打开临时分享（文件、网页服务、只读终端）、浏览器里不留存储。
 //
 // 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 //
-// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71
+// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71, R73
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -206,6 +207,66 @@ try {
   log("打开网页服务");
   await page.click("#device-list li:has-text('home') button");
   await waitFor("提示符", async () => (await screen()).includes("$"), 20000);
+
+  // 临时分享（R73，FP-9.1-01、02、03）：访客不登录，凭链接在页面上只读使用。每个访客一个新的浏览器上下文。
+  const guestPage = async (link, viewport) => {
+    const ctx = await browser.newContext(viewport ? { viewport } : {});
+    const g = await ctx.newPage();
+    g.on("pageerror", (e) => console.log("访客页面异常：", e.message));
+    await g.goto(link);
+    return { ctx, g };
+  };
+  {
+    // 目录：只看得到分享的子目录；分享码不留在地址栏里。
+    const { url: dirLink } = nexus("laptop", ["share", "create", "--drive", "work:/notes", "--ttl", "1h", "--json"]);
+    if (!dirLink.startsWith(`${pageUrl}/#share=`)) throw new Error(`分享链接没有指向锚点：${dirLink}`);
+    const { ctx, g } = await guestPage(dirLink);
+    await g.waitForSelector("#file-list a:has-text('hello.txt')", { timeout: 20000 });
+    const names = await g.$$eval("#file-list a", (as) => as.map((a) => a.textContent));
+    if (names.join() !== "hello.txt") throw new Error(`分享目录里应当只有 hello.txt：${names}`);
+    if (g.url().includes("share=")) throw new Error(`分享码留在了地址栏：${g.url()}`);
+    if (!(await g.textContent("#who")).includes("只读分享")) throw new Error("页面应当标明这是只读分享");
+    await g.click("#file-list a:has-text('hello.txt')");
+    await waitFor("分享文件预览", async () => (await g.textContent("#preview-text")).includes("hello from the workspace"));
+    await ctx.close();
+  }
+  {
+    // 网页服务：限 1 次，第二个访客被拒绝。
+    const { url: svcLink } = nexus("home", ["share", "create", "--service", "web", "--ttl", "1h", "--max-uses", "1", "--json"]);
+    const { ctx, g } = await guestPage(svcLink);
+    const open = await g.waitForSelector("#share-open", { timeout: 20000 });
+    const [svc] = await Promise.all([ctx.waitForEvent("page"), open.click()]);
+    await svc.waitForSelector("#msg:has-text('script ran')", { timeout: 20000 });
+    await waitFor("分享服务的图片", () => svc.$eval("#pic", (i) => i.complete && i.naturalWidth === 8));
+    const second = await guestPage(svcLink);
+    await waitFor("次数用完", async () => (await second.g.textContent("#error")).includes("次数"), 20000);
+    await second.ctx.close();
+    await ctx.close();
+  }
+  {
+    // 只读终端：看得到主人的输出；访客的按键不进终端；访客窗口小也不改变主人的终端尺寸；撤销后立即断开。
+    // 尺寸跟着最后打字的客户端：主人先打好一条延后执行的命令，访客在这期间连上，命令量到的就是只有访客在时的尺寸。
+    const sizeLater = async (tag, delay) => {
+      await page.keyboard.type(`sleep ${delay}; echo ${tag}-$(stty size | tr ' ' x)\n`);
+      return () => waitFor("终端尺寸", async () => (await screen()).match(new RegExp(`${tag}-(\\d+x\\d+)`))?.[1], 20000);
+    };
+    const before = await (await sizeLater("size1", 0))();
+    const { id, url: termLink } = nexus("home", ["share", "create", "--terminal", "main", "--ttl", "1h", "--json"]);
+    const pending = await sizeLater("size2", 5);
+    const { ctx, g } = await guestPage(termLink, { width: 480, height: 320 });
+    const guestScreen = () => g.$eval(".xterm-rows", (e) => e.innerText);
+    await g.waitForSelector(".xterm-rows", { timeout: 20000 });
+    await g.click("#xterm");
+    await g.keyboard.type("echo guest-typed\n");
+    const after = await pending();
+    await waitFor("访客看到主人的输出", async () => (await guestScreen()).includes("size2-"), 20000);
+    if (after !== before) throw new Error(`访客改变了主人的终端尺寸：${before} → ${after}`);
+    if ((await screen()).includes("guest-typed")) throw new Error("访客的按键进了终端");
+    nexus("home", ["share", "revoke", id, "--json"]);
+    await waitFor("撤销后断开", async () => (await g.textContent("#share-title")).includes("观看已结束"), 20000);
+    await ctx.close();
+  }
+  log("临时分享：文件、网页服务、只读终端");
 
   // 关闭即离开（R32，FP-2.5-02）：关掉页面，同一个浏览器里不留任何东西，home 上的客户端离开。
   await waitFor("会话有客户端", () => clientsOf("main")?.clients === 1);
