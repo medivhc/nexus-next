@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tomllib
 from dataclasses import asdict, dataclass
 
 
@@ -21,6 +22,9 @@ class Plan:
 
 DOC_DIRS = ("docs/", "tasks/")
 DOC_SUFFIXES = (".md", ".rst", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".webp")
+ROOT = Path(__file__).resolve().parents[1]
+# The browser job builds the WASM page and the native CLI it exercises.
+WEB_BUILD_ROOTS = ("crates/nexus-web", "crates/nexus-cli")
 # 只有浏览器才用的部分：不影响原生的 L2/L3。nexus-web-core 不在这里：testkit 的浏览器场景
 # （web、web_drive、web_service，在 L2/L3 里）直接跑它。
 WEB_DIRS = ("web/", "tools/web-e2e/", "crates/nexus-web/")
@@ -33,6 +37,33 @@ WIRE_CRATES = {
 }
 
 
+def web_build_dirs(root: Path) -> tuple[str, ...]:
+    root = root.resolve()
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace_deps = workspace["workspace"].get("dependencies", {})
+    pending = [root / directory for directory in WEB_BUILD_ROOTS]
+    visited: set[Path] = set()
+    while pending:
+        directory = pending.pop().resolve()
+        if directory in visited:
+            continue
+        visited.add(directory)
+        manifest = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
+        # Include optional and target-specific build inputs conservatively.
+        for table in (manifest, *manifest.get("target", {}).values()):
+            for kind in ("dependencies", "build-dependencies", "build_dependencies"):
+                for name, dependency in table.get(kind, {}).items():
+                    if not isinstance(dependency, dict):
+                        continue
+                    base = directory
+                    if dependency.get("workspace"):
+                        dependency = workspace_deps[name]
+                        base = root
+                    if isinstance(dependency, dict) and "path" in dependency:
+                        pending.append(base / dependency["path"])
+    return tuple(f"{directory.relative_to(root).as_posix()}/" for directory in visited)
+
+
 def is_document(path: str) -> bool:
     if path in EXECUTED_DOCS:
         return False
@@ -43,11 +74,12 @@ def is_document(path: str) -> bool:
     return path in {"LICENSE", "LICENSE-APACHE", "LICENSE-MIT", ".gitignore"}
 
 
-def classify(paths: list[str], event: str) -> Plan:
+def classify(paths: list[str], event: str, *, root: Path = ROOT) -> Plan:
     if event != "pull_request":
         # Main, nightly, and manual runs are the full-coverage backstop.
         return Plan(smoke=True, full=True, compat=True, web=True)
 
+    web_build = web_build_dirs(root)
     smoke = full = compat = web = False
     for path in paths:
         if not path or path.startswith("/") or ".." in PurePosixPath(path).parts:
@@ -55,6 +87,8 @@ def classify(paths: list[str], event: str) -> Plan:
         if is_document(path):
             continue
         smoke = True
+        if path.startswith(web_build):
+            web = True
         if path in EXECUTED_DOCS:
             full = True
             continue
@@ -83,12 +117,8 @@ def classify(paths: list[str], event: str) -> Plan:
             crate = parts[1]
             # Only browser-specific crates can bypass native L2/L3.
             full = True
-            if crate == "nexus-web-core":
-                web = True
             if crate in WIRE_CRATES:
-                compat = True
-            if crate in WIRE_CRATES or crate in {"nexus-sys-real", "nexus-sys"}:
-                web = True
+                compat = web = True
             continue
         # Unknown/new directory: fail closed by running everything.
         full = compat = web = True
@@ -100,7 +130,8 @@ def changed_files(base: str, head: str) -> list[str]:
         if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
             raise ValueError(f"invalid git SHA: {sha!r}")
     result = subprocess.run(
-        ["git", "diff", "--name-only", "-z", f"{base}...{head}", "--"],
+        # A move can affect both its original and destination directories.
+        ["git", "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--"],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     return [os.fsdecode(path) for path in result.stdout.split(b"\0") if path]

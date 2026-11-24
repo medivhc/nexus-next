@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """No-network, no-compiler tests for CI selection and its required gate."""
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from ci_gate import check
@@ -28,7 +30,50 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(classify(["crates/nexus-runtime/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
 
     def test_drive_core(self):
-        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, False, False))
+        # nexus-web-core uses Drive in the WASM build.
+        self.assertEqual(
+            classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"),
+            Plan(smoke=True, full=True, web=True),
+        )
+
+    def test_crates_outside_web_build(self):
+        for crate in ("nexus-android", "nexus-sys-sim", "nexus-testkit"):
+            with self.subTest(crate=crate):
+                self.assertEqual(
+                    classify([f"crates/{crate}/src/lib.rs"], "pull_request"),
+                    Plan(smoke=True, full=True),
+                )
+
+    def test_web_build_tracks_new_path_dependencies(self):
+        manifests = {
+            ".": '[workspace.dependencies]\nshared = { path = "crates/shared" }\n',
+            "crates/nexus-web": '[dependencies]\nshared.workspace = true\n',
+            "crates/nexus-cli": '[dev-dependencies]\ndev = { path = "../dev" }\n',
+            "crates/shared": (
+                "[target.wasm32-unknown-unknown.build-dependencies]\n"
+                'helper = { path = "../../tools/build-helper", package = "build-helper" }\n'
+            ),
+            "tools/build-helper": '[dependencies]\nleaf = { path = "../../crates/leaf" }\n',
+            "crates/leaf": "",
+            "crates/dev": "",
+        }
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            for directory, manifest in manifests.items():
+                path = root / directory / "Cargo.toml"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(manifest, encoding="utf-8")
+
+            for path in ("crates/shared/src/lib.rs", "tools/build-helper/src/lib.rs", "crates/leaf/src/lib.rs"):
+                with self.subTest(path=path):
+                    self.assertEqual(
+                        classify([path], "pull_request", root=root),
+                        Plan(smoke=True, full=True, web=True),
+                    )
+            self.assertEqual(
+                classify(["crates/dev/src/lib.rs"], "pull_request", root=root),
+                Plan(smoke=True, full=True),
+            )
 
     def test_ci_change_triggers_all(self):
         self.assertEqual(classify([".github/workflows/ci.yml"], "pull_request"), Plan(True, True, True, True))

@@ -27,7 +27,8 @@ Clippy + compile-only 共 1616.5 秒，占脚本步骤总耗时 2533.1 秒的 63
 | `docs/manual.md`（L3 用户手册照着执行） | ✓ | ✓ | – | – |
 | Web UI、web E2E、nexus-web | ✓ | – | – | ✓ |
 | nexus-web-core（L2/L3 的浏览器场景直接跑它） | ✓ | ✓ | – | ✓ |
-| nexus-drive-core 与非协议 native crate | ✓ | ✓ | 受影响时 ✓ | 受影响时 ✓ |
+| `nexus-web` 或 `nexus-cli` 构建使用的其他内部依赖（如 `nexus-drive-core`） | ✓ | ✓ | 受影响时 ✓ | ✓ |
+| 其他非协议 native crate | ✓ | ✓ | – | – |
 | Wire、协议、CLI、Runtime、Fabric 与核心网络 | ✓ | ✓ | ✓ | ✓ |
 | Cargo.lock / vendor / CI 配置与计划 | ✓ | ✓ | ✓ | ✓ |
 | 新目录、未知类型 | ✓ | ✓ | ✓ | ✓ |
