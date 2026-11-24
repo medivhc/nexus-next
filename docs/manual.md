@@ -621,7 +621,7 @@ nexus anchor show
 ### 网页节点
 
 浏览器不用装任何东西，用通行密钥登录后成为一个临时节点，可以看到被授权的设备、进入它们的终端会话
-（行为和 `nexus ssh` 一样）、浏览被授权的工作区。浏览器的所有流量都经锚点的中继。
+（行为和 `nexus ssh` 一样）、打开被授权的网页服务、浏览被授权的工作区。浏览器的所有流量都经锚点的中继。
 
 ```sh laptop
 nexus web enroll --label phone --page http://localhost:8080   # 管理设备上：输出登记链接（默认 10 分钟内有效）
@@ -638,13 +638,19 @@ nexus web ls
 | 撤销 | 撤销后不能再登录，已有的网页连接立即断开 |
 | 痕迹 | 页面不用任何浏览器存储；关掉页面，临时身份和凭证就没了 |
 | 断网 | 自动重连会话 |
+| 网页服务 | 设备后面列出它的网页服务，点开在新标签页打开 |
 | 工作区 | 能读的工作区列在设备下面：逐级浏览目录，文本和图片直接预览（只取开头 1 MiB），任何文件都能下载；只读 |
+
+**网页服务**：设备后面列出它上面用 `--proto http` 发布的服务，点开在新标签页里打开（地址是 `/svc/<随机令牌>/`），
+页面里的请求都经 Nexus 到那个服务；登录的页面要一直开着。服务设置的 cookie 只记在登录页面的内存里，
+服务的页面在浏览器里存的东西在登录页面关闭时清掉。不支持 WebSocket 和流式回应（回应读完才显示），
+页面里写死 `http://localhost:<端口>/…` 的完整网址也到不了服务。需要授权 `svc.connect`（例如 `--grant 'svc.connect@home/svc/web'`）。
 
 页面里看到的工作区是存储设备（`nexus drive serve on`，第 12 节）上最近同步的提交，还没提交或同步的改动看不到。
 默认权限不含读工作区，登记时要明确给出，例如：
 
 ```sh
-nexus web enroll --label phone --grant 'term.session.*@**' --grant 'node.info@**' --grant 'drive.read@**'
+nexus web enroll --label phone --grant 'term.session.*@**' --grant 'node.info@**' --grant 'drive.read@**' --grant 'svc.connect@**'
 nexus web enroll --label kiosk --grant 'node.info@**' --grant 'drive.read@anchor/drive/docs'   # 只能看 anchor 上的 docs
 ```
 

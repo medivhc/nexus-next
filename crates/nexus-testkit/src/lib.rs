@@ -635,6 +635,26 @@ impl Browser {
         on_node!(node, n => n.serve_hardware(state, provider, stop, on_usage).await)
     }
 
+    /// 设备上能用的服务（M8.2）。
+    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.services(device).await)
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求（M8.2）。
+    pub async fn http(
+        &self,
+        device: &str,
+        service: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.http(device, service, method, path, headers, body).await)
+    }
+
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
     pub async fn term(&self, device: &str, session: &str) -> Result<Term, nexus_wire::WireError> {
         let node = self.node();
@@ -1241,8 +1261,8 @@ impl RealWorld {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
         let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
-        let child = Command::new(&bin)
-            .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
             .args(&rendezvous)
             .args(&proxy)
@@ -1254,9 +1274,19 @@ impl RealWorld {
             .env_remove("ENV")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("无法启动 nexus daemon");
+            .stderr(log);
+        // 刚复制出来的二进制（use_own_binary）：并行的测试里别的线程 fork 出的子进程在 exec 之前还持有它的写句柄，
+        // 这时执行会得到 ETXTBSY。等一下再试。
+        let mut tries = 0;
+        let child = loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.expect("无法启动 nexus daemon"),
+            }
+        };
         self.children.borrow_mut().insert(name.to_string(), child);
     }
 
@@ -1949,6 +1979,21 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
             let (mut r, mut w) = s.split();
             let _ = tokio::io::copy(&mut r, &mut w).await;
             let _ = w.shutdown().await;
+        }
+        Service::HttpEcho => {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            let reply = loop {
+                if let Some(r) = nexus_sys_sim::http_echo_reply(&req) {
+                    break r;
+                }
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            };
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
         }
         Service::Http(body) => {
             let mut head = Vec::new();
