@@ -129,6 +129,8 @@ pub const DEFAULT_WEB_PAGE: &str = "https://bewith.link";
 /// 发给一个终端会话任务的命令。
 enum SessCmd {
     Attach { client: ClientId, size: Size, tx: mpsc::UnboundedSender<ClientMsg> },
+    /// 只读观看（M9.1）：收输出，不成为活跃客户端，不改变会话尺寸。
+    Watch { client: ClientId, size: Size, tx: mpsc::UnboundedSender<ClientMsg> },
     Event(TermEvent),
     Kill,
 }
@@ -186,6 +188,10 @@ impl LiveSession {
             SessCmd::Attach { client, size, tx } => {
                 self.clients.insert(client, tx);
                 self.apply(pty, TermEvent::Attach { client, size });
+            }
+            SessCmd::Watch { client, size, tx } => {
+                self.clients.insert(client, tx);
+                self.apply(pty, TermEvent::Watch { client, size });
             }
             SessCmd::Event(event) => {
                 if let TermEvent::Detach { client } = &event {
@@ -1952,7 +1958,6 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = tokio::time::timeout(PEER_SILENT, reader.drain()).await;
     }
 
-    /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
     /// 只读观看终端会话（M9.1）：访客只收输出并可发 Ack/Ping，所有按键与调整尺寸输入均被忽略；分享撤销或到期立即断开。
     async fn serve_share_session<St: AsyncRead + AsyncWrite + Unpin>(
         &self,
@@ -1979,7 +1984,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let client = self.next_client.get();
         self.next_client.set(client + 1);
         let (tx, mut out) = mpsc::unbounded_channel();
-        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
+        if cmd.send(SessCmd::Watch { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
             let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
             return;
         }
@@ -2030,6 +2035,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = tokio::time::timeout(PEER_SILENT, reader.drain()).await;
     }
 
+    /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
     async fn serve_session<St: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: St,

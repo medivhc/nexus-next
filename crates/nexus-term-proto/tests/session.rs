@@ -128,7 +128,7 @@ impl Harness {
     }
 
     fn apply(&mut self, event: Event) {
-        if let Event::Attach { client, size } = &event {
+        if let Event::Attach { client, size } | Event::Watch { client, size } = &event {
             self.peers.insert(*client, Peer::new(*size));
         }
         for action in self.session.handle(event) {
@@ -362,6 +362,23 @@ fn size_follows_the_client_that_typed_last() {
     h.apply(Event::Resize { client: 1, size: mid });
     assert_eq!(h.resizes.last(), Some(&mid));
     assert_eq!(h.session.size(), mid);
+}
+
+#[test]
+fn watcher_never_changes_the_session_size() {
+    // 只读观看（M9.1）：观看者连上来不抢活跃，也不改变会话尺寸，但能拿到屏幕。
+    let mut h = Harness::new(1 << 20);
+    h.apply(Event::Attach { client: 1, size: SIZE });
+    let resizes = h.resizes.clone();
+    h.apply(Event::Watch { client: 2, size: Size { cols: 20, rows: 5 } });
+    assert_eq!(h.resizes, resizes, "观看者不能改变会话尺寸");
+    assert_eq!(h.session.size(), SIZE);
+    h.apply(Event::PtyOutput(b"hello".to_vec()));
+    h.settle(2);
+    assert!(h.peer(2).term.screen().contents().starts_with("hello"));
+    // 观看者的窗口大小变化同样不影响会话；打字的客户端才是活跃的。
+    h.apply(Event::Resize { client: 2, size: Size { cols: 120, rows: 40 } });
+    assert_eq!(h.resizes, resizes);
 }
 
 #[test]

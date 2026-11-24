@@ -13,7 +13,7 @@ use nexus_wire::{
     hex_encode, Response, ShareCreatedReport, ShareDriveEntry, ShareInfo, ShareRecord, ShareTarget, Size, WireError,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const KEY_SHARES: &str = "shares-v1";
 
@@ -27,7 +27,14 @@ pub(crate) struct StoredShare {
     pub max_uses: Option<u32>,
     pub uses: u32,
     pub revoked: bool,
+    /// 打开过这项分享的访客（每次 `ShareOpen` 记一个）：后续访问只认这些访客，
+    /// 否则跳过 `ShareOpen` 直接发子请求就能绕过次数上限。
+    #[serde(default)]
+    pub opened: BTreeSet<NodeId>,
 }
+
+/// 访客一次读取的上限：回应要装进一帧（`MAX_FRAME`），留出编码的余量。
+const MAX_SHARE_READ: u64 = 512 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ShareStore {
@@ -139,6 +146,7 @@ impl<T: Transport, S: System> Node<T, S> {
             max_uses,
             uses: 0,
             revoked: false,
+            opened: BTreeSet::new(),
         };
         self.shares.borrow_mut().entries.insert(id.clone(), stored);
         self.save_shares()?;
@@ -226,20 +234,18 @@ impl<T: Transport, S: System> Node<T, S> {
             self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::SessionExpired));
             return Err(err(ErrorCode::Denied, "这项分享已过期"));
         }
-        if let Some(max) = entry.max_uses {
-            if consume && entry.uses >= max {
-                drop(store);
-                self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
-                return Err(err(ErrorCode::Denied, "这项分享的使用次数已用完"));
-            }
-            if !consume && entry.uses > max {
-                drop(store);
-                self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
-                return Err(err(ErrorCode::Denied, "这项分享的使用次数已用完"));
-            }
-        }
         if consume {
+            if entry.max_uses.is_some_and(|max| entry.uses >= max) {
+                drop(store);
+                self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
+                return Err(err(ErrorCode::Denied, "这项分享的使用次数已用完"));
+            }
             entry.uses = entry.uses.saturating_add(1);
+            entry.opened.insert(peer);
+        } else if !entry.opened.contains(&peer) {
+            drop(store);
+            self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
+            return Err(err(ErrorCode::Denied, "请先打开分享链接"));
         }
         let snapshot = entry.clone();
         drop(store);
@@ -381,7 +387,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 .get(&manifest)
                 .and_then(|b| FileManifest::decode(&b))
                 .ok_or_else(|| internal("本机缺少文件清单"))?;
-            let spans = m.spans(0, max);
+            let spans = m.spans(0, max.min(MAX_SHARE_READ));
             let mut bytes = Vec::new();
             for span in spans {
                 let chunk = cas.get(&span.hash).ok_or_else(|| internal("本机缺少文件数据块"))?;

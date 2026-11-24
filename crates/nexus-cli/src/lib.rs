@@ -1214,7 +1214,8 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 list.iter()
                     .map(|s| {
                         let status = if s.revoked { "已撤销" } else { "有效" };
-                        format!("{}  {}  已用 {}/{:?}  {status}\n", s.id, s.target.kind_str(), s.uses, s.max_uses)
+                        let max = s.max_uses.map_or_else(|| "不限".to_string(), |m| m.to_string());
+                        format!("{}  {}  已用 {}/{max}  {status}\n", s.id, s.target.kind_str(), s.uses)
                     })
                     .collect()
             }

@@ -38,6 +38,8 @@ pub enum Event {
     PtyOutput(Vec<u8>),
     /// 一个客户端连上来，报告它的终端尺寸。
     Attach { client: ClientId, size: Size },
+    /// 一个只读观看的客户端连上来（M9.1）：收输出，但永远不会成为活跃客户端，不改变会话尺寸。
+    Watch { client: ClientId, size: Size },
     /// 客户端的键盘输入。
     Input { client: ClientId, bytes: Vec<u8> },
     /// 客户端的终端尺寸变了。
@@ -157,9 +159,10 @@ impl Session {
         let mut actions = Vec::new();
         match event {
             Event::PtyOutput(bytes) => self.output(bytes, &mut actions),
-            Event::Attach { client, size } => {
+            Event::Attach { client, size } | Event::Watch { client, size } => {
+                let watch = matches!(event, Event::Watch { .. });
                 self.clients.insert(client, Client { size: size.clamped(), credit: self.window, lagging: false });
-                if self.exited.is_none() {
+                if self.exited.is_none() && !watch {
                     self.activate(client, &mut actions);
                 }
                 let restore = ClientMsg::Restore(self.restore());
