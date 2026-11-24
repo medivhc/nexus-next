@@ -129,6 +129,16 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::ShareDriveRead { token: [8; 16], path: "/a.txt".into(), max: 1024 },
         Request::ShareServiceConnect { token: [8; 16] },
         Request::ShareSessionWatch { token: [8; 16], size: Size { cols: 80, rows: 24 } },
+        Request::RootRotate {
+            rotation: nexus_core_proto::roster::RootRotation {
+                old_root: SecretKey::from_seed([1; 32]).public(),
+                new_root: SecretKey::from_seed([2; 32]).public(),
+                version: 8,
+            }
+            .sign(&SecretKey::from_seed([1; 32])),
+            roster: roster(),
+            addrs: vec![(node(3), "hint".into())],
+        },
     ];
     all.into_iter()
         .map(|r| {
@@ -160,6 +170,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::ShareDriveRead { .. } => "request.share_drive_read",
                 Request::ShareServiceConnect { .. } => "request.share_service_connect",
                 Request::ShareSessionWatch { .. } => "request.share_session_watch",
+                Request::RootRotate { .. } => "request.root_rotate",
             };
             (name, r)
         })

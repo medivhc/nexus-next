@@ -15,7 +15,7 @@ use nexus_core_proto::path::{CapabilityPattern, ResourcePattern};
 use nexus_core_proto::roster::{RevokedAgent, WebKey};
 use nexus_core_proto::webauthn::{login_challenge, verify_assertion, P256Key, WebAuthnAssertion};
 use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
-use nexus_core_proto::roster::{accept_update, Device, DeviceRole, Roster, SignedRoster};
+use nexus_core_proto::roster::{accept_update, verify_root_rotation, Device, DeviceRole, RootRotation, Roster, SignedRootRotation, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
 use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
 use nexus_net_core::http::{self, BadRequest, ProxyRequest};
@@ -277,6 +277,7 @@ const KEY_DEVICE: &str = "device_key";
 const KEY_ROOT_PUB: &str = "root_pub";
 const KEY_ROOT_KEY: &str = "root_key";
 const KEY_ROSTER: &str = "roster";
+const KEY_ROTATIONS: &str = "root-rotations-v1";
 const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
@@ -383,6 +384,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
             }));
         }
         Request::RosterPush { .. }
+        | Request::RootRotate { .. }
         | Request::JoinOffer { .. }
         | Request::WebEnroll { .. }
         | Request::WebLogin { .. }
@@ -502,6 +504,8 @@ struct Trust {
     /// 只有管理设备持有。
     root_key: Option<[u8; 32]>,
     addrs: BTreeMap<NodeId, String>,
+    /// 历史根密钥轮换链（M10.1）：供离线设备重连时追赶信任根。
+    rotations: Vec<(SignedRootRotation, SignedRoster)>,
 }
 
 struct PendingJoin {
@@ -565,6 +569,7 @@ impl<T: Transport, S: System> Node<T, S> {
             },
             root_key: load(&system, KEY_ROOT_KEY)?,
             addrs: load::<_, Vec<(NodeId, String)>>(&system, KEY_ADDRS)?.unwrap_or_default().into_iter().collect(),
+            rotations: load(&system, KEY_ROTATIONS)?.unwrap_or_default(),
         };
         for (node, hint) in &trust.addrs {
             transport.add_hint(*node, hint);
@@ -678,6 +683,29 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let list: Vec<_> = trust.addrs.iter().map(|(k, v)| (*k, v.clone())).collect();
         save(&self.system, KEY_ADDRS, &list)
+    }
+
+    /// 采用一次根密钥轮换（M10.1）：校验旧根与新根双重签名，切换本机信任根与名册并落盘。
+    fn adopt_root_rotation(&self, rotation: &SignedRootRotation, candidate: &SignedRoster) -> Result<(), WireError> {
+        let root = self.trust.borrow().root.ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        if root == rotation.rotation.new_root {
+            // 已经处于新根之下：只按普通名册更新处理。
+            return self.adopt_roster(candidate);
+        }
+        let current = self.trust.borrow().roster.clone();
+        verify_root_rotation(&root, current.as_ref(), rotation, candidate)
+            .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        let new_root = rotation.rotation.new_root;
+        save(&self.system, KEY_ROOT_PUB, &new_root).map_err(internal)?;
+        save(&self.system, KEY_ROSTER, candidate).map_err(internal)?;
+        let mut trust = self.trust.borrow_mut();
+        trust.root = Some(new_root);
+        trust.roster = Some(candidate.clone());
+        trust.rotations.push((rotation.clone(), candidate.clone()));
+        let _ = save(&self.system, KEY_ROTATIONS, &trust.rotations);
+        drop(trust);
+        self.roster_epoch.send_modify(|v| *v += 1);
+        Ok(())
     }
 
     /// 采用一份新名册：校验根、签名和版本，然后落盘。
@@ -825,7 +853,9 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 回应方向的优先级由这一端定：和请求同一类。
         conn.set_priority(&mut stream, body.class().priority());
-        if matches!(body, Request::RosterPush { .. }) && self.roster().is_some_and(|r| r.device(peer).is_some()) {
+        if matches!(body, Request::RosterPush { .. } | Request::RootRotate { .. })
+            && self.roster().is_some_and(|r| r.device(peer).is_some())
+        {
             self.transport.peer_announced(conn);
         }
         let dispatch = match proto {
@@ -874,6 +904,22 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn handle_rpc(&self, peer: NodeId, header: RequestHeader, body: Request) -> Dispatch {
+        // 根密钥轮换推送：由旧根与新根双重签名自证（M10.1）。
+        if let Request::RootRotate { rotation, roster, addrs } = &body {
+            return Dispatch::Reply(match self.adopt_root_rotation(rotation, roster) {
+                Ok(()) => {
+                    let _ = self.learn_hints(addrs);
+                    Response::Ok
+                }
+                Err(e) if matches!(e.code, ErrorCode::InvalidInput) && self.trust.borrow().root == Some(rotation.rotation.new_root) => {
+                    if self.roster().is_some_and(|r| r.device(peer).is_some()) {
+                        let _ = self.learn_hints(addrs);
+                    }
+                    Response::Ok
+                }
+                Err(e) => Response::Error(e),
+            });
+        }
         // 名册推送只靠签名证明自己，不要求发送方已经在本机的旧名册里。
         if let Request::RosterPush { roster, addrs } = &body {
             return Dispatch::Reply(match self.adopt_roster(roster) {
@@ -1109,8 +1155,18 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     async fn push_roster(&self, to: NodeId) -> io::Result<()> {
-        let Some(roster) = self.trust.borrow().roster.clone() else { return Ok(()) };
-        let body = Request::RosterPush { roster, addrs: self.addr_hints() };
+        let (rotations, roster) = {
+            let t = self.trust.borrow();
+            (t.rotations.clone(), t.roster.clone())
+        };
+        let addrs = self.addr_hints();
+        // 若本机经历过根密钥轮换，先按顺序把轮换证书推过去，让错过轮换的离线设备能验证并切换到新根。
+        for (rotation, step_roster) in rotations {
+            let body = Request::RootRotate { rotation, roster: step_roster, addrs: addrs.clone() };
+            let _ = self.request_once(to, Proto::Rpc, Principal::Device, body).await;
+        }
+        let Some(roster) = roster else { return Ok(()) };
+        let body = Request::RosterPush { roster, addrs };
         match self.request_once(to, Proto::Rpc, Principal::Device, body).await?.0 {
             Response::Ok => Ok(()),
             other => Err(io::Error::other(format!("推送名册失败：{other:?}"))),
@@ -1166,6 +1222,7 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::Approve { code, name } => self.approve(&code, name).await.map(CtlResponse::Membership),
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
             CtlRequest::Recover { code } => self.recover(&code).await.map(CtlResponse::Membership),
+            CtlRequest::RootRotate => self.rotate_root().await.map(CtlResponse::RootRotated),
             CtlRequest::List => Ok(CtlResponse::List(self.list(agent_ref).await)),
             CtlRequest::SessionList { node } => self.remote_session_list(&node, agent_ref).await.map(CtlResponse::Sessions),
             CtlRequest::SessionKill { node, session } => {
@@ -1243,6 +1300,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::JoinStart
                 | CtlRequest::Approve { .. }
                 | CtlRequest::Revoke { .. }
+                | CtlRequest::RootRotate
                 | CtlRequest::AgentIssue { .. }
                 | CtlRequest::AgentRevoke { .. }
                 | CtlRequest::AgentList
@@ -2999,6 +3057,56 @@ impl<T: Transport, S: System> Node<T, S> {
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         Ok(MembershipReport { name: name.to_string(), node_id: device.node_id, roster_version: self.roster_version(), pushed, unreachable })
+    }
+
+    /// 在管理设备上轮换网络的根密钥（M10.1，R75）：无需重建网络，旧恢复码与旧根签发的 agent 立即失效。
+    async fn rotate_root(&self) -> Result<nexus_wire::RootRotateReport, WireError> {
+        let _write = self.roster_write.lock().await;
+        let old_root = self.admin_key()?;
+        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut new_seed = [0u8; 32];
+        self.system.random(&mut new_seed);
+        let new_root = SecretKey::from_seed(new_seed);
+        let old_pub = old_root.public();
+        let new_pub = new_root.public();
+        roster.version += 1;
+        roster.root = new_pub;
+        let signed_roster = roster.sign(&new_root);
+        let signed_rotation = RootRotation {
+            old_root: old_pub,
+            new_root: new_pub,
+            version: signed_roster.roster.version,
+        }
+        .sign(&old_root);
+
+        let mut rotations = self.trust.borrow().rotations.clone();
+        rotations.push((signed_rotation.clone(), signed_roster.clone()));
+        let persist = || -> io::Result<()> {
+            save(&self.system, KEY_ROOT_KEY, &new_seed)?;
+            save(&self.system, KEY_ROOT_PUB, &new_pub)?;
+            save(&self.system, KEY_ROSTER, &signed_roster)?;
+            save(&self.system, KEY_ROTATIONS, &rotations)?;
+            Ok(())
+        };
+        persist().map_err(internal)?;
+        {
+            let mut t = self.trust.borrow_mut();
+            t.root = Some(new_pub);
+            t.root_key = Some(new_seed);
+            t.roster = Some(signed_roster);
+            t.rotations = rotations;
+        }
+        self.roster_epoch.send_modify(|v| *v += 1);
+        drop(_write);
+        let (pushed, unreachable) = self.broadcast_roster(None).await;
+        Ok(nexus_wire::RootRotateReport {
+            old_root: old_pub,
+            new_root: new_pub,
+            recovery_code: hex_encode(&new_seed),
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     /// 用恢复码（网络根密钥）让本机成为管理设备（M6.2）：名册里本机改为管理设备、原来的改为成员。
