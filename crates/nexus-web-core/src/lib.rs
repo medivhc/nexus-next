@@ -6,13 +6,16 @@
 
 mod drive;
 mod handle;
+mod hardware;
 mod http;
 mod node;
 mod terminal;
 pub use drive::{DriveEntry, DriveFile, DriveWorkspace};
 pub use http::{encode_request, parse_response, HttpResponse, MAX_RESPONSE};
 pub use handle::{EntryHandle, MAX_USER_HANDLE};
+pub use hardware::{HardwareProvider, HardwareState, HardwareUsageEvent};
 pub use node::{challenge, WebNode, WebTerminal};
+pub use nexus_wire::{HardwareCapture, HardwareKind};
 pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
 use nexus_core_proto::authz::Principal;

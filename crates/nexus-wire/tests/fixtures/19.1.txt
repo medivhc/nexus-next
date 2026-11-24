@@ -1,0 +1,5 @@
+# 协议 19.1 新增的消息的编码（tests/compat.rs 生成，不要手改）
+request.hardware_capture 1502
+request.hardware_list 14
+response.hardware_capture 0d028086eba902d0a9bb8609e20964
+response.hardware_list 0c020002

@@ -122,6 +122,8 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::DrivePush { ws: "work".into(), head: [4; 32], count: 3 },
         Request::DriveProfilePut { ws: "work".into(), name: "build".into(), files: vec!["/a".into()] },
         Request::DriveProfileGet { ws: "work".into(), name: "build".into() },
+        Request::HardwareList,
+        Request::HardwareCapture { kind: HardwareKind::Location },
     ];
     all.into_iter()
         .map(|r| {
@@ -146,6 +148,8 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::DrivePush { .. } => "request.drive_push",
                 Request::DriveProfilePut { .. } => "request.drive_profile_put",
                 Request::DriveProfileGet { .. } => "request.drive_profile_get",
+                Request::HardwareList => "request.hardware_list",
+                Request::HardwareCapture { .. } => "request.hardware_capture",
             };
             (name, r)
         })
@@ -180,6 +184,8 @@ fn response_samples() -> Vec<(&'static str, Response)> {
         Response::DrivePushed { accepted: false, head: Some([7; 32]) },
         Response::DriveProfile(Some(vec!["/a".into()])),
         Response::Error(WireError::new(ErrorCode::Denied, "不行")),
+        Response::HardwareList(vec![HardwareKind::Camera, HardwareKind::Location]),
+        Response::HardwareCapture(HardwareCapture::Location { lat_e7: 312_304_000, lon_e7: 1_214_737_000, accuracy_cm: 1250, timestamp_ms: 100 }),
     ];
     all.into_iter()
         .map(|r| {
@@ -196,6 +202,8 @@ fn response_samples() -> Vec<(&'static str, Response)> {
                 Response::DrivePushed { .. } => "response.drive_pushed",
                 Response::DriveProfile(_) => "response.drive_profile",
                 Response::Error(_) => "response.error",
+                Response::HardwareList(_) => "response.hardware_list",
+                Response::HardwareCapture(_) => "response.hardware_capture",
             };
             (name, r)
         })
@@ -254,9 +262,15 @@ fn encoded_samples() -> BTreeMap<&'static str, Vec<u8>> {
         ("principal.web", Principal::Web { session: web_session() }),
     ];
     for (n, p) in principals {
-        out.insert(n, postcard::to_allocvec(&RequestHeader::new(7, p, &Request::NodeInfo)).unwrap());
+        // 请求头的形状不变；次版本取固定值，样例才不随 WIRE_MINOR 变。
+        let mut header = RequestHeader::new(7, p, &Request::NodeInfo);
+        header.minor = 0;
+        out.insert(n, postcard::to_allocvec(&header).unwrap());
     }
-    out.insert("envelope.response", postcard::to_allocvec(&ResponseEnvelope::new(&Response::Ok)).unwrap());
+    // 信封的形状不变；次版本取固定值，样例才不随 WIRE_MINOR 变。
+    let mut envelope = ResponseEnvelope::new(&Response::Ok);
+    envelope.minor = 0;
+    out.insert("envelope.response", postcard::to_allocvec(&envelope).unwrap());
     out.insert("frame.input_resize", postcard::to_allocvec(&Input::Resize(size())).unwrap());
     let audit = PrincipalRef::Agent { id: key(8).public(), label: "ci".into() };
     out.insert("audit.principal_agent", postcard::to_allocvec(&audit).unwrap());
@@ -311,7 +325,6 @@ fn existing_messages_keep_their_encoding() {
     let samples = encoded_samples();
     let bless = std::env::var("NEXUS_BLESS").is_ok_and(|v| v == "1");
     for (minor, name, bytes) in &fixtures {
-        #[allow(clippy::absurd_extreme_comparisons)] // WIRE_MINOR 现在是 0
         let ok = *minor <= WIRE_MINOR;
         assert!(ok, "fixtures 里有比当前次版本 {WIRE_MINOR} 新的文件");
         assert!(round_trips(name, bytes), "{WIRE_VERSION}.{minor} 的 {name} 解码不了或者再编码不一样");
