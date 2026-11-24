@@ -7,7 +7,7 @@
 
 ## 现在能做什么
 
-已完成路线的阶段 0–5，`FEATURES.md` 里的 74 条需求都已实现并有测试：
+已完成路线的阶段 0–8（阶段 7 差真实跨网络验证）和阶段 9 的临时分享，`FEATURES.md` 里的 74 条需求（R00–R73）都已实现并有测试：
 
 | 阶段 | 内容 |
 | --- | --- |
@@ -17,14 +17,16 @@
 | 4 | 文件：版本化工作区、跨设备同步与分叉合并、Linux 挂载、预读 |
 | 5 | 多条网络：断一条不断会话、交互流量冗余、批量分摊、计费网络 |
 | 6 | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码；用恢复码恢复管理设备 |
-| 7（进行中） | 日常可用：新旧版本互通（设备可以一台一台升级）；终端会话在常驻程序重启后保留；`nexus upgrade`（自动换回） |
+| 7 | 日常可用：新旧版本互通（设备可以一台一台升级）；终端会话在常驻程序重启后保留；`nexus upgrade`（自动回滚、推送给其他设备）；`nexus open` 在浏览器打开网页服务 |
+| 8 | 网页节点补齐：浏览工作区（Drive）、打开已发布的网页服务、发布硬件能力（摄像头/麦克风/位置） |
+| 9（进行中） | 临时分享：文件/目录、网页服务、只读终端（带到期时间、次数限制与撤销） |
 
-还没做：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。已知限制见手册的第 17 节。
-**还没有在两台不同网络的真实设备上验证过**，步骤见 `docs/real-network-check.md`。
+还没做：凭据同步（Vault，M9.2）、根密钥轮换、远程桌面。已知限制见手册的第 17 节。
+**还没有在两台不同网络的真实设备上验证过**（M7.0），步骤见 `docs/real-network-check.md`。
 
 ## 上手
 
-预编译的 Linux 二进制（x86_64、aarch64）在 Releases 页面；或者从源码构建：
+预编译的 Linux 静态二进制（x86_64、aarch64）在 Releases 页面；或者从源码构建（需要 Rust 1.85+）：
 
 ```sh
 cargo build --release -p nexus-cli       # target/release/nexus
@@ -45,13 +47,14 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 | 文档 | 内容 |
 | --- | --- |
 | [docs/manual.md](docs/manual.md) | 用户手册：怎么工作、从零开始的三台设备、所有命令、维护和排查 |
-| [FEATURES.md](FEATURES.md) | 需求（R01–R61）和实现状态 |
+| [FEATURES.md](FEATURES.md) | 需求（R00–R73）和实现状态 |
 | [docs/anchor.md](docs/anchor.md) | 在 VPS 上部署锚点 |
 | [docs/unified-entry.md](docs/unified-entry.md) | 统一入口、路由规则、出口、`nexus run`、完整节点的细节 |
 | [docs/android.md](docs/android.md) | Android 应用的构建、安装和加入 |
 | [docs/real-network-check.md](docs/real-network-check.md) | 在两台真实设备上验证的清单 |
 | [docs/roadmap.md](docs/roadmap.md) | 之后的开发计划：和产品文档的差距、阶段 7–9 |
 | [docs/protocol.md](docs/protocol.md) | 协议与版本兼容：改协议时的规则（开发者） |
+| [docs/ci-selective-policy.md](docs/ci-selective-policy.md) | CI 影响分析与分层门禁策略 |
 | [web/README.md](web/README.md) | 网页节点的页面：构建、本机试用、浏览器端到端测试 |
 | [vendor/README.md](vendor/README.md) | iroh 和 noq 的分支：改了什么、为什么（多路径） |
 | `docs/feature-points/` | 每个里程碑的功能点（Given / When / Then），开发时的规格 |
@@ -59,7 +62,7 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 
 ## 升级兼容性
 
-当前协议：主版本 19、次版本 0（连接的协议名 `nexus/rpc/5`、`nexus/join/5`、`nexus/web/4`）。
+当前协议：主版本 19、次版本 2（连接的协议名 `nexus/rpc/5`、`nexus/join/5`、`nexus/web/4`）。
 同一主版本内新旧版本互通，设备可以一台一台升级；改协议的规则见 [docs/protocol.md](docs/protocol.md)。
 升级保留已有的设备密钥、名册和工作区，浏览器需要重新登录。
 
@@ -74,7 +77,8 @@ NEXUS_SIM_SEED=7 cargo test --test scenarios node_sees_peer_status::sim   # 复�
 ```
 
 `tools/manual_check.py` 在本机起几台设备，照着用户手册里带设备名的代码块从上到下执行一遍（CI 的「L3 用户手册」）：
-改了命令的行为或输出，要同时改手册。
+改了命令的行为或输出，要同时改手册。GitHub Actions 的 PR 检查按改动范围由 `tools/ci_plan.py` 选择执行并汇总到必过门禁
+（见 [docs/ci-selective-policy.md](docs/ci-selective-policy.md)）。
 
 真实网络的检查要 root（CI 里用 sudo）：`tools/sched_bench.py`（流量调度）、`tools/multipath_check.py`（多路径）、
 `tools/drive_bench.py`（文件的衡量）。浏览器端到端测试在 `tools/web-e2e`，Android 的在 `tools/android_e2e.py`。
@@ -94,7 +98,7 @@ Linux 的静态二进制（x86_64、aarch64）发布到 Releases。不带标签�
 | 驱动 | `nexus-sys-real`、`nexus-sys-sim`、`nexus-fabric-iroh`、`nexus-fabric-sim` | 接缝的真实实现和仿真实现 |
 | 运行时 | `nexus-runtime` | 只依赖接缝，不依赖任何具体驱动 |
 | 外壳 | `nexus-cli`（`nexus` 二进制）、`nexus-android`（JNI 库）、`nexus-web`（WASM 包装） | |
-| 网页核心 | `nexus-web-core` | 浏览器里的节点：协议、会话、重连 |
+| 网页核心 | `nexus-web-core` | 浏览器里的节点：协议、会话、重连、工作区、网页服务、硬件能力与临时分享 |
 | 测试 | `nexus-testkit` | 同一份验收场景跑在仿真和真实两种后端上 |
 
 这些规则由 `tools/check.py` 强制执行。传输层用 iroh 和 noq 的分支（`vendor/`），通过根目录 `Cargo.toml` 的
