@@ -83,7 +83,8 @@ def classify(paths: list[str], event: str) -> Plan:
             crate = parts[1]
             # Only browser-specific crates can bypass native L2/L3.
             full = True
-            if crate == "nexus-web-core":
+            # The browser depends on both Web and Drive core (see Cargo manifests).
+            if crate in {"nexus-web-core", "nexus-drive-core"}:
                 web = True
             if crate in WIRE_CRATES:
                 compat = True
