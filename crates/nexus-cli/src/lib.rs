@@ -302,6 +302,11 @@ pub enum Cmd {
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
     /// 登记、列出、撤销用于网页登录的通行密钥
+    /// Vault（M9.2）：加密保存秘密并按条目同步到授权设备，每次取用记入审计
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
     Web {
         #[command(subcommand)]
         cmd: WebCmd,
@@ -431,6 +436,55 @@ pub enum SessionCmd {
     Kill {
         node: String,
         session: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultCmd {
+    /// 写入或轮换一条秘密（加密后同步给 --device 指定的授权设备）
+    Put {
+        /// 条目名（字母、数字、- 和 _）
+        name: String,
+        /// 秘密内容（不给则从标准输入读取）
+        #[arg(long)]
+        value: Option<String>,
+        /// 允许持有并读取该条目的设备名（可写多次；管理设备默认包含）
+        #[arg(long = "device", value_name = "设备名")]
+        devices: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 读取并解密一条秘密（每次取用都会记入审计）
+    Get {
+        /// 条目名
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本机可见的 Vault 条目
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除一条秘密并通知各设备擦除
+    Rm {
+        /// 条目名
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从管理设备主动同步本机被授权的条目
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出因设备被吊销而需要轮换的条目
+    RotateNeeded {
+        /// 只看某台已吊销设备
+        #[arg(long)]
+        device: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -949,6 +1003,24 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
             (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
         }
+        Cmd::Vault { cmd: VaultCmd::Put { name, value, devices, json } } => {
+            let bytes = match value {
+                Some(v) => v.as_bytes().to_vec(),
+                None => {
+                    let mut buf = Vec::new();
+                    let _ = stdin.read_to_end(&mut buf).await;
+                    buf
+                }
+            };
+            (CtlRequest::VaultPut { name: name.clone(), value: bytes, devices: devices.clone() }, *json)
+        }
+        Cmd::Vault { cmd: VaultCmd::Get { name, json } } => (CtlRequest::VaultGet { name: name.clone() }, *json),
+        Cmd::Vault { cmd: VaultCmd::Ls { json } } => (CtlRequest::VaultList, *json),
+        Cmd::Vault { cmd: VaultCmd::Rm { name, json } } => (CtlRequest::VaultRm { name: name.clone() }, *json),
+        Cmd::Vault { cmd: VaultCmd::Sync { json } } => (CtlRequest::VaultSync, *json),
+        Cmd::Vault { cmd: VaultCmd::RotateNeeded { device, json } } => {
+            (CtlRequest::VaultRotateNeeded { device: device.clone() }, *json)
+        }
         Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
         Cmd::Anchor { cmd: AnchorCmd::Set { url, clear, json } } => {
             (CtlRequest::AnchorSet { url: if *clear { None } else { url.clone() } }, *json)
@@ -1024,10 +1096,82 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 if !m.unreachable.is_empty() {
                     s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
                 }
+                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
+                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                    {
+                        for item in items {
+                            if !item.entries.is_empty() {
+                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                            }
+                        }
+                    }
+                }
                 s
             }
         }
         CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::VaultPut(info) => {
+            if json {
+                format!(
+                    "{}\n",
+                    json!({
+                        "name": info.name,
+                        "version": info.version,
+                        "updated_at_ms": info.updated_at.0,
+                        "devices": info.devices,
+                    })
+                )
+            } else {
+                format!("已保存 Vault 条目 {}（版本 {}，授权设备：{}）\n", info.name, info.version, info.devices.join("、"))
+            }
+        }
+        CtlResponse::VaultValue { name, value } => {
+            let text = String::from_utf8_lossy(&value);
+            if json {
+                format!("{}\n", json!({ "name": name, "value": text }))
+            } else {
+                format!("{text}\n")
+            }
+        }
+        CtlResponse::VaultList(list) => {
+            if json {
+                let entries: Vec<Value> = list
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "name": e.name,
+                            "version": e.version,
+                            "updated_at_ms": e.updated_at.0,
+                            "devices": e.devices,
+                        })
+                    })
+                    .collect();
+                format!("{}\n", json!({ "entries": entries }))
+            } else if list.is_empty() {
+                "没有 Vault 条目。\n".into()
+            } else {
+                list.iter()
+                    .map(|e| format!("{}  v{}  {}\n", e.name, e.version, e.devices.join(",")))
+                    .collect()
+            }
+        }
+        CtlResponse::VaultRotateNeeded(items) => {
+            if json {
+                let arr: Vec<Value> = items
+                    .iter()
+                    .map(|i| json!({ "revoked_device": i.revoked_device, "entries": i.entries }))
+                    .collect();
+                format!("{}\n", json!({ "items": arr }))
+            } else if items.is_empty() {
+                "没有需要轮换的 Vault 条目。\n".into()
+            } else {
+                items
+                    .iter()
+                    .map(|i| format!("已吊销设备 {} 接触过、建议轮换的条目：{}\n", i.revoked_device, i.entries.join("、")))
+                    .collect()
+            }
+        }
         CtlResponse::WebEnroll(r) => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "label": r.label, "url": r.url, "expires_at_ms": r.expires_at.0 }))
@@ -1085,6 +1229,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
         CtlResponse::Ok => match cmd {
+            Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
+                } else {
+                    format!("已删除 Vault 条目 {name}\n")
+                }
+            }
             Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "killed": session }))
@@ -1380,6 +1531,17 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 let mut s = format!("完成：{}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed);
                 if !m.unreachable.is_empty() {
                     s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
+                }
+                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
+                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                    {
+                        for item in items {
+                            if !item.entries.is_empty() {
+                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                            }
+                        }
+                    }
                 }
                 s
             }

@@ -130,6 +130,36 @@ pub enum Request {
     DriveProfilePut { ws: String, name: String, files: Vec<String> },
     /// 取预读清单：回应 `DriveProfile`。
     DriveProfileGet { ws: String, name: String },
+    /// Vault（M9.2）：管理设备把一条加密后的秘密推送给被授权的设备（`entry: None` 表示擦除）。
+    VaultPush { name: String, entry: Option<VaultCipherEntry> },
+    /// Vault（M9.2）：成员设备向管理设备拉取自己被授权的所有密文条目。
+    VaultPull,
+}
+
+/// Vault 密文条目（M9.2）：落盘与跨网传输均只含认证密文 `sealed`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultCipherEntry {
+    pub name: String,
+    pub version: u64,
+    pub updated_at: Timestamp,
+    pub devices: Vec<String>,
+    pub sealed: Vec<u8>,
+}
+
+/// Vault 条目的摘要信息（M9.2，不含秘密明文与密文）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultEntryInfo {
+    pub name: String,
+    pub version: u64,
+    pub updated_at: Timestamp,
+    pub devices: Vec<String>,
+}
+
+/// 吊销设备后需要轮换的 Vault 条目清单项（M9.2）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultRotateItem {
+    pub revoked_device: String,
+    pub entries: Vec<String>,
 }
 
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
@@ -165,7 +195,9 @@ impl Request {
             | Request::DriveRegister { .. }
             | Request::DriveHave { .. }
             | Request::DriveProfilePut { .. }
-            | Request::DriveProfileGet { .. } => TrafficClass::Interactive,
+            | Request::DriveProfileGet { .. }
+            | Request::VaultPush { .. }
+            | Request::VaultPull => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -453,6 +485,7 @@ pub enum Response {
     DrivePushed { accepted: bool, head: Option<[u8; 32]> },
     DriveProfile(Option<Vec<String>>),
     Error(WireError),
+    VaultEntries(Vec<VaultCipherEntry>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,6 +602,12 @@ pub enum CtlRequest {
     WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
     WebList,
     WebRevoke { label: String },
+    VaultPut { name: String, value: Vec<u8>, devices: Vec<String> },
+    VaultGet { name: String },
+    VaultList,
+    VaultRm { name: String },
+    VaultSync,
+    VaultRotateNeeded { device: Option<String> },
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
@@ -634,6 +673,10 @@ pub enum CtlResponse {
     Audit(Vec<AuditRecord>),
     SshHostKey([u8; 32]),
     WebEnroll(WebEnrollReport),
+    VaultPut(VaultEntryInfo),
+    VaultValue { name: String, value: Vec<u8> },
+    VaultList(Vec<VaultEntryInfo>),
+    VaultRotateNeeded(Vec<VaultRotateItem>),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),

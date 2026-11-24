@@ -30,6 +30,7 @@ use nexus_wire::{
     RouteExplanation, WireError, WIRE_VERSION,
 };
 mod drive;
+mod vault;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -345,7 +346,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::SvcList | Request::DriveInfo => ("node.info", None),
+        Request::SvcList | Request::DriveInfo | Request::VaultPush { .. } | Request::VaultPull => ("node.info", None),
         Request::DriveRegister { ws }
         | Request::DriveHave { ws, .. }
         | Request::DrivePush { ws, .. }
@@ -532,6 +533,8 @@ pub struct Node<T, S: System> {
     tun_rx: RefCell<Option<mpsc::UnboundedReceiver<TunInbound>>>,
     /// 本机的工作区（M4.1）。
     drive_state: RefCell<drive::DriveState>,
+    /// 本机的 Vault 加密秘密存储（M9.2）。
+    vault: RefCell<vault::VaultStore>,
     /// 用户对网络接口是否计费的设置（M5.2）。
     metered: RefCell<BTreeMap<String, bool>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
@@ -562,6 +565,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         let (tun_tx, tun_rx) = mpsc::unbounded_channel();
         let drive_state = RefCell::new(drive::DriveState::load(&system)?);
+        let vault = RefCell::new(vault::VaultStore::load(&system)?);
         let metered = RefCell::new(load(&system, KEY_METERED)?.unwrap_or_default());
         Ok(Self {
             routes: RefCell::new(routes),
@@ -570,6 +574,7 @@ impl<T: Transport, S: System> Node<T, S> {
             proxy_rx: RefCell::new(Some(proxy_rx)),
             tun: RefCell::new(None),
             drive_state,
+            vault,
             metered,
             tun_tx,
             tun_rx: RefCell::new(Some(tun_rx)),
@@ -911,6 +916,8 @@ impl<T: Transport, S: System> Node<T, S> {
             Request::DriveHave { ws, hashes } => self.drive_have(&ws, hashes),
             Request::DriveProfilePut { ws, name, files } => self.drive_profile_put(&ws, &name, files),
             Request::DriveProfileGet { ws, name } => self.drive_profile_get(&ws, &name),
+            Request::VaultPush { name, entry } => self.handle_vault_push(peer, name, entry),
+            Request::VaultPull => self.handle_vault_pull(peer),
             Request::DriveGet { ws, hashes } => match self.ws_exists(&ws) {
                 true => return Dispatch::DriveGet { hashes },
                 false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),
@@ -1149,6 +1156,18 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
             CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
+            CtlRequest::VaultPut { name, value, devices } => {
+                self.vault_put(name, value, devices, agent_ref).await.map(CtlResponse::VaultPut)
+            }
+            CtlRequest::VaultGet { name } => {
+                self.vault_get(&name, agent_ref).map(|value| CtlResponse::VaultValue { name, value })
+            }
+            CtlRequest::VaultList => self.vault_list(agent_ref).map(CtlResponse::VaultList),
+            CtlRequest::VaultRm { name } => self.vault_rm(&name, agent_ref).await.map(|()| CtlResponse::Ok),
+            CtlRequest::VaultSync => self.vault_sync().await.map(CtlResponse::VaultList),
+            CtlRequest::VaultRotateNeeded { device } => {
+                self.vault_rotate_needed(device.as_deref()).map(CtlResponse::VaultRotateNeeded)
+            }
             CtlRequest::AnchorSet { url } => self.anchor_set(url).await.map(CtlResponse::Anchor),
             CtlRequest::Connect { node, name } => return self.connect(&node, &name, agent, server).await,
             CtlRequest::Publish { name, addr, proto, env } => self.publish(name, addr, proto, env).map(|path| CtlResponse::Published { path }),
@@ -1196,6 +1215,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::WebEnroll { .. }
                 | CtlRequest::WebList
                 | CtlRequest::WebRevoke { .. }
+                | CtlRequest::VaultPut { .. }
+                | CtlRequest::VaultRm { .. }
+                | CtlRequest::VaultSync
+                | CtlRequest::VaultRotateNeeded { .. }
                 | CtlRequest::AnchorSet { .. }
                 | CtlRequest::AnchorShow
                 | CtlRequest::Publish { .. }
@@ -2842,6 +2865,7 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         roster.version += 1;
         roster.devices.retain(|d| d.node_id != device.node_id);
+        let _ = self.note_device_revoked_for_vault(name);
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);

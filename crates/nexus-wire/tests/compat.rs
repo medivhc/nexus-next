@@ -122,6 +122,17 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::DrivePush { ws: "work".into(), head: [4; 32], count: 3 },
         Request::DriveProfilePut { ws: "work".into(), name: "build".into(), files: vec!["/a".into()] },
         Request::DriveProfileGet { ws: "work".into(), name: "build".into() },
+        Request::VaultPush {
+            name: "api_key".into(),
+            entry: Some(VaultCipherEntry {
+                name: "api_key".into(),
+                version: 1,
+                updated_at: Timestamp(100),
+                devices: vec!["home".into()],
+                sealed: vec![1, 2, 3],
+            }),
+        },
+        Request::VaultPull,
     ];
     all.into_iter()
         .map(|r| {
@@ -146,6 +157,8 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::DrivePush { .. } => "request.drive_push",
                 Request::DriveProfilePut { .. } => "request.drive_profile_put",
                 Request::DriveProfileGet { .. } => "request.drive_profile_get",
+                Request::VaultPush { .. } => "request.vault_push",
+                Request::VaultPull => "request.vault_pull",
             };
             (name, r)
         })
@@ -180,6 +193,13 @@ fn response_samples() -> Vec<(&'static str, Response)> {
         Response::DrivePushed { accepted: false, head: Some([7; 32]) },
         Response::DriveProfile(Some(vec!["/a".into()])),
         Response::Error(WireError::new(ErrorCode::Denied, "不行")),
+        Response::VaultEntries(vec![VaultCipherEntry {
+            name: "api_key".into(),
+            version: 1,
+            updated_at: Timestamp(100),
+            devices: vec!["home".into()],
+            sealed: vec![1, 2, 3],
+        }]),
     ];
     all.into_iter()
         .map(|r| {
@@ -196,6 +216,7 @@ fn response_samples() -> Vec<(&'static str, Response)> {
                 Response::DrivePushed { .. } => "response.drive_pushed",
                 Response::DriveProfile(_) => "response.drive_profile",
                 Response::Error(_) => "response.error",
+                Response::VaultEntries(_) => "response.vault_entries",
             };
             (name, r)
         })
