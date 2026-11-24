@@ -1,0 +1,24 @@
+2026-11-24 13:51:59 UTC
+## experiment/ab-baseline-20261124
+a54db991393645db5e9f13888fcc79b4a2d5cf3f
+e1408f6b98a6ea5f90a4d62a9fd3fc9dfcf5366ed659faecda5371a44f547384  /workspace/scratch/nexus-ab-b/contract.md
+a8b2c2a20b9ae900de8f5691108b2ddd9b7cbd5c80afda8f3b224eacc09bc0a5  /workspace/scratch/nexus-ab-b/model.py
++ python3 /workspace/scratch/nexus-ab-b/model.py --repo . --cargo /workspace/.nexus-next-toolchain/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo
+Build inputs and dependency witnesses:
+  nexus-cli
+  nexus-web -> nexus-core-proto
+  nexus-cli -> nexus-drive-core
+  nexus-web -> nexus-fabric
+  nexus-web -> nexus-fabric-iroh
+  nexus-cli -> nexus-net-core
+  nexus-cli -> nexus-runtime
+  nexus-cli -> nexus-sys-real -> nexus-sys
+  nexus-cli -> nexus-sys-real
+  nexus-web -> nexus-wire -> nexus-term-proto
+  nexus-web
+  nexus-web -> nexus-web-core
+  nexus-web -> nexus-wire
+Minimal case: ["crates/nexus-drive-core/Cargo.toml"] expected web=True, got web=False
+Minimal case: ["crates/nexus-drive-core/src/lib.rs"] expected web=True, got web=False
+Checked 1197 cases, found 32 counterexamples.
+Model exit status: 1

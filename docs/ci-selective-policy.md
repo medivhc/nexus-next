@@ -27,11 +27,14 @@ Clippy + compile-only 共 1616.5 秒，占脚本步骤总耗时 2533.1 秒的 63
 | `docs/manual.md`（L3 用户手册照着执行） | ✓ | ✓ | – | – |
 | Web UI、web E2E、nexus-web | ✓ | – | – | ✓ |
 | nexus-web-core（L2/L3 的浏览器场景直接跑它） | ✓ | ✓ | – | ✓ |
-| nexus-drive-core 与非协议 native crate | ✓ | ✓ | 受影响时 ✓ | 受影响时 ✓ |
+| nexus-drive-core 与其他非协议浏览器构建依赖 | ✓ | ✓ | – | ✓ |
+| 其他非协议 native crate | ✓ | ✓ | – | – |
 | Wire、协议、CLI、Runtime、Fabric 与核心网络 | ✓ | ✓ | ✓ | ✓ |
 | Cargo.lock / vendor / CI 配置与计划 | ✓ | ✓ | ✓ | ✓ |
 | 新目录、未知类型 | ✓ | ✓ | ✓ | ✓ |
 | push 到 main、每日 schedule、workflow_dispatch | ✓ | ✓ | ✓ | ✓ |
+
+浏览器任务按 Cargo 清单跟踪 `nexus-web`（Wasm 页面）和 `nexus-cli`（端到端测试启动的原生程序）的仓库内传递构建依赖。普通依赖和构建依赖会纳入检查，包含目标专属和可选依赖。重命名按旧路径和新路径计算影响。
 
 PR 的 Full CI 仍执行 Clippy、L1、L2、L3，但跳过独立的 cargo test --no-run：实际执行的测试会自行编译；未执行的 test targets 的编译覆盖由 **main / nightly / manual** 的完整运行保留。L0 检查在 PR 中由强制 sanity Job 完成，避免重复。**这不是删除测试能力**，而是改变运行时机。
 

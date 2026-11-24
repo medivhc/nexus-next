@@ -1,0 +1,139 @@
+
+## baseline-model
+2026-11-24 13:51:59 UTC
+## experiment/ab-baseline-20261124
+a54db991393645db5e9f13888fcc79b4a2d5cf3f
+e1408f6b98a6ea5f90a4d62a9fd3fc9dfcf5366ed659faecda5371a44f547384  /workspace/scratch/nexus-ab-b/contract.md
+a8b2c2a20b9ae900de8f5691108b2ddd9b7cbd5c80afda8f3b224eacc09bc0a5  /workspace/scratch/nexus-ab-b/model.py
++ python3 /workspace/scratch/nexus-ab-b/model.py --repo . --cargo /workspace/.nexus-next-toolchain/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo
+Build inputs and dependency witnesses:
+  nexus-cli
+  nexus-web -> nexus-core-proto
+  nexus-cli -> nexus-drive-core
+  nexus-web -> nexus-fabric
+  nexus-web -> nexus-fabric-iroh
+  nexus-cli -> nexus-net-core
+  nexus-cli -> nexus-runtime
+  nexus-cli -> nexus-sys-real -> nexus-sys
+  nexus-cli -> nexus-sys-real
+  nexus-web -> nexus-wire -> nexus-term-proto
+  nexus-web
+  nexus-web -> nexus-web-core
+  nexus-web -> nexus-wire
+Minimal case: ["crates/nexus-drive-core/Cargo.toml"] expected web=True, got web=False
+Minimal case: ["crates/nexus-drive-core/src/lib.rs"] expected web=True, got web=False
+Checked 1197 cases, found 32 counterexamples.
+Model exit status: 1
+
+## baseline-replay
+2026-11-24 13:52:17 UTC
++ Reproduce a single tracked source change using the workflow CLI and real three-dot git diff
+crates/nexus-drive-core/src/lib.rs
++ python3 tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head f9a8c084bd4578ad10c4072a9cdc96940cbea670
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/src/lib.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}
+smoke=true
+full=true
+compat=false
+web=false
+web=false
++ Replay the manifest-only counterexample
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/Cargo.toml"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}
++ Verify workflow consumes the browser output
+41:      web: ${{ steps.select.outputs.web }}
+217:    if: ${{ needs.plan.outputs.web == 'true' }}
+
+## baseline-rename
+2026-11-24 13:53:27 UTC
+R100	crates/nexus-web-core/src/drive.rs	crates/nexus-testkit/src/renamed_drive.rs
++ python3 tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head 93039c30ac2219f1461b43b67d8d2dc157a6ab69
+{"event": "pull_request", "paths": ["crates/nexus-testkit/src/renamed_drive.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}
+
+## fixed-model
+2026-11-24 13:54:09 UTC
+## experiment/ab-baseline-20261124
+ M tools/ci_plan.py
+a54db991393645db5e9f13888fcc79b4a2d5cf3f
+e1408f6b98a6ea5f90a4d62a9fd3fc9dfcf5366ed659faecda5371a44f547384  /workspace/scratch/nexus-ab-b/contract.md
+a8b2c2a20b9ae900de8f5691108b2ddd9b7cbd5c80afda8f3b224eacc09bc0a5  /workspace/scratch/nexus-ab-b/model.py
++ python3 /workspace/scratch/nexus-ab-b/model.py --repo . --cargo /workspace/.nexus-next-toolchain/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo
+Build inputs and dependency witnesses:
+  nexus-cli
+  nexus-web -> nexus-core-proto
+  nexus-cli -> nexus-drive-core
+  nexus-web -> nexus-fabric
+  nexus-web -> nexus-fabric-iroh
+  nexus-cli -> nexus-net-core
+  nexus-cli -> nexus-runtime
+  nexus-cli -> nexus-sys-real -> nexus-sys
+  nexus-cli -> nexus-sys-real
+  nexus-web -> nexus-wire -> nexus-term-proto
+  nexus-web
+  nexus-web -> nexus-web-core
+  nexus-web -> nexus-wire
+Checked 1197 cases, found 0 counterexamples.
+Model exit status: 0
+
+## fixed-replay
+2026-11-24 13:55:14 UTC
++ source replay: python3 /workspace/nexus-next/tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head f9a8c084bd4578ad10c4072a9cdc96940cbea670
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/src/lib.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
+smoke=true
+full=true
+compat=false
+web=true
++ rename replay: python3 /workspace/nexus-next/tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head 93039c30ac2219f1461b43b67d8d2dc157a6ab69
+{"event": "pull_request", "paths": ["crates/nexus-testkit/src/renamed_drive.rs", "crates/nexus-web-core/src/drive.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
+smoke=true
+full=true
+compat=false
+web=true
++ Replay the manifest-only counterexample
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/Cargo.toml"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
+
+## Final targeted regression
+2026-11-24 13:56:30 UTC
++ python3 -m unittest discover -s tools -p 'test_ci_plan.py' -v
+test_all_skipped_intentionally (test_ci_plan.GateTests.test_all_skipped_intentionally) ... ok
+test_failed_plan_fails (test_ci_plan.GateTests.test_failed_plan_fails) ... ok
+test_failure_or_cancel_fails (test_ci_plan.GateTests.test_failure_or_cancel_fails) ... ok
+test_full_runs_successfully (test_ci_plan.GateTests.test_full_runs_successfully) ... ok
+test_unexpected_skip_fails (test_ci_plan.GateTests.test_unexpected_skip_fails) ... ok
+test_unknown_plan_value_does_not_pass (test_ci_plan.GateTests.test_unknown_plan_value_does_not_pass) ... ok
+test_ci_change_triggers_all (test_ci_plan.PolicyTests.test_ci_change_triggers_all) ... ok
+test_docs_do_not_build (test_ci_plan.PolicyTests.test_docs_do_not_build) ... ok
+test_drive_core (test_ci_plan.PolicyTests.test_drive_core) ... ok
+test_executable_under_tasks_is_not_skipped (test_ci_plan.PolicyTests.test_executable_under_tasks_is_not_skipped) ... ok
+test_invalid_path (test_ci_plan.PolicyTests.test_invalid_path) ... ok
+test_lockfile_triggers_all (test_ci_plan.PolicyTests.test_lockfile_triggers_all) ... ok
+test_manual_is_executed (test_ci_plan.PolicyTests.test_manual_is_executed) ... ok
+test_move_out_of_web_dependency_selects_web (test_ci_plan.PolicyTests.test_move_out_of_web_dependency_selects_web) ... ok
+test_new_transitive_build_dependencies_select_web (test_ci_plan.PolicyTests.test_new_transitive_build_dependencies_select_web) ... ok
+test_runtime (test_ci_plan.PolicyTests.test_runtime) ... ok
+test_rust_wire (test_ci_plan.PolicyTests.test_rust_wire) ... ok
+test_scheduled_and_main_full (test_ci_plan.PolicyTests.test_scheduled_and_main_full) ... ok
+test_unknown_fails_closed (test_ci_plan.PolicyTests.test_unknown_fails_closed) ... ok
+test_web_core (test_ci_plan.PolicyTests.test_web_core) ... ok
+test_web_only (test_ci_plan.PolicyTests.test_web_only) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.206s
+
+OK
+
+## Required gate replay
+baseline, browser result skipped: gate passed
+fixed-source, browser result skipped: ['web: expected success, got skipped']
+fixed-source, browser result success: gate passed
+
+## Final working tree
+## experiment/ab-baseline-20261124
+ M docs/ci-selective-policy.md
+ M tools/ci_plan.py
+ M tools/test_ci_plan.py
+a54db991393645db5e9f13888fcc79b4a2d5cf3f
+
+Started: 2026-11-24 13:48:28 UTC
+Finished verification: 2026-11-24 13:56:30 UTC
+Elapsed including modeling: 482 seconds
+Production repair iterations: 1
+Token usage: unknown

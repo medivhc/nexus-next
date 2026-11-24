@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """No-network, no-compiler tests for CI selection and its required gate."""
+import json
+from pathlib import Path
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from ci_gate import check
 from ci_plan import Plan, classify
@@ -28,7 +34,72 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(classify(["crates/nexus-runtime/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
 
     def test_drive_core(self):
-        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, False, False))
+        for path in ("src/lib.rs", "Cargo.toml"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    classify([f"crates/nexus-drive-core/{path}"], "pull_request"),
+                    Plan(smoke=True, full=True, web=True),
+                )
+
+    def test_new_transitive_build_dependencies_select_web(self):
+        manifests = {
+            "Cargo.toml": '[workspace.dependencies]\nalias = { path = "crates/shared", package = "shared" }\n',
+            "crates/nexus-web/Cargo.toml": "[dependencies]\nalias.workspace = true\n",
+            "crates/nexus-cli/Cargo.toml": '[dev-dependencies]\nhelper = { path = "../helper" }\n',
+            "crates/shared/Cargo.toml": (
+                '[target.\'cfg(target_arch = "wasm32")\'.build-dependencies]\n'
+                'generator = { path = "../generator" }\n'
+            ),
+            "crates/generator/Cargo.toml": "",
+            "crates/helper/Cargo.toml": "",
+        }
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, contents in manifests.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="utf-8")
+
+            with patch("ci_plan.ROOT", root):
+                self.assertTrue(classify(["crates/shared/src/lib.rs"], "pull_request").web)
+                self.assertTrue(classify(["crates/generator/build.rs"], "pull_request").web)
+                self.assertFalse(classify(["crates/helper/src/lib.rs"], "pull_request").web)
+                self.assertFalse(classify(["crates/generator-extra/src/lib.rs"], "pull_request").web)
+
+    def test_move_out_of_web_dependency_selects_web(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = "crates/nexus-web-core/src/drive.rs"
+            new = "crates/nexus-testkit/src/renamed_drive.rs"
+
+            def git(*args):
+                return subprocess.check_output(
+                    [
+                        "git", "-c", "user.name=CI test", "-c", "user.email=ci@example.invalid",
+                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args,
+                    ],
+                    cwd=root, text=True,
+                ).strip()
+
+            git("init", "--quiet")
+            (root / old).parent.mkdir(parents=True)
+            (root / old).write_text("mod drive;\n", encoding="utf-8")
+            git("add", old)
+            git("commit", "--quiet", "-m", "Add browser input")
+            base = git("rev-parse", "HEAD")
+            (root / new).parent.mkdir(parents=True)
+            git("mv", old, new)
+            git("commit", "--quiet", "-m", "Move browser input")
+            head = git("rev-parse", "HEAD")
+
+            script = Path(__file__).with_name("ci_plan.py").resolve()
+            result = subprocess.check_output(
+                [sys.executable, str(script), "--event", "pull_request", "--base", base, "--head", head],
+                cwd=root, text=True,
+            )
+            replay = json.loads(result)
+            self.assertCountEqual(replay["paths"], [old, new])
+            self.assertTrue(replay["plan"]["web"])
 
     def test_ci_change_triggers_all(self):
         self.assertEqual(classify([".github/workflows/ci.yml"], "pull_request"), Plan(True, True, True, True))

@@ -1,0 +1,4 @@
+smoke=true
+full=true
+compat=false
+web=true

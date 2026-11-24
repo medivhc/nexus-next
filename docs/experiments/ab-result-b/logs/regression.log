@@ -1,0 +1,28 @@
+2026-11-24 13:56:30 UTC
++ python3 -m unittest discover -s tools -p 'test_ci_plan.py' -v
+test_all_skipped_intentionally (test_ci_plan.GateTests.test_all_skipped_intentionally) ... ok
+test_failed_plan_fails (test_ci_plan.GateTests.test_failed_plan_fails) ... ok
+test_failure_or_cancel_fails (test_ci_plan.GateTests.test_failure_or_cancel_fails) ... ok
+test_full_runs_successfully (test_ci_plan.GateTests.test_full_runs_successfully) ... ok
+test_unexpected_skip_fails (test_ci_plan.GateTests.test_unexpected_skip_fails) ... ok
+test_unknown_plan_value_does_not_pass (test_ci_plan.GateTests.test_unknown_plan_value_does_not_pass) ... ok
+test_ci_change_triggers_all (test_ci_plan.PolicyTests.test_ci_change_triggers_all) ... ok
+test_docs_do_not_build (test_ci_plan.PolicyTests.test_docs_do_not_build) ... ok
+test_drive_core (test_ci_plan.PolicyTests.test_drive_core) ... ok
+test_executable_under_tasks_is_not_skipped (test_ci_plan.PolicyTests.test_executable_under_tasks_is_not_skipped) ... ok
+test_invalid_path (test_ci_plan.PolicyTests.test_invalid_path) ... ok
+test_lockfile_triggers_all (test_ci_plan.PolicyTests.test_lockfile_triggers_all) ... ok
+test_manual_is_executed (test_ci_plan.PolicyTests.test_manual_is_executed) ... ok
+test_move_out_of_web_dependency_selects_web (test_ci_plan.PolicyTests.test_move_out_of_web_dependency_selects_web) ... ok
+test_new_transitive_build_dependencies_select_web (test_ci_plan.PolicyTests.test_new_transitive_build_dependencies_select_web) ... ok
+test_runtime (test_ci_plan.PolicyTests.test_runtime) ... ok
+test_rust_wire (test_ci_plan.PolicyTests.test_rust_wire) ... ok
+test_scheduled_and_main_full (test_ci_plan.PolicyTests.test_scheduled_and_main_full) ... ok
+test_unknown_fails_closed (test_ci_plan.PolicyTests.test_unknown_fails_closed) ... ok
+test_web_core (test_ci_plan.PolicyTests.test_web_core) ... ok
+test_web_only (test_ci_plan.PolicyTests.test_web_only) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 0.206s
+
+OK

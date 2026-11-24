@@ -1,0 +1,15 @@
+2026-11-24 13:52:17 UTC
++ Reproduce a single tracked source change using the workflow CLI and real three-dot git diff
+crates/nexus-drive-core/src/lib.rs
++ python3 tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head f9a8c084bd4578ad10c4072a9cdc96940cbea670
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/src/lib.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}
+smoke=true
+full=true
+compat=false
+web=false
+web=false
++ Replay the manifest-only counterexample
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/Cargo.toml"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}
++ Verify workflow consumes the browser output
+41:      web: ${{ steps.select.outputs.web }}
+217:    if: ${{ needs.plan.outputs.web == 'true' }}

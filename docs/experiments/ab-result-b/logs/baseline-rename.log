@@ -1,0 +1,4 @@
+2026-11-24 13:53:27 UTC
+R100	crates/nexus-web-core/src/drive.rs	crates/nexus-testkit/src/renamed_drive.rs
++ python3 tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head 93039c30ac2219f1461b43b67d8d2dc157a6ab69
+{"event": "pull_request", "paths": ["crates/nexus-testkit/src/renamed_drive.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": false}}

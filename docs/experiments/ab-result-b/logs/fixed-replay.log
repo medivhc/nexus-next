@@ -1,0 +1,15 @@
+2026-11-24 13:55:14 UTC
++ source replay: python3 /workspace/nexus-next/tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head f9a8c084bd4578ad10c4072a9cdc96940cbea670
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/src/lib.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
+smoke=true
+full=true
+compat=false
+web=true
++ rename replay: python3 /workspace/nexus-next/tools/ci_plan.py --event pull_request --base a54db991393645db5e9f13888fcc79b4a2d5cf3f --head 93039c30ac2219f1461b43b67d8d2dc157a6ab69
+{"event": "pull_request", "paths": ["crates/nexus-testkit/src/renamed_drive.rs", "crates/nexus-web-core/src/drive.rs"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
+smoke=true
+full=true
+compat=false
+web=true
++ Replay the manifest-only counterexample
+{"event": "pull_request", "paths": ["crates/nexus-drive-core/Cargo.toml"], "plan": {"smoke": true, "full": true, "compat": false, "web": true}}
