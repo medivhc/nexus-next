@@ -39,7 +39,8 @@ adb shell "NEXUS_DATA_DIR=/data/data/link.bewith.nexus/files /data/local/tmp/nex
 之后手机上的任何应用都能按名字访问服务（`http://web.home.internal/`），规则里送去出口的域名经出口设备出去
 （`nexus route add --domain example.com --via anchor`），其余流量照常走手机自己的网络。
 
-启动时的参数：`--es name <设备名>`、`--es relay default|disabled|<中继地址>`、`--ez discovery true|false`。
+启动时的参数：`--es name <设备名>`、`--es relay default|disabled|<中继地址>`、`--ez discovery true|false`、
+`--es rendezvous default|disabled|<碰头服务地址>`（短加入码用；自建网络里是 `https://<锚点>/pkarr`）。
 停止：`adb shell am start -n link.bewith.nexus/.MainActivity --es action stop`。
 核心的日志在 `/data/data/link.bewith.nexus/files/daemon.log`；数据目录里放一个名为 `trace` 的文件，
 下次启动时各个库的调试日志也会写进去。

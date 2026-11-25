@@ -14,7 +14,9 @@
 
 用法：tools/android_join_e2e.py [--serial 127.0.0.1:5555] [--apk target/android/nexus.apk]
       [--home-bin target/debug/nexus] [--no-rendezvous]
-先运行 tools/build-android.sh 和 cargo build -p nexus-cli。默认模式要能连上公共的碰头服务（dns.iroh.link）。
+先运行 tools/build-android.sh 和 cargo build -p nexus-cli。
+默认在本机起一个碰头服务（只存取记录；签名由两端自己检查），手机经 --host-ip（容器里看到的本机地址）连它；
+--public-rendezvous 改用公共的碰头服务（dns.iroh.link）。
 """
 # covers: R79, R80
 import argparse
@@ -27,11 +29,39 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = "link.bewith.nexus"
 SHORT = re.compile(r"^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$")
+
+
+def rendezvous_server():
+    """最简单的碰头服务：PUT /pkarr/<公钥> 存，GET 取（没有时 404）。"""
+    records = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_PUT(self):
+            records[self.path] = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            body = records.get(self.path)
+            self.send_response(200 if body is not None else 404)
+            self.send_header("Content-Length", str(len(body or b"")))
+            self.end_headers()
+            self.wfile.write(body or b"")
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 class E2E:
@@ -96,8 +126,15 @@ class E2E:
         self.adb("shell", "appops", "set", PKG, "ACTIVATE_VPN", "allow")
         log = open(os.path.join(self.tmp, "home.log"), "w")
         args = [self.a.home_bin, "daemon", "--name", "home", "--relay", "disabled"]
+        phone_rv = "default"
         if self.a.no_rendezvous:
             args.append("--no-discovery")
+            phone_rv = "disabled"
+        elif not self.a.public_rendezvous:
+            self.rv = rendezvous_server()
+            port = self.rv.server_port
+            args += ["--no-discovery", "--rendezvous", f"http://127.0.0.1:{port}/pkarr"]
+            phone_rv = f"http://{self.a.host_ip}:{port}/pkarr"
         self.daemon = subprocess.Popen(args, env=self.home_env, stdout=log, stderr=log)
         sock = os.path.join(self.home_env["NEXUS_DATA_DIR"], "ctl.sock")
         deadline = time.time() + 20
@@ -106,8 +143,9 @@ class E2E:
                 raise RuntimeError("home 没有就绪")
             time.sleep(0.05)
         self.home("init", "--name", "home")
-        start = ["shell", "am", "start", "-n", f"{PKG}/.MainActivity", "--es", "name", "phone", "--es", "relay", "disabled"]
-        if self.a.no_rendezvous:
+        start = ["shell", "am", "start", "-n", f"{PKG}/.MainActivity", "--es", "name", "phone", "--es", "relay", "disabled",
+                 "--es", "rendezvous", phone_rv]
+        if not self.a.public_rendezvous:
             start += ["--ez", "discovery", "false"]
         self.adb(*start)
 
@@ -190,6 +228,8 @@ def main():
     ap.add_argument("--apk", default=os.path.join(ROOT, "target/android/nexus.apk"))
     ap.add_argument("--home-bin", default=os.path.join(ROOT, "target/debug/nexus"))
     ap.add_argument("--no-rendezvous", action="store_true", help="不用碰头服务：用二维码里的长加入码批准")
+    ap.add_argument("--public-rendezvous", action="store_true", help="用公共的碰头服务，不在本机起一个")
+    ap.add_argument("--host-ip", default="172.17.0.1", help="手机那边看到的本机地址（redroid 的 docker 网桥）")
     ap.add_argument("--shot", help="把加入码和已加入的截图存到这里（.png）")
     ap.add_argument("--keep", action="store_true", help="结束后不清理（调试用）")
     a = ap.parse_args()
