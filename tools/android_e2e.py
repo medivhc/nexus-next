@@ -227,7 +227,7 @@ class E2E:
         out = self.as_app("echo hello | nc -w 10 echo.home.internal 7")
         check("半关闭：echo hello | nc 收到回应", out.replace("\r\n", "\n").strip() == "hello", repr(out[-300:]))
 
-        out = self.as_app("echo hi | nc -u -w 3 game.home.internal 9000")
+        out = self.as_app("echo hi | nc -u -q 3 game.home.internal 9000")
         check("UDP：数据报到 home 上的 UDP 服务、回应送回", "echo:hi" in out, repr(out[-300:]))
 
         out = self.as_app("ping -c 1 -W 2 localhost")
