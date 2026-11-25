@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod joincode;
 pub mod path;
 pub mod roster;
+pub mod vault;
 pub mod webauthn;
 
 pub use crypto::{PublicKey, SecretKey, Signature};

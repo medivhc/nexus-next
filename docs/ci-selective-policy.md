@@ -23,11 +23,13 @@ Clippy + compile-only 共 1616.5 秒，占脚本步骤总耗时 2533.1 秒的 63
 
 | 修改范围 | Smoke | Full L0–L3 | 真实跨版本 | 浏览器 |
 | --- | --- | --- | --- | --- |
-| 仅文档（Markdown、docs/tasks 下常见文档与图片；`docs/manual.md` 除外） | – | – | – | – |
+| 仅文档（Markdown、docs/ 下常见文档与图片；`docs/manual.md` 除外） | – | – | – | – |
 | `docs/manual.md`（L3 用户手册照着执行） | ✓ | ✓ | – | – |
 | Web UI、web E2E、nexus-web | ✓ | – | – | ✓ |
 | nexus-web-core（L2/L3 的浏览器场景直接跑它） | ✓ | ✓ | – | ✓ |
-| nexus-drive-core 与非协议 native crate | ✓ | ✓ | 受影响时 ✓ | 受影响时 ✓ |
+| nexus-drive-core、nexus-sys-real、nexus-sys（进真实 nexus 二进制） | ✓ | ✓ | ✓ | ✓ |
+| 其他非协议 native crate（sys-sim、testkit、android；仅 full 通道） | ✓ | ✓ | – | – |
+| 新 crate、tools/ 下未知脚本（fail closed，未登记默认全跑） | ✓ | ✓ | ✓ | ✓ |
 | Wire、协议、CLI、Runtime、Fabric 与核心网络 | ✓ | ✓ | ✓ | ✓ |
 | Cargo.lock / vendor / CI 配置与计划 | ✓ | ✓ | ✓ | ✓ |
 | 新目录、未知类型 | ✓ | ✓ | ✓ | ✓ |
@@ -40,10 +42,12 @@ PR 的 Full CI 仍执行 Clippy、L1、L2、L3，但跳过独立的 cargo test -
 ## 门禁与风险
 
 - tools/ci_plan.py 若无法计算 merge-base diff，计划 Job 失败；未知改动默认跑全部。
-- tools/ci_gate.py 验证每个应执行的 Job 为 success；不应执行的 Job 必须明确 skipped；任何失败、取消、未按计划执行、非法布尔输出均失败。
+- tools/ci_gate.py 验证每个应执行的 Job 为 success；不应执行的 Job 必须明确 skipped；任何失败、取消、未按计划执行、非法布尔输出均失败；`needs` 的键集合必须恰好是 plan/sanity/smoke/ci/compat/web 六个，多一个少一个都失败。
 - **必须在 GitHub 的 main 分支保护 / ruleset 中将 Required CI gate 设为必需检查**，建议同时保留 Fast sanity (no compilation)。不要只依赖按需执行的 Full CI (tools/ci.sh)：被条件跳过的 Job 不能替代 Gate 对覆盖范围的校验。
 - 合并规则更新前，不应以“跳过的 Full CI 是绿色”作为放行理由。
-- concurrency.cancel-in-progress 只会取消同一 ref 的旧 run；gate 不可能替已取消的 run 放行。
+- concurrency.cancel-in-progress 只在 pull_request 事件时取消同一 ref 的旧 run；push 到 main 与 nightly schedule 不互相取消。gate 用 `if: ${{ !cancelled() }}`，被取代的 run 不再跑 gate 变红。
+- 仅根目录文档与 docs/ 下的 `.md` 算文档跳过；crate 内的 `.md` 不跳过（可能被 `include_str!` 内嵌或另有他用）。
+- nexus-web 的 Clippy 覆盖在 smoke Job 里（`cargo clippy -p nexus-web`）：planner 把 nexus-web 的 PR 只派给 smoke+web，`tools/ci.sh` 的 `clippy --all-targets` 在 PR 模式下跑不到它。
 
 ## 本地验证与复核
 

@@ -313,6 +313,7 @@ nexus daemon --name home
 | `--data-dir <目录>` | 数据目录，默认 `$NEXUS_DATA_DIR` 或 `~/.local/share/nexus`。命令行要用同一个（同样的选项或环境变量） |
 | `--relay default\|disabled\|<地址>` | 中继：iroh 的公共中继（默认）、不用，或自建的中继 |
 | `--no-discovery` | 不用公共地址发现服务（也就默认不用公共的碰头服务） |
+| `--relay-only` | 只经中继通信，不开 UDP 直连（禁用 UDP 的沙箱、受限网络） |
 | `--rendezvous default\|disabled\|<地址>` | 短加入码用的碰头服务：公共的（用了地址发现时的默认）、不用，或自建的（锚点的 `https://<锚点>/pkarr`） |
 | `--proxy 127.0.0.1:1080` | 开本机统一入口（第 9 节） |
 | `--tun nexus0` | 成为完整节点（第 10 节，需要 root） |
@@ -321,6 +322,8 @@ nexus daemon --name home
 
 `nexus status` 查看本机状态；`nexus status <设备>` 查看另一台设备（在线与否、走直连还是中继、往返时间）。
 排查问题时设 `NEXUS_LOG=info` 再启动，日志写到标准错误。
+连中继和地址发现服务时，除了内置的根证书，还信任 `$SSL_CERT_FILE` 指的证书包（没设就用系统的，如 `/etc/ssl/certs/ca-certificates.crt`）：
+企业代理或沙箱的出站代理换了证书时也连得上。
 
 ### 开机自启（systemd）
 

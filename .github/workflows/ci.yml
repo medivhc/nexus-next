@@ -28,7 +28,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs cancel their predecessors: push-to-main and the nightly
+  # schedule share refs/heads/main, and cancelling a full run there would
+  # silently drop the all-lane backstop.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   plan:
@@ -78,12 +81,19 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Cache core build
         uses: Swatinem/rust-cache@v2
         with:
           key: smoke
       - name: Unit tests for core protocol and network logic
-        run: cargo test --locked --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core
+        run: cargo test --locked --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core -p nexus-web
+      - name: Clippy for nexus-web
+        # crates/nexus-web is not covered by tools/ci.sh in PR mode: the
+        # planner sends nexus-web-only PRs to smoke+web, skipping the ci job
+        # that runs clippy --all-targets. Smoke is where it gets linted.
+        run: cargo clippy --locked -p nexus-web -- -D warnings
 
   ci:
     name: Full CI (tools/ci.sh)
@@ -245,6 +255,9 @@ jobs:
       - name: Build the page
         run: bash tools/build-web.sh
 
+      - name: Frontend unit tests
+        run: node --test web/share.test.mjs
+
       - name: Build nexus
         run: cargo build --release -p nexus-cli
 
@@ -257,7 +270,10 @@ jobs:
   gate:
     name: Required CI gate
     needs: [plan, sanity, smoke, ci, compat, web]
-    if: ${{ always() }}
+    # always() would also run on superseded runs and turn the gate red for a
+    # run that was replaced, not for a real failure. !cancelled() still runs
+    # the gate when a needed job fails, but not when the run itself was cut.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

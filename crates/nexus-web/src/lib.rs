@@ -24,6 +24,33 @@ fn js_err(e: WireError) -> JsError {
     JsError::new(&e.message)
 }
 
+fn share_relay(hint: &str, default_relay: String) -> String {
+    nexus_fabric_iroh::hint_relay(hint).unwrap_or(default_relay)
+}
+
+fn parse_http_headers(headers_json: &str) -> Result<Vec<(String, String)>, String> {
+    serde_json::from_str(headers_json).map_err(|e| format!("请求头 JSON 无效：{e}"))
+}
+
+fn encode_http_headers(headers: &[(String, String)]) -> js_sys::Array {
+    let out = js_sys::Array::new();
+    for (k, v) in headers {
+        let pair = js_sys::Array::new();
+        pair.push(&JsValue::from_str(k));
+        pair.push(&JsValue::from_str(v));
+        out.push(&pair);
+    }
+    out
+}
+
+fn terminal_end_result(res: Result<TerminalEnd, WireError>) -> (i32, String) {
+    match res {
+        Ok(TerminalEnd::Exited(code)) => (code.unwrap_or(0), String::new()),
+        Ok(TerminalEnd::Left) => (0, String::new()),
+        Err(e) => (-1, e.message),
+    }
+}
+
 /// 页面加载后调用一次。
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -93,7 +120,8 @@ impl Browser {
                 return Err(JsError::new("这个浏览器实例已经使用过").into());
             }
             let parsed = ShareLink::parse(&link).map_err(|e| JsError::new(&e))?;
-            let t = connect(seed, default_relay).await?;
+            let relay = share_relay(&parsed.hint, default_relay);
+            let t = connect(seed, relay).await?;
             let guest = GuestShare::open(t, &parsed).await.map_err(js_err)?;
             Ok(JsValue::from(GuestSession { guest: Rc::new(guest) }))
         })
@@ -256,7 +284,7 @@ impl Session {
     pub fn http(&self, device: String, service: String, method: String, path: String, headers: String, body: Vec<u8>) -> js_sys::Promise {
         let node = self.node.clone();
         future_to_promise(async move {
-            let headers: Vec<(String, String)> = serde_json::from_str(&headers).map_err(|e| JsValue::from_str(&format!("请求头不合法：{e}")))?;
+            let headers = parse_http_headers(&headers).map_err(|e| JsValue::from_str(&e))?;
             let r = node.http(&device, &service, &method, &path, &headers, &body).await.map_err(js_err)?;
             Ok(JsValue::from(HttpResult { status: r.status, reason: r.reason, headers: r.headers, body: r.body }))
         })
@@ -273,11 +301,7 @@ impl Session {
         wasm_bindgen_futures::spawn_local(async move {
             let mut ui = JsUi { on_output, on_notice, rx };
             let size = Size { cols, rows };
-            let (code, message) = match node.run_terminal(&device, &session, size, &mut ui).await {
-                Ok(TerminalEnd::Exited(code)) => (code.unwrap_or(0), String::new()),
-                Ok(TerminalEnd::Left) => (0, String::new()),
-                Err(e) => (-1, e.message),
-            };
+            let (code, message) = terminal_end_result(node.run_terminal(&device, &session, size, &mut ui).await);
             let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
@@ -395,18 +419,40 @@ impl GuestSession {
         })
     }
 
-    /// 访问被分享的 HTTP 服务。
+    /// 访问被分享的 HTTP 服务：返回 `{ status, reason, headers, body }`。
     pub fn http_fetch(&self, method: String, path: String, headers_json: String, body: Vec<u8>) -> js_sys::Promise {
         let g = self.guest.clone();
         future_to_promise(async move {
-            let headers: Vec<(String, String)> =
-                serde_json::from_str(&headers_json).map_err(|e| JsError::new(&format!("请求头 JSON 无效：{e}")))?;
+            let headers = parse_http_headers(&headers_json).map_err(|e| JsError::new(&e))?;
             let resp = g.http_fetch(&WebHttpRequest { method, path, headers, body }).await.map_err(js_err)?;
             let obj = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("status"), &JsValue::from(resp.status));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("reason"), &JsValue::from_str(&resp.reason));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("headers"), &encode_http_headers(&resp.headers));
             let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("body"), &js_sys::Uint8Array::from(resp.body.as_slice()));
             Ok(obj.into())
         })
+    }
+
+    /// 只读观看被分享的终端会话：输出喂给 `on_output(Uint8Array)`，状态变化通知 `on_notice(string)`，
+    /// 结束或出错时调用 `on_end(code, message)`。返回 [`Terminal`] 句柄供页面在离开时调用 `leave()`。
+    pub fn watch_terminal(
+        &self,
+        cols: u16,
+        rows: u16,
+        on_output: Function,
+        on_notice: Function,
+        on_end: Function,
+    ) -> Terminal {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let guest = self.guest.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut ui = JsUi { on_output, on_notice, rx };
+            let size = Size { cols, rows };
+            let (code, message) = terminal_end_result(guest.watch_terminal(size, &mut ui).await);
+            let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
+        });
+        Terminal { tx }
     }
 }
 
@@ -432,5 +478,37 @@ impl TerminalUi for JsUi {
     async fn event(&mut self) -> UiEvent {
         // 页面没了（终端对象被丢弃）就是离开。
         self.rx.recv().await.unwrap_or(UiEvent::Leave)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_wire::ErrorCode;
+
+    #[test]
+    fn terminal_end_maps_exit_leave_and_error() {
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Exited(Some(42)))), (42, String::new()));
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Exited(None))), (0, String::new()));
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Left)), (0, String::new()));
+        assert_eq!(
+            terminal_end_result(Err(WireError::new(ErrorCode::Denied, "这项分享已被撤销"))),
+            (-1, "这项分享已被撤销".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_http_headers_validates_json_pairs() {
+        let parsed = parse_http_headers(r#"[["Accept","text/html"],["X-Test","1"]]"#).unwrap();
+        assert_eq!(parsed, vec![("Accept".into(), "text/html".into()), ("X-Test".into(), "1".into())]);
+        assert!(parse_http_headers("not-json").is_err());
+    }
+
+    #[test]
+    fn share_relay_prefers_hint_and_falls_back_to_default() {
+        let node = nexus_fabric_iroh::node_id_from_seed(&[7; 32]);
+        let hint = nexus_fabric_iroh::relay_hint(node, "https://anchor.example").unwrap();
+        assert_eq!(share_relay(&hint, "https://fallback.example".into()), "https://anchor.example/");
+        assert_eq!(share_relay("127.0.0.1:1999", "https://fallback.example".into()), "https://fallback.example");
     }
 }
