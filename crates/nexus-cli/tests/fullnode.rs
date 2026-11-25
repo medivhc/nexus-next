@@ -78,3 +78,27 @@ scenario! {
         assert_eq!(out.code, 102, "--tun-net 要和 --tun 一起用：{}", out.stderr);
     },
 }
+
+scenario! {
+    name: half_closed_connections_still_get_their_reply,
+    covers: "R89",
+    nodes: ["laptop", "home"],
+    sim: (pending "虚拟网卡是真实的系统设备"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let port = w.serve("home", Service::Echo).await.to_string();
+        w.cli_ok("home", &["publish", "echo", "--port", &port]).await;
+        let full = w.full_node("laptop").await;
+        let ip = full.resolve("echo.home.internal", 1).unwrap()[0];
+
+        // 像 `echo hello | nc`：发完就关闭写方向，回应照样回来，连接随后正常结束。
+        let got = full.send_then_half_close(ip, 7, b"hello\n");
+        assert_eq!(got.as_deref().ok(), Some(&b"hello\n"[..]), "{got:?}\n{}", w.daemon_log("laptop"));
+
+        // 数据比一个包大、跨多个包时也一样。
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let got = full.send_then_half_close(ip, 7, &big).expect("大块数据的回应");
+        assert!(got == big, "回来 {} 字节，应当 {}", got.len(), big.len());
+    },
+}

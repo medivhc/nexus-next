@@ -1901,6 +1901,22 @@ impl FullNode {
     pub fn http_get(&self, ip: std::net::IpAddr, port: u16, path: &str) -> io::Result<String> {
         http_get_at((ip, port).into(), path)
     }
+
+    /// 像 `echo ... | nc ip port`：送出 `data` 后关闭写方向，返回读到的全部字节（10 秒没有结束算出错）。
+    pub fn send_then_half_close(&self, ip: std::net::IpAddr, port: u16, data: &[u8]) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // 边写边读：回声服务边读边回，不读的话两边的缓冲区都满了会互相等。
+        let mut r = s.try_clone()?;
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).map(|_| out)
+        });
+        s.write_all(data)?;
+        s.shutdown(std::net::Shutdown::Write)?;
+        reader.join().map_err(|_| io::Error::other("读的线程出错"))?
+    }
 }
 
 /// 在本机临时目录里建一棵文件树（测试 `nexus drive import` 用）。`files` 是（相对路径，内容）。
