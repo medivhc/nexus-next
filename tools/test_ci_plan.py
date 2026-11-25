@@ -28,7 +28,36 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(classify(["crates/nexus-runtime/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
 
     def test_drive_core(self):
-        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, False, False))
+        # nexus-cli depends on nexus-drive-core, and the web_drive scenarios
+        # run nexus-web-core (which depends on it) directly: compat and web
+        # must run when it changes.
+        self.assertEqual(classify(["crates/nexus-drive-core/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
+
+    def test_sys_real_and_sys(self):
+        # nexus-sys-real is linked into the nexus binary the compat job
+        # builds, and it depends on nexus-sys: both get compat (web already).
+        self.assertEqual(classify(["crates/nexus-sys-real/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
+        self.assertEqual(classify(["crates/nexus-sys/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
+
+    def test_full_only_crates(self):
+        # Test-only / platform-only code: full lane, no compat/web.
+        for crate in ("nexus-sys-sim", "nexus-testkit", "nexus-android"):
+            with self.subTest(crate=crate):
+                self.assertEqual(classify([f"crates/{crate}/src/lib.rs"], "pull_request"), Plan(True, True, False, False))
+
+    def test_unknown_crate_fails_closed(self):
+        # A crate added without updating the planner lists runs every lane
+        # instead of silently skipping compat/web.
+        self.assertEqual(classify(["crates/nexus-vault/src/lib.rs"], "pull_request"), Plan(True, True, True, True))
+
+    def test_unknown_tools_script_fails_closed(self):
+        self.assertEqual(classify(["tools/new_tool.py"], "pull_request"), Plan(True, True, True, True))
+
+    def test_crate_md_is_not_document(self):
+        # A .md file inside a crate may be embedded or otherwise
+        # load-bearing; only root docs and docs/ skip the build.
+        self.assertEqual(classify(["crates/nexus-wire/README.md"], "pull_request"), Plan(True, True, True, True))
+        self.assertEqual(classify(["docs/guide.md"], "pull_request"), Plan())
 
     def test_ci_change_triggers_all(self):
         self.assertEqual(classify([".github/workflows/ci.yml"], "pull_request"), Plan(True, True, True, True))
@@ -89,6 +118,14 @@ class GateTests(unittest.TestCase):
             needs = self.make_needs(smoke=selected)
             needs["plan"]["outputs"]["smoke"] = "typo"
             self.assertTrue(check(needs))
+
+    def test_unexpected_needs_keys_fail(self):
+        needs = self.make_needs()
+        needs["extra-job"] = {"result": "success"}
+        self.assertTrue(check(needs))
+        needs = self.make_needs()
+        del needs["web"]
+        self.assertTrue(check(needs))
 
 
 if __name__ == "__main__":

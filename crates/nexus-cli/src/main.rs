@@ -66,7 +66,7 @@ fn main() {
     };
     let code = rt.block_on(async {
         match &cli.cmd {
-            Cmd::Daemon { name, local_only, preflight, relay, no_discovery, rendezvous, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
+            Cmd::Daemon { name, local_only, preflight, relay, relay_only, no_discovery, rendezvous, no_scheduling, agent_socket, proxy, tun, tun_net, anchor: anchor_args } => {
                 // 升级前检查新版本（M7.3）：读得了数据目录就行，不起网络。
                 if *preflight {
                     return match nexus_cli::daemon::preflight(&data_dir) {
@@ -110,6 +110,9 @@ fn main() {
                 };
                 let agent_socket = agent_socket.clone().unwrap_or_else(|| data_dir.join("agent.sock"));
                 let mut config = transport_config(*local_only, relay, *no_discovery);
+                if *relay_only {
+                    config.direct = false;
+                }
                 config.scheduling = !*no_scheduling;
                 match rendezvous.as_deref() {
                     None => {}
