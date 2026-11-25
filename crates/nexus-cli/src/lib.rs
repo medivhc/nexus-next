@@ -304,7 +304,6 @@ pub enum Cmd {
     /// 提供工具 nexus_ls、nexus_status、nexus_exec、nexus_session_ls。
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
-    /// 登记、列出、撤销用于网页登录的通行密钥
     /// 访问网页节点发布的硬件能力（摄像头、麦克风、位置，M8.3）
     Hw {
         #[command(subcommand)]
@@ -320,6 +319,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: VaultCmd,
     },
+    /// 登记、列出、撤销用于网页登录的通行密钥
     Web {
         #[command(subcommand)]
         cmd: WebCmd,
@@ -1300,7 +1300,11 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 list.iter()
                     .map(|s| {
                         let status = if s.revoked { "已撤销" } else { "有效" };
-                        format!("{}  {}  已用 {}/{:?}  {status}\n", s.id, s.target.kind_str(), s.uses, s.max_uses)
+                        let uses = match s.max_uses {
+                            Some(m) => format!("{}/{m}", s.uses),
+                            None => format!("{}（不限次数）", s.uses),
+                        };
+                        format!("{}  {}  已用 {uses}  {status}\n", s.id, s.target.kind_str())
                     })
                     .collect()
             }
