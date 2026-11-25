@@ -403,6 +403,9 @@ def tun(a, b):
 
 
 def main():
+    # Windows 的控制台默认不是 UTF-8：输出里有中文。
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
     ap.add_argument("--tun", action="store_true", help="也检查虚拟网卡（要管理员权限）")

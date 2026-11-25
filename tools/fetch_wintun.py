@@ -20,6 +20,9 @@ SHA256 = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
 
 
 def main():
+    # Windows 的控制台默认不是 UTF-8：输出里有中文。
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("--arch", default="amd64")
