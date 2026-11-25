@@ -166,14 +166,14 @@ fn probe(bin: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Result<Strin
     let mut stderr = child.stderr.take();
     let out_t = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut r) = stdout.take() {
+        if let Some(r) = stdout.take() {
             let _ = r.take(1 << 20).read_to_end(&mut buf);
         }
         buf
     });
     let err_t = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut r) = stderr.take() {
+        if let Some(r) = stderr.take() {
             let _ = r.take(1 << 20).read_to_end(&mut buf);
         }
         buf

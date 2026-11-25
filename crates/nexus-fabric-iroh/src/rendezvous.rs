@@ -80,17 +80,12 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const PUT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_PUTS_PER_IP_PER_WINDOW: u32 = 30;
 
+#[derive(Default)]
 struct StoreInner {
     records: Records,
     last_sweep: Option<Instant>,
     /// 按来源 IP 限制 PUT 频率，防止未鉴权客户端打满 `MAX_RECORDS`。
     put_rates: HashMap<std::net::IpAddr, (Instant, u32)>,
-}
-
-impl Default for StoreInner {
-    fn default() -> Self {
-        Self { records: HashMap::new(), last_sweep: None, put_rates: HashMap::new() }
-    }
 }
 
 /// 服务端的存储，锚点和测试共用。

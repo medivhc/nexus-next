@@ -96,7 +96,11 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             tokio::spawn(async move {
                 loop {
                     let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
-                    let Ok((stream, peer)) = listener.accept().await else { continue };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let page = page.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -110,7 +114,11 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             tokio::spawn(async move {
                 loop {
                     let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
-                    let Ok((stream, peer)) = listener.accept().await else { continue };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let (page, acceptor) = (page.clone(), acceptor.clone());
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -142,7 +150,11 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             tokio::spawn(async move {
                 loop {
                     let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
-                    let Ok((stream, peer)) = listener.accept().await else { continue };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let (page, acceptor, config) = (page.clone(), acceptor.clone(), config.clone());
                     tokio::spawn(async move {
                         let _permit = permit;

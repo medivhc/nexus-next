@@ -98,6 +98,9 @@ pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io
     rt.block_on(hold(data_dir, name, size, created_at))
 }
 
+/// 发给常驻程序的消息排队等待的上限。
+const UP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<()> {
     let dir = sessions_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
@@ -123,7 +126,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
     let mut screen = nexus_term_proto::Session::new(size, u64::MAX);
     let mut size = size.clamped();
     let (down_tx, mut down_rx) = mpsc::channel::<(u64, Down)>(256);
-    let mut conn: Option<(u64, mpsc::Sender<Up>)> = None;
+    let mut conn: Option<(u64, mpsc::Sender<Up>, tokio::task::JoinHandle<()>)> = None;
     let mut next_conn = 0u64;
     // 套接字文件被删掉了（数据目录被清掉了，比如测试结束）：没有常驻程序能再找到这个会话，结束它。
     let mut check = tokio::time::interval(Duration::from_secs(5));
@@ -146,7 +149,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                 let (up_tx, mut up_rx) = mpsc::channel::<Up>(256);
                 let _ = up_tx.try_send(hello);
                 let _ = up_tx.try_send(restore);
-                tokio::spawn(async move {
+                let writer = tokio::spawn(async move {
                     while let Some(msg) = up_rx.recv().await {
                         let is_exit = matches!(msg, Up::Exited { .. });
                         if wr.write_all(&encode(&msg)).await.is_err() {
@@ -158,7 +161,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                         }
                     }
                 });
-                conn = Some((id, up_tx));
+                conn = Some((id, up_tx, writer));
                 let tx = down_tx.clone();
                 tokio::spawn(async move {
                     while let Ok(msg) = read_frame::<Down, _>(&mut rd).await {
@@ -169,7 +172,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                 });
             }
             Some((id, msg)) = down_rx.recv() => {
-                if conn.as_ref().map(|(c, _)| *c) != Some(id) {
+                if conn.as_ref().map(|(c, _, _)| *c) != Some(id) {
                     continue;
                 }
                 match msg {
@@ -185,16 +188,23 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
             event = pty.next_event() => match event {
                 PtyEvent::Output(bytes) => {
                     let _ = screen.handle(nexus_term_proto::Event::PtyOutput(bytes.clone()));
-                    if let Some((_, up_tx)) = conn.as_ref() {
-                        if up_tx.try_send(Up::Output(bytes)).is_err() {
-                            // 对端断开或消费过慢：丢弃当前连接，不阻塞 PTY 读取与新常驻程序接管。
+                    if let Some((_, up_tx, _)) = conn.as_ref() {
+                        // 缓冲满时先等一会儿（正常的背压，比如一次输出很多），对端断开或长时间不读才丢弃连接，
+                        // 这样既不会因为一阵大输出断开，也不会被卡死的常驻程序永远挡住 PTY 读取与新常驻程序接管。
+                        let sent = tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(Up::Output(bytes))).await;
+                        if !matches!(sent, Ok(Ok(()))) {
                             conn = None;
                         }
                     }
                 }
                 PtyEvent::Exited(status) => {
-                    if let Some((_, up_tx)) = conn.take() {
-                        let _ = up_tx.send(Up::Exited { code: status.code, signal: status.signal }).await;
+                    if let Some((_, up_tx, writer)) = conn.take() {
+                        let exited = Up::Exited { code: status.code, signal: status.signal };
+                        if tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(exited)).await.is_ok() {
+                            drop(up_tx);
+                            // 等写端任务把退出消息真正写出去再结束进程，否则运行时退出时它会被直接丢掉。
+                            let _ = tokio::time::timeout(UP_SEND_TIMEOUT, writer).await;
+                        }
                     }
                     return Ok(());
                 }
