@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const KEY_VAULT: &str = "vault-v1";
+/// 成员设备：本机条目来自哪台（已经不是管理设备的）设备。有值时，当前的管理设备可能还不知道本机的某些条目
+/// （用恢复码换了管理设备），`vault sync` 只更新、不删除；新管理设备的清单覆盖本机全部条目后清掉。
+pub(crate) const KEY_VAULT_ADMIN: &str = "vault-admin-v1";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct VaultStore {
@@ -36,6 +39,69 @@ impl VaultStore {
 impl<T: Transport, S: System> Node<T, S> {
     fn save_vault(&self) -> Result<(), WireError> {
         save(&self.system, KEY_VAULT, &*self.vault.borrow()).map_err(internal)
+    }
+
+    fn vault_prev_admin(&self) -> Option<NodeId> {
+        load::<_, Option<NodeId>>(&self.system, KEY_VAULT_ADMIN).ok().flatten().flatten()
+    }
+
+    fn set_vault_prev_admin(&self, admin: Option<NodeId>) -> Result<(), WireError> {
+        save(&self.system, KEY_VAULT_ADMIN, &admin).map_err(internal)
+    }
+
+    /// 收到管理设备换了的名册时调用（恢复码，R64）：本机已有的条目是原来的管理设备给的，
+    /// 新管理设备收回它们之前，同步不能按它的清单删除本机条目。
+    pub(crate) fn note_admin_changed_for_vault(&self, old_admin: NodeId) {
+        if self.vault.borrow().entries.is_empty() || self.vault_prev_admin().is_some() {
+            return;
+        }
+        let _ = self.set_vault_prev_admin(Some(old_admin));
+    }
+
+    /// 管理设备：从名册里每台在线的设备收回它持有的条目，补上本机没有的或更旧的（恢复码换了管理设备后，
+    /// 原来的条目只在各台设备上）。返回收不到的设备名。
+    pub(crate) async fn vault_collect(&self) -> Result<Vec<String>, WireError> {
+        let root = self.admin_key()?;
+        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let me_name = self.me_name();
+        let self_secret = self.vault_shared_secret(&root, &PublicKey(self.me().0))?;
+        let mut unreachable = Vec::new();
+        let mut changed = false;
+        for dev in roster.devices.iter().filter(|d| d.node_id != self.me()) {
+            let entries = match self.request(dev, Request::VaultPull, None).await {
+                Ok((Response::VaultEntries(entries), _)) => entries,
+                _ => {
+                    unreachable.push(dev.name.clone());
+                    continue;
+                }
+            };
+            let peer_secret = self.vault_shared_secret(&root, &PublicKey(dev.node_id.0))?;
+            for mut e in entries {
+                if !valid_segment(&e.name) {
+                    continue;
+                }
+                let newer = self.vault.borrow().entries.get(&e.name).is_none_or(|have| have.version < e.version);
+                if !newer {
+                    continue;
+                }
+                let Some(plain) = crypto_vault::open(&peer_secret, &e.name, &e.sealed) else { continue };
+                let mut salt = [0u8; 16];
+                self.system.random(&mut salt);
+                e.sealed = crypto_vault::seal(&self_secret, &e.name, salt, &plain);
+                if !e.devices.contains(&me_name) {
+                    e.devices.push(me_name.clone());
+                    e.devices.sort();
+                }
+                let mut store = self.vault.borrow_mut();
+                store.exposed_to.entry(e.name.clone()).or_default().extend(e.devices.iter().cloned());
+                store.entries.insert(e.name.clone(), e);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_vault()?;
+        }
+        Ok(unreachable)
     }
 
     fn vault_shared_secret(&self, my_secret: &SecretKey, peer_public: &PublicKey) -> Result<[u8; 32], WireError> {
@@ -268,20 +334,32 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidState, "名册里没有管理设备"));
         };
         if admin.node_id == self.me() {
+            self.vault_collect().await?;
             return self.vault_list(None);
         }
         match self.request(&admin, Request::VaultPull, None).await {
             Ok((Response::VaultEntries(entries), _)) => {
-                {
+                // 管理设备换过（恢复码）且新的还没收回本机的条目时，只更新、不删除，免得按它更短的清单丢掉条目。
+                let merge_only = self.vault_prev_admin().is_some_and(|prev| prev != admin.node_id);
+                let covered = {
                     let mut store = self.vault.borrow_mut();
-                    store.entries.clear();
+                    let theirs: BTreeSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+                    if !merge_only {
+                        store.entries.clear();
+                    }
                     for e in entries {
                         if e.devices.iter().any(|d| d == &me_name) {
                             store.entries.insert(e.name.clone(), e);
+                        } else {
+                            store.entries.remove(&e.name);
                         }
                     }
-                }
+                    store.entries.keys().all(|n| theirs.contains(n))
+                };
                 self.save_vault()?;
+                if merge_only && covered {
+                    self.set_vault_prev_admin(None)?;
+                }
                 self.vault_list(None)
             }
             Ok((Response::Error(e), _)) => Err(e),
@@ -374,6 +452,15 @@ impl<T: Transport, S: System> Node<T, S> {
             return Response::Error(err(ErrorCode::Denied, "设备不在名册里"));
         };
         let Ok(root) = self.admin_key() else {
+            // 管理设备来收回条目（恢复码换了管理设备之后）：交出本机持有的密文，
+            // 它们是按本机和根密钥协商的密钥加密的，管理设备用根私钥就能解开。
+            if peer_dev.role == DeviceRole::Admin {
+                let entries: Vec<VaultCipherEntry> = self.vault.borrow().entries.values().cloned().collect();
+                for e in &entries {
+                    self.audit_vault(peer, PrincipalRef::Device(peer), &e.name, Outcome::Allow);
+                }
+                return Response::VaultEntries(entries);
+            }
             return Response::Error(err(ErrorCode::Denied, "只有管理设备可以提供 Vault 同步"));
         };
         let device_key = match load_or_create_device_key(&self.system) {

@@ -83,6 +83,16 @@ impl<T: Transport> WebNode<T> {
         self.transport.local_hint()
     }
 
+    /// 设备上取用这个网页节点硬件能力的命令（M8.3），页面原样显示给用户复制：
+    /// `None` 列出开放了哪几项，`Some(kind)` 采集一项。
+    pub fn hardware_command(&self, kind: Option<nexus_wire::HardwareKind>) -> String {
+        let (id, hint) = (self.node_id(), self.hint());
+        match kind {
+            None => format!("nexus hw ls {id} --hint {hint}"),
+            Some(k) => format!("nexus hw capture {id} {} --hint {hint}", k.as_str()),
+        }
+    }
+
     /// 通行密钥在网络里的名字。
     pub fn label(&self) -> &str {
         &self.session.session.label
