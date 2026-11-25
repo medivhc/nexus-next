@@ -345,6 +345,9 @@ pub enum Cmd {
         rows: u16,
         #[arg(long)]
         created_at_ms: u64,
+        /// 按上次记下的状态恢复（设备重启或持有进程意外结束之后，M11.5）
+        #[arg(long)]
+        restore: bool,
     },
     /// 供 ssh 的 ProxyCommand 调用：在标准输入输出上充当 SSH 服务端（一般不直接运行）
     SshProxy {

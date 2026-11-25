@@ -104,7 +104,7 @@ impl System for RealSystem {
     fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
         #[cfg(unix)]
         if let Some(exe) = &self.session_holder {
-            return holder::spawn(exe, &self.dir, name, size, created_at).map(RealTerm::Held);
+            return holder::spawn(exe, &self.dir, name, size, created_at, false).map(RealTerm::Held);
         }
         let _ = (name, created_at);
         RealPty::spawn(size).map(RealTerm::Local)
@@ -113,7 +113,7 @@ impl System for RealSystem {
     async fn adopt_ptys(&self) -> Vec<nexus_sys::AdoptedPty<RealTerm>> {
         #[cfg(unix)]
         if self.session_holder.is_some() {
-            return holder::adopt(&self.dir)
+            return holder::adopt(self.session_holder.as_deref().expect("上面判断过"), &self.dir)
                 .into_iter()
                 .map(|a| nexus_sys::AdoptedPty { name: a.name, size: a.size, created_at: a.created_at, pty: RealTerm::Held(a.pty) })
                 .collect();
@@ -403,6 +403,11 @@ pub struct RealPty {
 
 impl RealPty {
     fn spawn(size: Size) -> io::Result<Self> {
+        Self::spawn_in(size, None)
+    }
+
+    /// 在 `cwd`（没有时是家目录）里启动 shell。
+    fn spawn_in(size: Size, cwd: Option<&std::path::Path>) -> io::Result<Self> {
         fn other(e: impl std::fmt::Display) -> io::Error {
             io::Error::other(e.to_string())
         }
@@ -428,9 +433,9 @@ impl RealPty {
         #[cfg(unix)]
         cmd.env("TERM", "xterm-256color");
         #[cfg(unix)]
-        cmd.cwd(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| "/".into())));
         #[cfg(windows)]
-        cmd.cwd(std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into()));
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into())));
 
         let mut child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
@@ -481,6 +486,14 @@ impl RealPty {
             }
         });
         Ok(Self { master: pair.master, killer, pid, events, input, eof: false, status: None })
+    }
+}
+
+impl RealPty {
+    /// shell 的进程号。
+    #[cfg(unix)]
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 
