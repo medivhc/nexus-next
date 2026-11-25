@@ -3,6 +3,10 @@
 //! 每个会话一个持有进程（`nexus session-hold`）：它打开伪终端、启动 shell、自己解析终端输出以保持当前屏幕，
 //! 在 `<数据目录>/sessions/<会话名>.sock` 上等常驻程序连上来。常驻程序重启后重新连上，会话还在。
 //!
+//! 连接方式（[`transport`]）按平台分：Unix 上 `.sock` 是 `0600` 的域套接字；Windows 上（M11.3，R84）
+//! `.sock` 是一个端点文件，写着回环 TCP 地址和一次性口令：数据目录只有本人能读，读得到口令才连得上，
+//! 和域套接字的 `0600` 等价。口令是连上后的第一帧之前的 32 个字节，之后的协议两个平台完全一样。
+//!
 //! 常驻程序和持有进程之间的协议（[`Up`]、[`Down`]）跨版本使用：升级后新的常驻程序要接管旧的持有进程。
 //! 规则和节点间协议一样（docs/protocol.md）：只在末尾加新种类，已有的编码不变（`tests/holder_compat.rs`）。
 
@@ -11,7 +15,6 @@ use nexus_core_proto::Timestamp;
 use nexus_sys::{AdoptedPty, ExitStatus, Pty, PtyEvent, Size};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,14 +103,12 @@ pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io
 
 async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<()> {
     let dir = sessions_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     let pid = pid_path(&dir, name);
     let _ = std::fs::remove_file(&sock);
     let mut pty = RealPty::spawn(size)?;
-    let listener = tokio::net::UnixListener::bind(&sock)?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+    let mut accepted = transport::listen(&sock).await?;
     std::fs::write(&pid, std::process::id().to_string())?;
     // 走到哪一步都要删掉这两个文件：常驻程序靠它们找会话。
     struct Cleanup(PathBuf, PathBuf);
@@ -123,7 +124,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
     let mut screen = nexus_term_proto::Session::new(size, u64::MAX);
     let mut size = size.clamped();
     let (down_tx, mut down_rx) = mpsc::unbounded_channel::<(u64, Down)>();
-    let mut conn: Option<(u64, tokio::net::unix::OwnedWriteHalf)> = None;
+    let mut conn: Option<(u64, transport::WriteHalf)> = None;
     let mut next_conn = 0u64;
     // 套接字文件被删掉了（数据目录被清掉了，比如测试结束）：没有常驻程序能再找到这个会话，结束它。
     let mut check = tokio::time::interval(Duration::from_secs(5));
@@ -135,8 +136,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                     pty.kill();
                 }
             }
-            accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+            Some(stream) = accepted.recv() => {
                 // 新连上的常驻程序取代旧的（旧的多半已经不在了）。
                 let (mut rd, mut wr) = stream.into_split();
                 next_conn += 1;
@@ -203,7 +203,7 @@ pub struct HeldPty {
 impl HeldPty {
     /// 连上持有进程，读出 `Hello`（阻塞，限时）。
     fn connect(sock: &Path) -> io::Result<(Self, Up)> {
-        let mut s = std::os::unix::net::UnixStream::connect(sock)?;
+        let mut s = transport::connect(sock)?;
         s.set_read_timeout(Some(READY_TIMEOUT))?;
         let hello: Up = read_frame_blocking(&mut s)?;
         match hello {
@@ -212,8 +212,7 @@ impl HeldPty {
             _ => return Err(bad("持有进程没有先发 Hello")),
         }
         s.set_read_timeout(None)?;
-        s.set_nonblocking(true)?;
-        let stream = tokio::net::UnixStream::from_std(s)?;
+        let stream = transport::into_async(s)?;
         let (mut rd, mut wr) = stream.into_split();
         let (ev_tx, events) = mpsc::unbounded_channel();
         let (down, mut down_rx) = mpsc::unbounded_channel::<Down>();
@@ -283,14 +282,12 @@ impl Pty for HeldPty {
 
 /// 启动一个持有进程并连上它。`exe` 是 `nexus` 二进制。
 pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<HeldPty> {
-    use std::os::unix::process::CommandExt;
     let dir = sessions_dir(data_dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     if sock.exists() {
         // 上一次留下的：还活着就是同名的会话已经在了。
-        if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        if transport::connect(&sock).is_ok() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("会话 {name} 的持有进程已经在运行")));
         }
         let _ = std::fs::remove_file(&sock);
@@ -305,8 +302,7 @@ pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Ti
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // 自成一个进程组：常驻程序在前台被 Ctrl-C、或者被结束时，持有进程不受影响。
-    cmd.process_group(0);
+    transport::detach(&mut cmd);
     let mut child = cmd.spawn()?;
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
@@ -355,6 +351,149 @@ pub fn adopt(data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// 持有进程和常驻程序之间的连接，按平台分。
+#[cfg(unix)]
+mod transport {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use tokio::sync::mpsc;
+
+    pub type Stream = tokio::net::UnixStream;
+    pub type WriteHalf = tokio::net::unix::OwnedWriteHalf;
+
+    /// 会话目录只给本人。
+    pub fn private_dir(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+
+    /// 在 `sock` 上等连接；连上的从返回的通道里出来。
+    pub async fn listen(sock: &Path) -> io::Result<mpsc::UnboundedReceiver<Stream>> {
+        let listener = tokio::net::UnixListener::bind(sock)?;
+        std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                if tx.send(s).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    pub fn connect(sock: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+        std::os::unix::net::UnixStream::connect(sock)
+    }
+
+    pub fn into_async(s: std::os::unix::net::UnixStream) -> io::Result<Stream> {
+        s.set_nonblocking(true)?;
+        Stream::from_std(s)
+    }
+
+    /// 自成一个进程组：常驻程序在前台被 Ctrl-C、或者被结束时，持有进程不受影响。
+    pub fn detach(cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
+/// Windows：回环 TCP 加一次性口令（见模块说明）。
+#[cfg(windows)]
+mod transport {
+    use std::io::{self, Write};
+    use std::path::Path;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+
+    pub type Stream = tokio::net::TcpStream;
+    pub type WriteHalf = tokio::net::tcp::OwnedWriteHalf;
+
+    const TOKEN_LEN: usize = 32;
+    const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// 数据目录在本人的用户目录里，默认的访问控制只给本人。
+    pub fn private_dir(dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    pub async fn listen(sock: &Path) -> io::Result<mpsc::UnboundedReceiver<Stream>> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let mut token = [0u8; TOKEN_LEN];
+        getrandom::fill(&mut token).map_err(|e| io::Error::other(e.to_string()))?;
+        let tmp = sock.with_extension("sock.tmp");
+        std::fs::write(&tmp, format!("{} {}\n", listener.local_addr()?, hex(&token)))?;
+        std::fs::rename(&tmp, sock)?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let _ = s.set_nodelay(true);
+                let tx = tx.clone();
+                // 口令在单独的任务里核对：慢的或不对的连接不耽误别的。
+                tokio::spawn(async move {
+                    let mut got = [0u8; TOKEN_LEN];
+                    let ok = matches!(tokio::time::timeout(TOKEN_TIMEOUT, s.read_exact(&mut got)).await, Ok(Ok(_)));
+                    if ok && got == token {
+                        let _ = tx.send(s);
+                    }
+                });
+            }
+        });
+        Ok(rx)
+    }
+
+    fn parse(text: &str) -> Option<(std::net::SocketAddr, Vec<u8>)> {
+        let (addr, token) = text.trim().split_once(' ')?;
+        let addr = addr.parse().ok()?;
+        if token.len() != TOKEN_LEN * 2 {
+            return None;
+        }
+        let token = (0..TOKEN_LEN).map(|i| u8::from_str_radix(&token[2 * i..2 * i + 2], 16).ok()).collect::<Option<Vec<u8>>>()?;
+        Some((addr, token))
+    }
+
+    pub fn connect(sock: &Path) -> io::Result<std::net::TcpStream> {
+        let text = std::fs::read_to_string(sock)?;
+        // 还没写完或者坏了：当作没有这个会话。
+        let (addr, token) = parse(&text).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "会话的端点文件不完整"))?;
+        let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        let _ = s.set_nodelay(true);
+        // 持有进程核对口令后立即发 Hello，由调用方读。
+        s.write_all(&token)?;
+        Ok(s)
+    }
+
+    pub fn into_async(s: std::net::TcpStream) -> io::Result<Stream> {
+        s.set_nonblocking(true)?;
+        Stream::from_std(s)
+    }
+
+    /// 自成一个进程组、不开窗口：常驻程序被 Ctrl-C 或被结束时，持有进程不受影响。
+    pub fn detach(cmd: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn endpoint_file_round_trips() {
+            let token: Vec<u8> = (0..32).collect();
+            let text = format!("127.0.0.1:4000 {}\n", super::hex(&token));
+            assert_eq!(super::parse(&text), Some(("127.0.0.1:4000".parse().unwrap(), token)));
+            assert_eq!(super::parse("127.0.0.1:4000 abc"), None);
+        }
+    }
 }
 
 /// 写一个帧，测试用。
