@@ -333,7 +333,7 @@ impl PublishedService {
 }
 
 /// 服务的协议：只用来告诉使用方怎么用。
-const SERVICE_PROTOS: [&str; 2] = ["tcp", "http"];
+const SERVICE_PROTOS: [&str; 4] = ["tcp", "http", "vnc", "rdp"];
 const LOG_AUDIT: &str = "audit";
 /// 审计日志的轮转上限：最近这么多字节（约 4 万条）的记录总在，总占用不超过约两倍。
 const AUDIT_LOG_MAX: u64 = 8 << 20;

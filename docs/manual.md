@@ -547,6 +547,40 @@ nexus run --use home/llm -- sh -c 'echo $OPENAI_BASE_URL'   # 开好端口、按
 `nexus run` 还会设置 `NEXUS_SVC_<设备>_<服务>=127.0.0.1:<端口>`（名字转成大写，其他字符换成 `_`）；
 可以给多个 `--use`；程序退出后端口关闭，退出码就是程序的退出码。
 
+### 远程桌面
+
+Nexus 不自己传画面，而是让现成的远程桌面（VNC 或 RDP）经 Nexus 的网络连起来：被看的设备上打开系统自带的
+屏幕共享或装一个 VNC 服务端，Nexus 把它发布成服务；看的设备上 Nexus 开一个本机端口，启动现成的查看器。
+连接经过 Nexus（加密、按身份判定、有审计），远程桌面服务端不需要对外开端口。
+
+先在被看的设备上打开远程桌面服务端：
+
+- macOS：系统设置 → 通用 → 共享 → 打开「屏幕共享」（VNC，端口 5900；登录用这台 Mac 的账户）。
+- Windows（专业版）：设置 → 系统 → 远程桌面（RDP，端口 3389）。家庭版没有，可以装一个 VNC 服务端。
+- Linux：`wayvnc 127.0.0.1`（Wayland）、`x11vnc -localhost -usepw`（X11），或者 GNOME 设置里的远程桌面（RDP）。
+
+能只监听本机（127.0.0.1）的就只监听本机：经 Nexus 的连接都从本机进来。
+
+```sh home
+nexus desktop share                        # 依次试本机的 5900、5901、3389，认出 VNC 或 RDP，发布成 home/desktop
+nexus desktop share --port 5902 --proto vnc --name screen2   # 别的端口；给了 --proto 就不识别
+```
+
+```sh laptop
+nexus desktop ls                           # 在线设备上能用的远程桌面
+nexus desktop open home                    # 开本机端口、启动查看器（前台运行，Ctrl-C 停止）
+nexus desktop open home/screen2 --no-viewer --port 5999   # 只开端口，自己用查看器连 127.0.0.1:5999
+```
+
+`nexus desktop open` 显示的地址是 `vnc://127.0.0.1:<端口>` 或 `rdp://127.0.0.1:<端口>`。查看器：设置了
+`NEXUS_DESKTOP_VIEWER` 就执行它（地址作为最后一个参数）；否则 macOS 用系统的「屏幕共享」或 Windows App，
+Windows 用 `mstsc`（RDP）或 `vncviewer`（VNC），Linux 依次试 `vncviewer`、`remmina`、`xdg-open`（VNC）或
+`xfreerdp3`、`xfreerdp`、`remmina`（RDP）。找不到查看器时照样服务，并说明手动连哪个地址。
+`nexus open home/desktop` 遇到远程桌面也是一样。也可以不用 `nexus desktop share`，直接
+`nexus publish desktop --port 5900 --proto vnc`。
+
+远程桌面服务端自己的登录（VNC 密码、系统账户）照常要输；Nexus 只负责连通。网页里还不能看远程桌面。
+
 ## 9. 统一入口、路由与出口
 
 ### 本机统一入口
@@ -832,4 +866,5 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - 多路径和计费网络识别只支持 Linux；两条链路的批量吞吐约为一条的 1.5 倍；经中继的路径没有测过。
 - 网页节点目前只有终端和状态查看；文件浏览、打开发布的网页服务、发布摄像头等硬件能力还没做。
 - 预编译版本只有 Linux（x86_64、aarch64）；没有安装包。`nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），Windows 上还不支持。
-- 还没有：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。
+- 还没有：凭据同步（Vault）、临时分享、硬件能力发布。
+- 远程桌面只是让现成的 VNC / RDP 经 Nexus 连通：网页里还不能看；没有在真实的 macOS 屏幕共享、Windows 远程桌面上验证过。
