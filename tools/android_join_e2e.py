@@ -15,7 +15,7 @@
 用法：tools/android_join_e2e.py [--serial 127.0.0.1:5555] [--apk target/android/nexus.apk]
       [--home-bin target/debug/nexus] [--no-rendezvous]
 先运行 tools/build-android.sh 和 cargo build -p nexus-cli。
-默认在本机起一个碰头服务（只存取记录；签名由两端自己检查），手机经 --host-ip（容器里看到的本机地址）连它；
+默认在本机起一个碰头服务（只存取记录；签名由两端自己检查），手机经 adb reverse 连它；
 --public-rendezvous 改用公共的碰头服务（dns.iroh.link）。
 """
 # covers: R79, R80
@@ -134,7 +134,9 @@ class E2E:
             self.rv = rendezvous_server()
             port = self.rv.server_port
             args += ["--no-discovery", "--rendezvous", f"http://127.0.0.1:{port}/pkarr"]
-            phone_rv = f"http://{self.a.host_ip}:{port}/pkarr"
+            # 手机经 adb reverse 连本机的碰头服务：不依赖手机到本机的网络（redroid 的网桥、真机的 USB 都一样）。
+            self.adb("reverse", f"tcp:{port}", f"tcp:{port}")
+            phone_rv = f"http://127.0.0.1:{port}/pkarr"
         self.daemon = subprocess.Popen(args, env=self.home_env, stdout=log, stderr=log)
         sock = os.path.join(self.home_env["NEXUS_DATA_DIR"], "ctl.sock")
         deadline = time.time() + 20
@@ -152,6 +154,7 @@ class E2E:
     def teardown(self):
         self.adb("shell", "am", "start", "-n", f"{PKG}/.MainActivity", "--es", "action", "stop", check=False)
         self.adb("shell", "am", "force-stop", PKG, check=False)
+        self.adb("reverse", "--remove-all", check=False)
         if self.daemon:
             self.daemon.send_signal(signal.SIGTERM)
             try:
@@ -229,7 +232,6 @@ def main():
     ap.add_argument("--home-bin", default=os.path.join(ROOT, "target/debug/nexus"))
     ap.add_argument("--no-rendezvous", action="store_true", help="不用碰头服务：用二维码里的长加入码批准")
     ap.add_argument("--public-rendezvous", action="store_true", help="用公共的碰头服务，不在本机起一个")
-    ap.add_argument("--host-ip", default="172.17.0.1", help="手机那边看到的本机地址（redroid 的 docker 网桥）")
     ap.add_argument("--shot", help="把加入码和已加入的截图存到这里（.png）")
     ap.add_argument("--keep", action="store_true", help="结束后不清理（调试用）")
     a = ap.parse_args()
