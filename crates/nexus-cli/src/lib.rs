@@ -90,6 +90,9 @@ pub enum Cmd {
         /// 中继：default（公共中继）、disabled，或自建中继的地址
         #[arg(long, default_value = "default")]
         relay: String,
+        /// 只经中继通信，不打开 UDP 直连套接字（适用于禁用 UDP 的沙箱或受限网络）
+        #[arg(long)]
+        relay_only: bool,
         /// 不使用公共地址发现服务
         #[arg(long)]
         no_discovery: bool,
@@ -302,6 +305,21 @@ pub enum Cmd {
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
     /// 登记、列出、撤销用于网页登录的通行密钥
+    /// 访问网页节点发布的硬件能力（摄像头、麦克风、位置，M8.3）
+    Hw {
+        #[command(subcommand)]
+        cmd: HwCmd,
+    },
+    /// 临时分享（M9.1）：把文件/目录、网页服务或只读终端用限时/限次链接分享给访客
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
+    /// Vault（M9.2）：加密保存秘密并按条目同步到授权设备，每次取用记入审计
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
+    },
     Web {
         #[command(subcommand)]
         cmd: WebCmd,
@@ -431,6 +449,120 @@ pub enum SessionCmd {
     Kill {
         node: String,
         session: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HwCmd {
+    /// 列出网页节点当前已显式同意开放的硬件能力
+    Ls {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从网页节点采集一项硬件能力（camera、microphone、location）
+    Capture {
+        /// 网页节点的标识（64 位十六进制）
+        node_id: String,
+        /// 硬件能力：camera、microphone 或 location
+        kind: String,
+        /// 网页节点的地址提示
+        #[arg(long, default_value = "")]
+        hint: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShareCmd {
+    /// 创建一条只读临时分享链接（文件/目录、已发布网页服务或只读终端）
+    Create {
+        /// 分享工作区里的文件或目录，格式 <工作区>:/<路径>
+        #[arg(long, value_name = "工作区:/路径")]
+        drive: Option<String>,
+        /// 分享本机已发布的网页服务（--proto http）
+        #[arg(long, value_name = "服务名")]
+        service: Option<String>,
+        /// 分享本机正在运行的终端会话（访客只读观看）
+        #[arg(long, value_name = "会话名")]
+        terminal: Option<String>,
+        /// 有效期，例如 30m、1h、24h
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+        /// 最多允许打开的次数（不设则不限次数）
+        #[arg(long, value_name = "次数")]
+        max_uses: Option<u32>,
+        /// 网页入口地址（默认用网络的锚点）
+        #[arg(long, value_name = "网址")]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本机的所有临时分享及其剩余次数/撤销状态
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 立即撤销一条临时分享
+    Revoke {
+        /// 分享编号（8 位十六进制）
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultCmd {
+    /// 写入或轮换一条秘密（加密后同步给 --device 指定的授权设备）
+    Put {
+        /// 条目名（字母、数字、- 和 _）
+        name: String,
+        /// 秘密内容（不给则从标准输入读取）
+        #[arg(long)]
+        value: Option<String>,
+        /// 允许持有并读取该条目的设备名（可写多次；管理设备默认包含）
+        #[arg(long = "device", value_name = "设备名")]
+        devices: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 读取并解密一条秘密（每次取用都会记入审计）
+    Get {
+        /// 条目名
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出本机可见的 Vault 条目
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除一条秘密并通知各设备擦除
+    Rm {
+        /// 条目名
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从管理设备主动同步本机被授权的条目
+    Sync {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出因设备被吊销而需要轮换的条目
+    RotateNeeded {
+        /// 只看某台已吊销设备
+        #[arg(long)]
+        device: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -949,6 +1081,58 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
             (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
         }
+        Cmd::Hw { cmd: HwCmd::Ls { node_id, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            (CtlRequest::HardwareList { node_id: id, hint: hint.clone() }, *json)
+        }
+        Cmd::Hw { cmd: HwCmd::Capture { node_id, kind, hint, json } } => {
+            let Ok(id) = node_id.parse() else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+            };
+            let Some(k) = nexus_wire::HardwareKind::parse(kind) else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("硬件能力应为 camera、microphone 或 location：{kind}"));
+            };
+            (CtlRequest::HardwareCapture { node_id: id, hint: hint.clone(), kind: k }, *json)
+        }
+        Cmd::Share { cmd: ShareCmd::Create { drive, service, terminal, ttl, max_uses, page, json } } => {
+            let Some(ttl_ms) = parse_ttl(ttl) else {
+                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"));
+            };
+            let target = match (drive, service, terminal) {
+                (Some(d), None, None) => {
+                    let Some((ws, p)) = d.split_once(":/") else {
+                        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("工作区路径应写成 <工作区>:/<路径>：{d}"));
+                    };
+                    nexus_wire::ShareTarget::Drive { ws: ws.to_string(), path: format!("/{p}") }
+                }
+                (None, Some(s), None) => nexus_wire::ShareTarget::Service { name: s.clone() },
+                (None, None, Some(t)) => nexus_wire::ShareTarget::Terminal { session: t.clone() },
+                _ => return fail(sink, EXIT_USAGE, "usage", "必须且只能指定 --drive、--service 或 --terminal 之一"),
+            };
+            (CtlRequest::ShareCreate { target, ttl_ms, max_uses: *max_uses, page: page.clone() }, *json)
+        }
+        Cmd::Share { cmd: ShareCmd::Ls { json } } => (CtlRequest::ShareList, *json),
+        Cmd::Share { cmd: ShareCmd::Revoke { id, json } } => (CtlRequest::ShareRevoke { id: id.clone() }, *json),
+        Cmd::Vault { cmd: VaultCmd::Put { name, value, devices, json } } => {
+            let bytes = match value {
+                Some(v) => v.as_bytes().to_vec(),
+                None => {
+                    let mut buf = Vec::new();
+                    let _ = stdin.read_to_end(&mut buf).await;
+                    buf
+                }
+            };
+            (CtlRequest::VaultPut { name: name.clone(), value: bytes, devices: devices.clone() }, *json)
+        }
+        Cmd::Vault { cmd: VaultCmd::Get { name, json } } => (CtlRequest::VaultGet { name: name.clone() }, *json),
+        Cmd::Vault { cmd: VaultCmd::Ls { json } } => (CtlRequest::VaultList, *json),
+        Cmd::Vault { cmd: VaultCmd::Rm { name, json } } => (CtlRequest::VaultRm { name: name.clone() }, *json),
+        Cmd::Vault { cmd: VaultCmd::Sync { json } } => (CtlRequest::VaultSync, *json),
+        Cmd::Vault { cmd: VaultCmd::RotateNeeded { device, json } } => {
+            (CtlRequest::VaultRotateNeeded { device: device.clone() }, *json)
+        }
         Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
         Cmd::Anchor { cmd: AnchorCmd::Set { url, clear, json } } => {
             (CtlRequest::AnchorSet { url: if *clear { None } else { url.clone() } }, *json)
@@ -1024,10 +1208,171 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 if !m.unreachable.is_empty() {
                     s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
                 }
+                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
+                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                    {
+                        for item in items {
+                            if !item.entries.is_empty() {
+                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                            }
+                        }
+                    }
+                }
                 s
             }
         }
         CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::HardwareList(list) => {
+            let names: Vec<&str> = list.iter().map(|k| k.as_str()).collect();
+            if json {
+                format!("{}\n", json!({ "capabilities": names }))
+            } else if names.is_empty() {
+                "没有开放的硬件能力。\n".into()
+            } else {
+                format!("{}\n", names.join("\n"))
+            }
+        }
+        CtlResponse::HardwareCapture(cap) => {
+            if json {
+                let v = match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        json!({ "kind": "camera", "mime": mime, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        json!({ "kind": "microphone", "mime": mime, "duration_ms": duration_ms, "data_base64": base64(&data) })
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, timestamp_ms } => {
+                        json!({ "kind": "location", "lat_e7": lat_e7, "lon_e7": lon_e7, "accuracy_cm": accuracy_cm, "timestamp_ms": timestamp_ms })
+                    }
+                };
+                format!("{v}\n")
+            } else {
+                match cap {
+                    nexus_wire::HardwareCapture::Camera { mime, data } => {
+                        format!("camera ({mime}, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                        format!("microphone ({mime}, {duration_ms}ms, {} bytes)\n", data.len())
+                    }
+                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, .. } => {
+                        format!("location ({:.6}, {:.6}, ±{:.2}m)\n", lat_e7 as f64 / 1e7, lon_e7 as f64 / 1e7, accuracy_cm as f64 / 100.0)
+                    }
+                }
+            }
+        }
+        CtlResponse::ShareCreated(r) => {
+            if json {
+                format!(
+                    "{}\n",
+                    json!({
+                        "id": r.id,
+                        "url": r.url,
+                        "kind": r.target.kind_str(),
+                        "expires_at_ms": r.expires_at.0,
+                        "max_uses": r.max_uses,
+                    })
+                )
+            } else {
+                format!("分享已创建（编号 {}）：\n  {}\n", r.id, r.url)
+            }
+        }
+        CtlResponse::Shares(list) => {
+            if json {
+                let items: Vec<Value> = list
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "kind": s.target.kind_str(),
+                            "created_at_ms": s.created_at.0,
+                            "expires_at_ms": s.expires_at.0,
+                            "max_uses": s.max_uses,
+                            "uses": s.uses,
+                            "revoked": s.revoked,
+                        })
+                    })
+                    .collect();
+                format!("{}\n", json!({ "shares": items }))
+            } else if list.is_empty() {
+                "没有临时分享。\n".into()
+            } else {
+                list.iter()
+                    .map(|s| {
+                        let status = if s.revoked { "已撤销" } else { "有效" };
+                        format!("{}  {}  已用 {}/{:?}  {status}\n", s.id, s.target.kind_str(), s.uses, s.max_uses)
+                    })
+                    .collect()
+            }
+        }
+        CtlResponse::ShareRevoked(s) => {
+            if json {
+                format!("{}\n", json!({ "id": s.id, "revoked": s.revoked }))
+            } else {
+                format!("已撤销分享 {}\n", s.id)
+            }
+        }
+        CtlResponse::VaultPut(info) => {
+            if json {
+                format!(
+                    "{}\n",
+                    json!({
+                        "name": info.name,
+                        "version": info.version,
+                        "updated_at_ms": info.updated_at.0,
+                        "devices": info.devices,
+                    })
+                )
+            } else {
+                format!("已保存 Vault 条目 {}（版本 {}，授权设备：{}）\n", info.name, info.version, info.devices.join("、"))
+            }
+        }
+        CtlResponse::VaultValue { name, value } => {
+            let text = String::from_utf8_lossy(&value);
+            if json {
+                format!("{}\n", json!({ "name": name, "value": text }))
+            } else {
+                format!("{text}\n")
+            }
+        }
+        CtlResponse::VaultList(list) => {
+            if json {
+                let entries: Vec<Value> = list
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "name": e.name,
+                            "version": e.version,
+                            "updated_at_ms": e.updated_at.0,
+                            "devices": e.devices,
+                        })
+                    })
+                    .collect();
+                format!("{}\n", json!({ "entries": entries }))
+            } else if list.is_empty() {
+                "没有 Vault 条目。\n".into()
+            } else {
+                list.iter()
+                    .map(|e| format!("{}  v{}  {}\n", e.name, e.version, e.devices.join(",")))
+                    .collect()
+            }
+        }
+        CtlResponse::VaultRotateNeeded(items) => {
+            if json {
+                let arr: Vec<Value> = items
+                    .iter()
+                    .map(|i| json!({ "revoked_device": i.revoked_device, "entries": i.entries }))
+                    .collect();
+                format!("{}\n", json!({ "items": arr }))
+            } else if items.is_empty() {
+                "没有需要轮换的 Vault 条目。\n".into()
+            } else {
+                items
+                    .iter()
+                    .map(|i| format!("已吊销设备 {} 接触过、建议轮换的条目：{}\n", i.revoked_device, i.entries.join("、")))
+                    .collect()
+            }
+        }
         CtlResponse::WebEnroll(r) => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "label": r.label, "url": r.url, "expires_at_ms": r.expires_at.0 }))
@@ -1085,6 +1430,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
         CtlResponse::Ok => match cmd {
+            Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
+                } else {
+                    format!("已删除 Vault 条目 {name}\n")
+                }
+            }
             Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "killed": session }))
@@ -1380,6 +1732,17 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 let mut s = format!("完成：{}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed);
                 if !m.unreachable.is_empty() {
                     s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
+                }
+                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
+                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                    {
+                        for item in items {
+                            if !item.entries.is_empty() {
+                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                            }
+                        }
+                    }
                 }
                 s
             }

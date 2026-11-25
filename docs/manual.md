@@ -313,6 +313,7 @@ nexus daemon --name home
 | `--data-dir <目录>` | 数据目录，默认 `$NEXUS_DATA_DIR` 或 `~/.local/share/nexus`。命令行要用同一个（同样的选项或环境变量） |
 | `--relay default\|disabled\|<地址>` | 中继：iroh 的公共中继（默认）、不用，或自建的中继 |
 | `--no-discovery` | 不用公共地址发现服务（也就默认不用公共的碰头服务） |
+| `--relay-only` | 只经中继通信，不开 UDP 直连（禁用 UDP 的沙箱、受限网络） |
 | `--rendezvous default\|disabled\|<地址>` | 短加入码用的碰头服务：公共的（用了地址发现时的默认）、不用，或自建的（锚点的 `https://<锚点>/pkarr`） |
 | `--proxy 127.0.0.1:1080` | 开本机统一入口（第 9 节） |
 | `--tun nexus0` | 成为完整节点（第 10 节，需要 root） |
@@ -321,6 +322,8 @@ nexus daemon --name home
 
 `nexus status` 查看本机状态；`nexus status <设备>` 查看另一台设备（在线与否、走直连还是中继、往返时间）。
 排查问题时设 `NEXUS_LOG=info` 再启动，日志写到标准错误。
+连中继和地址发现服务时，除了内置的根证书，还信任 `$SSL_CERT_FILE` 指的证书包（没设就用系统的，如 `/etc/ssl/certs/ca-certificates.crt`）：
+企业代理或沙箱的出站代理换了证书时也连得上。
 
 ### 开机自启（systemd）
 
@@ -621,7 +624,7 @@ nexus anchor show
 ### 网页节点
 
 浏览器不用装任何东西，用通行密钥登录后成为一个临时节点，可以看到被授权的设备、进入它们的终端会话
-（行为和 `nexus ssh` 一样）、浏览被授权的工作区。浏览器的所有流量都经锚点的中继。
+（行为和 `nexus ssh` 一样）、打开被授权的网页服务、浏览被授权的工作区。浏览器的所有流量都经锚点的中继。
 
 ```sh laptop
 nexus web enroll --label phone --page http://localhost:8080   # 管理设备上：输出登记链接（默认 10 分钟内有效）
@@ -638,13 +641,19 @@ nexus web ls
 | 撤销 | 撤销后不能再登录，已有的网页连接立即断开 |
 | 痕迹 | 页面不用任何浏览器存储；关掉页面，临时身份和凭证就没了 |
 | 断网 | 自动重连会话 |
+| 网页服务 | 设备后面列出它的网页服务，点开在新标签页打开 |
 | 工作区 | 能读的工作区列在设备下面：逐级浏览目录，文本和图片直接预览（只取开头 1 MiB），任何文件都能下载；只读 |
+
+**网页服务**：设备后面列出它上面用 `--proto http` 发布的服务，点开在新标签页里打开（地址是 `/svc/<随机令牌>/`），
+页面里的请求都经 Nexus 到那个服务；登录的页面要一直开着。服务设置的 cookie 只记在登录页面的内存里，
+服务的页面在浏览器里存的东西在登录页面关闭时清掉。不支持 WebSocket 和流式回应（回应读完才显示），
+页面里写死 `http://localhost:<端口>/…` 的完整网址也到不了服务。需要授权 `svc.connect`（例如 `--grant 'svc.connect@home/svc/web'`）。
 
 页面里看到的工作区是存储设备（`nexus drive serve on`，第 12 节）上最近同步的提交，还没提交或同步的改动看不到。
 默认权限不含读工作区，登记时要明确给出，例如：
 
 ```sh
-nexus web enroll --label phone --grant 'term.session.*@**' --grant 'node.info@**' --grant 'drive.read@**'
+nexus web enroll --label phone --grant 'term.session.*@**' --grant 'node.info@**' --grant 'drive.read@**' --grant 'svc.connect@**'
 nexus web enroll --label kiosk --grant 'node.info@**' --grant 'drive.read@anchor/drive/docs'   # 只能看 anchor 上的 docs
 ```
 

@@ -30,6 +30,8 @@ use nexus_wire::{
     RouteExplanation, WireError, WIRE_VERSION,
 };
 mod drive;
+mod share;
+mod vault;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +77,7 @@ enum Dispatch {
     DriveGet { hashes: Vec<[u8; 32]> },
     DrivePush { ws: String, head: [u8; 32], count: u32 },
     WebEnroll { token: [u8; 16], credential: NewCredential },
+    ShareSession { name: String, size: Size, token: [u8; 16], expires_at: Timestamp },
 }
 
 /// 终端连接的主体：名册变化时重新判定，凭据到期时断开。
@@ -345,7 +348,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::SvcList | Request::DriveInfo => ("node.info", None),
+        Request::SvcList | Request::DriveInfo | Request::VaultPush { .. } | Request::VaultPull => ("node.info", None),
         Request::DriveRegister { ws }
         | Request::DriveHave { ws, .. }
         | Request::DrivePush { ws, .. }
@@ -362,6 +365,9 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
                 resource: ResourcePath::parse(&format!("{node}/drive/{ws}")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
+        Request::HardwareList | Request::HardwareCapture { .. } => {
+            return Err(err(ErrorCode::Denied, "常驻设备不提供网页硬件能力"));
+        }
         Request::SvcConnect { name } => {
             if !valid_segment(name) {
                 return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
@@ -377,7 +383,15 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
                 resource: ResourcePath::parse(&format!("{node}/exit")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
-        Request::RosterPush { .. } | Request::JoinOffer { .. } | Request::WebEnroll { .. } | Request::WebLogin { .. } => {
+        Request::RosterPush { .. }
+        | Request::JoinOffer { .. }
+        | Request::WebEnroll { .. }
+        | Request::WebLogin { .. }
+        | Request::ShareOpen { .. }
+        | Request::ShareDriveList { .. }
+        | Request::ShareDriveRead { .. }
+        | Request::ShareServiceConnect { .. }
+        | Request::ShareSessionWatch { .. } => {
             return Ok(None)
         }
     };
@@ -532,6 +546,10 @@ pub struct Node<T, S: System> {
     tun_rx: RefCell<Option<mpsc::UnboundedReceiver<TunInbound>>>,
     /// 本机的工作区（M4.1）。
     drive_state: RefCell<drive::DriveState>,
+    /// 本机的临时分享（M9.1）。
+    shares: RefCell<share::ShareStore>,
+    /// 本机的 Vault 加密秘密存储（M9.2）。
+    vault: RefCell<vault::VaultStore>,
     /// 用户对网络接口是否计费的设置（M5.2）。
     metered: RefCell<BTreeMap<String, bool>>,
     /// 名册每换一次加一：网页会话据此重新判定（例如通行密钥被撤销时立即断开）。
@@ -562,6 +580,8 @@ impl<T: Transport, S: System> Node<T, S> {
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         let (tun_tx, tun_rx) = mpsc::unbounded_channel();
         let drive_state = RefCell::new(drive::DriveState::load(&system)?);
+        let shares = RefCell::new(share::ShareStore::load(&system)?);
+        let vault = RefCell::new(vault::VaultStore::load(&system)?);
         let metered = RefCell::new(load(&system, KEY_METERED)?.unwrap_or_default());
         Ok(Self {
             routes: RefCell::new(routes),
@@ -570,6 +590,8 @@ impl<T: Transport, S: System> Node<T, S> {
             proxy_rx: RefCell::new(Some(proxy_rx)),
             tun: RefCell::new(None),
             drive_state,
+            shares,
+            vault,
             metered,
             tun_tx,
             tun_rx: RefCell::new(Some(tun_rx)),
@@ -817,6 +839,11 @@ impl<T: Transport, S: System> Node<T, S> {
             Proto::Web => match body {
                 Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
                 Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
+                Request::ShareOpen { token } => Dispatch::Reply(self.handle_share_open(peer, token)),
+                Request::ShareDriveList { token, path } => Dispatch::Reply(self.handle_share_drive_list(peer, token, &path)),
+                Request::ShareDriveRead { token, path, max } => Dispatch::Reply(self.handle_share_drive_read(peer, token, &path, max)),
+                Request::ShareServiceConnect { token } => self.handle_share_service(peer, token),
+                Request::ShareSessionWatch { token, size } => self.handle_share_terminal(peer, token, size),
                 _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
             },
         };
@@ -825,6 +852,9 @@ impl<T: Transport, S: System> Node<T, S> {
             Dispatch::Exec(spec) => return self.serve_exec(stream, spec).await,
             Dispatch::Session { name, create, size, guard } => {
                 return self.serve_session(stream, &name, create, size, guard).await
+            }
+            Dispatch::ShareSession { name, size, token, expires_at } => {
+                return self.serve_share_session(stream, &name, size, token, expires_at).await
             }
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
@@ -911,6 +941,18 @@ impl<T: Transport, S: System> Node<T, S> {
             Request::DriveHave { ws, hashes } => self.drive_have(&ws, hashes),
             Request::DriveProfilePut { ws, name, files } => self.drive_profile_put(&ws, &name, files),
             Request::DriveProfileGet { ws, name } => self.drive_profile_get(&ws, &name),
+            Request::HardwareList | Request::HardwareCapture { .. } => {
+                Response::Error(err(ErrorCode::Denied, "常驻设备不提供网页硬件能力"))
+            }
+            Request::ShareOpen { .. }
+            | Request::ShareDriveList { .. }
+            | Request::ShareDriveRead { .. }
+            | Request::ShareServiceConnect { .. }
+            | Request::ShareSessionWatch { .. } => {
+                Response::Error(err(ErrorCode::InvalidInput, "临时分享请求只能走网页协议"))
+            }
+            Request::VaultPush { name, entry } => self.handle_vault_push(peer, name, entry),
+            Request::VaultPull => self.handle_vault_pull(peer),
             Request::DriveGet { ws, hashes } => match self.ws_exists(&ws) {
                 true => return Dispatch::DriveGet { hashes },
                 false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),
@@ -1149,6 +1191,37 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
             CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
+            CtlRequest::HardwareList { node_id, hint } => {
+                self.hardware_rpc(node_id, &hint, Request::HardwareList).await.and_then(|r| match r {
+                    Response::HardwareList(list) => Ok(CtlResponse::HardwareList(list)),
+                    Response::Error(e) => Err(e),
+                    other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
+                })
+            }
+            CtlRequest::HardwareCapture { node_id, hint, kind } => {
+                self.hardware_rpc(node_id, &hint, Request::HardwareCapture { kind }).await.and_then(|r| match r {
+                    Response::HardwareCapture(cap) => Ok(CtlResponse::HardwareCapture(cap)),
+                    Response::Error(e) => Err(e),
+                    other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
+                })
+            }
+            CtlRequest::ShareCreate { target, ttl_ms, max_uses, page } => {
+                self.share_create(target, ttl_ms, max_uses, page).map(CtlResponse::ShareCreated)
+            }
+            CtlRequest::ShareList => self.share_list().map(CtlResponse::Shares),
+            CtlRequest::ShareRevoke { id } => self.share_revoke(&id).map(CtlResponse::ShareRevoked),
+            CtlRequest::VaultPut { name, value, devices } => {
+                self.vault_put(name, value, devices, agent_ref).await.map(CtlResponse::VaultPut)
+            }
+            CtlRequest::VaultGet { name } => {
+                self.vault_get(&name, agent_ref).map(|value| CtlResponse::VaultValue { name, value })
+            }
+            CtlRequest::VaultList => self.vault_list(agent_ref).map(CtlResponse::VaultList),
+            CtlRequest::VaultRm { name } => self.vault_rm(&name, agent_ref).await.map(|()| CtlResponse::Ok),
+            CtlRequest::VaultSync => self.vault_sync().await.map(CtlResponse::VaultList),
+            CtlRequest::VaultRotateNeeded { device } => {
+                self.vault_rotate_needed(device.as_deref()).map(CtlResponse::VaultRotateNeeded)
+            }
             CtlRequest::AnchorSet { url } => self.anchor_set(url).await.map(CtlResponse::Anchor),
             CtlRequest::Connect { node, name } => return self.connect(&node, &name, agent, server).await,
             CtlRequest::Publish { name, addr, proto, env } => self.publish(name, addr, proto, env).map(|path| CtlResponse::Published { path }),
@@ -1196,6 +1269,15 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::WebEnroll { .. }
                 | CtlRequest::WebList
                 | CtlRequest::WebRevoke { .. }
+                | CtlRequest::HardwareList { .. }
+                | CtlRequest::HardwareCapture { .. }
+                | CtlRequest::ShareCreate { .. }
+                | CtlRequest::ShareList
+                | CtlRequest::ShareRevoke { .. }
+                | CtlRequest::VaultPut { .. }
+                | CtlRequest::VaultRm { .. }
+                | CtlRequest::VaultSync
+                | CtlRequest::VaultRotateNeeded { .. }
                 | CtlRequest::AnchorSet { .. }
                 | CtlRequest::AnchorShow
                 | CtlRequest::Publish { .. }
@@ -1413,6 +1495,20 @@ impl<T: Transport, S: System> Node<T, S> {
                 added_at: k.added_at,
             })
             .collect())
+    }
+
+    /// 向网页节点发起一次硬件能力 RPC（M8.3）。
+    async fn hardware_rpc(&self, node_id: NodeId, hint: &str, body: Request) -> Result<Response, WireError> {
+        if !hint.is_empty() {
+            self.transport.add_hint(node_id, hint);
+        }
+        let conn = self.transport.connect(node_id, Proto::Rpc).await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let mut stream = conn.open_bi().await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let header = RequestHeader::new(0, Principal::Device, &body);
+        write_msg(&mut stream, &header).await.map_err(|e| err(ErrorCode::Unreachable, format!("发送请求失败：{e}")))?;
+        let resp: Response = read_response(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, format!("读取回应失败：{e}")))?;
+        let _ = stream.shutdown().await;
+        Ok(resp)
     }
 
     async fn web_revoke(&self, label: &str) -> Result<MembershipReport, WireError> {
@@ -1880,6 +1976,83 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 会话一侧：连上（必要时创建）会话，转发这个客户端的输入和会话给它的输出，直到它离开或会话结束。
+    /// 只读观看终端会话（M9.1）：访客只收输出并可发 Ack/Ping，所有按键与调整尺寸输入均被忽略；分享撤销或到期立即断开。
+    async fn serve_share_session<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: St,
+        name: &str,
+        size: Size,
+        token: [u8; 16],
+        expires_at: Timestamp,
+    ) {
+        let mut epoch = self.roster_epoch.subscribe();
+        let left = expires_at.0.saturating_sub(self.system.now().0);
+        let expires = tokio::time::Instant::now() + Duration::from_millis(left);
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = FrameReader::new(rd);
+        let cmd = match self.open_session(name, false, size) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let _ = write_response(&mut wr, &Response::Error(e)).await;
+                let _ = wr.shutdown().await;
+                reader.drain().await;
+                return;
+            }
+        };
+        let client = self.next_client.get();
+        self.next_client.set(client + 1);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
+            let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
+            return;
+        }
+        let mut last_heard = tokio::time::Instant::now();
+        let mut next_beat = last_heard + HEARTBEAT;
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(last_heard + PEER_SILENT) => break,
+                _ = tokio::time::sleep_until(expires) => break,
+                Ok(()) = epoch.changed() => {
+                    if !self.share_is_active(&token) {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(next_beat) => {
+                    next_beat = tokio::time::Instant::now() + HEARTBEAT;
+                    if !send_within(&mut wr, &SessionFrame::Heartbeat).await {
+                        break;
+                    }
+                }
+                msg = out.recv() => match msg {
+                    Some(msg) => {
+                        let done = matches!(msg, ClientMsg::Exit(_));
+                        if !send_within(&mut wr, &SessionFrame::Msg(msg)).await || done {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                input = reader.next::<Input>() => {
+                    last_heard = tokio::time::Instant::now();
+                    match input {
+                        // 只读：忽略 Stdin 和 Resize！
+                        Ok(Some(Input::Stdin(_) | Input::Resize(_) | Input::CloseStdin | Input::Ping)) => continue,
+                        Ok(Some(Input::Ack(bytes))) => {
+                            if cmd.send(SessCmd::Event(TermEvent::Ack { client, bytes })).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Some(Input::Detach | Input::Cancel)) | Ok(None) | Err(_) => break,
+                    }
+                }
+            }
+        }
+        let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
+        let _ = tokio::time::timeout(PEER_SILENT, wr.shutdown()).await;
+        let _ = tokio::time::timeout(PEER_SILENT, reader.drain()).await;
+    }
+
     async fn serve_session<St: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: St,
@@ -2842,6 +3015,7 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         roster.version += 1;
         roster.devices.retain(|d| d.node_id != device.node_id);
+        let _ = self.note_device_revoked_for_vault(name);
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);

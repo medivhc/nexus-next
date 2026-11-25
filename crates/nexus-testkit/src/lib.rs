@@ -6,6 +6,8 @@
 //! 场景只通过命令行这一层操作节点，和用户、agent 看到的完全一样。
 #![forbid(unsafe_code)]
 
+pub use nexus_web_core;
+
 pub use nexus_cli::Output;
 
 use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
@@ -125,7 +127,7 @@ impl World {
                 };
                 Output::from_captured(code, sink)
             }
-            Inner::Real(real) => real.cli(node, args, stdin),
+            Inner::Real(real) => real.cli_async(node, args, stdin).await,
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
         self.trace
@@ -368,7 +370,7 @@ impl World {
             Inner::Sim { .. } => {
                 // 仿真里身份由种子决定，保持可复现。
                 let key = nexus_core_proto::SecretKey::from_seed([(n % 200) as u8 + 50; 32]);
-                BrowserTransport::Sim(SimTransport::client(nexus_core_proto::NodeId(key.public().0)))
+                BrowserTransport::Sim(SimTransport::bind_port(nexus_core_proto::NodeId(key.public().0), SCENARIO_HOST, 19100 + (n as u16)).await.expect("仿真浏览器监听端口失败"))
             }
             Inner::Real(_) => {
                 let mut seed = [0u8; 32];
@@ -461,8 +463,23 @@ pub struct Browser {
 enum BrowserState {
     Fresh(BrowserTransport),
     LoggedIn(Rc<BrowserNode>),
+    Guest(Rc<BrowserGuest>),
     /// 登录失败：临时身份已经用掉，换一个浏览器重来。
     Spent,
+}
+
+enum BrowserGuest {
+    Sim(nexus_web_core::GuestShare<SimTransport>),
+    Real(nexus_web_core::GuestShare<nexus_fabric_iroh::IrohTransport>),
+}
+
+macro_rules! on_guest {
+    ($g:expr, $n:ident => $body:expr) => {
+        match &*$g {
+            BrowserGuest::Sim($n) => $body,
+            BrowserGuest::Real($n) => $body,
+        }
+    };
 }
 
 enum BrowserTransport {
@@ -571,6 +588,83 @@ impl Browser {
         }
     }
 
+    fn guest(&self) -> Rc<BrowserGuest> {
+        match &*self.state.borrow() {
+            BrowserState::Guest(g) => g.clone(),
+            _ => panic!("{}：还没有打开分享链接", self.label),
+        }
+    }
+
+    /// 访客打开临时分享链接（M9.1）。
+    pub async fn share_open(&self, link: &str) -> Result<nexus_wire::ShareInfo, nexus_wire::WireError> {
+        let parsed = nexus_web_core::ShareLink::parse(link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
+        let BrowserState::Fresh(t) = state else { panic!("{}：每个浏览器只能打开一次分享", self.label) };
+        let guest = match t {
+            BrowserTransport::Sim(t) => BrowserGuest::Sim(nexus_web_core::GuestShare::open(t, &parsed).await?),
+            BrowserTransport::Real(t) => BrowserGuest::Real(nexus_web_core::GuestShare::open(t, &parsed).await?),
+        };
+        let info = on_guest!(&guest, g => g.info().clone());
+        *self.state.borrow_mut() = BrowserState::Guest(Rc::new(guest));
+        Ok(info)
+    }
+
+    /// 访客列出分享目录（M9.1）。
+    pub async fn share_drive_ls(&self, sub_path: &str) -> Result<Vec<nexus_wire::ShareDriveEntry>, nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.drive_list(sub_path).await)
+    }
+
+    /// 访客读取分享文件（M9.1）。
+    pub async fn share_drive_read(&self, sub_path: &str, max: u64) -> Result<(u64, Vec<u8>, bool), nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.drive_read(sub_path, max).await)
+    }
+
+    /// 访客访问分享的 HTTP 服务（M9.1）。
+    pub async fn share_http_fetch(
+        &self,
+        req: &nexus_web_core::WebHttpRequest,
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
+        let g = self.guest();
+        on_guest!(g, n => n.http_fetch(req).await)
+    }
+
+    /// 访客只读观看分享的终端会话（M9.1）。
+    pub async fn share_term(&self) -> Result<Term, nexus_wire::WireError> {
+        let g = self.guest();
+        let size = nexus_wire::Size::DEFAULT;
+        let state = Arc::new(TermState::new(size));
+        let label = format!("{}（访客只读终端）", self.label);
+        let (input, keys) = tokio::io::duplex(4096);
+        let (resize_tx, resizes) = mpsc::channel(8);
+        let mut ui = PageUi { state: state.clone(), keys, resizes, buf: vec![0u8; 4096] };
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let st = state.clone();
+        tokio::task::spawn_local(async move {
+            let mut first = Some(first_tx);
+            let result = on_guest!(g, n => n.watch_terminal(size, &mut FirstOutput(&mut ui, &mut first)).await);
+            let code = match result {
+                Ok(nexus_web_core::TerminalEnd::Exited(code)) => code.unwrap_or(0),
+                Ok(nexus_web_core::TerminalEnd::Left) => 0,
+                Err(e) => {
+                    if let Some(tx) = first.take() {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    st.feed(format!("\r\n[{}]\r\n", e.message).as_bytes());
+                    -1
+                }
+            };
+            if let Some(tx) = first.take() {
+                let _ = tx.send(Ok(()));
+            }
+            *st.exit.lock().unwrap() = Some(code);
+        });
+        first_rx.await.expect("访客终端任务提前结束")?;
+        Ok(Term { io: TermIo::Sim(SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: Some(resize_tx) }), state, label })
+    }
+
     /// 能看到的设备的名字，按字母排序。
     pub fn devices(&self) -> Vec<String> {
         let node = self.node();
@@ -608,6 +702,49 @@ impl Browser {
     pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_read(ws, path, max).await)
+    }
+
+    /// 网页节点的临时标识与地址提示（M8.3）。
+    pub fn node_id(&self) -> nexus_core_proto::NodeId {
+        let node = self.node();
+        on_node!(node, n => n.node_id())
+    }
+
+    pub fn hint(&self) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hint())
+    }
+
+    /// 启动网页节点的硬件能力服务循环（M8.3）。
+    pub async fn serve_hardware<P: nexus_web_core::HardwareProvider>(
+        &self,
+        state: nexus_web_core::HardwareState,
+        provider: P,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        on_usage: impl FnMut(nexus_web_core::HardwareUsageEvent),
+    ) {
+        let node = self.node();
+        on_node!(node, n => n.serve_hardware(state, provider, stop, on_usage).await)
+    }
+
+    /// 设备上能用的服务（M8.2）。
+    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.services(device).await)
+    }
+
+    /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求（M8.2）。
+    pub async fn http(
+        &self,
+        device: &str,
+        service: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<nexus_web_core::HttpResponse, nexus_wire::WireError> {
+        let node = self.node();
+        on_node!(node, n => n.http(device, service, method, path, headers, body).await)
     }
 
     /// 在页面里打开一台设备上的终端会话，80x24。运行的是网页节点核心里页面用的同一份终端代码。
@@ -1216,8 +1353,8 @@ impl RealWorld {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
         let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
         let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
-        let child = Command::new(&bin)
-            .args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
             .args(extra)
             .args(&rendezvous)
             .args(&proxy)
@@ -1229,9 +1366,19 @@ impl RealWorld {
             .env_remove("ENV")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .expect("无法启动 nexus daemon");
+            .stderr(log);
+        // 刚复制出来的二进制（use_own_binary）：并行的测试里别的线程 fork 出的子进程在 exec 之前还持有它的写句柄，
+        // 这时执行会得到 ETXTBSY。等一下再试。
+        let mut tries = 0;
+        let child = loop {
+            match cmd.spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.expect("无法启动 nexus daemon"),
+            }
+        };
         self.children.borrow_mut().insert(name.to_string(), child);
     }
 
@@ -1371,6 +1518,42 @@ impl RealWorld {
         RealTerm { child: RefCell::new(child), stdin: RefCell::new(stdin), stderr }
     }
 
+    async fn cli_async(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
+        let bin = self.bin.clone();
+        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
+        let agent_socket = self.agent_socket(node);
+        let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let data = stdin.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut child = Command::new(&bin)
+                .args(["--data-dir", dir.to_str().unwrap()])
+                .args(&args)
+                .env("NEXUS_AGENT_SOCKET", agent_socket)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("无法执行 nexus");
+            let mut pipe = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || {
+                let _ = pipe.write_all(&data);
+            });
+            let out = child.wait_with_output().expect("无法等待 nexus");
+            let _ = writer.join();
+            let code = out.status.code().unwrap_or(1);
+            Output {
+                code,
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stdout_raw: out.stdout,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }
+        })
+        .await
+        .expect("后台执行 nexus 失败")
+    }
+
+    #[allow(dead_code)]
     fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
         let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
@@ -1888,6 +2071,21 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
             let (mut r, mut w) = s.split();
             let _ = tokio::io::copy(&mut r, &mut w).await;
             let _ = w.shutdown().await;
+        }
+        Service::HttpEcho => {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            let reply = loop {
+                if let Some(r) = nexus_sys_sim::http_echo_reply(&req) {
+                    break r;
+                }
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            };
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
         }
         Service::Http(body) => {
             let mut head = Vec::new();

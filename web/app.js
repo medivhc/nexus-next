@@ -1,9 +1,10 @@
 // 网页节点的页面：通行密钥（浏览器的 WebAuthn）+ 网页节点核心（WebAssembly）+ 终端显示（xterm.js）。
 // 不使用任何浏览器存储：临时身份和登录凭证只在内存里，关掉页面即消失。
 import init, { Browser } from "./pkg/nexus_web.js";
+import { classifyShareError, mountShareView, normalizeReplyHeaders, renderStateBox } from "./share.mjs";
 
 const $ = (id) => document.getElementById(id);
-const show = (id) => { for (const s of ["enroll", "login", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
+const show = (id) => { for (const s of ["enroll", "login", "share-view", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
 const status = (text) => { $("status").textContent = text; };
 const fail = (e) => { $("error").textContent = String(e && e.message ? e.message : e); };
 const bytes = (buf) => new Uint8Array(buf);
@@ -58,6 +59,7 @@ async function login() {
       );
       status("");
       $("who").textContent = `${session.label()} · ${new Date(session.expires_at_ms()).toLocaleTimeString()} 前有效`;
+      currentSession = session;
       devices(session);
     } catch (e) { status(""); fail(e); }
   };
@@ -75,8 +77,171 @@ function devices(session) {
     open.onclick = () => terminal(session, name, "main");
     li.append(open);
     list.append(li);
+    webServices(session, name, li);
   }
+  hardwareControls(session);
   workspaces(session);
+}
+
+// ---- 本机硬件能力发布（M8.3）：默认关闭、逐项在浏览器中明确同意、页面显示谁在用、关闭即停止。 ----
+
+const hwStreams = { camera: null, microphone: null };
+
+function stopHardwareAll(session) {
+  for (const key of ["camera", "microphone"]) {
+    if (hwStreams[key]) {
+      for (const t of hwStreams[key].getTracks()) t.stop();
+      hwStreams[key] = null;
+    }
+  }
+  try { session.hardware_clear(); } catch {}
+}
+
+function renderHardwareStatus(session) {
+  const enabled = new Set(JSON.parse(session.hardware_enabled()));
+  for (const [kind, id] of [["camera", "hw-camera"], ["microphone", "hw-microphone"], ["location", "hw-location"]]) {
+    const btn = $(id);
+    if (btn) btn.textContent = enabled.has(kind) ? "关闭" : "开启";
+  }
+  const active = JSON.parse(session.hardware_active());
+  const banner = $("hw-active");
+  if (banner) {
+    banner.textContent = active.length
+      ? `正在使用：${active.map((a) => `${a.caller}（${a.kind}）`).join("、")}`
+      : "当前无人使用本机硬件。";
+  }
+}
+
+function hardwareControls(session) {
+  renderHardwareStatus(session);
+  const toggle = async (kind) => {
+    $("error").textContent = "";
+    const enabled = new Set(JSON.parse(session.hardware_enabled()));
+    try {
+      if (enabled.has(kind)) {
+        if (hwStreams[kind]) {
+          for (const t of hwStreams[kind].getTracks()) t.stop();
+          hwStreams[kind] = null;
+        }
+        session.hardware_disable(kind);
+      } else {
+        if (kind === "camera") {
+          hwStreams.camera = await navigator.mediaDevices.getUserMedia({ video: true });
+        } else if (kind === "microphone") {
+          hwStreams.microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } else if (kind === "location") {
+          await new Promise((resolve, reject) =>
+            navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000 }),
+          );
+        }
+        session.hardware_enable(kind);
+      }
+      renderHardwareStatus(session);
+    } catch (e) { fail(e); }
+  };
+  $("hw-camera").onclick = () => toggle("camera");
+  $("hw-microphone").onclick = () => toggle("microphone");
+  $("hw-location").onclick = () => toggle("location");
+  addEventListener("pagehide", () => stopHardwareAll(session), { once: true });
+}
+
+// ---- 网页服务（M8.2 & M9.1）：请求经转发程序（sw.js）交回这里，由网页节点核心或访客分享会话发出。 ----
+// 令牌 → { device, service, jar } 或 { guest, name, jar }：令牌和 cookie 只在内存里。
+
+const services = new Map();
+let currentSession = null;
+let shareCleanup = null;
+
+function randomToken() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// 注册转发程序（只在有网页服务可开时）；离开页面时注销。
+async function ensureForwarder() {
+  if (!("serviceWorker" in navigator)) throw new Error("这个浏览器不支持打开网页服务");
+  await navigator.serviceWorker.register("sw.js", { scope: "./" });
+  await navigator.serviceWorker.ready;
+}
+
+// 清掉这个站点下的一切浏览器存储和转发程序：页面自己不用存储，网页服务的页面和它同源，可能用了。
+async function wipe() {
+  try { localStorage.clear(); sessionStorage.clear(); } catch { /* 不可用 */ }
+  for (const c of document.cookie.split(";")) {
+    const name = c.split("=")[0].trim();
+    if (name) document.cookie = `${name}=; Max-Age=0; path=/`;
+  }
+  const jobs = [];
+  if (navigator.serviceWorker) jobs.push(navigator.serviceWorker.getRegistrations().then((rs) => Promise.all(rs.map((r) => r.unregister()))));
+  if (self.indexedDB && indexedDB.databases) jobs.push(indexedDB.databases().then((dbs) => dbs.forEach((d) => indexedDB.deleteDatabase(d.name))));
+  if (self.caches) jobs.push(caches.keys().then((ks) => Promise.all(ks.map((k) => caches.delete(k)))));
+  await Promise.allSettled(jobs);
+}
+
+function remember(jar, setCookie) {
+  const [pair, ...attrs] = setCookie.split(";");
+  const eq = pair.indexOf("=");
+  if (eq <= 0) return;
+  const name = pair.slice(0, eq).trim();
+  const value = pair.slice(eq + 1).trim();
+  const gone = attrs.some((a) => {
+    const [k, v = ""] = a.split("=").map((x) => x.trim());
+    if (k.toLowerCase() === "max-age") return Number(v) <= 0;
+    if (k.toLowerCase() === "expires") return Date.parse(v) < Date.now();
+    return false;
+  });
+  if (gone) jar.delete(name); else jar.set(name, value);
+}
+
+async function onForward(event) {
+  const m = event.data;
+  const port = event.ports[0];
+  if (!m || m.type !== "nexus-http" || !port) return;
+  const svc = services.get(m.token);
+  if (!svc || (!svc.guest && !currentSession)) { port.postMessage({ unknown: true }); return; }
+  const headers = m.headers.filter(([k]) => k.toLowerCase() !== "cookie");
+  if (svc.jar.size) headers.push(["Cookie", [...svc.jar].map(([k, v]) => `${k}=${v}`).join("; ")]);
+  try {
+    let replyStatus, reason, replyHeaders, body;
+    if (svc.guest) {
+      const r = await svc.guest.http_fetch(m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
+      replyStatus = r.status;
+      reason = r.reason || "";
+      replyHeaders = normalizeReplyHeaders(r.headers);
+      body = r.body.buffer.slice(r.body.byteOffset, r.body.byteOffset + r.body.byteLength);
+    } else {
+      const r = await currentSession.http(svc.device, svc.service, m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
+      replyStatus = r.status();
+      reason = r.reason();
+      replyHeaders = JSON.parse(r.headers());
+      body = r.body().buffer;
+    }
+    for (const [k, v] of replyHeaders) if (k.toLowerCase() === "set-cookie") remember(svc.jar, v);
+    port.postMessage({ status: replyStatus, reason, headers: replyHeaders, body }, [body]);
+  } catch (e) {
+    const label = svc.guest ? `分享/${svc.name}` : `${svc.device}/${svc.service}`;
+    port.postMessage({ error: `${label}：${e && e.message ? e.message : e}`, status: 502 });
+  }
+}
+if (navigator.serviceWorker) navigator.serviceWorker.onmessage = onForward;
+
+// 设备后面列出它上面的网页服务：每个是一个在新标签页打开的链接。
+async function webServices(session, device, li) {
+  let list;
+  try { list = JSON.parse(await session.services(device)).filter((s) => s.proto === "http"); } catch { return; }
+  if (list.length === 0) return;
+  try { await ensureForwarder(); } catch (e) { return fail(e); }
+  for (const s of list) {
+    const token = randomToken();
+    services.set(token, { device, service: s.name, jar: new Map() });
+    const a = document.createElement("a");
+    a.className = "svc";
+    a.href = `svc/${token}/`;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = `${s.name} ↗`;
+    a.title = `在新标签页打开 ${device}/${s.name}（这个页面要一直开着）`;
+    li.append(a);
+  }
 }
 
 // ---- 工作区（M8.1）：只读浏览、预览、下载。内容只在内存里。 ----
@@ -235,6 +400,94 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
+function createReadonlyTerminal(host) {
+  const term = new window.Terminal({ cursorBlink: false, disableStdin: true, fontSize: 14, scrollback: 2000 });
+  const fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(host);
+  fit.fit();
+  return {
+    get cols() { return term.cols; },
+    get rows() { return term.rows; },
+    write: (data) => term.write(data),
+    fit: () => fit.fit(),
+    dispose: () => term.dispose(),
+  };
+}
+
+function triggerBlobDownload(data, mime, name) {
+  const url = URL.createObjectURL(new Blob([data], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function openShare(link) {
+  if (shareCleanup) {
+    shareCleanup();
+    shareCleanup = null;
+  }
+  show("share-view");
+  $("error").textContent = "";
+  $("who").textContent = "访客（只读）";
+  document.title = "临时分享 · Nexus";
+  $("share-title").textContent = "临时分享（只读）";
+  $("share-meta").innerHTML = "";
+  renderStateBox($("share-body"), {
+    kind: "loading",
+    title: "正在打开分享…",
+    detail: "正在连接分享设备并校验访问权限。",
+  });
+  status("正在打开分享…");
+  try {
+    const browser = new Browser(relay);
+    const guest = await browser.open_share(link);
+    status("");
+    const info = JSON.parse(guest.info());
+    shareCleanup = await mountShareView({
+      guest,
+      info,
+      titleEl: $("share-title"),
+      metaEl: $("share-meta"),
+      bodyEl: $("share-body"),
+      helpers: {
+        setStatus: status,
+        ensureForwarder,
+        registerGuestService: (g, name) => {
+          const token = randomToken();
+          services.set(token, { guest: g, name, jar: new Map() });
+          return token;
+        },
+        unregisterGuestService: (token) => services.delete(token),
+        createObjectURL: (data, mime) => URL.createObjectURL(new Blob([data], { type: mime })),
+        revokeObjectURL: (url) => URL.revokeObjectURL(url),
+        triggerDownload: triggerBlobDownload,
+        createTerminal: createReadonlyTerminal,
+        addResizeListener: (fn) => addEventListener("resize", fn),
+        removeResizeListener: (fn) => removeEventListener("resize", fn),
+      },
+    });
+  } catch (e) {
+    status("");
+    renderStateBox($("share-body"), classifyShareError(e));
+  }
+}
+
+// 关闭页面：注销转发程序，清掉网页服务的页面可能留下的存储（R32）。
+addEventListener("pagehide", () => {
+  if (shareCleanup) { shareCleanup(); shareCleanup = null; }
+  currentSession = null;
+  services.clear();
+  wipe();
+});
+await wipe();
 await init();
+
 const hash = location.hash.slice(1);
-if (hash.startsWith("enroll=")) enroll(hash); else login();
+if (hash.startsWith("enroll=")) enroll(hash);
+else if (hash.startsWith("share=")) openShare(hash);
+else login();

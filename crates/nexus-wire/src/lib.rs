@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 0;
+pub const WIRE_MINOR: u16 = 3;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -130,6 +130,154 @@ pub enum Request {
     DriveProfilePut { ws: String, name: String, files: Vec<String> },
     /// 取预读清单：回应 `DriveProfile`。
     DriveProfileGet { ws: String, name: String },
+    /// 网页节点硬件能力（M8.3）：列出浏览器当前已显式同意开放的硬件能力。
+    HardwareList,
+    /// 网页节点硬件能力（M8.3）：采集一项硬件能力（摄像头/麦克风/位置）。
+    HardwareCapture { kind: HardwareKind },
+    /// 临时分享（M9.1）：访客打开分享链接，校验令牌并扣减一次可用次数。
+    ShareOpen { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客列出被分享目录下的相对子路径。
+    ShareDriveList { token: [u8; 16], path: String },
+    /// 临时分享（M9.1）：访客读取被分享文件（或被分享目录下的相对子路径）最多 `max` 字节。
+    ShareDriveRead { token: [u8; 16], path: String, max: u64 },
+    /// 临时分享（M9.1）：访客连接被分享的 HTTP 服务。
+    ShareServiceConnect { token: [u8; 16] },
+    /// 临时分享（M9.1）：访客只读观看被分享的终端会话。
+    ShareSessionWatch { token: [u8; 16], size: Size },
+    /// Vault（M9.2）：管理设备把一条加密后的秘密推送给被授权的设备（`entry: None` 表示擦除）。
+    VaultPush { name: String, entry: Option<VaultCipherEntry> },
+    /// Vault（M9.2）：成员设备向管理设备拉取自己被授权的所有密文条目。
+    VaultPull,
+}
+
+/// 临时分享的目标（M9.1）：全部为只读访问。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareTarget {
+    Drive { ws: String, path: String },
+    Service { name: String },
+    Terminal { session: String },
+}
+
+impl ShareTarget {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ShareTarget::Drive { .. } => "drive",
+            ShareTarget::Service { .. } => "service",
+            ShareTarget::Terminal { .. } => "terminal",
+        }
+    }
+
+    pub fn describe(&self, device: &str) -> String {
+        match self {
+            ShareTarget::Drive { ws, path } => format!("{device}/drive/{ws}:{path}"),
+            ShareTarget::Service { name } => format!("{device}/svc/{name}"),
+            ShareTarget::Terminal { session } => format!("{device}/session/{session}"),
+        }
+    }
+}
+
+/// 网页节点可发布的硬件能力类别（M8.3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HardwareKind {
+    Camera,
+    Microphone,
+    Location,
+}
+
+impl HardwareKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HardwareKind::Camera => "camera",
+            HardwareKind::Microphone => "microphone",
+            HardwareKind::Location => "location",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "camera" => Some(HardwareKind::Camera),
+            "microphone" => Some(HardwareKind::Microphone),
+            "location" => Some(HardwareKind::Location),
+            _ => None,
+        }
+    }
+}
+
+/// 访客打开临时分享后看到的元信息（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInfo {
+    pub id: String,
+    pub device: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub remaining_uses: Option<u32>,
+}
+
+/// 临时分享目录里的一项（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDriveEntry {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub target: Option<String>,
+}
+
+/// 本机创建的一条临时分享记录（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub id: String,
+    pub target: ShareTarget,
+    pub created_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    pub revoked: bool,
+}
+
+/// 创建临时分享的结果（M9.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareCreatedReport {
+    pub id: String,
+    pub url: String,
+    pub target: ShareTarget,
+    pub expires_at: Timestamp,
+    pub max_uses: Option<u32>,
+}
+
+/// 网页节点返回的一次硬件采集结果（M8.3）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HardwareCapture {
+    Camera { mime: String, data: Vec<u8> },
+    Microphone { mime: String, duration_ms: u32, data: Vec<u8> },
+    /// 经纬度采用 1e-7 度整数（精度约 1.1 cm），精度采用厘米整数，保持确定性与 Eq。
+    Location { lat_e7: i64, lon_e7: i64, accuracy_cm: u32, timestamp_ms: u64 },
+}
+
+
+/// Vault 密文条目（M9.2）：落盘与跨网传输均只含认证密文 `sealed`。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultCipherEntry {
+    pub name: String,
+    pub version: u64,
+    pub updated_at: Timestamp,
+    pub devices: Vec<String>,
+    pub sealed: Vec<u8>,
+}
+
+/// Vault 条目的摘要信息（M9.2，不含秘密明文与密文）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultEntryInfo {
+    pub name: String,
+    pub version: u64,
+    pub updated_at: Timestamp,
+    pub devices: Vec<String>,
+}
+
+/// 吊销设备后需要轮换的 Vault 条目清单项（M9.2）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultRotateItem {
+    pub revoked_device: String,
+    pub entries: Vec<String>,
 }
 
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
@@ -158,14 +306,26 @@ impl Request {
     pub fn class(&self) -> TrafficClass {
         match self {
             Request::Exec(_) => TrafficClass::Normal,
-            Request::SvcConnect { .. } | Request::ExitConnect { .. } | Request::DriveGet { .. } | Request::DrivePush { .. } => {
+            Request::SvcConnect { .. }
+            | Request::ExitConnect { .. }
+            | Request::DriveGet { .. }
+            | Request::DrivePush { .. }
+            | Request::ShareServiceConnect { .. } => {
                 TrafficClass::Bulk
             }
             Request::DriveInfo
             | Request::DriveRegister { .. }
             | Request::DriveHave { .. }
             | Request::DriveProfilePut { .. }
-            | Request::DriveProfileGet { .. } => TrafficClass::Interactive,
+            | Request::DriveProfileGet { .. }
+            | Request::HardwareList
+            | Request::HardwareCapture { .. }
+            | Request::ShareOpen { .. }
+            | Request::ShareDriveList { .. }
+            | Request::ShareDriveRead { .. }
+            | Request::ShareSessionWatch { .. }
+            | Request::VaultPush { .. }
+            | Request::VaultPull => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -453,6 +613,12 @@ pub enum Response {
     DrivePushed { accepted: bool, head: Option<[u8; 32]> },
     DriveProfile(Option<Vec<String>>),
     Error(WireError),
+    HardwareList(Vec<HardwareKind>),
+    HardwareCapture(HardwareCapture),
+    ShareOpened(ShareInfo),
+    ShareDriveEntries(Vec<ShareDriveEntry>),
+    ShareDriveFile { size: u64, bytes: Vec<u8>, truncated: bool },
+    VaultEntries(Vec<VaultCipherEntry>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,6 +735,19 @@ pub enum CtlRequest {
     WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
     WebList,
     WebRevoke { label: String },
+    /// 列出网页节点当前开放的硬件能力（M8.3）。
+    HardwareList { node_id: NodeId, hint: String },
+    /// 从网页节点采集一项硬件能力（M8.3）。
+    HardwareCapture { node_id: NodeId, hint: String, kind: HardwareKind },
+    ShareCreate { target: ShareTarget, ttl_ms: u64, max_uses: Option<u32>, page: Option<String> },
+    ShareList,
+    ShareRevoke { id: String },
+    VaultPut { name: String, value: Vec<u8>, devices: Vec<String> },
+    VaultGet { name: String },
+    VaultList,
+    VaultRm { name: String },
+    VaultSync,
+    VaultRotateNeeded { device: Option<String> },
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
@@ -634,6 +813,15 @@ pub enum CtlResponse {
     Audit(Vec<AuditRecord>),
     SshHostKey([u8; 32]),
     WebEnroll(WebEnrollReport),
+    HardwareList(Vec<HardwareKind>),
+    HardwareCapture(HardwareCapture),
+    ShareCreated(ShareCreatedReport),
+    Shares(Vec<ShareRecord>),
+    ShareRevoked(ShareRecord),
+    VaultPut(VaultEntryInfo),
+    VaultValue { name: String, value: Vec<u8> },
+    VaultList(Vec<VaultEntryInfo>),
+    VaultRotateNeeded(Vec<VaultRotateItem>),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),
