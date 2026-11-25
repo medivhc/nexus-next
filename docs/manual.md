@@ -560,13 +560,14 @@ Nexus 不自己传画面，而是让现成的远程桌面（VNC 或 RDP）经 Ne
 - Linux：`wayvnc 127.0.0.1`（Wayland）、`x11vnc -localhost -usepw`（X11），或者 GNOME 设置里的远程桌面（RDP）。
 
 能只监听本机（127.0.0.1）的就只监听本机：经 Nexus 的连接都从本机进来。
+下面两段分别在被看的设备（home）和看的设备（laptop）上运行。
 
-```sh home
+```sh
 nexus desktop share                        # 依次试本机的 5900、5901、3389，认出 VNC 或 RDP，发布成 home/desktop
 nexus desktop share --port 5902 --proto vnc --name screen2   # 别的端口；给了 --proto 就不识别
 ```
 
-```sh laptop
+```sh
 nexus desktop ls                           # 在线设备上能用的远程桌面
 nexus desktop open home                    # 开本机端口、启动查看器（前台运行，Ctrl-C 停止）
 nexus desktop open home/screen2 --no-viewer --port 5999   # 只开端口，自己用查看器连 127.0.0.1:5999
