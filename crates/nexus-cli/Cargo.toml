@@ -34,6 +34,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-rustls-acme = "0.9"
 
+# 应用界面里加入码的二维码（M11.2）。纯计算。
+qrcode = { version = "0.14", default-features = false }
+
 # 排查问题用的日志（NEXUS_LOG）。
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
 
@@ -55,3 +58,5 @@ serde_json.workspace = true
 crossterm.workspace = true
 russh.workspace = true
 rcgen = "0.14"
+# 验证生成的二维码能被独立的识读库读出来（M11.2）。
+rqrr = "0.10"

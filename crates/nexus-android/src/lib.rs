@@ -7,7 +7,7 @@
 //! 这里有 unsafe：JNI 导出函数要求不改名（`no_mangle`），网卡来自一个原始文件描述符。
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use nexus_cli::daemon;
 use std::path::PathBuf;
@@ -105,6 +105,27 @@ pub fn stop() {
     }
 }
 
+/// 应用界面刷新一次（M11.2，R79）：经数据目录里的控制套接字问核心，返回 [`nexus_cli::app::Screen`] 的 JSON。
+/// `held` 是上次返回的加入码（`Screen::Joining` 的 JSON，没有时为空串），`renew` 要求换一个加入码。
+pub fn screen_json(data_dir: &std::path::Path, held: &str, renew: bool, now_ms: u64) -> String {
+    use nexus_cli::app::{refresh, Screen};
+    let held = match serde_json::from_str::<Screen>(held) {
+        Ok(Screen::Joining(view)) => Some(view),
+        _ => None,
+    };
+    let ctl = nexus_cli::UnixCtl::new(data_dir, None);
+    let screen = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(async {
+            // 核心卡住时界面不能跟着卡住。
+            tokio::time::timeout(std::time::Duration::from_secs(15), refresh(&ctl, held, renew, now_ms))
+                .await
+                .unwrap_or(Screen::Failed { message: "核心没有回应".into() })
+        }),
+        Err(e) => Screen::Failed { message: e.to_string() },
+    };
+    serde_json::to_string(&screen).unwrap_or_default()
+}
+
 fn string(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s).map(Into::into).unwrap_or_default()
 }
@@ -132,4 +153,34 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(_env: JNIEnv, _class: JClass) {
     stop();
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    held: JString,
+    renew: jboolean,
+    now_ms: jlong,
+) -> jstring {
+    let (data_dir, held) = (string(&mut env, &data_dir), string(&mut env, &held));
+    let json = screen_json(std::path::Path::new(&data_dir), &held, renew != 0, now_ms.max(0) as u64);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod tests {
+    // covers: R79
+    use super::*;
+
+    // FP-11.2-06：核心还没起来（没有控制套接字）时界面显示正在启动；交回的内容不对也不影响
+    #[test]
+    fn screen_before_the_core_is_up() {
+        let dir = std::env::temp_dir().join(format!("nexus-android-test-{}", std::process::id()));
+        for held in ["", "{", r#"{"state":"starting","message":"x"}"#] {
+            let v: serde_json::Value = serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
+            assert_eq!(v["state"], "starting", "{v}");
+        }
+    }
 }

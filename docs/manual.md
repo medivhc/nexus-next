@@ -776,7 +776,8 @@ nexus iface wlan0 --metered on           # 手动设置：on、off，或 auto �
 Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，手机上的任何应用都能按名字访问服务
 （`http://web.home.internal/`），规则里送去出口的域名经出口设备出去，其余流量照常走手机自己的网络。
 
-构建和安装见 `docs/android.md`。目前加入网络要用调试版系统上的命令行完成（应用界面上的加入流程还没做），
+构建和安装见 `docs/android.md`。打开应用、同意 VPN 授权后，屏幕上显示短加入码和二维码，
+在管理设备上 `nexus device approve <短码>`（或扫二维码，把扫出的文字交给它）即可加入，屏幕随后显示已加入的设备。
 多路径和计费网络的识别在 Android 上还没做。
 
 ## 15. 排查问题

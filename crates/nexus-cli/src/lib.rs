@@ -4,12 +4,15 @@
 //! 因此仿真测试可以直接调用它，行为与真实的 `nexus` 二进制一致。
 #![forbid(unsafe_code)]
 
+pub mod app;
 pub mod ctl_endpoint;
 pub mod daemon;
 pub mod drive;
 pub mod tun;
 pub mod upgrade;
 mod push;
+mod unix_ctl;
+pub use unix_ctl::UnixCtl;
 
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
