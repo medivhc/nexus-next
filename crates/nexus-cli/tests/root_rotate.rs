@@ -86,3 +86,27 @@ scenario! {
         assert_eq!(w.cli("laptop", &["--agent", &old_agent, "exec", "office", "--", "true"]).await.code, 105);
     },
 }
+
+scenario! {
+    name: rotate_root_keeps_vault_entries_readable,
+    covers: "R75, R74",
+    nodes: ["laptop", "home", "office"],
+    real: yes,
+    run: |w: World| async move {
+        network(&w, &["home", "office"]).await;
+        w.cli_ok("laptop", &["vault", "put", "api_key", "--value", "sk-before", "--device", "home", "--device", "office"]).await;
+
+        // office 离线时轮换：Vault 条目按「根密钥 × 设备密钥」加密，轮换后要重新加密，不能丢
+        w.take_offline("office");
+        w.cli_ok("laptop", &["rotate-root"]).await;
+        assert_eq!(w.cli_ok("laptop", &["vault", "get", "api_key"]).await["value"], "sk-before");
+        // 在线的 home 收到按新根重新加密的条目
+        assert_eq!(w.cli_ok("home", &["vault", "get", "api_key"]).await["value"], "sk-before");
+
+        // 错过轮换的 office 上线后，同步一次即可重新读到
+        w.bring_online("office");
+        assert_eq!(w.cli("laptop", &["exec", "office", "--", "true"]).await.code, 0);
+        w.cli_ok("office", &["vault", "sync"]).await;
+        assert_eq!(w.cli_ok("office", &["vault", "get", "api_key"]).await["value"], "sk-before");
+    },
+}

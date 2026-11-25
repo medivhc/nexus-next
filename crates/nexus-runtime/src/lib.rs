@@ -3114,14 +3114,18 @@ impl<T: Transport, S: System> Node<T, S> {
 
         let mut rotations = self.trust.borrow().rotations.clone();
         rotations.push((signed_rotation.clone(), signed_roster.clone()));
+        // Vault 条目按「根密钥 × 设备密钥」加密：先在内存里重新加密好，和新根一起落盘。
+        let vault = self.vault_resealed(&old_root, &new_root)?;
         let persist = || -> io::Result<()> {
             save(&self.system, KEY_ROOT_KEY, &new_seed)?;
             save(&self.system, KEY_ROOT_PUB, &new_pub)?;
             save(&self.system, KEY_ROSTER, &signed_roster)?;
             save(&self.system, KEY_ROTATIONS, &rotations)?;
+            save(&self.system, vault::KEY_VAULT, &vault)?;
             Ok(())
         };
         persist().map_err(internal)?;
+        *self.vault.borrow_mut() = vault;
         {
             let mut t = self.trust.borrow_mut();
             t.root = Some(new_pub);
@@ -3132,6 +3136,7 @@ impl<T: Transport, S: System> Node<T, S> {
         self.roster_epoch.send_modify(|v| *v += 1);
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
+        self.vault_repush_all().await;
         Ok(nexus_wire::RootRotateReport {
             old_root: old_pub,
             new_root: new_pub,
