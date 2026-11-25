@@ -9,12 +9,14 @@ far.test（在 /etc/hosts 里临时加一行，结束时删掉；需要免密 su
   - http://web.home.internal/      → home 上的服务（内网访问）
   - http://far.test/               → 经 home 出去（出口）；home 的审计里有 net.exit
   - localhost                      → 照常解析，不是 Nexus 的地址（其余流量不经过 Nexus）
+  - echo hello | nc echo.home.internal → 发完就关闭写方向，回应照样回来（半关闭，M11.5 R89）
+  - nc -u game.home.internal         → UDP 数据报到 home 上的 UDP 服务，回应送回（M11.5 R91）
 
 用法：tools/android_e2e.py [--serial 127.0.0.1:5555] [--apk target/android/nexus.apk]
       [--cli target/android/x86_64/nexus] [--home-bin target/debug/nexus]
 先运行 tools/build-android.sh 和 cargo build -p nexus-cli。
 """
-# covers: R46
+# covers: R46, R89, R91
 import argparse
 import json
 import os
@@ -50,6 +52,45 @@ def serve(addr, body):
     srv = ThreadingHTTPServer(addr, H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def serve_echo(addr):
+    """TCP：读到结束（对方关闭写方向）后才把收到的原样送回再关闭。半关闭不通时什么也收不到。"""
+    import socket
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(addr)
+    srv.listen()
+
+    def one(c):
+        data = b""
+        while chunk := c.recv(65536):
+            data += chunk
+        c.sendall(data)
+        c.close()
+
+    def loop():
+        while True:
+            c, _ = srv.accept()
+            threading.Thread(target=one, args=(c,), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def serve_udp_echo(addr):
+    """UDP：每个数据报前面加 echo: 送回。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(addr)
+
+    def loop():
+        while True:
+            data, frm = s.recvfrom(65536)
+            s.sendto(b"echo:" + data, frm)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return s.getsockname()[1]
 
 
 class E2E:
@@ -91,9 +132,7 @@ class E2E:
         """以普通程序（nc）发一个 HTTP 请求，返回正文。请求先写成文件，免得在几层 shell 里转义。"""
         req = f"/data/local/tmp/req-{host}"
         self.adb("shell", f"printf 'GET / HTTP/1.0\\r\\nHost: {host}\\r\\n\\r\\n' > {req}; chmod 644 {req}")
-        # 发完请求后不立刻关闭写方向：协议栈（ipstack）收到对方的 FIN 就整条关掉，不支持半关闭，
-        # 那样回应送不回来。浏览器和常见的 HTTP 客户端不会半关闭；这是已知的限制，见 docs/feature-points/M3.6.md。
-        out = self.as_app(f"(cat {req}; sleep 3) | nc -w 10 {host} {port}")
+        out = self.as_app(f"cat {req} | nc -w 10 {host} {port}")
         out = out.replace("\r\n", "\n")
         return out.split("\n\n", 1)[1] if "\n\n" in out else out
 
@@ -127,6 +166,8 @@ class E2E:
         self.web = serve(("127.0.0.1", 0), "hello from home")
         self.home("publish", "web", "--port", str(self.web.server_port), "--proto", "http")
         self.home("exit", "on")
+        self.home("publish", "echo", "--port", str(serve_echo(("127.0.0.1", 0))))
+        self.home("publish", "game", "--port", str(serve_udp_echo(("127.0.0.1", 0))), "--proto", "udp")
         # far.test：只有 home 能按名字找到的网站。
         self.far = serve(("0.0.0.0", 0), "far away site")
         subprocess.run(["sudo", "-n", "sh", "-c", f"echo '{self.a.far_ip} far.test {HOSTS_MARK}' >> /etc/hosts"], check=True)
@@ -182,6 +223,12 @@ class E2E:
         events = self.home("audit")["events"][before:]
         check("home 的审计里有 net.exit",
               any(e.get("capability") == "net.exit" and e.get("outcome") == "allow" for e in events), json.dumps(events)[-500:])
+
+        out = self.as_app("echo hello | nc -w 10 echo.home.internal 7")
+        check("半关闭：echo hello | nc 收到回应", out.replace("\r\n", "\n").strip() == "hello", repr(out[-300:]))
+
+        out = self.as_app("echo hi | nc -u -w 3 game.home.internal 9000")
+        check("UDP：数据报到 home 上的 UDP 服务、回应送回", "echo:hi" in out, repr(out[-300:]))
 
         out = self.as_app("ping -c 1 -W 2 localhost")
         check("其余名字照常解析，不经过 Nexus", "127.0.0.1" in out and "198.18." not in out, out[-300:])
