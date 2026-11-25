@@ -40,6 +40,12 @@ public class MainActivity extends Activity {
     private boolean renew;
     private boolean running;
     private boolean busy;
+    private final Runnable ticker = new Runnable() {
+        @Override
+        public void run() {
+            tick();
+        }
+    };
 
     private TextView title;
     private TextView message;
@@ -116,15 +122,22 @@ public class MainActivity extends Activity {
         final String h = held;
         final boolean r = renew;
         renew = false;
-        worker.execute(() -> {
-            String json = NexusCore.nativeScreen(dir, h, r, System.currentTimeMillis());
-            main.post(() -> {
-                busy = false;
-                render(json);
-                if (!isFinishing() && !isDestroyed()) {
-                    main.postDelayed(this::tick, REFRESH_MS);
-                }
-            });
+        // 用匿名类而不是 lambda：构建不经 Gradle（javac -source 8 + d8），android.jar 里没有 LambdaMetafactory。
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                final String json = NexusCore.nativeScreen(dir, h, r, System.currentTimeMillis());
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        busy = false;
+                        render(json);
+                        if (!isFinishing() && !isDestroyed()) {
+                            main.postDelayed(ticker, REFRESH_MS);
+                        }
+                    }
+                });
+            }
         });
     }
 
@@ -228,13 +241,21 @@ public class MainActivity extends Activity {
         col.addView(qr, new LinearLayout.LayoutParams(720, 720));
         longCode = text(col, "long_code", 12, false);
         longCode.setTypeface(Typeface.MONOSPACE);
-        longCode.setOnClickListener(v -> copy(longCode.getText().toString()));
+        longCode.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copy(longCode.getText().toString());
+            }
+        });
         renewButton = new Button(this);
         renewButton.setText("换一个加入码");
         renewButton.setContentDescription("renew");
-        renewButton.setOnClickListener(v -> {
-            renew = true;
-            tick();
+        renewButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                renew = true;
+                tick();
+            }
         });
         col.addView(renewButton);
         devices = text(col, "devices", 16, false);
