@@ -222,6 +222,7 @@ def main():
     ap.add_argument("--loss", type=float, default=0.3, help="交互冗余检查时一条链路的随机丢包率")
     ap.add_argument("--max-gap", type=float, default=0.2, help="有丢包时终端输出允许的最长间隔（秒）")
     ap.add_argument("--bulk-rate", type=float, default=20, help="批量检查时两条链路的限速（Mbit/s）")
+    ap.add_argument("--bulk-repeat", type=int, default=1, help="批量检查每种情况取几次（测量用；默认 1 次，不达标时最多 3 次）")
     ap.add_argument("--bulk-mb", type=float, default=16, help="批量检查取的文件大小（MB）")
     ap.add_argument("--only", default="failover,redundancy,metered,bulk", help="只做这些检查（逗号分隔）")
     ap.add_argument("--delay-ms", type=float, default=0, help="两条链路的往返延迟（毫秒，需要 netem；没有时跳过）")
@@ -350,7 +351,10 @@ def main():
             n.cli("home", "drive", "serve", "on")
             n.cli("home", "drive", "create", "work")
             # two*.bin：批量分摊最多测三次（runner 上偶尔低一点，有一次达标就算通过；真的退步时三次都不达标）。
-            for name in ("one.bin", "two.bin", "two-b.bin", "two-c.bin"):
+            reps = max(1, args.bulk_repeat)
+            ones = [f"one-{i}.bin" for i in range(reps)]
+            twos = [f"two-{i}.bin" for i in range(max(3, reps))]
+            for name in ones + twos:
                 p = subprocess.run([n.bin, "drive", "put", f"work:/{name}", "--json"], env=n.env("home"),
                                    input=os.urandom(size), capture_output=True, timeout=120)
                 if p.returncode != 0:
@@ -372,21 +376,29 @@ def main():
             metered_link = "link2"
             n.cli("laptop", "iface", n.iface(metered_link), "--metered", "on")
             time.sleep(7)  # 传输在下一次检查连接时（5 秒内）按新的设置调度
-            mbit_m, use_m = fetch("one.bin")
+            singles = []
+            for name in ones:
+                mbit_m, use_m = fetch(name)
+                singles.append(round(mbit_m, 1))
             share = use_m[metered_link] / max(sum(use_m.values()), 1)
             print(f"计费网络：{metered_link} 标为计费，取 {args.bulk_mb:g} MB：{mbit_m:.1f} Mbit/s，各链路字节数 {use_m}（计费的占 {share:.1%}）")
-            result["metered"] = {"mbit": round(mbit_m, 1), "bytes": use_m, "metered_share": round(share, 4)}
+            result["metered"] = {"mbit": round(mbit_m, 1), "bytes": use_m, "metered_share": round(share, 4), "runs_mbit": singles}
+            if reps > 1:
+                print(f"  只有一条可用（计费的不承担批量）时各次：{singles} Mbit/s")
             if "metered" in phases and share > 0.1:
                 failures.append(f"计费的链路承担了 {share:.0%} 的批量流量")
             n.cli("laptop", "iface", n.iface(metered_link), "--metered", "auto")
             time.sleep(7)
             single = min(args.rate1, args.rate2)
-            for attempt, name in enumerate(("two.bin", "two-b.bin", "two-c.bin"), 1):
+            runs = []
+            for attempt, name in enumerate(twos, 1):
                 mbit_b, use_b = fetch(name)
+                runs.append(round(mbit_b, 1))
                 print(f"批量分摊（第 {attempt} 次）：两条都不计费，取 {args.bulk_mb:g} MB：{mbit_b:.1f} Mbit/s（一条链路 {single:g} Mbit/s），各链路字节数 {use_b}")
-                if mbit_b >= single * 1.3 or "bulk" not in phases:
+                if reps == 1 and (mbit_b >= single * 1.3 or "bulk" not in phases):
                     break
-            result["bulk"] = {"mbit": round(mbit_b, 1), "single_link_mbit": single, "bytes": use_b}
+            mbit_b = max(runs)
+            result["bulk"] = {"mbit": mbit_b, "single_link_mbit": single, "bytes": use_b, "runs_mbit": runs}
             if "bulk" in phases and mbit_b < single * 1.3:
                 failures.append(f"两条链路时批量吞吐 {mbit_b:.1f} Mbit/s，没有超过一条链路的 1.3 倍（{single * 1.3:.1f}）")
     finally:
