@@ -66,10 +66,11 @@ class Net:
                 sh("ip", "-n", ns, "addr", "add", f"{net}.{host}/24", "dev", dev)
                 sh("ip", "-n", ns, "link", "set", dev, "up")
                 rate = self.args.rate1 if name == "link1" else self.args.rate2
-                if self.args.delay_ms:
+                delay = self.args.delay_ms if name == "link1" else self.args.delay2_ms
+                if delay:
                     # 每个方向一半延迟（往返 = --delay-ms）；需要内核的 netem。
                     cmd = ["ip", "netns", "exec", ns, "tc", "qdisc", "add", "dev", dev, "root", "netem",
-                           "delay", f"{self.args.delay_ms / 2}ms", "limit", "10000"]
+                           "delay", f"{delay / 2}ms", "limit", "10000"]
                     if rate:
                         cmd += ["rate", f"{rate}mbit"]
                     if sh(*cmd, check=False).returncode != 0:
@@ -111,7 +112,7 @@ class Net:
         os.makedirs(d, exist_ok=True)
         log = open(os.path.join(d, "daemon.log"), "a")
         p = subprocess.Popen(["ip", "netns", "exec", self.ns[node], self.bin, "daemon", "--name", node,
-                              "--relay", "disabled", "--no-discovery"], env=self.env(node), stdout=log, stderr=log)
+                              "--relay", "disabled", "--no-discovery", *self.args.daemon_arg], env=self.env(node), stdout=log, stderr=log)
         self.procs.append(p)
         sock = os.path.join(d, "ctl.sock")
         deadline = time.time() + 15
@@ -224,10 +225,14 @@ def main():
     ap.add_argument("--bulk-mb", type=float, default=16, help="批量检查取的文件大小（MB）")
     ap.add_argument("--only", default="failover,redundancy,metered,bulk", help="只做这些检查（逗号分隔）")
     ap.add_argument("--delay-ms", type=float, default=0, help="两条链路的往返延迟（毫秒，需要 netem；没有时跳过）")
+    ap.add_argument("--delay2-ms", type=float, default=None, help="link2 的往返延迟（默认同 --delay-ms）：测延迟不同的两条链路")
+    ap.add_argument("--daemon-arg", action="append", default=[], help="传给两边常驻程序的额外参数（对比测量用，例如 --no-scheduling）")
     ap.add_argument("--record", help="把结果写成 JSON")
     ap.add_argument("--require", action="store_true", help="条件不满足时失败而不是跳过")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（常驻程序的日志在里面）")
     args = ap.parse_args()
+    if args.delay2_ms is None:
+        args.delay2_ms = args.delay_ms
     why = missing_requirements()
     if why:
         print(f"跳过多路径检查：{why}")
@@ -241,6 +246,7 @@ def main():
     failures = []
     result = {"rate1_mbit": args.rate1, "rate2_mbit": args.rate2}
     result["rtt_ms"] = args.delay_ms
+    result["rtt2_ms"] = args.delay2_ms
     n = Net(args)
     try:
         try:
