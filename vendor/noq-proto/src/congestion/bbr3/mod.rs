@@ -1740,7 +1740,11 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            // NEXUS: 原来是 `else if`：上一段应用受限的数据刚送达的那次，即使现在仍然没有数据可发，也不再标为受限，
+            // 之后发出的包就算作「不受应用限制」。零星的交互流量（终端每 20 毫秒一行、心跳）于是被当成带宽到顶，
+            // BBR 早早退出起步阶段、带宽估计停在几十 KB/s，之后的批量传输要好几秒才涨上去（M11.4）。
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;

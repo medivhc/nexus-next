@@ -3314,17 +3314,23 @@ impl Connection {
         self.set_loss_detection_timer(now, path_id);
     }
 
-    /// NEXUS: 除了 `path_id`，还有没有已验证、没放弃、没有出现过超时的路径。
-    /// Backup 路径（经中继的路径、计费的接口）也算：直连路径都断了时，在途的数据马上转到中继或 5G 上（M11.4），
-    /// 不等直连路径被放弃（几秒）。Available 路径都还好时 Backup 照旧不承担数据（见 `scheduling_info`）。
+    /// NEXUS: 除了 `path_id`，还有没有健康的路径（已验证、没放弃、没有出现过超时）可以接手它的数据。
+    ///
+    /// 先看 Available 的路径。都没有时，`path_id` 连续两次超时（更确定是断了，而不是满载时偶尔的一次超时）后，
+    /// Backup 的路径（经中继的路径、计费的接口）也算（M11.4）：直连都断时在途的数据马上转到中继或 5G 上，
+    /// 不等直连路径被放弃（几秒）。
     fn nexus_has_healthy_path_besides(&self, path_id: PathId) -> bool {
-        self.paths.iter().any(|(id, path)| {
+        let healthy = |id: &PathId, path: &PathState| {
             *id != path_id
                 && self.remote_cids.contains_key(id)
                 && !self.abandoned_paths.contains(id)
                 && path.data.validated
                 && path.data.pto_count == 0
-        })
+        };
+        if self.paths.iter().any(|(id, path)| healthy(id, path) && path.data.nexus_status() == PathStatus::Available) {
+            return true;
+        }
+        self.paths.get(&path_id).is_some_and(|p| p.data.pto_count >= 2) && self.paths.iter().any(|(id, path)| healthy(id, path))
     }
 
     /// NEXUS: 把 `path_id` 上所有在途的包算作丢失（数据回到待发队列，由别的路径发出）。

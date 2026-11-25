@@ -84,6 +84,7 @@ mod tests {
     use super::{auto_metered, looks_metered};
     use std::collections::BTreeMap;
 
+    // covers: R88
     #[test]
     fn the_system_report_wins_over_names() {
         // Android：计费的 Wi-Fi 热点（名字看不出来）按系统的结果计费；系统说不计费的蜂窝网络（不限流量的套餐）不计费。

@@ -20,7 +20,7 @@ laptop 和 home 的常驻程序各在一个网络命名空间里，中间有两�
 
 用法：tools/multipath_check.py [--bin target/debug/nexus] [--rate1 0] [--rate2 0] [--record 文件] [--require]
 """
-# covers: R56, R57, R58, R59, R60, R61
+# covers: R56, R57, R58, R59, R60, R61, R85, R86
 import argparse
 import json
 import os
