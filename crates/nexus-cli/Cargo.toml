@@ -22,6 +22,8 @@ serde_json.workspace = true
 # 升级（M7.3）：解开发布的 .tar.gz、校验 SHA256SUMS。
 tar = "0.4"
 flate2 = "1"
+# Windows 的发布包是 .zip（M11.3）。只读，解压用 flate2。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2.workspace = true
 # 输出里的时间用本地时区显示。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -48,10 +50,14 @@ path = "src/main.rs"
 
 [dev-dependencies]
 nexus-core-proto.workspace = true
-nexus-testkit.workspace = true
 nexus-wire.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 crossterm.workspace = true
 russh.workspace = true
 rcgen = "0.14"
+
+# 验收场景的测试工具只在 Unix 上（伪终端、进程组、网络命名空间）。macOS 和 Windows 上跑单元测试和
+# tools/platform_check.py（M11.3）。
+[target.'cfg(unix)'.dev-dependencies]
+nexus-testkit.workspace = true

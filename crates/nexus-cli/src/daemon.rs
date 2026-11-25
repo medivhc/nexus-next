@@ -37,7 +37,7 @@ pub fn parse_tun_net(s: &str) -> Option<nexus_net_core::fakeip::FakePool> {
 
 /// 完整节点的虚拟网卡。
 pub enum Tun {
-    /// 常驻程序自己建网卡（Linux、macOS）。
+    /// 常驻程序自己建网卡（Linux、macOS、Windows）。
     Named { name: String, pool: FakePool },
     /// 别人建好的网卡（Android 的 VpnService），`label` 只用于显示。
     Device { device: tun_rs::AsyncDevice, label: String, pool: FakePool },
@@ -79,13 +79,20 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     let node = Node::new(transport, system, &name)?;
 
     // 虚拟网卡先于控制套接字：控制套接字出现时完整节点已经可用。
+    // 名字解析配置（macOS、Windows）在常驻程序正常退出时撤掉：守卫活到本函数结束。
+    let mut _resolver = None;
     match tun {
         None => {}
         Some(Tun::Named { name: dev, pool }) => {
             let entry = node.enable_tun(&dev, pool.clone());
-            tun::start(&dev, &pool, entry).map_err(|e| io::Error::other(format!("无法建虚拟网卡 {dev}（需要管理员权限）：{e}")))?;
+            let (actual, guard) =
+                tun::start(&dev, &pool, entry).map_err(|e| io::Error::other(format!("无法建虚拟网卡 {dev}（需要管理员权限）：{e}")))?;
+            if actual != dev {
+                node.enable_tun(&actual, pool.clone());
+            }
+            _resolver = Some(guard);
             let (net, prefix) = pool.network();
-            eprintln!("nexus daemon: 完整节点：虚拟网卡 {dev}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
+            eprintln!("nexus daemon: 完整节点：虚拟网卡 {actual}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
         }
         Some(Tun::Device { device, label, pool }) => {
             let entry = node.enable_tun(&label, pool.clone());
@@ -233,7 +240,7 @@ async fn handle_upgrade(req: &CtlRequest, data_dir: &std::path::Path, tx: &mpsc:
             (CtlResponse::Upgrade(state.report()), Some(exe))
         }
         CtlRequest::Upgrade { file, confirm_ms, force } => {
-            if !cfg!(unix) {
+            if !cfg!(any(unix, windows)) {
                 return (CtlResponse::Error(WireError::new(ErrorCode::InvalidState, "这个系统上还不支持 nexus upgrade：手动换二进制再重启服务")), None);
             }
             let exe = match std::env::current_exe() {
