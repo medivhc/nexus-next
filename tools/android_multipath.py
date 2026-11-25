@@ -170,8 +170,13 @@ class MP:
 
     # ------------------------------------------------------------ 链路
     def link_bytes(self, dev):
-        st = self.in_phone("cat", f"/sys/class/net/{dev}/statistics/rx_bytes", f"/sys/class/net/{dev}/statistics/tx_bytes").split()
-        return int(st[0]) + int(st[1])
+        # /sys 跟着挂载命名空间（宿主的），/proc/net 跟着网络命名空间：用 /proc/net/dev。
+        for line in self.in_phone("cat", "/proc/net/dev").splitlines():
+            name, _, rest = line.partition(":")
+            if name.strip() == dev:
+                f = rest.split()
+                return int(f[0]) + int(f[8])
+        raise RuntimeError(f"phone 上没有接口 {dev}")
 
     def busy(self, secs=1.0):
         b0 = {d: self.link_bytes(d) for d in NET}
