@@ -140,6 +140,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             }),
         },
         Request::VaultPull,
+        Request::SvcDatagram { name: "dns".into() },
     ];
     all.into_iter()
         .map(|r| {
@@ -173,6 +174,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::ShareSessionWatch { .. } => "request.share_session_watch",
                 Request::VaultPush { .. } => "request.vault_push",
                 Request::VaultPull => "request.vault_pull",
+                Request::SvcDatagram { .. } => "request.svc_datagram",
             };
             (name, r)
         })

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 3;
+pub const WIRE_MINOR: u16 = 4;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -148,6 +148,9 @@ pub enum Request {
     VaultPush { name: String, entry: Option<VaultCipherEntry> },
     /// Vault（M9.2）：成员设备向管理设备拉取自己被授权的所有密文条目。
     VaultPull,
+    /// 连到对方发布的一个 UDP 服务（`--proto udp`，M11.5）。对方先回 `Response::Ok` 或 `Response::Error`；
+    /// 之后两个方向都是一串数据报帧：2 字节大端长度 + 数据报。任一方向结束发送即结束这条转发。
+    SvcDatagram { name: String },
 }
 
 /// 临时分享的目标（M9.1）：全部为只读访问。
@@ -325,7 +328,8 @@ impl Request {
             | Request::ShareDriveRead { .. }
             | Request::ShareSessionWatch { .. }
             | Request::VaultPush { .. }
-            | Request::VaultPull => TrafficClass::Interactive,
+            | Request::VaultPull
+            | Request::SvcDatagram { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }

@@ -11,6 +11,7 @@ M7.1 起，同一协议主版本内的任何两个版本互相连得上（R65）
   19.1（M8.3）：加了 `HardwareList`、`HardwareCapture` 请求和回应。
   19.2（M9.1）：加了临时分享的 `Share*` 请求和回应。
   19.3（M9.2）：加了 `VaultPush`、`VaultPull` 请求和 `VaultEntries` 回应。
+  19.4（M11.5）：加了 `SvcDatagram` 请求（转发 UDP 服务的数据报，之后的帧是 2 字节大端长度 + 数据报）。
 - 软件版本（`Cargo.toml` 的 `version`，`nexus --version`）和协议版本是两回事：
   不改协议的发布不动 `WIRE_MINOR`。
 

@@ -101,6 +101,22 @@ impl System for RealSystem {
         Ok(tokio::net::lookup_host((host, 0)).await?.map(|a| a.ip()).collect())
     }
 
+    async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<nexus_sys::UdpConn> {
+        struct Udp(tokio::net::UdpSocket);
+        impl nexus_sys::Datagram for Udp {
+            fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+                self.0.poll_send(cx, buf)
+            }
+            fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+                self.0.poll_recv(cx, buf)
+            }
+        }
+        let any: std::net::SocketAddr = if addr.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
+        let s = tokio::net::UdpSocket::bind(any).await?;
+        s.connect(addr).await?;
+        Ok(nexus_sys::UdpConn(Box::new(Udp(s))))
+    }
+
     fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
         #[cfg(unix)]
         if let Some(exe) = &self.session_holder {
