@@ -54,6 +54,32 @@ class Net:
         self.ns = {"laptop": f"nxma{tag}", "home": f"nxmb{tag}"}
         self.links = {"link1": ("10.81.1", f"m1a{tag}", f"m1b{tag}"), "link2": ("10.81.2", f"m2a{tag}", f"m2b{tag}")}
         self.procs = []
+        self.relay_url = None
+
+    def start_relay(self):
+        """在 home 的命名空间里起一个中继（R86），两边的常驻程序都用它；laptop 经 link1 连到它（TCP）。"""
+        log = open(os.path.join(self.tmp, "relay.log"), "a")
+        p = subprocess.Popen(["ip", "netns", "exec", self.ns["home"], self.args.relay_bin, "0.0.0.0:3340"],
+                             stdout=log, stderr=log)
+        self.procs.append(p)
+        self.relay_url = f"http://{self.links['link1'][0]}.2:3340"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            probe = sh("ip", "netns", "exec", self.ns["laptop"], "python3", "-c",
+                       f"import socket; socket.create_connection(('{self.links['link1'][0]}.2', 3340), 1)", check=False)
+            if probe.returncode == 0:
+                return
+            if p.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise RuntimeError("中继没有起来：" + open(os.path.join(self.tmp, "relay.log")).read())
+
+    def block_udp(self, on):
+        """laptop 两条链路上的 UDP 全部丢弃（直连路径都断），TCP（到中继）照常。"""
+        op = "-A" if on else "-D"
+        for _, va, _ in self.links.values():
+            for chain, flag in (("INPUT", "-i"), ("OUTPUT", "-o")):
+                sh("ip", "netns", "exec", self.ns["laptop"], "iptables", op, chain, flag, va, "-p", "udp", "-j", "DROP")
 
     def setup(self):
         a, b = self.ns["laptop"], self.ns["home"]
@@ -112,7 +138,7 @@ class Net:
         os.makedirs(d, exist_ok=True)
         log = open(os.path.join(d, "daemon.log"), "a")
         p = subprocess.Popen(["ip", "netns", "exec", self.ns[node], self.bin, "daemon", "--name", node,
-                              "--relay", "disabled", "--no-discovery", *self.args.daemon_arg], env=self.env(node), stdout=log, stderr=log)
+                              "--relay", self.relay_url or "disabled", "--no-discovery", *self.args.daemon_arg], env=self.env(node), stdout=log, stderr=log)
         self.procs.append(p)
         sock = os.path.join(d, "ctl.sock")
         deadline = time.time() + 15
@@ -228,12 +254,17 @@ def main():
     ap.add_argument("--delay-ms", type=float, default=0, help="两条链路的往返延迟（毫秒，需要 netem；没有时跳过）")
     ap.add_argument("--delay2-ms", type=float, default=None, help="link2 的往返延迟（默认同 --delay-ms）：测延迟不同的两条链路")
     ap.add_argument("--daemon-arg", action="append", default=[], help="传给两边常驻程序的额外参数（对比测量用，例如 --no-scheduling）")
+    ap.add_argument("--relay-bin", help="测试用中继（cargo build --example local_relay -p nexus-fabric-iroh）；默认在 --bin 旁边的 examples 目录")
+    ap.add_argument("--max-relay-pause", type=float, default=3.0, help="直连都断开、转到中继时输出允许的最长停顿（秒）")
+    ap.add_argument("--relay-mb", type=float, default=4, help="经中继取的文件大小（MB）")
     ap.add_argument("--record", help="把结果写成 JSON")
     ap.add_argument("--require", action="store_true", help="条件不满足时失败而不是跳过")
     ap.add_argument("--keep", action="store_true", help="保留临时目录（常驻程序的日志在里面）")
     args = ap.parse_args()
     if args.delay2_ms is None:
         args.delay2_ms = args.delay_ms
+    if not args.relay_bin:
+        args.relay_bin = os.path.join(os.path.dirname(os.path.abspath(args.bin)), "examples", "local_relay")
     why = missing_requirements()
     if why:
         print(f"跳过多路径检查：{why}")
@@ -255,6 +286,8 @@ def main():
         except NoNetem:
             print("跳过多路径检查：内核没有 netem，不能加延迟")
             return 1 if args.require else 0
+        if "relay" in phases:
+            n.start_relay()
         n.start("home")
         n.start("laptop")
         n.cli("home", "init", "--name", "home")
@@ -344,6 +377,86 @@ def main():
                     failures.append(f"一条链路丢包时终端输出最长间隔 {mx:.3f} 秒，上限 {args.max_gap:g} 秒")
                 time.sleep(1)
             result["redundancy"] = red
+
+        # 经中继的路径（R86）：直连全断时会话转到中继上继续，批量也能走；直连恢复后重新用上，批量回到直连。
+        if "relay" in phases:
+            rel = {}
+
+            def relay_path(paths):
+                return next((p for p in paths if p["kind"] == "relay"), None)
+
+            # 直连都好时中继路径也开着（Backup，不承担数据），直连断了才能马上接管。
+            deadline = time.time() + 10
+            while relay_path(n.cli("laptop", "path", "home")["devices"][0]["paths"]) is None and time.time() < deadline:
+                time.sleep(0.2)
+            if relay_path(n.cli("laptop", "path", "home")["devices"][0]["paths"]) is None:
+                failures.append("直连都好时没有开着的中继路径")
+            t_cut = time.monotonic()
+            n.block_udp(True)
+            time.sleep(args.hold + 3)
+            gaps = exec_tick.gaps(t_cut, time.monotonic())
+            pause = gaps[-1]
+            alive = ex.poll() is None
+            paths = n.cli("laptop", "path", "home")["devices"][0]["paths"]
+            via = relay_path(paths)
+            print(f"中继：两条链路的 UDP 都断开，exec 输出最长停顿 {pause:.3f} 秒，会话{'还在' if alive else '已结束'}；"
+                  f"路径 {[(p['local'], p['remote'], p['kind']) for p in paths]}")
+            rel["cut_max_pause_s"] = round(pause, 3)
+            rel["alive"] = alive
+            if not alive:
+                failures.append(f"直连都断开后命令结束了：{ex.stderr.read()}")
+            elif pause > args.max_relay_pause:
+                failures.append(f"直连都断开后输出停了 {pause:.3f} 秒，上限 {args.max_relay_pause:g} 秒")
+            if via is None:
+                failures.append(f"直连都断开后 nexus path 没有列出中继路径：{paths}")
+            # 经中继取一个文件。
+            size = int(args.relay_mb * 1e6)
+            n.cli("home", "drive", "serve", "on")
+            n.cli("home", "drive", "create", "relayws")
+            for name in ("via-relay.bin", "after-relay.bin"):
+                p = subprocess.run([n.bin, "drive", "put", f"relayws:/{name}", "--json"], env=n.env("home"),
+                                   input=os.urandom(size), capture_output=True, timeout=120)
+                if p.returncode != 0:
+                    raise RuntimeError(p.stderr.decode())
+            n.cli("home", "drive", "commit", "relayws", "-m", "relay")
+            n.cli("laptop", "drive", "sync", "relayws")
+
+            def fetch_relay(name):
+                before = relay_path(n.cli("laptop", "path", "home")["devices"][0]["paths"]) or {"rx_bytes": 0}
+                t = time.monotonic()
+                p = subprocess.run([n.bin, "drive", "cat", f"relayws:/{name}"], env=n.env("laptop"),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
+                secs = time.monotonic() - t
+                if p.returncode != 0:
+                    raise RuntimeError(p.stderr.decode())
+                after = relay_path(n.cli("laptop", "path", "home")["devices"][0]["paths"]) or {"rx_bytes": 0}
+                return size * 8 / secs / 1e6, max(0, after["rx_bytes"] - before["rx_bytes"])
+
+            mbit, via_relay = fetch_relay("via-relay.bin")
+            print(f"  经中继取 {args.relay_mb:g} MB：{mbit:.1f} Mbit/s，中继路径收 {via_relay} 字节")
+            rel["relay_mbit"] = round(mbit, 1)
+            if via_relay < size * 0.9:
+                failures.append(f"直连都断开时取文件，中继路径只收了 {via_relay} 字节（文件 {size} 字节）")
+            # 恢复直连。
+            t_back = time.monotonic()
+            n.block_udp(False)
+            links, _ = n.wait_links(2, 20)
+            back = time.monotonic() - t_back
+            print(f"  恢复后 {back:.1f} 秒重新有直连路径：{links}")
+            rel["direct_back_s"] = round(back, 1)
+            if links != ["link1", "link2"]:
+                failures.append(f"UDP 恢复 20 秒后直连路径只经过 {links}")
+            time.sleep(2)
+            mbit2, via_relay2 = fetch_relay("after-relay.bin")
+            share = via_relay2 / size
+            print(f"  恢复后取 {args.relay_mb:g} MB：{mbit2:.1f} Mbit/s，经中继的占 {share:.1%}")
+            rel["after_mbit"] = round(mbit2, 1)
+            rel["after_relay_share"] = round(share, 4)
+            if share > 0.1:
+                failures.append(f"直连恢复后批量流量仍有 {share:.0%} 走中继")
+            if ex.poll() is not None:
+                failures.append("直连恢复的过程中命令结束了")
+            result["relay"] = rel
 
         # 4、5. 计费网络（R60）和批量分摊（R59）：从 home 取大文件。
         if {"metered", "bulk"} & phases:

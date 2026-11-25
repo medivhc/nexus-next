@@ -3314,14 +3314,15 @@ impl Connection {
         self.set_loss_detection_timer(now, path_id);
     }
 
-    /// NEXUS: 除了 `path_id`，还有没有已验证、没放弃、可用（Available）且没有出现过超时的路径。
+    /// NEXUS: 除了 `path_id`，还有没有已验证、没放弃、没有出现过超时的路径。
+    /// Backup 路径（经中继的路径、计费的接口）也算：直连路径都断了时，在途的数据马上转到中继或 5G 上（M11.4），
+    /// 不等直连路径被放弃（几秒）。Available 路径都还好时 Backup 照旧不承担数据（见 `scheduling_info`）。
     fn nexus_has_healthy_path_besides(&self, path_id: PathId) -> bool {
         self.paths.iter().any(|(id, path)| {
             *id != path_id
                 && self.remote_cids.contains_key(id)
                 && !self.abandoned_paths.contains(id)
                 && path.data.validated
-                && path.data.nexus_status() == PathStatus::Available
                 && path.data.pto_count == 0
         })
     }
