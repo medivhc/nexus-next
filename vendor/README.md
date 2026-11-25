@@ -18,3 +18,5 @@
 | 只减新确认的字节 | noq-proto `src/connection/send_buffer.rs`、`streams/send.rs`、`streams/state.rs` | 同一段数据被确认两次时原来会下溢 |
 | 任何一端标为 Backup 就按 Backup 调度；Available 路径可疑时 Backup 立刻接管 | noq-proto `src/connection/paths.rs`（`nexus_status`）、`mod.rs` | 计费网络（对端的接口计费时本端也不发批量） |
 | 计费的本机地址：从它们出去的直连路径是 Backup | iroh `src/lib.rs`（`nexus_set_metered_ips`）、`remote_state.rs` | 计费网络只承担交互和故障接管 |
+| 直连都可疑时 Backup 路径（中继、计费的接口）也算健康路径：在途的数据马上转过去 | noq-proto `src/connection/mod.rs`（`nexus_has_healthy_path_besides`） | 直连都断时原来要等直连被放弃（5 秒）才在中继上重发（M11.4） |
+| BBR 的应用受限标记：上一段受限的数据送达时，现在仍受限就重新标记（原来是 `else if`） | noq-proto `src/congestion/bbr3/mod.rs`（`on_end_acks`） | 零星的交互流量被当成带宽到顶，起步阶段过早结束，批量传输开头几秒只有一半速度（M11.4） |

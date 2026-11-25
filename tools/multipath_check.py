@@ -13,7 +13,10 @@ laptop 和 home 的常驻程序各在一个网络命名空间里，中间有两�
      `nexus exec`（普通流量，不冗余）作对比。（R58）
   4. 计费网络：把 laptop 在 link2 上的接口标为计费，从 home 取一个大文件（批量流量），link2 上几乎没有这部分流量；
      终端输出照样两条都走。（R60）
-  5. 批量分摊：两条链路都限速（--bulk-rate，默认 20 Mbit/s），取大文件的吞吐超过一条链路的 1.3 倍。（R59）
+  5. 批量分摊：两条链路都限速（--bulk-rate，默认 20 Mbit/s），取大文件的吞吐超过只有一条时（4 里计费时实测的）的
+     --bulk-ratio 倍（默认 1.7）；计费改回自动后的第一次传输也算（不预热）。（R59、R85）
+  6. 经中继的路径（--only relay，默认也做）：home 上起一个中继，两条链路的 UDP 都丢弃后会话在 --max-relay-pause
+     （默认 3 秒）内转到中继上继续，取文件经中继；恢复 UDP 后回到直连。（R86）
   结果写进 --record（R61 的测量记录）。
 
 需要 root、ip、iptables。条件不满足时说明原因并跳过（退出码 0），除非给出 --require。
@@ -249,8 +252,9 @@ def main():
     ap.add_argument("--max-gap", type=float, default=0.2, help="有丢包时终端输出允许的最长间隔（秒）")
     ap.add_argument("--bulk-rate", type=float, default=20, help="批量检查时两条链路的限速（Mbit/s）")
     ap.add_argument("--bulk-repeat", type=int, default=1, help="批量检查每种情况取几次（测量用；默认 1 次，不达标时最多 3 次）")
+    ap.add_argument("--bulk-ratio", type=float, default=1.7, help="两条链路时批量吞吐至少是只有一条时的几倍（R85）")
     ap.add_argument("--bulk-mb", type=float, default=16, help="批量检查取的文件大小（MB）")
-    ap.add_argument("--only", default="failover,redundancy,metered,bulk", help="只做这些检查（逗号分隔）")
+    ap.add_argument("--only", default="failover,redundancy,relay,metered,bulk", help="只做这些检查（逗号分隔）")
     ap.add_argument("--delay-ms", type=float, default=0, help="两条链路的往返延迟（毫秒，需要 netem；没有时跳过）")
     ap.add_argument("--delay2-ms", type=float, default=None, help="link2 的往返延迟（默认同 --delay-ms）：测延迟不同的两条链路")
     ap.add_argument("--daemon-arg", action="append", default=[], help="传给两边常驻程序的额外参数（对比测量用，例如 --no-scheduling）")
@@ -270,6 +274,11 @@ def main():
         print(f"跳过多路径检查：{why}")
         return 1 if args.require else 0
     phases = set(args.only.split(","))
+    if "relay" in phases and not os.path.exists(args.relay_bin):
+        print(f"跳过经中继的检查：没有测试用中继 {args.relay_bin}（cargo build --example local_relay -p nexus-fabric-iroh）")
+        if args.require:
+            return 1
+        phases.discard("relay")
     if {"metered", "bulk"} & phases:
         # 批量检查要两条链路都限速（才看得出分摊）；其他检查在限速下照样做。
         args.rate1 = args.rate1 or args.bulk_rate
@@ -502,18 +511,21 @@ def main():
                 failures.append(f"计费的链路承担了 {share:.0%} 的批量流量")
             n.cli("laptop", "iface", n.iface(metered_link), "--metered", "auto")
             time.sleep(7)
-            single = min(args.rate1, args.rate2)
+            # 和实测的「只有一条」比（R85），不是和限速比：限速的链路实际能跑的比标称低一点。
+            single = max(singles)
+            want = single * args.bulk_ratio
             runs = []
             for attempt, name in enumerate(twos, 1):
                 mbit_b, use_b = fetch(name)
                 runs.append(round(mbit_b, 1))
-                print(f"批量分摊（第 {attempt} 次）：两条都不计费，取 {args.bulk_mb:g} MB：{mbit_b:.1f} Mbit/s（一条链路 {single:g} Mbit/s），各链路字节数 {use_b}")
-                if reps == 1 and (mbit_b >= single * 1.3 or "bulk" not in phases):
+                print(f"批量分摊（第 {attempt} 次）：两条都不计费，取 {args.bulk_mb:g} MB：{mbit_b:.1f} Mbit/s（只有一条时 {single:g} Mbit/s 的 {mbit_b / single:.2f} 倍），各链路字节数 {use_b}")
+                if reps == 1 and (mbit_b >= want or "bulk" not in phases):
                     break
             mbit_b = max(runs)
-            result["bulk"] = {"mbit": mbit_b, "single_link_mbit": single, "bytes": use_b, "runs_mbit": runs}
-            if "bulk" in phases and mbit_b < single * 1.3:
-                failures.append(f"两条链路时批量吞吐 {mbit_b:.1f} Mbit/s，没有超过一条链路的 1.3 倍（{single * 1.3:.1f}）")
+            result["bulk"] = {"mbit": mbit_b, "single_path_mbit": single, "ratio": round(mbit_b / single, 2),
+                              "first_ratio": round(runs[0] / single, 2), "bytes": use_b, "runs_mbit": runs}
+            if "bulk" in phases and mbit_b < want:
+                failures.append(f"两条链路时批量吞吐 {mbit_b:.1f} Mbit/s，没有超过只有一条时的 {args.bulk_ratio:g} 倍（{want:.1f}）")
     finally:
         n.teardown()
 
