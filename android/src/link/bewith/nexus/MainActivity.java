@@ -102,7 +102,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        main.removeCallbacksAndMessages(null);
+        main.removeCallbacks(ticker);
     }
 
     @Override
@@ -113,7 +113,8 @@ public class MainActivity extends Activity {
 
     /** 在后台线程里问核心，回到界面线程画出来，2 秒后再来。 */
     private void tick() {
-        main.removeCallbacksAndMessages(null);
+        // 只撤掉排着的下一次刷新；后台线程投递回来的结果不能撤，否则 busy 一直为真、界面再也不刷新。
+        main.removeCallbacks(ticker);
         if (busy) {
             return;
         }
