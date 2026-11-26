@@ -136,6 +136,31 @@ impl World {
         out
     }
 
+    /// 节点上应用的界面刷新一次（M11.2）：和 Android 应用一样经控制通道调用 [`nexus_cli::app::refresh`]。
+    /// `now_ms` 为空时用节点现在的时间。
+    pub async fn app_screen(
+        &self,
+        node: &str,
+        held: Option<nexus_cli::app::JoinView>,
+        renew: bool,
+        now_ms: Option<u64>,
+    ) -> nexus_cli::app::Screen {
+        let now = now_ms.unwrap_or_else(|| self.now().0);
+        let screen = match &self.inner {
+            Inner::Sim { nodes, .. } => {
+                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                nexus_cli::app::refresh(&ChanCtl(tx.clone(), None), held, renew, now).await
+            }
+            Inner::Real(real) => {
+                let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                nexus_cli::app::refresh(&nexus_cli::UnixCtl::new(dir, None), held, renew, now).await
+            }
+        };
+        let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
+        self.trace.borrow_mut().push(format!("{at}ms {node} app {screen:?}"));
+        screen
+    }
+
     /// 让所有节点的时钟向前跳一段，期间什么都不发生。
     ///
     /// 仿真里瞬间完成，适合验证「四小时后授权过期」这类只取决于当前时间的行为。
