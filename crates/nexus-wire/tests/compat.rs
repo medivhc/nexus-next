@@ -186,6 +186,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::VaultPull => "request.vault_pull",
                 Request::RootRotate { .. } => "request.root_rotate",
                 Request::SvcDatagram { .. } => "request.svc_datagram",
+                Request::ExitDatagram { .. } => "request.exit_datagram",
             };
             (name, r)
         })

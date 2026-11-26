@@ -26,9 +26,9 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * 请求 VPN 授权（第一次会弹出系统对话框），启动 Nexus，然后显示这台设备的状态（M11.2，R79）：
- * 还没加入网络时显示短加入码、长加入码和二维码，管理设备批准后自动变成「已加入」。
- * 显示什么由核心决定（NexusCore.nativeScreen），这里只负责画和每 2 秒刷新一次。
+ * 请求 VPN 授权（第一次会弹出系统对话框），启动 Nexus，然后显示这台设备的状态（M11.2 / N1 / N2）：
+ * - 还没加入网络时显示短加入码、长加入码和二维码，管理设备批准后自动变成「已加入」。
+ * - 已加入时提供 N2 电源模式切换（默认平衡省电，按需开启实时多路径）与 N1/N2 一键停止 VPN 快速回退。
  */
 public class MainActivity extends Activity {
     private static final int REQUEST_VPN = 1;
@@ -40,6 +40,7 @@ public class MainActivity extends Activity {
     private boolean renew;
     private boolean running;
     private boolean busy;
+    private String powerMode = "balanced";
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -54,21 +55,49 @@ public class MainActivity extends Activity {
     private TextView longCode;
     private Button renewButton;
     private TextView devices;
+    private Button powerModeButton;
+    private Button stopButton;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         buildViews();
         if ("stop".equals(getIntent().getStringExtra("action"))) {
-            startService(new Intent(this, NexusVpnService.class).setAction(NexusVpnService.ACTION_STOP));
-            show(title, "Nexus 已停止");
+            stopVpn();
             return;
+        }
+        String extraMode = getIntent().getStringExtra("power_mode");
+        if (extraMode != null && !extraMode.isEmpty()) {
+            powerMode = extraMode.trim().toLowerCase();
+        } else if (getIntent().hasExtra("multipath") && getIntent().getBooleanExtra("multipath", false)) {
+            powerMode = "realtime";
         }
         Intent consent = VpnService.prepare(this);
         if (consent != null) {
             startActivityForResult(consent, REQUEST_VPN);
         } else {
             onActivityResult(REQUEST_VPN, RESULT_OK, null);
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (intent == null) {
+            return;
+        }
+        if ("stop".equals(intent.getStringExtra("action"))) {
+            stopVpn();
+            return;
+        }
+        String extraMode = intent.getStringExtra("power_mode");
+        if (extraMode != null && !extraMode.isEmpty()) {
+            powerMode = extraMode.trim().toLowerCase();
+            startService(new Intent(this, NexusVpnService.class)
+                .setAction(NexusVpnService.ACTION_POWER_MODE)
+                .putExtra("power_mode", powerMode));
+            updatePowerButtonLabel();
         }
     }
 
@@ -111,9 +140,34 @@ public class MainActivity extends Activity {
         worker.shutdownNow();
     }
 
+    private void stopVpn() {
+        running = false;
+        main.removeCallbacks(ticker);
+        startService(new Intent(this, NexusVpnService.class).setAction(NexusVpnService.ACTION_STOP));
+        hideAll();
+        show(title, "Nexus 已停止");
+        show(message, "VPN 已释放，系统已恢复原有网络。");
+    }
+
+    private void togglePowerMode() {
+        powerMode = "realtime".equals(powerMode) ? "balanced" : "realtime";
+        Intent intent = new Intent(this, NexusVpnService.class)
+            .setAction(NexusVpnService.ACTION_POWER_MODE)
+            .putExtra("power_mode", powerMode);
+        startService(intent);
+        updatePowerButtonLabel();
+    }
+
+    private void updatePowerButtonLabel() {
+        if ("realtime".equals(powerMode)) {
+            powerModeButton.setText("电源模式：实时多路径（点按切回平衡省电）");
+        } else {
+            powerModeButton.setText("电源模式：平衡省电（点按切换实时多路径）");
+        }
+    }
+
     /** 在后台线程里问核心，回到界面线程画出来，2 秒后再来。 */
     private void tick() {
-        // 只撤掉排着的下一次刷新；后台线程投递回来的结果不能撤，否则 busy 一直为真、界面再也不刷新。
         main.removeCallbacks(ticker);
         if (busy) {
             return;
@@ -132,6 +186,9 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         busy = false;
+                        if (!running) {
+                            return;
+                        }
                         render(json);
                         if (!isFinishing() && !isDestroyed()) {
                             main.postDelayed(ticker, REFRESH_MS);
@@ -154,20 +211,26 @@ public class MainActivity extends Activity {
         switch (state) {
             case "starting":
                 show(title, "正在启动 Nexus…");
+                stopButton.setVisibility(View.VISIBLE);
                 break;
             case "joined":
                 held = "";
                 show(title, "已加入网络");
                 show(message, "本机：" + s.optString("name"));
                 show(devices, deviceList(s.optJSONArray("devices")));
+                updatePowerButtonLabel();
+                powerModeButton.setVisibility(View.VISIBLE);
+                stopButton.setVisibility(View.VISIBLE);
                 break;
             case "joining":
                 held = json;
                 renderJoining(s);
+                stopButton.setVisibility(View.VISIBLE);
                 break;
             default:
                 show(title, "出错了");
                 show(message, s.optString("message", "核心的回应无法理解"));
+                stopButton.setVisibility(View.VISIBLE);
         }
     }
 
@@ -261,6 +324,25 @@ public class MainActivity extends Activity {
         col.addView(renewButton);
         devices = text(col, "devices", 16, false);
         devices.setGravity(Gravity.START);
+        powerModeButton = new Button(this);
+        powerModeButton.setContentDescription("power_mode");
+        powerModeButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                togglePowerMode();
+            }
+        });
+        col.addView(powerModeButton);
+        stopButton = new Button(this);
+        stopButton.setText("停止 VPN（快速回退）");
+        stopButton.setContentDescription("stop_vpn");
+        stopButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                stopVpn();
+            }
+        });
+        col.addView(stopButton);
         hideAll();
         show(title, "Nexus");
         ScrollView scroll = new ScrollView(this);
@@ -282,7 +364,7 @@ public class MainActivity extends Activity {
     }
 
     private void hideAll() {
-        for (View v : new View[] {title, message, shortCode, qr, longCode, renewButton, devices}) {
+        for (View v : new View[] {title, message, shortCode, qr, longCode, renewButton, devices, powerModeButton, stopButton}) {
             v.setVisibility(View.GONE);
         }
     }

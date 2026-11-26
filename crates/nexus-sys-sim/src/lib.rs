@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use nexus_core_proto::Timestamp;
-use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System};
+use nexus_sys::{Cmd, Datagram, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System, UdpConn};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -45,7 +45,12 @@ pub struct SimSystem {
 
 /// 仿真节点上「本机运行着的 TCP 服务」，按端口登记。克隆后共享，测试可以随时增加。
 #[derive(Clone, Default)]
-pub struct SimServices(Rc<RefCell<BTreeMap<u16, SimService>>>, Rc<RefCell<BTreeMap<std::net::SocketAddr, SimService>>>);
+pub struct SimServices {
+    local: Rc<RefCell<BTreeMap<u16, SimService>>>,
+    public: Rc<RefCell<BTreeMap<std::net::SocketAddr, SimService>>>,
+    hosts: Rc<RefCell<BTreeMap<String, Vec<std::net::IpAddr>>>>,
+    udp_echo: Rc<RefCell<BTreeMap<std::net::SocketAddr, usize>>>,
+}
 
 /// 仿真里的本机服务。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,12 +69,27 @@ pub enum SimService {
 
 impl SimServices {
     pub fn add(&self, port: u16, service: SimService) {
-        self.0.borrow_mut().insert(port, service);
+        self.local.borrow_mut().insert(port, service);
     }
 
     /// 一个从「外面」连得到的服务：只有用这个地址才连得上，本机地址连不上。
     pub fn add_public(&self, addr: std::net::SocketAddr, service: SimService) {
-        self.1.borrow_mut().insert(addr, service);
+        self.public.borrow_mut().insert(addr, service);
+    }
+
+    /// 注册仿真主机名解析记录（N1 测试用）。
+    pub fn add_host(&self, host: &str, ip: std::net::IpAddr) {
+        self.hosts.borrow_mut().entry(host.to_ascii_lowercase()).or_default().push(ip);
+    }
+
+    /// 注册仿真 UDP 回声目标（收到 payload 返回 `echo:<payload>`，并计数）。
+    pub fn add_udp_echo(&self, addr: std::net::SocketAddr) {
+        self.udp_echo.borrow_mut().insert(addr, 0);
+    }
+
+    /// 查询仿真 UDP 目标收到的报文计数。
+    pub fn udp_hits(&self, addr: std::net::SocketAddr) -> usize {
+        self.udp_echo.borrow().get(&addr).copied().unwrap_or(0)
     }
 }
 
@@ -99,9 +119,9 @@ impl System for SimSystem {
 
     async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<SimTcp> {
         let service = if addr.ip().is_loopback() {
-            self.services.0.borrow().get(&addr.port()).cloned()
+            self.services.local.borrow().get(&addr.port()).cloned()
         } else {
-            self.services.1.borrow().get(&addr).cloned()
+            self.services.public.borrow().get(&addr).cloned()
         };
         match service {
             Some(service) => Ok(SimTcp { service, inbox: Vec::new(), outbox: VecDeque::new(), closed: false, stage: 0, reader: None, writer: None }),
@@ -109,8 +129,24 @@ impl System for SimSystem {
         }
     }
 
-    /// 仿真里只认识 localhost。
+    async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<UdpConn> {
+        if self.services.udp_echo.borrow().contains_key(&addr) {
+            Ok(UdpConn(Box::new(SimUdp {
+                addr,
+                hits: self.services.udp_echo.clone(),
+                inbox: RefCell::new(VecDeque::new()),
+                waker: RefCell::new(None),
+            })))
+        } else {
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("{addr} 上没有 UDP 服务")))
+        }
+    }
+
+    /// 仿真里默认认识 localhost，以及通过 `SimServices::add_host` 登记的主机名。
     async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        if let Some(ips) = self.services.hosts.borrow().get(&host.to_ascii_lowercase()) {
+            return Ok(ips.clone());
+        }
         match host {
             "localhost" => Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])]),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("仿真里没有主机 {host}"))),
@@ -850,5 +886,38 @@ mod tests {
         assert_eq!(printf("100%%", &[]), b"100%");
         assert_eq!(printf("x%sy", &[]), b"xy");
         assert_eq!(unescape("a\\nb\\\\"), b"a\nb\\");
+    }
+}
+
+struct SimUdp {
+    addr: std::net::SocketAddr,
+    hits: Rc<RefCell<BTreeMap<std::net::SocketAddr, usize>>>,
+    inbox: RefCell<VecDeque<Vec<u8>>>,
+    waker: RefCell<Option<std::task::Waker>>,
+}
+
+impl Datagram for SimUdp {
+    fn poll_send(&self, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        if let Some(count) = self.hits.borrow_mut().get_mut(&self.addr) {
+            *count += 1;
+        }
+        let mut reply = b"echo:".to_vec();
+        reply.extend_from_slice(buf);
+        self.inbox.borrow_mut().push_back(reply);
+        if let Some(w) = self.waker.borrow_mut().take() {
+            w.wake();
+        }
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+        if let Some(pkt) = self.inbox.borrow_mut().pop_front() {
+            let n = pkt.len().min(buf.remaining());
+            buf.put_slice(&pkt[..n]);
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            *self.waker.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
     }
 }

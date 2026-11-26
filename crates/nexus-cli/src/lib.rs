@@ -732,8 +732,11 @@ pub enum RouteCmd {
     #[command(group = clap::ArgGroup::new("outbound").required(true))]
     Add {
         /// 匹配这个域名和它的子域名
-        #[arg(long, value_name = "域名", required_unless_present = "cidr", conflicts_with = "cidr")]
+        #[arg(long, value_name = "域名", conflicts_with_all = ["cidr", "domain_exact"])]
         domain: Option<String>,
+        /// 仅精确匹配这个域名本身（不含子域名）
+        #[arg(long, value_name = "域名", conflicts_with_all = ["cidr", "domain"])]
+        domain_exact: Option<String>,
         /// 匹配这个地址段，例如 10.0.0.0/8
         #[arg(long, value_name = "地址/前缀")]
         cidr: Option<String>,
@@ -770,6 +773,35 @@ pub enum RouteCmd {
     Explain {
         /// 主机:端口
         target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从 Clash / Mihomo YAML 规则子集导入并输出审计报告（N1）
+    Import {
+        /// 规则文件路径
+        file: std::path::PathBuf,
+        /// 代理组默认映射到的 Nexus 出口设备
+        #[arg(long, value_name = "设备")]
+        via: Option<String>,
+        /// 代理组默认映射到的上游 SOCKS5 地址（主机:端口）
+        #[arg(long, value_name = "主机:端口")]
+        socks5: Option<String>,
+        /// 替换现有规则（默认追加）；替换前自动保存 LKG 快照
+        #[arg(long)]
+        replace: bool,
+        /// 仅解析并输出审计报告，不下发给常驻程序
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 回滚路由规则到上一份已验证的 LKG 快照（N1）
+    Rollback {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 对当前路由规则执行静态冲突/遮蔽/无效上游审计（N1）
+    Audit {
         #[arg(long)]
         json: bool,
     },
@@ -1037,11 +1069,12 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Some(addr) => connect_listen(ctl, node, name, addr, sink).await,
             };
         }
-        Cmd::Route { cmd: RouteCmd::Add { domain, cidr, reject, via, socks5, json, .. } } => {
-            let matcher = match (domain, cidr) {
-                (Some(d), _) => route::Matcher::parse_domain(d),
-                (None, Some(c)) => route::Matcher::parse_cidr(c),
-                (None, None) => Err("需要 --domain 或 --cidr".to_string()),
+        Cmd::Route { cmd: RouteCmd::Add { domain, domain_exact, cidr, reject, via, socks5, json, .. } } => {
+            let matcher = match (domain, domain_exact, cidr) {
+                (Some(d), _, _) => route::Matcher::parse_domain(d),
+                (None, Some(d), _) => route::Matcher::parse_domain_exact(d),
+                (None, None, Some(c)) => route::Matcher::parse_cidr(c),
+                (None, None, None) => Err("需要 --domain、--domain-exact 或 --cidr".to_string()),
             };
             let matcher = match matcher {
                 Ok(m) => m,
@@ -1066,6 +1099,50 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
             (CtlRequest::RouteExplain { target: target.clone() }, *json)
         }
+        Cmd::Route { cmd: RouteCmd::Import { file, via, socks5, replace, dry_run, json } } => {
+            let text = match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法读取规则文件 {}：{e}", file.display())),
+            };
+            let opts = nexus_net_core::import::ImportOptions {
+                default_exit: via.clone(),
+                default_socks5: socks5.clone(),
+            };
+            let report = nexus_net_core::import::parse_clash_rules(&text, &opts);
+            let audit = route::audit_rules(&report.imported);
+            if *dry_run {
+                if *json {
+                    sink.out(doc(json!({
+                        "schema": JSON_SCHEMA,
+                        "dry_run": true,
+                        "imported": report.imported.len(),
+                        "skipped": report.skipped,
+                        "notes": report.notes,
+                        "audit": audit,
+                    })).as_bytes());
+                } else {
+                    let mut out = format!("试运行：可导入 {} 条，跳过 {} 条
+", report.imported.len(), report.skipped.len());
+                    for s in &report.skipped {
+                        out.push_str(&format!("  跳过 第{}行 {}: {}
+", s.line, s.raw, s.reason));
+                    }
+                    for n in &report.notes {
+                        out.push_str(&format!("  提示 {n}
+"));
+                    }
+                    for i in &audit.issues {
+                        out.push_str(&format!("  审计 {}
+", i.message));
+                    }
+                    sink.out(out.as_bytes());
+                }
+                return 0;
+            }
+            (CtlRequest::RouteImport { rules: report.imported, replace: *replace }, *json)
+        }
+        Cmd::Route { cmd: RouteCmd::Rollback { json } } => (CtlRequest::RouteRollback, *json),
+        Cmd::Route { cmd: RouteCmd::Audit { json } } => (CtlRequest::RouteAudit, *json),
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
         Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
@@ -1460,6 +1537,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
         CtlResponse::Ok => match cmd {
+            Cmd::Route { cmd: RouteCmd::Rollback { .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "rolled_back": true }))
+                } else {
+                    "已回滚到上一版规则快照\n".into()
+                }
+            }
             Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
@@ -1490,6 +1574,38 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
             _ => String::new(),
         },
+        CtlResponse::RouteImported { total, audit } => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "total": total, "audit": audit }))
+            } else if audit.is_clean() {
+                format!("已导入规则（当前共 {total} 条，静态审计无冲突；已保存上一版 LKG 快照）
+")
+            } else {
+                let mut out = format!("已导入规则（当前共 {total} 条，发现 {} 条审计提示；已保存上一版 LKG 快照）：
+", audit.issues.len());
+                for i in &audit.issues {
+                    out.push_str(&format!("  - {}
+", i.message));
+                }
+                out
+            }
+        }
+        CtlResponse::RouteAudit(audit) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "clean": audit.is_clean(), "issues": audit.issues }))
+            } else if audit.is_clean() {
+                "规则静态审计通过：无重复、无遮蔽、无无效上游
+".into()
+            } else {
+                let mut out = format!("规则静态审计发现 {} 项问题：
+", audit.issues.len());
+                for i in &audit.issues {
+                    out.push_str(&format!("  - {}
+", i.message));
+                }
+                out
+            }
+        }
         CtlResponse::Exit { enabled } => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "exit": enabled }))

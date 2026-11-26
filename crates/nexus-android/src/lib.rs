@@ -227,6 +227,35 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
     env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+
+/// N2 电源模式查询：判断当前模式在有 Wi-Fi 时是否需要主动请求蜂窝网络。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeShouldKeepCellular(
+    mut env: JNIEnv,
+    _class: JClass,
+    power_mode: JString,
+) -> jboolean {
+    let mode_str = string(&mut env, &power_mode);
+    let mode = nexus_net_core::power::PowerMode::parse(&mode_str);
+    jboolean::from(nexus_net_core::power::PowerPolicy::for_mode(mode).keep_cellular_with_wifi)
+}
+
+/// N1 应用绕过列表归一化：返回按换行分隔的最终 `disallowed_packages`（强制包含自身包名防 VPN 环路）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeEffectiveBypass(
+    mut env: JNIEnv,
+    _class: JClass,
+    self_pkg: JString,
+    raw_lines: JString,
+) -> jstring {
+    let self_pkg = string(&mut env, &self_pkg);
+    let raw = string(&mut env, &raw_lines);
+    let policy = nexus_net_core::app_policy::AppPolicy::parse_lines(&raw);
+    let joined = policy.effective_disallowed_packages(&self_pkg).join("
+");
+    env.new_string(joined).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     // covers: R79
