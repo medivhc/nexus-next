@@ -6,7 +6,7 @@
 //!
 //! 这里有 unsafe：JNI 导出函数要求不改名（`no_mangle`），网卡来自一个原始文件描述符。
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JBooleanArray, JClass, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use nexus_cli::daemon;
@@ -169,6 +169,30 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(_env: JNIEnv, _class: JClass) {
     stop();
+}
+
+/// 系统的网络变化时（M11.4）：应用把当前每个网络的接口名和是否计费交过来，下一次查看接口（5 秒内）时生效。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeSetNetworks(
+    mut env: JNIEnv,
+    _class: JClass,
+    names: JObjectArray,
+    metered: JBooleanArray,
+) {
+    let n = env.get_array_length(&names).unwrap_or(0).max(0) as usize;
+    let mut flags = vec![0 as jboolean; n];
+    if env.get_boolean_array_region(&metered, 0, &mut flags).is_err() {
+        return;
+    }
+    let mut list = Vec::with_capacity(n);
+    for (i, m) in flags.iter().enumerate() {
+        let Ok(obj) = env.get_object_array_element(&names, i as i32) else { return };
+        let name = string(&mut env, &JString::from(obj));
+        if !name.is_empty() {
+            list.push((name, *m != 0));
+        }
+    }
+    nexus_fabric_iroh::set_system_networks(list);
 }
 
 #[unsafe(no_mangle)]

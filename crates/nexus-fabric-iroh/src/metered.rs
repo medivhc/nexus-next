@@ -2,9 +2,30 @@
 //!
 //! 自动识别（Linux、Android）：蜂窝网络的设备（`DEVTYPE=wwan`、原始 IP 类型的接口）和常见的蜂窝、
 //! USB 网络共享接口名（`wwan`、`rmnet`、`ccmni`、`usb`、`rndis`）。用户可以按接口名手动覆盖。
+//!
+//! Android（M11.4）：系统知道每个网络是否计费（`NET_CAPABILITY_NOT_METERED`，包括计费的 Wi-Fi 热点），
+//! 应用把它经 [`set_system_networks`] 交过来；系统报告过的接口按系统的结果，其余的仍按名字和设备类型识别。
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
+
+/// 系统报告的网络：接口名 → 是否计费。`None`：系统没有报告（Linux）。
+static SYSTEM: Mutex<Option<BTreeMap<String, bool>>> = Mutex::new(None);
+
+/// 系统（Android 的 ConnectivityManager）报告的当前网络：接口名和是否计费。每次网络变化时整体替换。
+pub fn set_system_networks(list: impl IntoIterator<Item = (String, bool)>) {
+    let map = list.into_iter().collect();
+    *SYSTEM.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
+}
+
+/// 自动识别的结果：系统报告过这个接口就按系统的，否则按名字和设备类型。
+fn auto_metered(name: &str, system: Option<&BTreeMap<String, bool>>) -> bool {
+    match system.and_then(|s| s.get(name)) {
+        Some(&m) => m,
+        None => looks_metered(name),
+    }
+}
 
 /// 一个接口：名字、地址、自动识别的结果。
 pub(crate) struct Iface {
@@ -35,10 +56,11 @@ pub(crate) fn scan() -> Vec<Iface> {
             by_name.entry(ifa.interface_name).or_default().push(ip);
         }
     }
+    let system = SYSTEM.lock().unwrap_or_else(|e| e.into_inner()).clone();
     by_name
         .into_iter()
         .map(|(name, addrs)| {
-            let auto_metered = looks_metered(&name);
+            let auto_metered = auto_metered(&name, system.as_ref());
             Iface { name, addrs, auto_metered }
         })
         .collect()
@@ -60,7 +82,23 @@ pub(crate) fn looks_metered(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_metered;
+    use super::{auto_metered, looks_metered};
+    use std::collections::BTreeMap;
+
+    // covers: R88
+    #[test]
+    fn the_system_report_wins_over_names() {
+        // Android：计费的 Wi-Fi 热点（名字看不出来）按系统的结果计费；系统说不计费的蜂窝网络（不限流量的套餐）不计费。
+        let system: BTreeMap<String, bool> = [("wlan0".to_string(), true), ("rmnet_data0".to_string(), false)].into();
+        assert!(auto_metered("wlan0", Some(&system)));
+        assert!(!auto_metered("rmnet_data0", Some(&system)));
+        // 系统没有报告的接口（例如 USB 网络共享）仍按名字识别。
+        assert!(auto_metered("rndis0", Some(&system)));
+        assert!(!auto_metered("eth0", Some(&system)));
+        // 没有系统报告（Linux）：和原来一样。
+        assert!(!auto_metered("wlan0", None));
+        assert!(auto_metered("rmnet_data0", None));
+    }
 
     #[test]
     fn cellular_and_tethering_names_are_metered() {
