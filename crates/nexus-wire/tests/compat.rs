@@ -150,6 +150,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             roster: roster(),
             addrs: vec![(node(3), "hint".into())],
         },
+        Request::SvcDatagram { name: "dns".into() },
     ];
     all.into_iter()
         .map(|r| {
@@ -184,6 +185,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::VaultPush { .. } => "request.vault_push",
                 Request::VaultPull => "request.vault_pull",
                 Request::RootRotate { .. } => "request.root_rotate",
+                Request::SvcDatagram { .. } => "request.svc_datagram",
             };
             (name, r)
         })

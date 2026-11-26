@@ -42,9 +42,9 @@ fn main() {
     }
     let data_dir = data_dir(&cli);
     // 终端会话的持有进程（M7.2）：自己建运行时，shell 退出才返回。
-    if let Cmd::SessionHold { name, cols, rows, created_at_ms } = &cli.cmd {
+    if let Cmd::SessionHold { name, cols, rows, created_at_ms, restore } = &cli.cmd {
         let size = nexus_sys_real::Size { cols: *cols, rows: *rows };
-        let r = nexus_sys_real::holder::run(&data_dir, name, size, nexus_core_proto::Timestamp(*created_at_ms));
+        let r = nexus_sys_real::holder::run(&data_dir, name, size, nexus_core_proto::Timestamp(*created_at_ms), *restore);
         if let Err(e) = r {
             Terminal.err(format!("nexus session-hold: {e}\n").as_bytes());
             std::process::exit(EXIT_INTERNAL);

@@ -7,6 +7,10 @@
 //! `.sock` 是一个端点文件，写着回环 TCP 地址和一次性口令：数据目录只有本人能读，读得到口令才连得上，
 //! 和域套接字的 `0600` 等价。口令是连上后的第一帧之前的 32 个字节，之后的协议两个平台完全一样。
 //!
+//! 持有进程还定时把会话的屏幕和 shell 的工作目录记在 `<会话名>.state`（M11.5，R90）。设备重启或持有进程意外结束后，
+//! 常驻程序下次启动时按它恢复会话：同名、同一个创建时间，在原来的工作目录里重新启动 shell，屏幕上是中断前的内容。
+//! shell 正常退出或会话被结束时删掉它。
+//!
 //! 常驻程序和持有进程之间的协议（[`Up`]、[`Down`]）跨版本使用：升级后新的常驻程序要接管旧的持有进程。
 //! 规则和节点间协议一样（docs/protocol.md）：只在末尾加新种类，已有的编码不变（`tests/holder_compat.rs`）。
 
@@ -58,6 +62,91 @@ fn pid_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.pid"))
 }
 
+fn state_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.state"))
+}
+
+/// 记下的会话状态的格式版本：不认识的版本不恢复。
+const STATE_VERSION: u16 = 1;
+/// 屏幕有变化时最多多久记一次。
+const SAVE_EVERY: Duration = Duration::from_secs(1);
+
+/// 为恢复会话记下的状态（`<会话名>.state`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub version: u16,
+    pub created_at_ms: u64,
+    pub size: Size,
+    /// shell 当时的工作目录（只在能查到的系统上有）。
+    pub cwd: Option<PathBuf>,
+    /// 把终端重绘成当时屏幕的数据。
+    pub screen: Vec<u8>,
+    /// 记下的时间（毫秒）。
+    pub saved_at_ms: u64,
+}
+
+fn load_state(dir: &Path, name: &str) -> Option<Saved> {
+    let bytes = std::fs::read(state_path(dir, name)).ok()?;
+    let saved: Saved = postcard::from_bytes(&bytes).ok()?;
+    (saved.version == STATE_VERSION).then_some(saved)
+}
+
+/// 先写临时文件再改名：中途断电也不会留下半个文件。
+fn store_state(dir: &Path, name: &str, saved: &Saved) -> io::Result<()> {
+    let path = state_path(dir, name);
+    let tmp = dir.join(format!("{name}.state.tmp"));
+    let bytes = postcard::to_allocvec(saved).map_err(bad)?;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, path)
+}
+
+/// shell 当前的工作目录。
+#[allow(unused_variables)]
+fn shell_cwd(pid: Option<u32>) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_link(format!("/proc/{}/cwd", pid?)).ok();
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// 关机时系统发来的结束信号（Unix 的 SIGTERM）。Windows 上没有对应的，永远等不到。
+struct Terminate {
+    #[cfg(unix)]
+    sig: tokio::signal::unix::Signal,
+}
+
+impl Terminate {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            sig: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            self.sig.recv().await;
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
+}
+
 fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
     let body = postcard::to_allocvec(msg).expect("内存中的值总能编码");
     let mut out = (body.len() as u32).to_be_bytes().to_vec();
@@ -96,36 +185,64 @@ fn read_frame_blocking<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::R
 // ------------------------------------------------------------------ 持有进程
 
 /// 持有进程的主体：`nexus session-hold` 调用，直到 shell 退出才返回。
-pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<()> {
+/// `restore` 时按记下的状态恢复（见模块说明）。
+pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(hold(data_dir, name, size, created_at))
+    rt.block_on(hold(data_dir, name, size, created_at, restore))
 }
 
 /// 发给常驻程序的消息排队等待的上限。
 const UP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<()> {
+async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<()> {
     let dir = sessions_dir(data_dir);
     transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     let pid = pid_path(&dir, name);
     let _ = std::fs::remove_file(&sock);
-    let mut pty = RealPty::spawn(size)?;
+    let saved = if restore { load_state(&dir, name) } else { None };
+    let cwd = saved.as_ref().and_then(|s| s.cwd.clone()).filter(|c| c.is_dir());
+    let mut pty = RealPty::spawn_in(size, cwd.as_deref())?;
     let mut accepted = transport::listen(&sock).await?;
     std::fs::write(&pid, std::process::id().to_string())?;
-    // 走到哪一步都要删掉这两个文件：常驻程序靠它们找会话。
-    struct Cleanup(PathBuf, PathBuf);
+    // 走到哪一步都要删掉这两个文件：常驻程序靠它们找会话。记下的状态只在会话真的结束时删（见下面 `ended`）。
+    struct Cleanup(PathBuf, PathBuf, PathBuf, bool);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
             let _ = std::fs::remove_file(&self.1);
+            if self.3 {
+                let _ = std::fs::remove_file(&self.2);
+            }
         }
     }
-    let _cleanup = Cleanup(sock, pid);
+    let mut _cleanup = Cleanup(sock, pid, state_path(&dir, name), true);
 
     // 只用来保持当前屏幕：它要发给客户端的东西（包括回答终端查询）由常驻程序那边的状态机做。
     let mut screen = nexus_term_proto::Session::new(size, u64::MAX);
+    if let Some(saved) = &saved {
+        // 先画中断前的屏幕（离开全屏程序的备用屏幕），再说明一句；新的 shell 的提示符接在下面。
+        let _ = screen.handle(nexus_term_proto::Event::PtyOutput(saved.screen.clone()));
+        let mut intro = Vec::new();
+        if screen.screen().alternate_screen() {
+            intro.extend_from_slice(b"\x1b[?1049l");
+        }
+        intro.extend_from_slice(b"\x1b[m\r\n");
+        let place = cwd.as_ref().map(|c| format!("，工作目录 {}", c.display())).unwrap_or_default();
+        intro.extend_from_slice(format!("[nexus] 会话已恢复：设备重启或会话的进程意外结束过，里面的程序没有保留，shell 重新启动{place}。\r\n").as_bytes());
+        let _ = screen.handle(nexus_term_proto::Event::PtyOutput(intro));
+    }
     let mut size = size.clamped();
+    // 屏幕或尺寸变了，下次定时记下来。
+    let mut dirty = true;
+    // 第一次也等一个间隔：刚启动时先让常驻程序连上。
+    let mut save = tokio::time::interval_at(tokio::time::Instant::now() + SAVE_EVERY, SAVE_EVERY);
+    save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 被要求结束（会话被 kill、数据目录没了）：shell 因此退出时会话真的结束。
+    let mut killing = false;
+    // 正在后台写的状态（同一时间只写一份）。
+    let mut saving: Option<tokio::task::JoinHandle<io::Result<()>>> = None;
+    let mut term = Terminate::new()?;
     let (down_tx, mut down_rx) = mpsc::channel::<(u64, Down)>(256);
     let mut conn: Option<(u64, mpsc::Sender<Up>, tokio::task::JoinHandle<()>)> = None;
     let mut next_conn = 0u64;
@@ -136,6 +253,7 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
             biased;
             _ = check.tick() => {
                 if !_cleanup.0.exists() {
+                    killing = true;
                     pty.kill();
                 }
             }
@@ -181,13 +299,18 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                         size = s.clamped();
                         screen.set_size(size);
                         pty.resize(size);
+                        dirty = true;
                     }
-                    Down::Kill => pty.kill(),
+                    Down::Kill => {
+                        killing = true;
+                        pty.kill();
+                    }
                 }
             }
             event = pty.next_event() => match event {
                 PtyEvent::Output(bytes) => {
                     let _ = screen.handle(nexus_term_proto::Event::PtyOutput(bytes.clone()));
+                    dirty = true;
                     if let Some((_, up_tx, _)) = conn.as_ref() {
                         // 缓冲满时先等一会儿（正常的背压，比如一次输出很多），对端断开或长时间不读才丢弃连接，
                         // 这样既不会因为一阵大输出断开，也不会被卡死的常驻程序永远挡住 PTY 读取与新常驻程序接管。
@@ -198,6 +321,12 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                     }
                 }
                 PtyEvent::Exited(status) => {
+                    // shell 自己退出、或者是我们结束的：会话结束。被别人用信号结束的（关机时）：留着状态，下次恢复。
+                    _cleanup.3 = killing || status.signal.is_none();
+                    // 等正在写的状态写完，再由 Cleanup 删掉它：否则写完的改名会把刚删的文件又放回去。
+                    if let Some(h) = saving.take() {
+                        let _ = h.await;
+                    }
                     if let Some((_, up_tx, writer)) = conn.take() {
                         let exited = Up::Exited { code: status.code, signal: status.signal };
                         if tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(exited)).await.is_ok() {
@@ -209,6 +338,32 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                     break;
                 }
             },
+            // 放在接受连接和终端输出之后，写盘（含 fsync）放到阻塞线程里：都不能挡住终端的输入输出。
+            // 特别是 Windows 的 ConPTY 启动时先问光标位置、得到回答才输出，这个询问要赶在常驻程序连上之后转过去。
+            _ = save.tick() => {
+                if dirty && !saving.as_ref().is_some_and(|h| !h.is_finished()) {
+                    let state = Saved {
+                        version: STATE_VERSION,
+                        created_at_ms: created_at.0,
+                        size,
+                        cwd: shell_cwd(pty.pid()),
+                        screen: screen.restore(),
+                        saved_at_ms: now_ms(),
+                    };
+                    // 写失败时下一次有输出会再标记、再写。
+                    dirty = false;
+                    let (dir, name) = (dir.clone(), name.to_string());
+                    saving = Some(tokio::task::spawn_blocking(move || store_state(&dir, &name, &state)));
+                }
+            }
+            // 关机时系统先发 SIGTERM：留着记下的状态，下次恢复。
+            _ = term.recv() => {
+                _cleanup.3 = false;
+                if let Some(h) = saving.take() {
+                    let _ = h.await;
+                }
+                return Ok(());
+            }
         }
     }
     // Windows：关掉伪终端（ClosePseudoConsole）可能要等控制台主机退出、迟迟不返回。shell 已经结束了，
@@ -308,7 +463,8 @@ impl Pty for HeldPty {
 }
 
 /// 启动一个持有进程并连上它。`exe` 是 `nexus` 二进制。
-pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<HeldPty> {
+/// `restore` 时持有进程按记下的状态恢复会话。
+pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<HeldPty> {
     let dir = sessions_dir(data_dir);
     transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
@@ -327,6 +483,7 @@ pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Ti
         .arg("session-hold")
         .args(["--name", name, "--cols", &size.cols.to_string(), "--rows", &size.rows.to_string()])
         .args(["--created-at-ms", &created_at.0.to_string()])
+        .args(if restore { &["--restore"][..] } else { &[] })
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -355,8 +512,35 @@ pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Ti
     }
 }
 
-/// 上一次运行留下的、还活着的会话。连不上的套接字（持有进程已经不在了）删掉。
-pub fn adopt(data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
+/// 上一次运行留下的会话：还活着的接管；连不上的套接字（持有进程已经不在了）删掉。
+/// 持有进程不在了、但记下了状态的（设备重启过，或持有进程意外结束），用 `exe` 启动新的持有进程恢复它。
+pub fn adopt(exe: &Path, data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
+    let mut out = adopt_live(data_dir);
+    let dir = sessions_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".state")).map(str::to_string) else {
+            continue;
+        };
+        if out.iter().any(|a| a.name == name) || socket_path(&dir, &name).exists() {
+            continue;
+        }
+        let Some(saved) = load_state(&dir, &name) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let created_at = Timestamp(saved.created_at_ms);
+        match spawn(exe, data_dir, &name, saved.size, created_at, true) {
+            Ok(pty) => out.push(AdoptedPty { name, size: saved.size, created_at, pty }),
+            Err(e) => eprintln!("nexus daemon: 恢复会话 {name} 失败：{e}"),
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn adopt_live(data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
     let dir = sessions_dir(data_dir);
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut out = Vec::new();

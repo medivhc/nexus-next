@@ -174,7 +174,7 @@ pub enum Cmd {
         /// 服务在本机监听的地址
         #[arg(long, default_value = "127.0.0.1")]
         host: std::net::IpAddr,
-        /// 协议，告诉使用方怎么用：tcp、http，远程桌面是 vnc 或 rdp
+        /// 协议，告诉使用方怎么用：tcp、http，udp（经完整节点按名字访问，M11.5），远程桌面是 vnc 或 rdp
         #[arg(long, default_value = "tcp")]
         proto: String,
         /// 使用方需要的环境变量，值里的 {addr} 换成使用方访问服务的地址；可以写多次
@@ -361,6 +361,9 @@ pub enum Cmd {
         rows: u16,
         #[arg(long)]
         created_at_ms: u64,
+        /// 按上次记下的状态恢复（设备重启或持有进程意外结束之后，M11.5）
+        #[arg(long)]
+        restore: bool,
     },
     /// 供 ssh 的 ProxyCommand 调用：在标准输入输出上充当 SSH 服务端（一般不直接运行）
     SshProxy {

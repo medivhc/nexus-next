@@ -442,6 +442,27 @@ impl World {
         real.wait_ready(node, args);
     }
 
+    /// 模拟设备重启：结束常驻程序和所有终端会话的持有进程（连同会话里的程序），再以 `args` 启动常驻程序。
+    /// 只在真实后端。
+    pub async fn reboot(&self, node: &str, args: &[&str]) {
+        let Inner::Real(real) = &self.inner else { panic!("reboot 只用于真实后端") };
+        real.kill(node);
+        let sessions = real.dirs[node].join("sessions");
+        for entry in std::fs::read_dir(&sessions).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "pid") {
+                if let Ok(pid) = std::fs::read_to_string(&path) {
+                    // 持有进程自成一个进程组；它不在了，会话里的 shell 随伪终端关闭而结束。
+                    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", pid.trim())]).status();
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
+        real.spawn_daemon(node, args);
+        real.wait_ready(node, args);
+    }
+
     /// 让节点的常驻程序用它自己的一份二进制（复制一份），并重新启动。返回那份二进制的路径。
     /// 升级的测试（M7.3）会替换它，不会改到构建出来的那个。只在真实后端。
     pub async fn use_own_binary(&self, node: &str, args: &[&str]) -> PathBuf {
@@ -1935,6 +1956,22 @@ impl FullNode {
     /// 用系统的网络栈连 `ip:port`，发一个 HTTP GET，返回正文；连接被关闭时正文为空。
     pub fn http_get(&self, ip: std::net::IpAddr, port: u16, path: &str) -> io::Result<String> {
         http_get_at((ip, port).into(), path)
+    }
+
+    /// 像 `echo ... | nc ip port`：送出 `data` 后关闭写方向，返回读到的全部字节（10 秒没有结束算出错）。
+    pub fn send_then_half_close(&self, ip: std::net::IpAddr, port: u16, data: &[u8]) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // 边写边读：回声服务边读边回，不读的话两边的缓冲区都满了会互相等。
+        let mut r = s.try_clone()?;
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).map(|_| out)
+        });
+        s.write_all(data)?;
+        s.shutdown(std::net::Shutdown::Write)?;
+        reader.join().map_err(|_| io::Error::other("读的线程出错"))?
     }
 }
 
