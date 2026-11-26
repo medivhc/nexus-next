@@ -256,6 +256,14 @@ impl System for RealSystem {
         }
         std::fs::rename(tmp, path)
     }
+
+    fn store_delete(&self, key: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub struct RealProc {
