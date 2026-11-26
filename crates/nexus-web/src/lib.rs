@@ -10,10 +10,10 @@ use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_web_core::{
-    EnrollLink, EntryHandle, GuestShare, HardwareKind, HardwareState, Notice, ShareLink, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest,
-    WebNode,
+    EnrollLink, EntryHandle, GuestShare, HardwareCapture, HardwareKind, HardwareProvider, HardwareState, Notice, ShareLink, TerminalEnd,
+    TerminalUi, UiEvent, WebHttpRequest, WebNode,
 };
-use nexus_wire::{NewCredential, Size, WireError};
+use nexus_wire::{ErrorCode, NewCredential, Size, WireError};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::mpsc;
@@ -151,7 +151,7 @@ impl Browser {
             t.add_hint(entry.node, &hint);
             let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
             let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
-            Ok(JsValue::from(Session { node: Rc::new(node), hardware: HardwareState::new() }))
+            Ok(JsValue::from(Session { node: Rc::new(node), hardware: HardwareState::new(), hardware_stop: RefCell::new(None) }))
         })
     }
 }
@@ -173,6 +173,53 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), JsError> {
 pub struct Session {
     node: Rc<WebNode<IrohTransport>>,
     hardware: HardwareState,
+    /// 硬件能力服务在运行时，停止它用的发送端（M8.3）。
+    hardware_stop: RefCell<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+/// 由页面提供的硬件采集：调用页面给的 `capture(kind)`，它返回 Promise。
+struct JsHardware {
+    capture: Function,
+}
+
+fn js_field(v: &JsValue, key: &str) -> JsValue {
+    js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap_or(JsValue::UNDEFINED)
+}
+
+/// 把页面的采集结果换成协议里的 [`HardwareCapture`]。
+fn parse_capture(kind: HardwareKind, v: &JsValue) -> Result<HardwareCapture, String> {
+    let num = |key: &str| js_field(v, key).as_f64().ok_or_else(|| format!("采集结果缺少 {key}"));
+    let bytes = |key: &str| {
+        let d = js_field(v, key);
+        if d.is_undefined() || d.is_null() {
+            return Err(format!("采集结果缺少 {key}"));
+        }
+        Ok(js_sys::Uint8Array::new(&d).to_vec())
+    };
+    let mime = || js_field(v, "mime").as_string().ok_or_else(|| "采集结果缺少 mime".to_string());
+    Ok(match kind {
+        HardwareKind::Camera => HardwareCapture::Camera { mime: mime()?, data: bytes("data")? },
+        HardwareKind::Microphone => {
+            HardwareCapture::Microphone { mime: mime()?, duration_ms: num("duration_ms")? as u32, data: bytes("data")? }
+        }
+        HardwareKind::Location => HardwareCapture::Location {
+            lat_e7: (num("lat")? * 1e7).round() as i64,
+            lon_e7: (num("lon")? * 1e7).round() as i64,
+            accuracy_cm: (num("accuracy")? * 100.0).round().max(0.0) as u32,
+            timestamp_ms: num("timestamp")?.max(0.0) as u64,
+        },
+    })
+}
+
+impl HardwareProvider for JsHardware {
+    async fn capture(&self, kind: HardwareKind) -> Result<HardwareCapture, WireError> {
+        let fail = |m: String| WireError::new(ErrorCode::Internal, format!("浏览器采集 {} 失败：{m}", kind.as_str()));
+        let promise = self.capture.call1(&JsValue::NULL, &JsValue::from_str(kind.as_str())).map_err(|e| fail(format!("{e:?}")))?;
+        let value = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&promise))
+            .await
+            .map_err(|e| fail(e.as_string().unwrap_or_else(|| format!("{e:?}"))))?;
+        parse_capture(kind, &value).map_err(fail)
+    }
 }
 
 #[wasm_bindgen]
@@ -201,9 +248,45 @@ impl Session {
         Ok(())
     }
 
-    /// 清空全部硬件授权（离开或关闭页面时调用，R32）。
+    /// 清空全部硬件授权并停止响应硬件请求（离开或关闭页面时调用，R32）。
     pub fn hardware_clear(&self) {
         self.hardware.clear();
+        if let Some(stop) = self.hardware_stop.borrow_mut().take() {
+            let _ = stop.send(());
+        }
+    }
+
+    /// 开始响应名册里的设备对硬件能力的请求（M8.3）；已经在响应时什么都不做。
+    /// `capture(kind)` 返回 Promise：摄像头、麦克风解析为 `{ mime, data: Uint8Array }`（麦克风另有 `duration_ms`），
+    /// 位置解析为 `{ lat, lon, accuracy（米）, timestamp（毫秒） }`。
+    /// `on_usage(caller, kind, active)` 在每次开始（true）和结束（false）采集时调用，页面据此显示谁在用。
+    pub fn hardware_serve(&self, capture: Function, on_usage: Function) {
+        if self.hardware_stop.borrow().is_some() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.hardware_stop.borrow_mut() = Some(tx);
+        let (node, state) = (self.node.clone(), self.hardware.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            node.serve_hardware(state, JsHardware { capture }, rx, move |ev| {
+                let _ = on_usage.call3(
+                    &JsValue::NULL,
+                    &JsValue::from_str(&ev.caller),
+                    &JsValue::from_str(ev.kind.as_str()),
+                    &JsValue::from_bool(ev.active),
+                );
+            })
+            .await;
+        });
+    }
+
+    /// 设备上取用硬件能力的命令，页面原样显示给用户复制（M8.3）：不给 `kind` 时列出开放了哪几项。
+    pub fn hardware_command(&self, kind: Option<String>) -> Result<String, JsError> {
+        let kind = match kind {
+            None => None,
+            Some(k) => Some(HardwareKind::parse(&k).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{k}")))?),
+        };
+        Ok(self.node.hardware_command(kind))
     }
 
     /// 返回当前已显式同意开放的硬件能力（JSON 数组）。

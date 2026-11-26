@@ -719,6 +719,12 @@ impl Browser {
         on_node!(node, n => n.hint())
     }
 
+    /// 页面上显示的 `nexus hw` 命令（M8.3）。
+    pub fn hardware_command(&self, kind: Option<nexus_web_core::HardwareKind>) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hardware_command(kind))
+    }
+
     /// 启动网页节点的硬件能力服务循环（M8.3）。
     pub async fn serve_hardware<P: nexus_web_core::HardwareProvider>(
         &self,
