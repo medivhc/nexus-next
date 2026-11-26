@@ -200,7 +200,11 @@ impl World {
                     turmoil::repair(node, other.as_str());
                 }
             }
-            Inner::Real(_) => panic!("真实后端无法让被杀掉的节点原样恢复"),
+            Inner::Real(real) => {
+                let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
+                real.spawn_daemon(node, &["--local-only"]);
+                real.wait_ready(node, &["--local-only"]);
+            }
         }
     }
 }

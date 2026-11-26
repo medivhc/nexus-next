@@ -271,7 +271,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let device_key = load_or_create_device_key(&self.system).map_err(internal)?;
         let secret = self.vault_shared_secret(&device_key, &roster.root)?;
         let plain = crypto_vault::open(&secret, name, &entry.sealed)
-            .ok_or_else(|| internal(format!("Vault 条目 {name} 密文校验失败")))?;
+            .ok_or_else(|| internal(format!("Vault 条目 {name} 密文校验失败（网络根密钥轮换过的话，先运行 nexus vault sync）")))?;
         Ok(plain)
     }
 
@@ -414,6 +414,42 @@ impl<T: Transport, S: System> Node<T, S> {
             }
         }
         Ok(out)
+    }
+
+    /// 根密钥轮换（M10.1）：把本机（管理设备）保存的全部条目从旧根重新加密到新根。
+    /// 返回新的存储，由调用方和新根一起落盘；任何一条解不开都放弃轮换，免得秘密永久丢失。
+    pub(crate) fn vault_resealed(&self, old_root: &SecretKey, new_root: &SecretKey) -> Result<VaultStore, WireError> {
+        let me = PublicKey(self.me().0);
+        let old_secret = self.vault_shared_secret(old_root, &me)?;
+        let new_secret = self.vault_shared_secret(new_root, &me)?;
+        let mut store = self.vault.borrow().clone();
+        for e in store.entries.values_mut() {
+            let plain = crypto_vault::open(&old_secret, &e.name, &e.sealed)
+                .ok_or_else(|| internal(format!("Vault 条目 {} 密文校验失败，没有轮换根密钥", e.name)))?;
+            let mut salt = [0u8; 16];
+            self.system.random(&mut salt);
+            e.sealed = crypto_vault::seal(&new_secret, &e.name, salt, &plain);
+        }
+        Ok(store)
+    }
+
+    /// 根密钥轮换（M10.1）之后：成员设备手里按旧根加密的条目已经解不开，按新根重新推送给被授权的设备。
+    /// 连不上的设备之后用 `nexus vault sync` 取回。
+    pub(crate) async fn vault_repush_all(&self) {
+        let (Ok(root), Some(roster)) = (self.admin_key(), self.roster()) else { return };
+        let Ok(self_secret) = self.vault_shared_secret(&root, &PublicKey(self.me().0)) else { return };
+        let entries: Vec<VaultCipherEntry> = self.vault.borrow().entries.values().cloned().collect();
+        for dev in roster.devices.iter().filter(|d| d.node_id != self.me()) {
+            let Ok(peer_secret) = self.vault_shared_secret(&root, &PublicKey(dev.node_id.0)) else { continue };
+            for e in entries.iter().filter(|e| e.devices.iter().any(|d| d == &dev.name)) {
+                let Some(plain) = crypto_vault::open(&self_secret, &e.name, &e.sealed) else { continue };
+                let mut salt = [0u8; 16];
+                self.system.random(&mut salt);
+                let mut peer_entry = e.clone();
+                peer_entry.sealed = crypto_vault::seal(&peer_secret, &e.name, salt, &plain);
+                let _ = self.request(dev, Request::VaultPush { name: e.name.clone(), entry: Some(peer_entry) }, None).await;
+            }
+        }
     }
 
     /// 处理来自管理设备的 `Request::VaultPush`。

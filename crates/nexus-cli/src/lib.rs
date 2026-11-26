@@ -301,7 +301,7 @@ pub enum Cmd {
     },
     /// 以 MCP 服务器的方式运行（标准输入输出），供 agent 框架调用
     ///
-    /// 提供工具 nexus_ls、nexus_status、nexus_exec、nexus_session_ls。
+    /// 提供设备/服务发现、命令执行、终端会话、工作区读写与提交、路径/路由诊断和审计查询工具。
     /// 带 --agent 或 NEXUS_AGENT 时，所有工具都以该 agent 的身份执行。
     Mcp,
     /// 访问网页节点发布的硬件能力（摄像头、麦克风、位置，M8.3）
@@ -318,6 +318,11 @@ pub enum Cmd {
     Vault {
         #[command(subcommand)]
         cmd: VaultCmd,
+    },
+    /// 在管理设备上轮换网络的根密钥并生成新恢复码（无需重建网络，旧恢复码与旧根签发的 agent 立即失效）
+    RotateRoot {
+        #[arg(long)]
+        json: bool,
     },
     /// 登记、列出、撤销用于网页登录的通行密钥
     Web {
@@ -989,6 +994,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         Cmd::Status { node: Some(n), json } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
         Cmd::Init { name, json } => (CtlRequest::Init { name: name.clone() }, *json),
         Cmd::Recover { code, json } => (CtlRequest::Recover { code: code.clone() }, *json),
+        Cmd::RotateRoot { json } => (CtlRequest::RootRotate, *json),
         Cmd::Join { json } => (CtlRequest::JoinStart, *json),
         Cmd::Device { cmd: DeviceCmd::Approve { code, name, json } } => {
             (CtlRequest::Approve { code: code.clone(), name: name.clone() }, *json)
@@ -1375,6 +1381,25 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     .iter()
                     .map(|i| format!("已吊销设备 {} 接触过、建议轮换的条目：{}\n", i.revoked_device, i.entries.join("、")))
                     .collect()
+            }
+        }
+        CtlResponse::RootRotated(r) => {
+            let v = json!({
+                "schema": JSON_SCHEMA,
+                "old_root": nexus_core_proto::NodeId(r.old_root.0).to_string(),
+                "new_root": nexus_core_proto::NodeId(r.new_root.0).to_string(),
+                "recovery_code": r.recovery_code,
+                "roster_version": r.roster_version,
+                "pushed": r.pushed,
+                "unreachable": r.unreachable,
+            });
+            if json {
+                doc(v)
+            } else {
+                format!(
+                    "已轮换网络根密钥（名册版本 {}，已通知 {} 台设备）。\n\n新恢复码（只显示这一次，请离线保存；旧恢复码已失效）：\n  {}\n",
+                    r.roster_version, r.pushed, r.recovery_code
+                )
             }
         }
         CtlResponse::WebEnroll(r) => {
@@ -2091,6 +2116,8 @@ const MCP_PROTOCOL: &str = "2025-06-18";
 
 fn mcp_tools() -> Value {
     let node = json!({ "type": "string", "description": "设备的名字或标识" });
+    let drive_path = json!({ "type": "string", "description": "工作区路径，格式 <工作区>:/<路径>，例如 work:/src/main.rs" });
+    let ws = json!({ "type": "string", "description": "工作区名" });
     json!([
         {
             "name": "nexus_ls",
@@ -2103,6 +2130,11 @@ fn mcp_tools() -> Value {
             "inputSchema": { "type": "object", "properties": { "node": node } },
         },
         {
+            "name": "nexus_services",
+            "description": "列出一台设备上发布的、当前身份有权使用的服务。",
+            "inputSchema": { "type": "object", "properties": { "node": node }, "required": ["node"] },
+        },
+        {
             "name": "nexus_exec",
             "description": "在一台设备上执行命令（不经过 shell），返回退出码、标准输出和标准错误。需要 shell 特性时写 [\"sh\", \"-c\", \"...\"]。",
             "inputSchema": {
@@ -2111,6 +2143,7 @@ fn mcp_tools() -> Value {
                     "node": node,
                     "command": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "程序及其参数" },
                     "cwd": { "type": "string", "description": "工作目录（默认是远端用户的主目录）" },
+                    "env": { "type": "array", "items": { "type": "string" }, "description": "追加的环境变量，每项格式 名字=值" },
                     "timeout_s": { "type": "number", "description": "超过这么多秒就终止命令（默认 300）" },
                 },
                 "required": ["node", "command"],
@@ -2121,54 +2154,323 @@ fn mcp_tools() -> Value {
             "description": "列出一台设备上的常驻终端会话。",
             "inputSchema": { "type": "object", "properties": { "node": node }, "required": ["node"] },
         },
+        {
+            "name": "nexus_session_kill",
+            "description": "结束一台设备上的常驻终端会话。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": node,
+                    "session": { "type": "string", "description": "终端会话名" },
+                },
+                "required": ["node", "session"],
+            },
+        },
+        {
+            "name": "nexus_drive_ls",
+            "description": "列出所有工作区（不给 path），或列出工作区里的一个目录。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": drive_path,
+                    "at": { "type": "string", "description": "可选：查看某次提交（提交号或至少 8 位前缀）" },
+                },
+            },
+        },
+        {
+            "name": "nexus_drive_read",
+            "description": "读取工作区里的文件内容（支持按字节范围读取）。UTF-8 文本返回 content，二进制返回 content_base64。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": drive_path,
+                    "at": { "type": "string", "description": "可选：查看某次提交" },
+                    "offset": { "type": "integer", "minimum": 0, "description": "从第几个字节开始（默认 0）" },
+                    "length": { "type": "integer", "minimum": 0, "description": "读取字节数（默认读到末尾）" },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "nexus_drive_write",
+            "description": "向工作区写入一个文件（新建或覆盖，中间目录自动建立）。content 与 content_base64 二选一。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": drive_path,
+                    "content": { "type": "string", "description": "UTF-8 文本内容" },
+                    "content_base64": { "type": "string", "description": "标准 Base64 编码的二进制内容" },
+                    "exec": { "type": "boolean", "description": "是否设置可执行位（默认 false）" },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "nexus_drive_rm",
+            "description": "删除工作区里的文件或目录。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": drive_path,
+                    "recursive": { "type": "boolean", "description": "删除目录时设为 true" },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "nexus_drive_status",
+            "description": "列出工作区里尚未提交的改动。",
+            "inputSchema": { "type": "object", "properties": { "ws": ws }, "required": ["ws"] },
+        },
+        {
+            "name": "nexus_drive_commit",
+            "description": "把工作区里未提交的改动生成一次提交并同步到副本。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ws": ws,
+                    "message": { "type": "string", "description": "提交说明" },
+                },
+                "required": ["ws"],
+            },
+        },
+        {
+            "name": "nexus_drive_where",
+            "description": "查看工作区或路径的数据分布、副本列表、同步状态与本机缓存量。",
+            "inputSchema": { "type": "object", "properties": { "path": drive_path }, "required": ["path"] },
+        },
+        {
+            "name": "nexus_path",
+            "description": "查看到其他设备的网络路径（本机地址、直连或中继、往返时间、收发字节数）；省略 device 时列出所有设备。",
+            "inputSchema": { "type": "object", "properties": { "device": node } },
+        },
+        {
+            "name": "nexus_route_explain",
+            "description": "解释一个目标地址（主机:端口）经统一入口会被路由到哪里。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "主机:端口，例如 web.home.internal:80" },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "nexus_audit",
+            "description": "查看本机的审计记录（经过本机的每次访问，包括被拒绝的）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "description": "只返回最近的这么多条" },
+                },
+            },
+        },
     ])
+}
+
+fn mcp_b64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn mcp_b64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("Base64 长度必须是 4 的倍数");
+    }
+    let val = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.as_chunks::<4>().0 {
+        let a = val(chunk[0]).ok_or("无效的 Base64 字符")?;
+        let b = val(chunk[1]).ok_or("无效的 Base64 字符")?;
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = val(chunk[2]).ok_or("无效的 Base64 字符")?;
+            out.push((b << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = val(chunk[3]).ok_or("无效的 Base64 字符")?;
+                out.push((c << 6) | d);
+            }
+        } else if chunk[3] != b'=' {
+            return Err("无效的 Base64 填充");
+        }
+    }
+    Ok(out)
+}
+
+fn mcp_parse_err(sink: &Captured, code: i32) -> (Value, bool) {
+    let err = String::from_utf8_lossy(&sink.stderr);
+    let v = err.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| {
+        json!({ "error": "internal", "message": err.trim(), "exit_code": code })
+    });
+    (v, true)
 }
 
 /// 把一次工具调用翻译成命令，执行，得到 (结构化结果, 是否出错)。
 async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
     let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
+    let flag = |key: &str| args.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let mut stdin_bytes: Option<Vec<u8>> = None;
+    let mut raw_read_path: Option<String> = None;
+
     let cmd = match name {
         "nexus_ls" => Cmd::Ls { node: None, json: true },
         "nexus_status" => Cmd::Status { node: text("node"), json: true },
+        "nexus_services" => match text("node") {
+            Some(node) => Cmd::Ls { node: Some(node), json: true },
+            None => return (json!({ "error": "usage", "message": "缺少 node" }), true),
+        },
         "nexus_session_ls" => match text("node") {
             Some(node) => Cmd::Session { cmd: SessionCmd::Ls { node, json: true } },
             None => return (json!({ "error": "usage", "message": "缺少 node" }), true),
+        },
+        "nexus_session_kill" => match (text("node"), text("session")) {
+            (Some(node), Some(session)) => Cmd::Session { cmd: SessionCmd::Kill { node, session, json: true } },
+            _ => return (json!({ "error": "usage", "message": "需要 node 和 session" }), true),
         },
         "nexus_exec" => {
             let command: Option<Vec<String>> = args
                 .get("command")
                 .and_then(Value::as_array)
                 .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect());
+            let env: Vec<String> = match args.get("env") {
+                None | Some(Value::Null) => vec![],
+                Some(Value::Array(arr)) => match arr.iter().map(|v| v.as_str().map(str::to_string)).collect() {
+                    Some(v) => v,
+                    None => return (json!({ "error": "usage", "message": "env 必须是字符串数组" }), true),
+                },
+                Some(_) => return (json!({ "error": "usage", "message": "env 必须是字符串数组" }), true),
+            };
             match (text("node"), command) {
                 (Some(node), Some(command)) if !command.is_empty() => Cmd::Exec {
                     node,
                     timeout: Some(args.get("timeout_s").and_then(Value::as_f64).unwrap_or(300.0)),
                     max_output: DEFAULT_MAX_OUTPUT,
                     cwd: text("cwd"),
-                    env: vec![],
+                    env,
                     json: true,
                     command,
                 },
                 _ => return (json!({ "error": "usage", "message": "需要 node 和非空的 command 数组" }), true),
             }
         }
+        "nexus_drive_ls" => Cmd::Drive {
+            cmd: drive::DriveCmd::Ls { path: text("path"), at: text("at"), json: true },
+        },
+        "nexus_drive_read" => match text("path") {
+            Some(path) => {
+                raw_read_path = Some(path.clone());
+                Cmd::Drive {
+                    cmd: drive::DriveCmd::Cat {
+                        path,
+                        at: text("at"),
+                        offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0),
+                        length: args.get("length").and_then(Value::as_u64),
+                    },
+                }
+            }
+            None => return (json!({ "error": "usage", "message": "缺少 path" }), true),
+        },
+        "nexus_drive_write" => match (text("path"), text("content"), text("content_base64")) {
+            (Some(path), Some(content), None) => {
+                stdin_bytes = Some(content.into_bytes());
+                Cmd::Drive { cmd: drive::DriveCmd::Put { path, exec: flag("exec"), json: true } }
+            }
+            (Some(path), None, Some(b64)) => match mcp_b64_decode(&b64) {
+                Ok(bytes) => {
+                    stdin_bytes = Some(bytes);
+                    Cmd::Drive { cmd: drive::DriveCmd::Put { path, exec: flag("exec"), json: true } }
+                }
+                Err(msg) => return (json!({ "error": "usage", "message": msg }), true),
+            },
+            _ => return (json!({ "error": "usage", "message": "需要 path，且 content 与 content_base64 二选一" }), true),
+        },
+        "nexus_drive_rm" => match text("path") {
+            Some(path) => Cmd::Drive { cmd: drive::DriveCmd::Rm { path, recursive: flag("recursive"), json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 path" }), true),
+        },
+        "nexus_drive_status" => match text("ws") {
+            Some(ws) => Cmd::Drive { cmd: drive::DriveCmd::Status { ws, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 ws" }), true),
+        },
+        "nexus_drive_commit" => match text("ws") {
+            Some(ws) => Cmd::Drive {
+                cmd: drive::DriveCmd::Commit { ws, message: text("message").unwrap_or_default(), json: true },
+            },
+            None => return (json!({ "error": "usage", "message": "缺少 ws" }), true),
+        },
+        "nexus_drive_where" => match text("path") {
+            Some(path) => Cmd::Drive { cmd: drive::DriveCmd::Where { path, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 path" }), true),
+        },
+        "nexus_path" => Cmd::Path { device: text("device"), json: true },
+        "nexus_route_explain" => match text("target") {
+            Some(target) => Cmd::Route { cmd: RouteCmd::Explain { target, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 target" }), true),
+        },
+        "nexus_audit" => {
+            let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+            Cmd::Audit { limit, json: true }
+        }
         _ => return (json!({ "error": "usage", "message": format!("没有工具 {name}") }), true),
     };
     let mut sink = Captured::default();
     // run_client 里也会调用到这里（nexus mcp），装箱以打断异步函数的递归。
-    let mut empty = tokio::io::empty();
-    let code = Box::pin(run_client(&cmd, ctl, &mut empty, &mut sink)).await;
+    let code = if let Some(bytes) = stdin_bytes {
+        let mut input = std::io::Cursor::new(bytes);
+        Box::pin(run_client(&cmd, ctl, &mut input, &mut sink)).await
+    } else {
+        let mut empty = tokio::io::empty();
+        Box::pin(run_client(&cmd, ctl, &mut empty, &mut sink)).await
+    };
+    if let Some(path) = raw_read_path {
+        if code != 0 {
+            return mcp_parse_err(&sink, code);
+        }
+        let size = sink.stdout.len();
+        let value = match std::str::from_utf8(&sink.stdout) {
+            Ok(content) if !sink.stdout.contains(&0) => json!({
+                "schema": JSON_SCHEMA,
+                "path": path,
+                "size": size,
+                "encoding": "utf-8",
+                "content": content,
+            }),
+            _ => json!({
+                "schema": JSON_SCHEMA,
+                "path": path,
+                "size": size,
+                "encoding": "base64",
+                "content_base64": mcp_b64_encode(&sink.stdout),
+            }),
+        };
+        return (value, false);
+    }
     let out = String::from_utf8_lossy(&sink.stdout);
     match serde_json::from_str::<Value>(out.trim()) {
         // 执行类命令即使远端命令失败也有完整的结果；那不是工具出错。
         Ok(v) if v.get("schema").is_some() => (v, false),
-        _ => {
-            let err = String::from_utf8_lossy(&sink.stderr);
-            let v = err.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| {
-                json!({ "error": "internal", "message": err.trim(), "exit_code": code })
-            });
-            (v, true)
-        }
+        _ => mcp_parse_err(&sink, code),
     }
 }
 

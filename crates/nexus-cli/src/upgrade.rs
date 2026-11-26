@@ -12,6 +12,8 @@ use std::time::Duration;
 
 /// 新版本反复启动失败时，最多试几次就换回。
 pub const MAX_ATTEMPTS: u32 = 3;
+/// 从压缩包解出的二进制大小上限（128 MiB），防止解压炸弹耗尽内存。
+const MAX_BINARY_BYTES: u64 = 128 << 20;
 const STATE_FILE: &str = "upgrade.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,15 +131,20 @@ fn extract(gz: &[u8]) -> Result<Vec<u8>, WireError> {
         let is_nexus = entry.path().ok().and_then(|p| p.file_name().map(|n| n == "nexus")).unwrap_or(false);
         if is_nexus && entry.header().entry_type().is_file() {
             let mut out = Vec::new();
-            io::Read::read_to_end(&mut entry, &mut out).map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+            io::Read::read_to_end(&mut io::Read::take(&mut entry, MAX_BINARY_BYTES + 1), &mut out)
+                .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+            if out.len() as u64 > MAX_BINARY_BYTES {
+                return Err(invalid(format!("压缩包里的 nexus 超过上限（{} MiB）", MAX_BINARY_BYTES >> 20)));
+            }
             return Ok(out);
         }
     }
     Err(invalid("压缩包里没有 nexus"))
 }
 
-/// 运行新二进制的一条命令，限时，返回标准输出。
-fn probe(bin: &Path, args: &[&str], data_dir: &Path) -> Result<String, String> {
+/// 运行新二进制的一条命令，限时，返回标准输出。并发排空管道以避免 64 KiB 缓冲死锁。
+fn probe(bin: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Result<String, String> {
+    use io::Read;
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args)
         .env("NEXUS_DATA_DIR", data_dir)
@@ -155,34 +162,53 @@ fn probe(bin: &Path, args: &[&str], data_dir: &Path) -> Result<String, String> {
             other => break other.map_err(|e| format!("运行不了（{e}）"))?,
         }
     };
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_t = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(r) = stdout.take() {
+            let _ = r.take(1 << 20).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(r) = stderr.take() {
+            let _ = r.take(1 << 20).read_to_end(&mut buf);
+        }
+        buf
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(s)) => break s,
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err("20 秒内没有结束".into());
             }
         }
+    };
+    let out_bytes = out_t.join().unwrap_or_default();
+    let err_bytes = err_t.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("退出码 {}：{}", status.code().unwrap_or(-1), String::from_utf8_lossy(&err_bytes).trim()));
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("退出码 {}：{}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out_bytes).into_owned())
 }
 
 /// 检查新版本：能运行、协议主版本相同（除非 `force`）、能读本机的数据目录。返回它的版本。
 fn preflight(new: &Path, data_dir: &Path, force: bool) -> Result<String, WireError> {
-    let v = probe(new, &["--version"], data_dir).map_err(|e| invalid(format!("新版本的 nexus --version {e}")))?;
+    use std::ffi::OsStr;
+    let v = probe(new, &[OsStr::new("--version")], data_dir).map_err(|e| invalid(format!("新版本的 nexus --version {e}")))?;
     let version = v
         .trim()
         .strip_prefix("nexus ")
         .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
         .ok_or_else(|| invalid(format!("新版本的 nexus --version 输出的不是 nexus 的版本：{:?}", v.trim())))?
         .to_string();
-    let major = probe(new, &["protocol-version"], data_dir)
+    let major = probe(new, &[OsStr::new("protocol-version")], data_dir)
         .ok()
         .and_then(|p| p.split_whitespace().next().and_then(|m| m.parse::<u16>().ok()));
     if major != Some(nexus_wire::WIRE_VERSION) && !force {
@@ -192,8 +218,12 @@ fn preflight(new: &Path, data_dir: &Path, force: bool) -> Result<String, WireErr
             nexus_wire::WIRE_VERSION
         )));
     }
-    let dir = data_dir.to_str().unwrap_or_default();
-    probe(new, &["--data-dir", dir, "daemon", "--preflight"], data_dir).map_err(|e| invalid(format!("新版本读不了本机的数据目录：{e}")))?;
+    probe(
+        new,
+        &[OsStr::new("--data-dir"), data_dir.as_os_str(), OsStr::new("daemon"), OsStr::new("--preflight")],
+        data_dir,
+    )
+    .map_err(|e| invalid(format!("新版本读不了本机的数据目录：{e}")))?;
     Ok(version)
 }
 
@@ -229,7 +259,11 @@ pub fn install(file: &Path, exe: &Path, data_dir: &Path, peers: Vec<String>, con
         message: String::new(),
         id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64),
     };
-    save(data_dir, &state).map_err(|e| WireError::new(ErrorCode::Internal, format!("写不了 upgrade.json：{e}")))?;
+    if let Err(e) = save(data_dir, &state) {
+        // 状态文件写失败时立刻换回旧二进制，避免没有 upgrade.json 导致无法自动回滚。
+        let _ = std::fs::rename(&state.prev, &state.exe).or_else(|_| std::fs::copy(&state.prev, &state.exe).map(|_| ()));
+        return Err(WireError::new(ErrorCode::Internal, format!("写不了 upgrade.json：{e}")));
+    }
     Ok(state)
 }
 
