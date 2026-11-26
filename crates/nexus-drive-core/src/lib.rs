@@ -459,6 +459,10 @@ pub mod tree {
         let o = leaves(store, ours)?;
         let t = leaves(store, theirs)?;
         let paths: std::collections::BTreeSet<&String> = b.keys().chain(o.keys()).chain(t.keys()).collect();
+        // Reserve all input leaf names (and their implied directories) before
+        // generating conflict copies, regardless of their iteration order.
+        let mut occupied: std::collections::BTreeSet<String> =
+            paths.iter().map(|p| (*p).clone()).collect();
         let mut merged: BTreeMap<String, Entry> = BTreeMap::new();
         let mut conflicts = Vec::new();
         for p in paths {
@@ -470,7 +474,21 @@ pub mod tree {
             } else {
                 conflicts.push(p.clone());
                 if let Some(e) = et {
-                    merged.insert(format!("{p}.conflict-{label}"), e.clone());
+                    let stem = format!("{p}.conflict-{label}");
+                    let mut candidate = stem.clone();
+                    let mut suffix = 0u64;
+                    loop {
+                        let prefix = format!("{candidate}/");
+                        let is_directory = occupied.range(prefix.clone()..).next()
+                            .is_some_and(|name| name.starts_with(&prefix));
+                        if !occupied.contains(&candidate) && !is_directory {
+                            break;
+                        }
+                        suffix += 1;
+                        candidate = format!("{stem}-{suffix}");
+                    }
+                    occupied.insert(candidate.clone());
+                    merged.insert(candidate, e.clone());
                 }
                 // 本机删除、对方修改：保留对方的修改（另存），本机这边没有文件。
                 eo
