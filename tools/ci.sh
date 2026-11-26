@@ -46,7 +46,8 @@ step "L3 用户手册"             python3 tools/manual_check.py
 step "L3 新旧混跑（自检）"     python3 tools/compat_check.py --old-bin target/debug/nexus
 # 需要 root、ip、tc；不满足时跳过（脚本自己说明原因）。
 step "L3 满载测量"             $SUDO python3 tools/sched_bench.py --only-scheduled --attempts 3
+step "编译测试用中继"           cargo build --quiet -p nexus-fabric-iroh --example local_relay
 step "L3 多路径"               $SUDO python3 tools/multipath_check.py
 # 有延迟的链路（需要 netem，GitHub 的 runner 上有；没有时跳过）。
-step "L3 多路径（延迟）"       $SUDO python3 tools/multipath_check.py --delay-ms 20 --only failover,redundancy
+step "L3 多路径（延迟）"       $SUDO python3 tools/multipath_check.py --delay-ms 20 --only failover,redundancy,relay,bulk
 echo "全部通过"

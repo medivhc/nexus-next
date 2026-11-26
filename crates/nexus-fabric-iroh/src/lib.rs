@@ -18,6 +18,8 @@ use tokio::io::Join;
 #[cfg(not(target_arch = "wasm32"))]
 mod metered;
 #[cfg(not(target_arch = "wasm32"))]
+pub use metered::set_system_networks;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod rendezvous;
 
 /// 每条路径的心跳间隔。
