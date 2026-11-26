@@ -26,7 +26,7 @@ public class NexusVpnService extends VpnService {
         System.loadLibrary("nexus_android");
     }
 
-    private static native int nativeStart(String dataDir, String name, int tunFd, String relay, boolean discovery);
+    private static native int nativeStart(String dataDir, String name, int tunFd, String relay, boolean discovery, String rendezvous);
     private static native void nativeStop();
 
     private ParcelFileDescriptor tun;
@@ -45,6 +45,8 @@ public class NexusVpnService extends VpnService {
         String name = intent != null && intent.getStringExtra("name") != null ? intent.getStringExtra("name") : defaultName();
         String relay = intent != null && intent.getStringExtra("relay") != null ? intent.getStringExtra("relay") : "default";
         boolean discovery = intent == null || intent.getBooleanExtra("discovery", true);
+        // 碰头服务（短加入码，M11.2）：default、disabled 或地址（自建网络里用锚点的 https://<锚点>/pkarr）。
+        String rendezvous = intent != null && intent.getStringExtra("rendezvous") != null ? intent.getStringExtra("rendezvous") : "default";
         try {
             Builder b = new Builder()
                 .setSession("Nexus")
@@ -59,7 +61,7 @@ public class NexusVpnService extends VpnService {
                 stopSelf();
                 return START_NOT_STICKY;
             }
-            nativeStart(getFilesDir().getAbsolutePath(), name, tun.detachFd(), relay, discovery);
+            nativeStart(getFilesDir().getAbsolutePath(), name, tun.detachFd(), relay, discovery, rendezvous);
             Log.i(TAG, "已启动：" + name);
         } catch (PackageManager.NameNotFoundException | RuntimeException e) {
             Log.e(TAG, "无法启动", e);

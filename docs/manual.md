@@ -911,7 +911,8 @@ nexus iface wlan0 --metered on           # 手动设置：on、off，或 auto �
 Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，手机上的任何应用都能按名字访问服务
 （`http://web.home.internal/`），规则里送去出口的域名经出口设备出去，其余流量照常走手机自己的网络。
 
-构建和安装见 `docs/android.md`。目前加入网络要用调试版系统上的命令行完成（应用界面上的加入流程还没做），
+构建和安装见 `docs/android.md`。打开应用、同意 VPN 授权后，屏幕上显示短加入码和二维码，
+在管理设备上 `nexus device approve <短码>`（或扫二维码，把扫出的文字交给它）即可加入，屏幕随后显示已加入的设备。
 多路径和计费网络的识别在 Android 上还没做。
 
 ## 17. 排查问题
@@ -973,5 +974,5 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - Vault 只能在管理设备上写入，写入时不在线的设备要等管理设备在线时 `nexus vault sync`。
   用恢复码换了管理设备后，「吊销后要轮换哪些条目」的记录留在原来的管理设备上，新的管理设备从收回的条目重新开始记。
 - 预编译版本只有 Linux（x86_64、aarch64）；没有安装包。`nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），Windows 上还不支持。
-- 还没有：Android 应用内加入（第 16 节）；Windows 的虚拟网卡。
+- 还没有：Windows 的虚拟网卡。
 - 远程桌面只是让现成的 VNC / RDP 经 Nexus 连通：网页里还不能看；没有在真实的 macOS 屏幕共享、Windows 远程桌面上验证过。
