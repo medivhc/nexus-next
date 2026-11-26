@@ -1,4 +1,4 @@
-//! 完整节点的虚拟网卡（M3.4）：在网卡上运行用户态协议栈，TCP 连接和发给名字服务的查询交给节点。
+//! 完整节点的虚拟网卡（M3.4）：在网卡上运行用户态协议栈，TCP 连接、UDP 数据报（M11.5）和发给名字服务的查询交给节点。
 //! 网卡的地址只覆盖完整节点的网段：只有发往本机临时地址（以及名字服务）的包会进来。
 
 use nexus_net_core::fakeip::FakePool;
@@ -81,7 +81,13 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
                 Ok(ipstack::IpStackStream::Udp(udp)) if udp.peer_addr().ip() == dns && udp.peer_addr().port() == 53 => {
                     tokio::spawn(serve_dns(udp, entry.clone()));
                 }
-                // 第一版只接 TCP 和名字服务。
+                // 其余的 UDP（M11.5）：交给节点按目标转发（只转发到 UDP 服务）。
+                Ok(ipstack::IpStackStream::Udp(udp)) => {
+                    let dst = udp.peer_addr();
+                    if entry.send(TunInbound::Udp { stream: Box::new(udp), dst }).is_err() {
+                        return;
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("nexus daemon: 虚拟网卡的协议栈停止了：{e}");

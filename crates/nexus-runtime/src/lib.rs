@@ -29,6 +29,7 @@ use nexus_wire::{
     Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, ServiceInfo, SessionInfo, Size, StatusReport,
     RouteExplanation, WireError, WIRE_VERSION,
 };
+mod datagrams;
 mod drive;
 mod share;
 mod vault;
@@ -73,6 +74,7 @@ enum Dispatch {
     Exec(ExecSpec),
     Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
     Pipe { addr: std::net::SocketAddr, name: String },
+    Datagram { addr: std::net::SocketAddr, name: String },
     Exit { target: Target },
     DriveGet { hashes: Vec<[u8; 32]> },
     DrivePush { ws: String, head: [u8; 32], count: u32 },
@@ -296,6 +298,8 @@ pub type ProxyStream = Box<dyn ProxyIo + Send>;
 pub enum TunInbound {
     /// 一条 TCP 连接，`dst` 是程序连的地址。
     Tcp { stream: ProxyStream, dst: std::net::SocketAddr },
+    /// 一个程序（源地址和端口）发往 `dst` 的 UDP 数据报（M11.5）：每次读出一个数据报，每次写入一个数据报。
+    Udp { stream: ProxyStream, dst: std::net::SocketAddr },
     /// 一个发给名字服务的查询；回应从 `reply` 送回（为空时不回应）。
     Dns { query: Vec<u8>, reply: tokio::sync::oneshot::Sender<Vec<u8>> },
 }
@@ -334,7 +338,9 @@ impl PublishedService {
 }
 
 /// 服务的协议：只用来告诉使用方怎么用。
-const SERVICE_PROTOS: [&str; 4] = ["tcp", "http", "vnc", "rdp"];
+const SERVICE_PROTOS: [&str; 5] = ["tcp", "http", "udp", "vnc", "rdp"];
+/// UDP 转发（M11.5）：这么久两个方向都没有数据报就结束。
+const DATAGRAM_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 const LOG_AUDIT: &str = "audit";
 /// 审计日志的轮转上限：最近这么多字节（约 4 万条）的记录总在，总占用不超过约两倍。
 const AUDIT_LOG_MAX: u64 = 8 << 20;
@@ -369,7 +375,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::HardwareList | Request::HardwareCapture { .. } => {
             return Err(err(ErrorCode::Denied, "常驻设备不提供网页硬件能力"));
         }
-        Request::SvcConnect { name } => {
+        Request::SvcConnect { name } | Request::SvcDatagram { name } => {
             if !valid_segment(name) {
                 return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
             }
@@ -784,6 +790,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Some(inbound) = tunneled.recv() => match inbound {
                     TunInbound::Tcp { stream, dst } => tasks.push(Box::pin(self.serve_tun(stream, dst))),
+                    TunInbound::Udp { stream, dst } => tasks.push(Box::pin(self.serve_tun_udp(stream, dst))),
                     TunInbound::Dns { query, reply } => tasks.push(Box::pin(async move {
                         let _ = reply.send(self.answer_dns(&query).await);
                     })),
@@ -902,6 +909,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 return self.serve_share_session(stream, &name, size, token, expires_at).await
             }
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
+            Dispatch::Datagram { addr, name } => return self.serve_datagram(stream, addr, &name).await,
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
             Dispatch::DriveGet { hashes } => return self.serve_drive_get(stream, hashes).await,
             Dispatch::DrivePush { ws, head, count } => return self.serve_drive_push(stream, ws, head, count).await,
@@ -1022,8 +1030,17 @@ impl<T: Transport, S: System> Node<T, S> {
                 true => return Dispatch::DrivePush { ws, head, count },
                 false => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有工作区 {ws}"))),
             },
-            Request::SvcConnect { name } => match self.service_addr(&name) {
-                Some(addr) => return Dispatch::Pipe { addr, name },
+            Request::SvcConnect { name } => match self.services.borrow().iter().find(|s| s.name == name).map(|s| (s.addr, s.proto == "udp")) {
+                Some((_, true)) => Response::Error(err(
+                    ErrorCode::InvalidInput,
+                    format!("{me} 上的服务 {name} 是 UDP 服务：经完整节点按名字访问（{name}.{me}.internal）"),
+                )),
+                Some((addr, false)) => return Dispatch::Pipe { addr, name },
+                None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
+            },
+            Request::SvcDatagram { name } => match self.services.borrow().iter().find(|s| s.name == name) {
+                Some(s) if s.proto == "udp" => return Dispatch::Datagram { addr: s.addr, name },
+                Some(s) => Response::Error(err(ErrorCode::InvalidInput, format!("{me} 上的服务 {name} 是 {}，不是 UDP 服务", s.proto))),
                 None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
             },
             Request::ExitConnect { target } => {
@@ -2426,6 +2443,24 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
     }
 
+    /// 别的设备经完整节点发给本机 UDP 服务的数据报（M11.5）：流上的帧和本机的 UDP 套接字互相转发。
+    async fn serve_datagram<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, addr: std::net::SocketAddr, name: &str) {
+        let udp = match self.system.udp_connect(addr).await {
+            Ok(u) => u,
+            Err(e) => {
+                let failure = err(ErrorCode::Unreachable, format!("服务 {name} 的 UDP 套接字打不开（{e}）"));
+                let _ = write_response(&mut stream, &Response::Error(failure)).await;
+                let _ = stream.shutdown().await;
+                drain(&mut stream).await;
+                return;
+            }
+        };
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
+            return;
+        }
+        let _ = datagrams::relay(stream, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+    }
+
     /// 出口：替别的设备连到目标。不连本机地址：本机上的程序要给别人用，应当发布成服务。
     async fn serve_exit<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, target: Target) {
         let result = async {
@@ -2644,6 +2679,45 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             Err(_) => {
                 let _ = client.shutdown().await;
+            }
+        }
+    }
+
+    /// 完整节点上程序发往服务临时地址的 UDP 数据报（M11.5）：只转发到发布成 `--proto udp` 的服务，
+    /// 端口和 TCP 一样不看。规则里的域名（出口、上游代理）不转发 UDP。
+    async fn serve_tun_udp(&self, client: ProxyStream, dst: std::net::SocketAddr) {
+        let name = match (dst.ip(), self.tun.borrow().as_ref()) {
+            (std::net::IpAddr::V4(ip), Some((_, pool))) => pool.lookup(ip).map(str::to_string),
+            _ => None,
+        };
+        let Some(name) = name else { return };
+        let target = Target { host: Host::Name(name), port: dst.port() };
+        let Decision::Service { device, service } = route::decide(&target, &self.routes.borrow().rules) else { return };
+        let Ok(device) = self.resolve(&device) else { return };
+        // 协议栈的 UDP 流：每次读出一个数据报，每次写入一个数据报。
+        let (mut client_rd, mut client_wr) = tokio::io::split(client);
+        let to_client = async |b: &[u8]| -> io::Result<usize> {
+            client_wr.write_all(b).await?;
+            Ok(b.len())
+        };
+        let from_client = async |b: &mut [u8]| -> io::Result<usize> { client_rd.read(b).await };
+        if device.node_id == self.me() {
+            let Some(addr) = self.services.borrow().iter().find(|s| s.name == service && s.proto == "udp").map(|s| s.addr) else { return };
+            let Ok(udp) = self.system.udp_connect(addr).await else { return };
+            let _ = datagrams::bridge(from_client, to_client, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+            return;
+        }
+        let body = Request::SvcDatagram { name: service };
+        for attempt in 0..2 {
+            match self.open_stream(&device, body.clone(), None).await {
+                Ok(stream) => {
+                    let _ = datagrams::relay(stream, to_client, from_client).await;
+                    return;
+                }
+                Err(OpenError::StaleRoster) if attempt == 0 => {
+                    let _ = self.push_roster(device.node_id).await;
+                }
+                Err(_) => return,
             }
         }
     }

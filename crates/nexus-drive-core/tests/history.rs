@@ -109,3 +109,51 @@ fn delete_against_modify_keeps_the_modification_and_reports_it() {
     assert!(tree::files(&s, merged).unwrap().contains_key("f.txt.conflict-desk"));
     assert_eq!(conflicts, vec!["f.txt".to_string()]);
 }
+
+/// 在 `root` 里建一个空目录。
+fn mkdir(s: &mut MemStore, root: Hash, path: &str) -> Hash {
+    let e = Entry::Dir { tree: tree::empty(s) };
+    tree::set(s, root, &path.split('/').map(str::to_string).collect::<Vec<_>>(), e).unwrap()
+}
+
+/// 树里的全部空目录。
+fn empty_dirs(s: &MemStore, root: Hash, prefix: &str, out: &mut Vec<String>) {
+    let t = tree::Tree::decode(&s.get(&root).unwrap()).unwrap();
+    if t.entries.is_empty() && !prefix.is_empty() {
+        out.push(prefix.to_string());
+    }
+    for (name, e) in t.entries {
+        if let Entry::Dir { tree } = e {
+            let p = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            empty_dirs(s, tree, &p, out);
+        }
+    }
+}
+
+// covers: R92
+#[test]
+fn merge_keeps_empty_directories() {
+    let mut s = MemStore::default();
+    // base：空目录 keep、gone、fill；fill2 里有文件。
+    let mut base = tree_of(&mut s, &[("fill2/f", b"x")]);
+    for d in ["keep", "gone", "fill"] {
+        base = mkdir(&mut s, base, d);
+    }
+    // ours：新建空目录 mine 和 deep/a/b；删掉 gone；往 fill 里放文件。
+    let mut ours = tree_of(&mut s, &[("fill/new", b"o"), ("fill2/f", b"x")]);
+    for d in ["keep", "mine", "deep/a/b"] {
+        ours = mkdir(&mut s, ours, d);
+    }
+    // theirs：新建空目录 theirs；删掉 fill2 里的文件（fill2 留成空目录）。
+    let mut theirs = tree::empty(&mut s);
+    for d in ["keep", "gone", "fill", "theirs", "fill2"] {
+        theirs = mkdir(&mut s, theirs, d);
+    }
+    let (merged, conflicts) = tree::merge(&mut s, Some(base), ours, theirs, "desk").unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    let mut got = Vec::new();
+    empty_dirs(&s, merged, "", &mut got);
+    got.sort();
+    assert_eq!(got, ["deep/a/b", "fill2", "keep", "mine", "theirs"], "gone 被本机删掉；fill 里有了文件");
+    assert!(tree::files(&s, merged).unwrap().contains_key("fill/new"));
+}
