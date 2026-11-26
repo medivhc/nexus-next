@@ -158,25 +158,20 @@ mod win {
 
     const MAX_INSTANCES: usize = 64;
 
-    /// 第一个实例：独占创建，避免接到上一次崩溃留下的同名管道。
+    /// 第一个实例：独占创建并拒绝远程 SMB 客户端，禁止回退附着到未知进程已占用的同名管道。
     pub fn create_pipe(name: &str) -> io::Result<NamedPipeServer> {
         let mut opts = ServerOptions::new();
         opts.first_pipe_instance(true)
             .reject_remote_clients(true)
             .max_instances(MAX_INSTANCES);
-        match opts.create(name) {
-            Ok(s) => Ok(s),
-            // 名字已被占（残留实例）：退而求其次直接接上。
-            Err(_) => {
-                let mut fallback = ServerOptions::new();
-                fallback.max_instances(MAX_INSTANCES).create(name)
-            }
-        }
+        opts.create(name)
     }
 
-    /// 服务完一个连接后为下一个客户端重建实例。
+    /// 服务完一个连接后为下一个客户端重建实例，同样拒绝远程客户端。
     pub fn recreate_pipe(name: &str) -> io::Result<NamedPipeServer> {
         let mut opts = ServerOptions::new();
-        opts.max_instances(MAX_INSTANCES).create(name)
+        opts.reject_remote_clients(true)
+            .max_instances(MAX_INSTANCES)
+            .create(name)
     }
 }

@@ -25,6 +25,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 .bar { display: flex; gap: 12px; align-items: center; padding: 4px 16px; }
 #xterm { flex: 1; min-height: 0; padding: 4px; background: #000; }
 #error { color: #d33; white-space: pre-wrap; }
+.hw-cmd { white-space: pre-wrap; word-break: break-all; padding: 8px; background: var(--surface); border-radius: 6px; font-size: 12px; user-select: all; }
 .svc { color: var(--accent); text-decoration: none; padding: 2px 6px; }
 
 /* M9.1 临时分享视图 */
