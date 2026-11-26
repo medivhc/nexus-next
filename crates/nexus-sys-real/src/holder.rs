@@ -391,7 +391,6 @@ mod transport {
     use tokio::sync::mpsc;
 
     pub type Stream = tokio::net::UnixStream;
-    pub type WriteHalf = tokio::net::unix::OwnedWriteHalf;
 
     /// 会话目录只给本人。
     pub fn private_dir(dir: &Path) -> io::Result<()> {
@@ -448,7 +447,6 @@ mod transport {
     use tokio::sync::mpsc;
 
     pub type Stream = tokio::net::TcpStream;
-    pub type WriteHalf = tokio::net::tcp::OwnedWriteHalf;
 
     const TOKEN_LEN: usize = 32;
     const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
