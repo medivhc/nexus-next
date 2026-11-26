@@ -18,7 +18,15 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
 
 pub struct RealSystem {
     dir: PathBuf,
@@ -28,7 +36,6 @@ pub struct RealSystem {
     exec_env: Vec<(String, String)>,
 }
 
-#[cfg(unix)]
 pub mod holder;
 
 impl RealSystem {
@@ -47,11 +54,9 @@ impl RealSystem {
         Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None, exec_env: Vec::new() })
     }
 
-    /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2）。只在 Unix 上。
+    /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2；Windows 见 M11.3）。
     pub fn with_session_holder(mut self, exe: PathBuf) -> Self {
-        if cfg!(unix) {
-            self.session_holder = Some(exe);
-        }
+        self.session_holder = Some(exe);
         self
     }
 
@@ -101,19 +106,33 @@ impl System for RealSystem {
         Ok(tokio::net::lookup_host((host, 0)).await?.map(|a| a.ip()).collect())
     }
 
+    async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<nexus_sys::UdpConn> {
+        struct Udp(tokio::net::UdpSocket);
+        impl nexus_sys::Datagram for Udp {
+            fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+                self.0.poll_send(cx, buf)
+            }
+            fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+                self.0.poll_recv(cx, buf)
+            }
+        }
+        let any: std::net::SocketAddr = if addr.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
+        let s = tokio::net::UdpSocket::bind(any).await?;
+        s.connect(addr).await?;
+        Ok(nexus_sys::UdpConn(Box::new(Udp(s))))
+    }
+
     fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
-        #[cfg(unix)]
         if let Some(exe) = &self.session_holder {
-            return holder::spawn(exe, &self.dir, name, size, created_at).map(RealTerm::Held);
+            return holder::spawn(exe, &self.dir, name, size, created_at, false).map(RealTerm::Held);
         }
         let _ = (name, created_at);
         RealPty::spawn(size).map(RealTerm::Local)
     }
 
     async fn adopt_ptys(&self) -> Vec<nexus_sys::AdoptedPty<RealTerm>> {
-        #[cfg(unix)]
         if self.session_holder.is_some() {
-            return holder::adopt(&self.dir)
+            return holder::adopt(self.session_holder.as_deref().expect("上面判断过"), &self.dir)
                 .into_iter()
                 .map(|a| nexus_sys::AdoptedPty { name: a.name, size: a.size, created_at: a.created_at, pty: RealTerm::Held(a.pty) })
                 .collect();
@@ -221,7 +240,7 @@ impl System for RealSystem {
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().expect("有上级目录"))?;
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = unique_tmp(&path);
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)
     }
@@ -232,7 +251,7 @@ impl System for RealSystem {
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let path = self.path(key)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp(&path);
         use std::io::Write;
         #[cfg(unix)]
         {
@@ -247,6 +266,14 @@ impl System for RealSystem {
             file.write_all(value)?;
         }
         std::fs::rename(tmp, path)
+    }
+
+    fn store_delete(&self, key: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -353,7 +380,6 @@ const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(3
 /// 终端：在本进程里，或者由持有进程管理（M7.2）。
 pub enum RealTerm {
     Local(RealPty),
-    #[cfg(unix)]
     Held(holder::HeldPty),
 }
 
@@ -361,28 +387,24 @@ impl Pty for RealTerm {
     async fn next_event(&mut self) -> PtyEvent {
         match self {
             RealTerm::Local(p) => p.next_event().await,
-            #[cfg(unix)]
             RealTerm::Held(p) => p.next_event().await,
         }
     }
     fn write(&mut self, data: Vec<u8>) {
         match self {
             RealTerm::Local(p) => p.write(data),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.write(data),
         }
     }
     fn resize(&mut self, size: Size) {
         match self {
             RealTerm::Local(p) => p.resize(size),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.resize(size),
         }
     }
     fn kill(&mut self) {
         match self {
             RealTerm::Local(p) => p.kill(),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.kill(),
         }
     }
@@ -403,6 +425,11 @@ pub struct RealPty {
 
 impl RealPty {
     fn spawn(size: Size) -> io::Result<Self> {
+        Self::spawn_in(size, None)
+    }
+
+    /// 在 `cwd`（没有时是家目录）里启动 shell。
+    fn spawn_in(size: Size, cwd: Option<&std::path::Path>) -> io::Result<Self> {
         fn other(e: impl std::fmt::Display) -> io::Error {
             io::Error::other(e.to_string())
         }
@@ -411,26 +438,26 @@ impl RealPty {
         #[cfg(unix)]
         let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
         #[cfg(windows)]
-        let shell = std::env::var("ComSpec")
-            .ok()
-            .and_then(|p| {
-                if std::path::Path::new(&p).file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe")) {
-                    Some(p)
-                } else if std::path::Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
-                    Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into())
-                } else {
-                    Some(p)
-                }
-            })
-            .unwrap_or_else(|| "cmd.exe".into());
+        let shell = {
+            // 有 Windows PowerShell 就用它，否则用 ComSpec（通常是 cmd.exe）。
+            const POWERSHELL: &str = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+            let comspec = std::env::var("ComSpec").ok().filter(|s| !s.is_empty());
+            let is_powershell = |p: &str| std::path::Path::new(p).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe"));
+            match comspec {
+                Some(p) if is_powershell(&p) => p,
+                _ if std::path::Path::new(POWERSHELL).exists() => POWERSHELL.to_string(),
+                Some(p) => p,
+                None => "cmd.exe".to_string(),
+            }
+        };
 
         let mut cmd = portable_pty::CommandBuilder::new(shell);
         #[cfg(unix)]
         cmd.env("TERM", "xterm-256color");
         #[cfg(unix)]
-        cmd.cwd(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| "/".into())));
         #[cfg(windows)]
-        cmd.cwd(std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into()));
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into())));
 
         let mut child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
@@ -481,6 +508,14 @@ impl RealPty {
             }
         });
         Ok(Self { master: pair.master, killer, pid, events, input, eof: false, status: None })
+    }
+}
+
+impl RealPty {
+    /// shell 的进程号。
+    #[allow(dead_code)]
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid
     }
 }
 

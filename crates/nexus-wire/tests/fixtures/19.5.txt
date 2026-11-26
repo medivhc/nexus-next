@@ -1,0 +1,2 @@
+# 协议 19.5 新增的消息的编码（tests/compat.rs 生成，不要手改）
+request.svc_datagram 1e03646e73

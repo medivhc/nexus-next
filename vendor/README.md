@@ -3,6 +3,8 @@
 阶段 5（多路径）要改传输层：iroh 1.4.1、noq 1.4.0、noq-proto 1.4.0、noq-udp 1.4.0 从 crates.io 原样复制到这里，
 通过根目录 `Cargo.toml` 的 `[patch.crates-io]` 替换。许可证都是 MIT OR Apache-2.0（见各目录的 LICENSE 文件）。
 
+M11.5 起完整节点和 Android 的用户态协议栈 ipstack 1.0.1 也在这里（许可证 Apache-2.0），同样经 `[patch.crates-io]` 替换。
+
 每一处改动都标注 `NEXUS:`，可以用 `grep -rn "NEXUS:" vendor/` 找到。升级上游时，先把上游新版本复制进来，
 再把这些改动重新加上。
 
@@ -20,3 +22,4 @@
 | 计费的本机地址：从它们出去的直连路径是 Backup | iroh `src/lib.rs`（`nexus_set_metered_ips`）、`remote_state.rs` | 计费网络只承担交互和故障接管 |
 | 直连都可疑时 Backup 路径（中继、计费的接口）也算健康路径：在途的数据马上转过去 | noq-proto `src/connection/mod.rs`（`nexus_has_healthy_path_besides`） | 直连都断时原来要等直连被放弃（5 秒）才在中继上重发（M11.4） |
 | BBR 的应用受限标记：上一段受限的数据送达时，现在仍受限就重新标记（原来是 `else if`） | noq-proto `src/congestion/bbr3/mod.rs`（`on_end_acks`） | 零星的交互流量被当成带宽到顶，起步阶段过早结束，批量传输开头几秒只有一半速度（M11.4） |
+| 收到对方的 FIN 只结束读方向、不替本端发 FIN；本端 shutdown 且在途数据都被确认后才发；FIN 可以带数据；去掉 CLOSE_WAIT 超时强行发 FIN；本端先关时对方的 FIN 立刻结束读方向；没 shutdown 就丢掉的连接发 RST | ipstack `src/stream/tcp.rs`（`HalfClose`） | TCP 半关闭：`echo ... \| nc` 收不到回应（M11.5，R89） |

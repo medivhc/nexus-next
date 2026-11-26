@@ -136,6 +136,31 @@ impl World {
         out
     }
 
+    /// 节点上应用的界面刷新一次（M11.2）：和 Android 应用一样经控制通道调用 [`nexus_cli::app::refresh`]。
+    /// `now_ms` 为空时用节点现在的时间。
+    pub async fn app_screen(
+        &self,
+        node: &str,
+        held: Option<nexus_cli::app::JoinView>,
+        renew: bool,
+        now_ms: Option<u64>,
+    ) -> nexus_cli::app::Screen {
+        let now = now_ms.unwrap_or_else(|| self.now().0);
+        let screen = match &self.inner {
+            Inner::Sim { nodes, .. } => {
+                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                nexus_cli::app::refresh(&ChanCtl(tx.clone(), None), held, renew, now).await
+            }
+            Inner::Real(real) => {
+                let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                nexus_cli::app::refresh(&nexus_cli::UnixCtl::new(dir, None), held, renew, now).await
+            }
+        };
+        let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
+        self.trace.borrow_mut().push(format!("{at}ms {node} app {screen:?}"));
+        screen
+    }
+
     /// 让所有节点的时钟向前跳一段，期间什么都不发生。
     ///
     /// 仿真里瞬间完成，适合验证「四小时后授权过期」这类只取决于当前时间的行为。
@@ -200,7 +225,11 @@ impl World {
                     turmoil::repair(node, other.as_str());
                 }
             }
-            Inner::Real(_) => panic!("真实后端无法让被杀掉的节点原样恢复"),
+            Inner::Real(real) => {
+                let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
+                real.spawn_daemon(node, &["--local-only"]);
+                real.wait_ready(node, &["--local-only"]);
+            }
         }
     }
 }
@@ -408,6 +437,27 @@ impl World {
         let Inner::Real(real) = &self.inner else { panic!("restart 只用于真实后端") };
         real.kill(node);
         // 被杀掉的常驻程序留下的控制套接字文件不代表新的已经就绪。
+        let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
+        real.spawn_daemon(node, args);
+        real.wait_ready(node, args);
+    }
+
+    /// 模拟设备重启：结束常驻程序和所有终端会话的持有进程（连同会话里的程序），再以 `args` 启动常驻程序。
+    /// 只在真实后端。
+    pub async fn reboot(&self, node: &str, args: &[&str]) {
+        let Inner::Real(real) = &self.inner else { panic!("reboot 只用于真实后端") };
+        real.kill(node);
+        let sessions = real.dirs[node].join("sessions");
+        for entry in std::fs::read_dir(&sessions).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "pid") {
+                if let Ok(pid) = std::fs::read_to_string(&path) {
+                    // 持有进程自成一个进程组；它不在了，会话里的 shell 随伪终端关闭而结束。
+                    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", pid.trim())]).status();
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
         let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
         real.spawn_daemon(node, args);
         real.wait_ready(node, args);
@@ -713,6 +763,12 @@ impl Browser {
     pub fn hint(&self) -> String {
         let node = self.node();
         on_node!(node, n => n.hint())
+    }
+
+    /// 页面上显示的 `nexus hw` 命令（M8.3）。
+    pub fn hardware_command(&self, kind: Option<nexus_web_core::HardwareKind>) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hardware_command(kind))
     }
 
     /// 启动网页节点的硬件能力服务循环（M8.3）。
@@ -1900,6 +1956,22 @@ impl FullNode {
     /// 用系统的网络栈连 `ip:port`，发一个 HTTP GET，返回正文；连接被关闭时正文为空。
     pub fn http_get(&self, ip: std::net::IpAddr, port: u16, path: &str) -> io::Result<String> {
         http_get_at((ip, port).into(), path)
+    }
+
+    /// 像 `echo ... | nc ip port`：送出 `data` 后关闭写方向，返回读到的全部字节（10 秒没有结束算出错）。
+    pub fn send_then_half_close(&self, ip: std::net::IpAddr, port: u16, data: &[u8]) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // 边写边读：回声服务边读边回，不读的话两边的缓冲区都满了会互相等。
+        let mut r = s.try_clone()?;
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).map(|_| out)
+        });
+        s.write_all(data)?;
+        s.shutdown(std::net::Shutdown::Write)?;
+        reader.join().map_err(|_| io::Error::other("读的线程出错"))?
     }
 }
 

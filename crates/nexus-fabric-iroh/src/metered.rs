@@ -36,6 +36,7 @@ pub(crate) struct Iface {
 
 /// 现在启用的、不是回环的接口（按名字排序）。
 pub(crate) fn scan() -> Vec<Iface> {
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "macos")), allow(unused_mut))]
     let mut by_name: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     if let Ok(list) = nix::ifaddrs::getifaddrs() {

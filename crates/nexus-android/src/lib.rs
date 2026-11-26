@@ -7,7 +7,7 @@
 //! 这里有 unsafe：JNI 导出函数要求不改名（`no_mangle`），网卡来自一个原始文件描述符。
 
 use jni::objects::{JBooleanArray, JClass, JObjectArray, JString};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use nexus_cli::daemon;
 use std::path::PathBuf;
@@ -20,7 +20,9 @@ pub const TUN_NET: &str = "198.18.0.0/16";
 static STOP: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
 
 /// 启动常驻程序。返回 0 表示已经启动；之后的错误写到数据目录里的 daemon.log。
-pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discovery: bool) -> Result<(), String> {
+/// `rendezvous` 和 `nexus daemon --rendezvous` 一样：空串或 `default` 跟随 `discovery`，`disabled` 不用，其余是地址
+/// （自建网络里用锚点的 `https://<锚点>/pkarr`）。
+pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discovery: bool, rendezvous: String) -> Result<(), String> {
     let mut stop = STOP.lock().map_err(|_| "状态损坏".to_string())?;
     if stop.is_some() {
         return Err("已经在运行".into());
@@ -40,6 +42,9 @@ pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discov
                     // SAFETY: VpnService.establish() 给出的描述符，所有权交给我们（Java 一侧 detachFd）。
                     let device = unsafe { tun_rs::AsyncDevice::from_fd(tun_fd) }.map_err(|e| format!("网卡：{e}"))?;
                     let mut config = daemon::transport_config(false, &relay, !discovery);
+                    if let Some(r) = rendezvous_override(&rendezvous) {
+                        config.rendezvous = r;
+                    }
                     config.scheduling = true;
                     let opts = daemon::Options {
                         data_dir: data_dir.clone(),
@@ -67,6 +72,15 @@ pub fn start(data_dir: PathBuf, name: String, tun_fd: i32, relay: String, discov
         })
         .map_err(|e| format!("无法启动线程：{e}"))?;
     Ok(())
+}
+
+/// 应用启动参数里的碰头服务（M11.2）：`None` 表示沿用默认（跟随 discovery）。
+pub fn rendezvous_override(text: &str) -> Option<Option<String>> {
+    match text.trim() {
+        "" | "default" => None,
+        "disabled" => Some(None),
+        url => Some(Some(url.to_string())),
+    }
 }
 
 /// 应用进程没有终端：核心的日志（标准错误）写到数据目录里的 daemon.log。
@@ -105,6 +119,27 @@ pub fn stop() {
     }
 }
 
+/// 应用界面刷新一次（M11.2，R79）：经数据目录里的控制套接字问核心，返回 [`nexus_cli::app::Screen`] 的 JSON。
+/// `held` 是上次返回的加入码（`Screen::Joining` 的 JSON，没有时为空串），`renew` 要求换一个加入码。
+pub fn screen_json(data_dir: &std::path::Path, held: &str, renew: bool, now_ms: u64) -> String {
+    use nexus_cli::app::{refresh, Screen};
+    let held = match serde_json::from_str::<Screen>(held) {
+        Ok(Screen::Joining(view)) => Some(view),
+        _ => None,
+    };
+    let ctl = nexus_cli::UnixCtl::new(data_dir, None);
+    let screen = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(async {
+            // 核心卡住时界面不能跟着卡住。
+            tokio::time::timeout(std::time::Duration::from_secs(15), refresh(&ctl, held, renew, now_ms))
+                .await
+                .unwrap_or(Screen::Failed { message: "核心没有回应".into() })
+        }),
+        Err(e) => Screen::Failed { message: e.to_string() },
+    };
+    serde_json::to_string(&screen).unwrap_or_default()
+}
+
 fn string(env: &mut JNIEnv, s: &JString) -> String {
     env.get_string(s).map(Into::into).unwrap_or_default()
 }
@@ -118,9 +153,11 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
     tun_fd: jint,
     relay: JString,
     discovery: jboolean,
+    rendezvous: JString,
 ) -> jint {
     let (data_dir, name, relay) = (string(&mut env, &data_dir), string(&mut env, &name), string(&mut env, &relay));
-    match start(data_dir.into(), name, tun_fd, relay, discovery != 0) {
+    let rendezvous = string(&mut env, &rendezvous);
+    match start(data_dir.into(), name, tun_fd, relay, discovery != 0, rendezvous) {
         Ok(()) => 0,
         Err(e) => {
             let _ = env.throw_new("java/lang/IllegalStateException", e);
@@ -156,4 +193,42 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeSetNetworks(
         }
     }
     nexus_fabric_iroh::set_system_networks(list);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    held: JString,
+    renew: jboolean,
+    now_ms: jlong,
+) -> jstring {
+    let (data_dir, held) = (string(&mut env, &data_dir), string(&mut env, &held));
+    let json = screen_json(std::path::Path::new(&data_dir), &held, renew != 0, now_ms.max(0) as u64);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod tests {
+    // covers: R79
+    use super::*;
+
+    #[test]
+    fn rendezvous_extra() {
+        assert_eq!(rendezvous_override(""), None);
+        assert_eq!(rendezvous_override("default"), None);
+        assert_eq!(rendezvous_override("disabled"), Some(None));
+        assert_eq!(rendezvous_override("http://10.0.0.1:8080/pkarr"), Some(Some("http://10.0.0.1:8080/pkarr".into())));
+    }
+
+    // FP-11.2-06：核心还没起来（没有控制套接字）时界面显示正在启动；交回的内容不对也不影响
+    #[test]
+    fn screen_before_the_core_is_up() {
+        let dir = std::env::temp_dir().join(format!("nexus-android-test-{}", std::process::id()));
+        for held in ["", "{", r#"{"state":"starting","message":"x"}"#] {
+            let v: serde_json::Value = serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
+            assert_eq!(v["state"], "starting", "{v}");
+        }
+    }
 }

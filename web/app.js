@@ -112,8 +112,57 @@ function renderHardwareStatus(session) {
   }
 }
 
+// 页面提供给网页节点核心的采集：摄像头拍一张，麦克风录几秒，位置取一次。只用已经同意开启时拿到的流。
+const MIC_CLIP_MS = 3000;
+
+async function captureHardware(kind) {
+  if (kind === "camera") {
+    const stream = hwStreams.camera;
+    if (!stream) throw new Error("摄像头没有开启");
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    await video.play();
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    video.pause();
+    video.srcObject = null;
+    const blob = await new Promise((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("拍照失败"))), "image/jpeg", 0.85),
+    );
+    return { mime: "image/jpeg", data: new Uint8Array(await blob.arrayBuffer()) };
+  }
+  if (kind === "microphone") {
+    const stream = hwStreams.microphone;
+    if (!stream) throw new Error("麦克风没有开启");
+    const rec = new MediaRecorder(stream);
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    const done = new Promise((resolve) => (rec.onstop = resolve));
+    const started = performance.now();
+    rec.start();
+    await new Promise((r) => setTimeout(r, MIC_CLIP_MS));
+    rec.stop();
+    await done;
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+    return { mime: blob.type, duration_ms: Math.round(performance.now() - started), data: new Uint8Array(await blob.arrayBuffer()) };
+  }
+  if (kind === "location") {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000, maximumAge: 0 }),
+    );
+    return { lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, timestamp: pos.timestamp };
+  }
+  throw new Error(`未知的硬件能力：${kind}`);
+}
+
 function hardwareControls(session) {
   renderHardwareStatus(session);
+  $("hw-cmd").textContent = `${session.hardware_command()}\n${session.hardware_command("location")}`;
+  session.hardware_serve(captureHardware, () => renderHardwareStatus(session));
   const toggle = async (kind) => {
     $("error").textContent = "";
     const enabled = new Set(JSON.parse(session.hardware_enabled()));

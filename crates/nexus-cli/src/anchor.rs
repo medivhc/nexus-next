@@ -90,14 +90,21 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
         tokio::spawn(redirect_to_https(http, url.clone()));
     }
     let page = Arc::new(page);
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(1024));
     match tls {
         Tls::Dev => {
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else { continue };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let page = page.clone();
                     tokio::spawn(async move {
-                        let _ = front(stream, &page, relay_addr).await;
+                        let _permit = permit;
+                        let _ = front(stream, peer.ip(), &page, relay_addr).await;
                     });
                 }
             });
@@ -106,11 +113,17 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             let acceptor = tokio_rustls::TlsAcceptor::from(config);
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else { continue };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let (page, acceptor) = (page.clone(), acceptor.clone());
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                            let _ = front(tls, &page, relay_addr).await;
+                            let _ = front(tls, peer.ip(), &page, relay_addr).await;
                         }
                     });
                 }
@@ -136,9 +149,15 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             });
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else { continue };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        // 文件句柄耗尽等错误时别空转。
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    };
                     let (page, acceptor, config) = (page.clone(), acceptor.clone(), config.clone());
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
                             match acceptor.accept(stream).await {
                                 // 证书验证用的连接，已经处理完。
@@ -149,7 +168,7 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
                         })
                         .await;
                         if let Ok(Some(tls)) = accepted {
-                            let _ = front(tls, &page, relay_addr).await;
+                            let _ = front(tls, peer.ip(), &page, relay_addr).await;
                         }
                     });
                 }
@@ -168,14 +187,14 @@ fn rendezvous_store() -> &'static nexus_fabric_iroh::rendezvous::Store {
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 读请求头，按路径交给中继或回应页面。
-async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, page: &Path, relay: SocketAddr) -> io::Result<()> {
+async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, peer_ip: std::net::IpAddr, page: &Path, relay: SocketAddr) -> io::Result<()> {
     let head = tokio::time::timeout(HANDSHAKE_TIMEOUT, web_serve::read_head(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "请求头超时"))??;
     let (_, target) = web_serve::request_line(&head);
     if target.starts_with("/pkarr/") {
         // 碰头服务（M6.1）：新设备在自建网络里用 --rendezvous https://<锚点>/pkarr。
-        nexus_fabric_iroh::rendezvous::respond(&mut stream, &head, rendezvous_store()).await
+        nexus_fabric_iroh::rendezvous::respond_with_ip(&mut stream, &head, rendezvous_store(), Some(peer_ip)).await
     } else if is_relay_path(&target) {
         let mut upstream = TcpStream::connect(relay).await?;
         // 按连接上的第一个请求分流：不是协议升级的请求（探测）回应后必须关闭连接，

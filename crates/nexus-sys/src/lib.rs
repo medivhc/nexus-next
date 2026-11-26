@@ -85,6 +85,10 @@ pub trait System {
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
     /// 原子地写入一个小的持久化值。
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()>;
+    /// 删除一个持久化值；键不存在时视为成功。
+    fn store_delete(&self, _key: &str) -> io::Result<()> {
+        Ok(())
+    }
     /// 在一份只追加的日志末尾写一条记录（审计用）。记录本身由调用方编码。
     ///
     /// 写入后会超过 `max_bytes` 时，先把当前内容轮转为旧日志（替换更早的旧日志），
@@ -103,6 +107,12 @@ pub trait System {
     }
     /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
+    /// 向本机（或本机能直接到达）的一个 UDP 服务收发数据报（M11.5：发布成 `--proto udp` 的服务）。
+    /// 没有 UDP 的实现（仿真）说不支持。
+    fn udp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<UdpConn>> {
+        let _ = addr;
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这里没有 UDP")))
+    }
     /// 按内容寻址的对象存储（Drive）：取出哈希为 `hash` 的对象。
     fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>>;
     /// 存入一个对象；调用方保证 `hash` 是它的哈希。已有时什么也不做。
@@ -110,6 +120,28 @@ pub trait System {
     fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool>;
     /// 解析主机名（统一入口直连时用）。
     fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>>;
+}
+
+/// 一个「连上」了对端的数据报套接字：只和那一个地址收发，每次收发一个完整的数据报。
+pub trait Datagram {
+    fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>>;
+    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>>;
+}
+
+/// [`System::udp_connect`] 的结果。
+pub struct UdpConn(pub Box<dyn Datagram>);
+
+impl UdpConn {
+    /// 发一个数据报。
+    pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.0.poll_send(cx, data)).await
+    }
+    /// 收一个数据报，返回长度（比 `buf` 长的部分丢掉）。
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut rb = tokio::io::ReadBuf::new(buf);
+        std::future::poll_fn(|cx| self.0.poll_recv(cx, &mut rb)).await?;
+        Ok(rb.filled().len())
+    }
 }
 
 /// 本机 TCP 连接。
@@ -121,6 +153,7 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     type Pty = S::Pty;
     type Tcp = S::Tcp;
     fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> { (**self).tcp_connect(addr) }
+    fn udp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<UdpConn>> { (**self).udp_connect(addr) }
     fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>> { (**self).resolve(host) }
     fn now(&self) -> Timestamp { (**self).now() }
     fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> { (**self).cas_get(hash) }
@@ -129,6 +162,7 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
+    fn store_delete(&self, key: &str) -> io::Result<()> { (**self).store_delete(key) }
     fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> { (**self).append_log(name, record, max_bytes) }
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }

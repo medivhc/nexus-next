@@ -127,3 +127,86 @@ scenario! {
         assert!(rot3["items"].as_array().unwrap().is_empty(), "{rot3}");
     },
 }
+
+/// 建网并返回恢复码：laptop 是管理设备，members 依次加入。
+async fn network_with_code(w: &World, members: &[&str]) -> String {
+    let init = w.cli_ok("laptop", &["init", "--name", "laptop"]).await;
+    let code = init["recovery_code"].as_str().unwrap().to_string();
+    for m in members {
+        let join = w.cli_ok(m, &["join"]).await;
+        w.cli_ok("laptop", &["device", "approve", join["code"].as_str().unwrap(), "--name", m]).await;
+    }
+    code
+}
+
+fn entry_names(ls: &serde_json::Value) -> Vec<String> {
+    ls["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect()
+}
+
+scenario! {
+    name: recovered_admin_collects_vault_entries_from_members,
+    covers: "R74, R64",
+    nodes: ["laptop", "home", "office"],
+    real: yes,
+    run: |w: World| async move {
+        let code = network_with_code(&w, &["home", "office"]).await;
+        w.cli_ok("laptop", &["vault", "put", "shared", "--value", "v-shared", "--device", "home", "--device", "office"]).await;
+        w.cli_ok("laptop", &["vault", "put", "office_only", "--value", "v-office", "--device", "office"]).await;
+
+        // 管理设备丢了，home 用恢复码接管：恢复时从在线的设备收回条目。
+        w.take_offline("laptop");
+        w.cli_ok("home", &["recover", &code]).await;
+        let ls = w.cli_ok("home", &["vault", "ls"]).await;
+        assert_eq!(entry_names(&ls), ["office_only", "shared"], "{ls}");
+        assert_eq!(w.cli_ok("home", &["vault", "get", "office_only"]).await["value"], "v-office");
+
+        // office 照常同步，不丢任何条目。
+        w.cli_ok("office", &["vault", "sync"]).await;
+        assert_eq!(w.cli_ok("office", &["vault", "get", "office_only"]).await["value"], "v-office");
+        assert_eq!(w.cli_ok("office", &["vault", "get", "shared"]).await["value"], "v-shared");
+
+        // 新的管理设备照常轮换和删除。
+        w.cli_ok("home", &["vault", "put", "shared", "--value", "v-shared-2", "--device", "office"]).await;
+        assert_eq!(w.cli_ok("office", &["vault", "get", "shared"]).await["value"], "v-shared-2");
+        w.cli_ok("home", &["vault", "rm", "office_only"]).await;
+        assert_eq!(w.cli("office", &["vault", "get", "office_only"]).await.code, 109);
+    },
+}
+
+scenario! {
+    name: member_keeps_vault_entries_the_recovered_admin_has_not_seen,
+    covers: "R74, R64",
+    nodes: ["laptop", "home", "office"],
+    real: (pending "需要让掉线的节点原样恢复，只有仿真后端能做到"),
+    run: |w: World| async move {
+        let code = network_with_code(&w, &["home", "office"]).await;
+        w.cli_ok("laptop", &["vault", "put", "shared", "--value", "v-shared", "--device", "home", "--device", "office"]).await;
+        w.cli_ok("laptop", &["vault", "put", "office_only", "--value", "v-office", "--device", "office"]).await;
+
+        // office 恢复时不在线：新的管理设备收不回它的条目。
+        w.take_offline("laptop");
+        w.take_offline("office");
+        w.cli_ok("home", &["recover", &code]).await;
+        assert_eq!(entry_names(&w.cli_ok("home", &["vault", "ls"]).await), ["shared"]);
+
+        // office 回来后同步：新管理设备的清单短，office 不能因此丢掉 office_only。
+        w.bring_online("office");
+        w.cli_ok("office", &["status", "home"]).await;
+        w.cli_ok("office", &["vault", "sync"]).await;
+        assert_eq!(w.cli_ok("office", &["vault", "get", "office_only"]).await["value"], "v-office");
+
+        // 管理设备上 vault sync 从在线的设备收回条目。
+        w.cli_ok("home", &["vault", "sync"]).await;
+        assert_eq!(entry_names(&w.cli_ok("home", &["vault", "ls"]).await), ["office_only", "shared"]);
+
+        // 之后新管理设备的删除照常生效，包括 office 离线时删的。
+        w.cli_ok("office", &["vault", "sync"]).await;
+        w.take_offline("office");
+        w.cli_ok("home", &["vault", "rm", "office_only"]).await;
+        w.bring_online("office");
+        w.cli_ok("office", &["status", "home"]).await;
+        w.cli_ok("office", &["vault", "sync"]).await;
+        assert_eq!(w.cli("office", &["vault", "get", "office_only"]).await.code, 109);
+        assert_eq!(w.cli_ok("office", &["vault", "get", "shared"]).await["value"], "v-shared");
+    },
+}

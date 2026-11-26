@@ -37,7 +37,7 @@ pub fn parse_tun_net(s: &str) -> Option<nexus_net_core::fakeip::FakePool> {
 
 /// 完整节点的虚拟网卡。
 pub enum Tun {
-    /// 常驻程序自己建网卡（Linux、macOS）。
+    /// 常驻程序自己建网卡（Linux、macOS、Windows）。
     Named { name: String, pool: FakePool },
     /// 别人建好的网卡（Android 的 VpnService），`label` 只用于显示。
     Device { device: tun_rs::AsyncDevice, label: String, pool: FakePool },
@@ -79,13 +79,20 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
     let node = Node::new(transport, system, &name)?;
 
     // 虚拟网卡先于控制套接字：控制套接字出现时完整节点已经可用。
+    // 名字解析配置（macOS、Windows）在常驻程序正常退出时撤掉：守卫活到本函数结束。
+    let mut _resolver = None;
     match tun {
         None => {}
         Some(Tun::Named { name: dev, pool }) => {
             let entry = node.enable_tun(&dev, pool.clone());
-            tun::start(&dev, &pool, entry).map_err(|e| io::Error::other(format!("无法建虚拟网卡 {dev}（需要管理员权限）：{e}")))?;
+            let (actual, guard) =
+                tun::start(&dev, &pool, entry).map_err(|e| io::Error::other(format!("无法建虚拟网卡 {dev}（需要管理员权限）：{e}")))?;
+            if actual != dev {
+                node.enable_tun(&actual, pool.clone());
+            }
+            _resolver = Some(guard);
             let (net, prefix) = pool.network();
-            eprintln!("nexus daemon: 完整节点：虚拟网卡 {dev}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
+            eprintln!("nexus daemon: 完整节点：虚拟网卡 {actual}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
         }
         Some(Tun::Device { device, label, pool }) => {
             let entry = node.enable_tun(&label, pool.clone());
@@ -107,37 +114,73 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
             eprintln!("nexus daemon: 统一入口 {a}（SOCKS5 / HTTP 代理）");
         }
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let _ = stream.set_nodelay(true);
-                if entry.send(Box::new(stream)).is_err() {
-                    return;
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        if entry.send(Box::new(stream)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("nexus daemon: 统一入口 accept 出错：{e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
             }
         });
     }
 
     let (tx, mut rx) = mpsc::channel::<CtlCall>(64);
+    let (reexec_tx, mut reexec_rx) = mpsc::channel::<PathBuf>(1);
     let agent_tx = tx.clone();
     // 刚升级过（M7.3）：确认新版本连得上网络，连不上就换回。
-    tokio::spawn(confirm_upgrade(data_dir.to_path_buf(), tx.clone()));
+    tokio::spawn(confirm_upgrade(data_dir.to_path_buf(), tx.clone(), reexec_tx.clone()));
     let owner_dir = data_dir.to_path_buf();
+    let owner_reexec = reexec_tx.clone();
     tokio::spawn(async move {
-        while let Ok(stream) = listener.accept().await {
-            tokio::spawn(serve_ctl(stream, tx.clone(), false, Some(owner_dir.clone())));
+        loop {
+            match listener.accept().await {
+                Ok(stream) => {
+                    tokio::spawn(serve_ctl(stream, tx.clone(), false, Some(owner_dir.clone()), Some(owner_reexec.clone())));
+                }
+                Err(e) => {
+                    eprintln!("nexus daemon: 控制入口 accept 出错：{e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     });
     tokio::spawn(async move {
-        while let Ok(stream) = agent_listener.accept().await {
-            tokio::spawn(serve_ctl(stream, agent_tx.clone(), true, None));
+        loop {
+            match agent_listener.accept().await {
+                Ok(stream) => {
+                    tokio::spawn(serve_ctl(stream, agent_tx.clone(), true, None, None));
+                }
+                Err(e) => {
+                    eprintln!("nexus daemon: agent 入口 accept 出错：{e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     });
 
+    let mut pending_reexec = None;
     let result = tokio::select! {
         r = node.run(&mut rx) => r,
+        Some(exe) = reexec_rx.recv() => {
+            pending_reexec = Some(exe);
+            Ok(())
+        }
         _ = stop => Ok(()),
     };
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(agent_socket);
+    if let Some(exe) = pending_reexec {
+        let e = crate::upgrade::reexec(&exe);
+        eprintln!("nexus daemon: 无法重新启动：{e}");
+        return Err(e);
+    }
     result
 }
 
@@ -233,7 +276,7 @@ async fn handle_upgrade(req: &CtlRequest, data_dir: &std::path::Path, tx: &mpsc:
             (CtlResponse::Upgrade(state.report()), Some(exe))
         }
         CtlRequest::Upgrade { file, confirm_ms, force } => {
-            if !cfg!(unix) {
+            if !cfg!(any(unix, windows)) {
                 return (CtlResponse::Error(WireError::new(ErrorCode::InvalidState, "这个系统上还不支持 nexus upgrade：手动换二进制再重启服务")), None);
             }
             let exe = match std::env::current_exe() {
@@ -256,18 +299,18 @@ async fn handle_upgrade(req: &CtlRequest, data_dir: &std::path::Path, tx: &mpsc:
 }
 
 /// 新版本启动时：按 `upgrade.json` 确认（M7.3）。
-async fn confirm_upgrade(data_dir: PathBuf, tx: mpsc::Sender<CtlCall>) {
+async fn confirm_upgrade(data_dir: PathBuf, tx: mpsc::Sender<CtlCall>, reexec_tx: mpsc::Sender<PathBuf>) {
     use crate::upgrade;
     let Some(mut state) = upgrade::load(&data_dir).filter(|s| s.state == "pending") else { return };
     state.attempts += 1;
     let _ = upgrade::save(&data_dir, &state);
     let roll_back = |mut state: upgrade::UpgradeState, why: String| {
         let dir = data_dir.clone();
+        let reexec_tx = reexec_tx.clone();
         async move {
             eprintln!("nexus daemon: {why}，换回 {}", state.from);
             if upgrade::restore(&mut state, &dir, &why).is_ok() {
-                let e = upgrade::reexec(&state.exe);
-                eprintln!("nexus daemon: 换回之后无法重新启动：{e}");
+                let _ = reexec_tx.send(state.exe).await;
             }
         }
     };
@@ -299,7 +342,13 @@ async fn confirm_upgrade(data_dir: PathBuf, tx: mpsc::Sender<CtlCall>) {
 
 /// 常驻程序一侧：读出请求，开一个会话交给节点，然后在套接字和会话之间双向转发。
 /// `owner_dir`：本人入口时是数据目录（升级请求要用）。
-async fn serve_ctl(mut stream: BoxedCtlStream, tx: mpsc::Sender<CtlCall>, agent_only: bool, owner_dir: Option<PathBuf>) {
+async fn serve_ctl(
+    mut stream: BoxedCtlStream,
+    tx: mpsc::Sender<CtlCall>,
+    agent_only: bool,
+    owner_dir: Option<PathBuf>,
+    reexec_tx: Option<mpsc::Sender<PathBuf>>,
+) {
     let Ok(hello) = read_msg::<_, CtlHello>(&mut stream).await else { return };
     if agent_only && hello.agent.is_none() {
         let e = WireError::new(ErrorCode::Denied, "agent 入口只接受 agent 凭据（--agent 或 NEXUS_AGENT）");
@@ -314,11 +363,10 @@ async fn serve_ctl(mut stream: BoxedCtlStream, tx: mpsc::Sender<CtlCall>, agent_
         };
         let _ = write_msg(&mut stream, &resp).await;
         let _ = stream.shutdown().await;
-        if let Some(exe) = then {
-            // 命令行收到回答后再换：用同样的参数执行新的二进制。
+        if let (Some(exe), Some(reexec_tx)) = (then, reexec_tx) {
+            // 命令行收到回答后再通知主循环清理并重新执行新的二进制。
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let e = crate::upgrade::reexec(&exe);
-            eprintln!("nexus daemon: 无法重新启动：{e}");
+            let _ = reexec_tx.send(exe).await;
         }
         return;
     }

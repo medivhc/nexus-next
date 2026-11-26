@@ -78,3 +78,95 @@ scenario! {
         assert_eq!(out.code, 102, "--tun-net 要和 --tun 一起用：{}", out.stderr);
     },
 }
+
+scenario! {
+    name: half_closed_connections_still_get_their_reply,
+    covers: "R89",
+    nodes: ["laptop", "home"],
+    sim: (pending "虚拟网卡是真实的系统设备"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let port = w.serve("home", Service::Echo).await.to_string();
+        w.cli_ok("home", &["publish", "echo", "--port", &port]).await;
+        let full = w.full_node("laptop").await;
+        let ip = full.resolve("echo.home.internal", 1).unwrap()[0];
+
+        // 像 `echo hello | nc`：发完就关闭写方向，回应照样回来，连接随后正常结束。
+        let got = full.send_then_half_close(ip, 7, b"hello\n");
+        assert_eq!(got.as_deref().ok(), Some(&b"hello\n"[..]), "{got:?}\n{}", w.daemon_log("laptop"));
+
+        // 数据比一个包大、跨多个包时也一样。
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let got = full.send_then_half_close(ip, 7, &big).expect("大块数据的回应");
+        assert!(got == big, "回来 {} 字节，应当 {}", got.len(), big.len());
+    },
+}
+
+/// 本机的 UDP 回声服务：每个数据报原样送回，前面加上 `echo:`。返回端口。
+fn udp_echo() -> u16 {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            let _ = sock.send_to(&reply, from);
+        }
+    });
+    port
+}
+
+/// 从一个新的 UDP 套接字发 `data` 给 `ip:port`，等回应（2 秒一次，最多五次：UDP 可能丢）。
+fn udp_ask(sock: &std::net::UdpSocket, ip: IpAddr, port: u16, data: &[u8]) -> Option<Vec<u8>> {
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 65536];
+    (0..5).find_map(|_| {
+        sock.send_to(data, (ip, port)).ok()?;
+        let n = sock.recv(&mut buf).ok()?;
+        Some(buf[..n].to_vec())
+    })
+}
+
+scenario! {
+    name: udp_services_are_reachable_through_the_full_node,
+    covers: "R91",
+    nodes: ["laptop", "home"],
+    sim: (pending "虚拟网卡是真实的系统设备"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let port = udp_echo().to_string();
+        w.cli_ok("home", &["publish", "game", "--port", &port, "--proto", "udp"]).await;
+        let tcp = w.serve("home", Service::Echo).await.to_string();
+        w.cli_ok("home", &["publish", "echo", "--port", &tcp]).await;
+        let full = w.full_node("laptop").await;
+        let ip = full.resolve("game.home.internal", 1).unwrap()[0];
+
+        // 发往服务的临时地址（任何端口）的数据报到了 home 上的 UDP 服务，回应原路送回。
+        let a = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let got = udp_ask(&a, ip, 9000, b"hi");
+        assert_eq!(got.as_deref(), Some(&b"echo:hi"[..]), "{}\n{}", w.daemon_log("laptop"), w.daemon_log("home"));
+        let big = vec![b'x'; 1200];
+        let mut want = b"echo:".to_vec();
+        want.extend_from_slice(&big);
+        assert_eq!(udp_ask(&a, ip, 9000, &big), Some(want), "1200 字节的数据报");
+        // 另一个程序（另一个源端口）各走各的。
+        let b = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        assert_eq!(udp_ask(&b, ip, 53, b"two").as_deref(), Some(&b"echo:two"[..]));
+        assert_eq!(udp_ask(&a, ip, 9000, b"one").as_deref(), Some(&b"echo:one"[..]));
+
+        // nexus connect 只转发 TCP：说明 UDP 服务要经完整节点访问。
+        let out = w.cli("laptop", &["connect", "home/game"]).await;
+        assert_ne!(out.code, 0);
+        assert!(out.stderr.contains("UDP") && out.stderr.contains("game.home.internal"), "{}", out.stderr);
+
+        // TCP 服务不收 UDP：没有回应。
+        let echo = full.resolve("echo.home.internal", 1).unwrap()[0];
+        let c = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        c.send_to(b"x", (echo, 7)).unwrap();
+        assert!(c.recv(&mut [0u8; 16]).is_err());
+    },
+}
