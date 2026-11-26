@@ -838,7 +838,7 @@ agent 读写工作区要有 `drive.read` / `drive.write`，`drive ls` 只列出�
 
 ```sh laptop
 nexus share create --drive work:/notes --ttl 30m --max-uses 3     # 工作区里的文件或目录
-nexus share ls                                                    # 编号、类型、用了几次、是否撤销
+nexus share ls                                                    # 编号、类型、用了几次、状态（有效/已过期/已用尽/已撤销）
 ```
 
 ```sh
@@ -994,7 +994,7 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - 多路径和计费网络识别支持 Linux 和 Android；Android 上的多路径只在 redroid 里测过（两条 veth 链路），还没有在有 Wi-Fi 和 5G 的真机上测过。
 - 网页节点打开网页服务时不支持 WebSocket 和流式回应，页面里写死 `localhost:<端口>` 的完整网址到不了服务（第 11 节）。
 - 网页节点的硬件能力：开了的那一项名册里的任何设备都能取用，没有再按设备细分；只能拍照、录一小段、取一次位置，没有连续的视频或音频流。
-- 临时分享只读，只能分享本机上的东西；`nexus share ls` 不显示是否已过期。
+- 临时分享只读，只能分享本机上的东西。
 - Vault 只能在管理设备上写入，写入时不在线的设备要等管理设备在线时 `nexus vault sync`。
   用恢复码换了管理设备后，「吊销后要轮换哪些条目」的记录留在原来的管理设备上，新的管理设备从收回的条目重新开始记。
 - 预编译版本有 Linux、macOS、Windows，但没有安装包，macOS 版没有签名；macOS 和 Windows 只在 CI 的 runner 上检查过，没在真机上用过。

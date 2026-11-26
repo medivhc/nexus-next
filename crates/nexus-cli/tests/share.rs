@@ -178,3 +178,76 @@ scenario! {
         );
     },
 }
+
+scenario! {
+    name: share_ls_reports_active_expired_exhausted_and_revoked,
+    covers: "R93, R73, R19",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let port = w.serve("home", Service::Http("status share".into())).await.to_string();
+        w.cli_ok("home", &["publish", "web", "--port", &port, "--proto", "http"]).await;
+
+        let active = w.cli_ok("home", &["share", "create", "--service", "web", "--ttl", "1h"]).await;
+        let active_id = active["id"].as_str().unwrap().to_string();
+
+        let expiring = w.cli_ok("home", &["share", "create", "--service", "web", "--ttl", "1s"]).await;
+        let expiring_id = expiring["id"].as_str().unwrap().to_string();
+
+        let limited = w.cli_ok("home", &["share", "create", "--service", "web", "--ttl", "1h", "--max-uses", "1"]).await;
+        let limited_id = limited["id"].as_str().unwrap().to_string();
+        let limited_url = limited["url"].as_str().unwrap().to_string();
+        let guest = w.browser().await;
+        guest.share_open(&limited_url).await.expect("限次分享首次应当可打开");
+
+        let revoked = w.cli_ok("home", &["share", "create", "--service", "web", "--ttl", "1h"]).await;
+        let revoked_id = revoked["id"].as_str().unwrap().to_string();
+        w.cli_ok("home", &["share", "revoke", &revoked_id]).await;
+
+        w.run_for(Duration::from_millis(1200)).await;
+
+        let human = w.cli("home", &["share", "ls"]).await;
+        assert_eq!(human.code, 0, "stderr: {}", human.stderr);
+        let line_for = |id: &str| -> String {
+            human
+                .stdout
+                .lines()
+                .find(|l| l.starts_with(id))
+                .unwrap_or_else(|| panic!("share ls 缺少 {id}：\n{}", human.stdout))
+                .to_string()
+        };
+        assert!(line_for(&active_id).contains("有效"), "{}", human.stdout);
+        assert!(line_for(&expiring_id).contains("已过期"), "{}", human.stdout);
+        assert!(line_for(&limited_id).contains("已用尽"), "{}", human.stdout);
+        assert!(line_for(&revoked_id).contains("已撤销"), "{}", human.stdout);
+
+        let list = w.cli_ok("home", &["share", "ls"]).await;
+        let item_for = |id: &str| {
+            list["shares"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"] == id)
+                .unwrap_or_else(|| panic!("share ls --json 缺少 {id}：{list}"))
+        };
+        let a = item_for(&active_id);
+        assert_eq!((a["revoked"].as_bool(), a["expired"].as_bool(), a["state"].as_str()), (Some(false), Some(false), Some("active")), "{a}");
+        let e = item_for(&expiring_id);
+        assert_eq!((e["revoked"].as_bool(), e["expired"].as_bool(), e["state"].as_str()), (Some(false), Some(true), Some("expired")), "{e}");
+        let u = item_for(&limited_id);
+        assert_eq!((u["revoked"].as_bool(), u["expired"].as_bool(), u["state"].as_str()), (Some(false), Some(false), Some("exhausted")), "{u}");
+        let r = item_for(&revoked_id);
+        assert_eq!((r["revoked"].as_bool(), r["expired"].as_bool(), r["state"].as_str()), (Some(true), Some(false), Some("revoked")), "{r}");
+
+        // 已过期的分享再被撤销时，state 为 revoked 且 expired 仍为 true。
+        w.cli_ok("home", &["share", "revoke", &expiring_id]).await;
+        let human_after = w.cli("home", &["share", "ls"]).await;
+        assert_eq!(human_after.code, 0, "stderr: {}", human_after.stderr);
+        let revoked_exp_line = human_after.stdout.lines().find(|l| l.starts_with(&expiring_id)).unwrap();
+        assert!(revoked_exp_line.contains("已撤销"), "{revoked_exp_line}");
+        let list_after = w.cli_ok("home", &["share", "ls"]).await;
+        let re = list_after["shares"].as_array().unwrap().iter().find(|x| x["id"] == expiring_id).unwrap();
+        assert_eq!((re["revoked"].as_bool(), re["expired"].as_bool(), re["state"].as_str()), (Some(true), Some(true), Some("revoked")), "{re}");
+    },
+}

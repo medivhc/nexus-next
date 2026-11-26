@@ -241,14 +241,24 @@ class Term:
     def expect(self, marker, within=30):
         wait(f"终端里出现 {marker}", lambda: marker in self.text(), within=within)
 
+    def send_until(self, text, marker, within=40):
+        """反复发送直到终端输出 marker：shell 还没就绪时送进去的输入可能被伪终端丢掉，单次发送不可靠。"""
+        deadline = time.time() + within
+        while True:
+            self.send(text)
+            try:
+                self.expect(marker, within=max(1, min(5, deadline - time.time())))
+                return
+            except SystemExit:
+                if time.time() >= deadline:
+                    raise
+
 
 def sessions(a, b):
     step("终端会话在常驻程序重启后还在")
     t = Term(a, "home")
-    time.sleep(2)
-    t.send(py_print("before-restart"))
     try:
-        t.expect("before-restart", within=40)
+        t.send_until(py_print("before-restart"), "before-restart", within=40)
     except SystemExit:
         print(f"终端输出：{t.text()[-2000:]!r}")
         raise
@@ -258,9 +268,8 @@ def sessions(a, b):
     wait("会话还在", lambda: [s for s in a.run("session", "ls", "home")["sessions"] if s["name"] == "main"])
     ls = a.run("session", "ls", "home")
     assert ls["sessions"][0]["created_at_ms"] == created, ls
-    t.send(py_print("after-restart"))
     try:
-        t.expect("after-restart", within=40)
+        t.send_until(py_print("after-restart"), "after-restart", within=40)
     except SystemExit:
         print(f"终端输出：{t.text()[-2000:]!r}\n{b.log()}")
         raise
