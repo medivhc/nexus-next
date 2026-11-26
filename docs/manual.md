@@ -281,10 +281,15 @@ vps 有域名（例如 `bewith.link`）时，把它设为锚点：它在 443 端
 
 ## 4. 安装、运行与维护
 
-### 下载预编译版本（Linux）
+### 下载预编译版本
 
-仓库的 Releases 页面有每个版本的静态二进制：`linux-x86_64` 和 `linux-aarch64`（ARM 服务器、树莓派），
-不依赖系统库，任何发行版都能用。压缩包里有 `nexus`、本手册和许可证。
+仓库的 Releases 页面有每个版本的预编译版本，压缩包里有 `nexus`、本手册和许可证：
+
+- Linux：`linux-x86_64` 和 `linux-aarch64`（ARM 服务器、树莓派），静态二进制，不依赖系统库，任何发行版都能用；
+- macOS：`macos-aarch64`（Apple 芯片）和 `macos-x86_64`（Intel），装法同 Linux；没有签名，第一次运行被拦时
+  `xattr -d com.apple.quarantine /usr/local/bin/nexus`；
+- Windows：`windows-x86_64.zip`，解开后 `nexus.exe` 和 `wintun.dll`（虚拟网卡用）放在同一个目录，把这个目录加到 PATH。
+  数据目录默认在 `%LOCALAPPDATA%\nexus`（其他系统是 `~/.local/share/nexus`）。
 
 ```sh
 tar xzf nexus-0.1.0-linux-x86_64.tar.gz
@@ -304,7 +309,8 @@ cargo build --release -p nexus-cli      # 二进制在 target/release/nexus
 sudo install target/release/nexus /usr/local/bin/
 ```
 
-挂载和多路径只在 Linux 上可用；macOS 和 Windows 还没有试过能不能编译。
+挂载和多路径只在 Linux 上可用。macOS 和 Windows 上其余功能都有（包括完整节点、会话保持、升级），
+但只在 GitHub 的 macOS、Windows runner 上自动检查过（`tools/platform_check.py`），还没有在真机上用过。
 
 ### 运行常驻程序
 
@@ -374,7 +380,8 @@ nexus upgrade --rollback                                # 换回上一个版本
 `nexus upgrade --status` 里写着原因。新版本启动就崩溃时，要有 systemd 这样的管理程序把它重新拉起来：拉起 3 次还没确认就换回。
 
 常驻程序要能写它的二进制所在的目录（装在 `/usr/local/bin` 时常驻程序要以 root 运行，或者把 nexus 装在自己的目录里）。
-目前只在 Linux 和其他 Unix 上；数据目录里的密钥、名册和工作区都保留。不用 `nexus upgrade` 也可以：停掉常驻程序，换二进制，再启动。
+Windows 上也可以：原来的留作 `nexus.prev.exe`，重新启动后常驻程序的进程号会变（Windows 不能原地换进程），
+`--file` 给 `.zip` 发布包或 `nexus.exe` 都行。数据目录里的密钥、名册和工作区都保留。不用 `nexus upgrade` 也可以：停掉常驻程序，换二进制，再启动。
 
 **从一台设备升级其他设备**：新版本只要下载到一台设备上，经 Nexus 送到其他设备：
 
@@ -638,6 +645,11 @@ curl http://web.home.internal/           # 不设代理，任何程序都能用
 - 路由规则里不直连的域名也解析成本机临时地址，连接按规则走；其余名字照常解析。
 - 有 systemd-resolved 时自动把 `.internal` 交给名字服务；否则按日志里的说明配置（例如 dnsmasq 的
   `server=/internal/198.18.0.2`）。
+- macOS：`sudo nexus daemon --tun nexus0`。网卡由系统分配成 `utunN`（`nexus status` 里看实际的名字）；
+  `.internal` 的名字经 `/etc/resolver/internal` 交给名字服务，常驻程序正常退出时删掉。
+- Windows：以管理员身份运行 `nexus daemon --tun nexus0`，`wintun.dll` 要和 `nexus.exe` 在同一目录。
+  `.internal` 的名字经名称解析策略表（NRPT）里一条注释为 `nexus` 的规则交给名字服务：启动时加（顺带删掉上次留下的），
+  正常退出时删。手动删：`Get-DnsClientNrptRule | Where-Object Comment -eq nexus | Remove-DnsClientNrptRule -Force`。
 - `nexus status` 显示虚拟网卡、网段和名字服务的地址。第一版只接 TCP；`--cidr` 规则只在统一入口生效。
 
 ## 11. 锚点与网页节点
@@ -963,7 +975,7 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 
 - **还没有在真实的跨网络设备上验证过**：自动化测试都在同一台机器上（回环地址或网络命名空间）。
 - 不能更换网络根密钥：恢复码或管理设备被别人拿到时只能重新建网络。恢复后看不到原来签发的 agent 列表（第 2 节）。
-- 终端会话在设备重启后不保留；在 Windows 和 Android 上，常驻程序重启时会话也会结束。
+- 终端会话在设备重启后不保留；在 Android 上，常驻程序重启时会话也会结束。
 - 完整节点和 Android 的用户态协议栈不支持 TCP 半关闭：发完数据就关闭写方向的程序（例如 `echo ... | nc`）收不到回应。
 - 完整节点和 Android 第一版只转发 TCP，不接管全部流量。
 - 挂载只支持 Linux；没有硬链接、扩展属性、文件锁。合并结果不保留空目录。
@@ -973,6 +985,6 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - 临时分享只读，只能分享本机上的东西；`nexus share ls` 不显示是否已过期。
 - Vault 只能在管理设备上写入，写入时不在线的设备要等管理设备在线时 `nexus vault sync`。
   用恢复码换了管理设备后，「吊销后要轮换哪些条目」的记录留在原来的管理设备上，新的管理设备从收回的条目重新开始记。
-- 预编译版本只有 Linux（x86_64、aarch64）；没有安装包。`nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），Windows 上还不支持。
-- 还没有：Windows 的虚拟网卡。
+- 预编译版本有 Linux、macOS、Windows，但没有安装包，macOS 版没有签名；macOS 和 Windows 只在 CI 的 runner 上检查过，没在真机上用过。
+  `nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），送的包要和那台设备的系统相同。
 - 远程桌面只是让现成的 VNC / RDP 经 Nexus 连通：网页里还不能看；没有在真实的 macOS 屏幕共享、Windows 远程桌面上验证过。

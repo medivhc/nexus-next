@@ -1,6 +1,5 @@
 //! 常驻程序和终端持有进程之间的协议（M7.2，FP-7.2-04）：升级后新的常驻程序要接管旧的持有进程，
 //! 所以已有消息的编码永远不变。加新种类只能加在末尾，并在这里加一行。
-#![cfg(unix)]
 
 use nexus_sys_real::holder::{encode_frame, Down, Up, HOLDER_VERSION};
 use nexus_sys_real::Size;

@@ -56,7 +56,7 @@ M7.1 要先定下兼容规则：请求和回应带能力列表或可忽略的扩
 
 - 根密钥轮换（恢复码或管理设备泄露时不用重建网络）。
 - Android：多路径和计费识别。（应用内加入：M11.2 完成，`docs/feature-points/M11.2.md`。）
-- macOS / Windows 的二进制；Windows 的虚拟网卡。
+- macOS / Windows 的二进制；Windows 的虚拟网卡：M11.3（R81–R84，docs/feature-points/M11.3.md）。
 - 多路径批量吞吐接近两倍的调优；经中继的路径。
 
 ## 远程桌面（M11.1、M11.6、M11.7）

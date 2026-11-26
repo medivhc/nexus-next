@@ -38,7 +38,7 @@ pub enum CtlListener {
 }
 
 #[cfg(windows)]
-struct PipeListener {
+pub struct PipeListener {
     name: String,
     server: tokio::net::windows::named_pipe::NamedPipeServer,
 }
