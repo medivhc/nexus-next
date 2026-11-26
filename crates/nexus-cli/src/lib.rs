@@ -6,6 +6,7 @@
 
 pub mod ctl_endpoint;
 pub mod daemon;
+pub mod desktop;
 pub mod drive;
 pub mod tun;
 pub mod upgrade;
@@ -170,7 +171,7 @@ pub enum Cmd {
         /// 服务在本机监听的地址
         #[arg(long, default_value = "127.0.0.1")]
         host: std::net::IpAddr,
-        /// 协议，告诉使用方怎么用：tcp 或 http
+        /// 协议，告诉使用方怎么用：tcp、http，远程桌面是 vnc 或 rdp
         #[arg(long, default_value = "tcp")]
         proto: String,
         /// 使用方需要的环境变量，值里的 {addr} 换成使用方访问服务的地址；可以写多次
@@ -210,6 +211,13 @@ pub enum Cmd {
         /// 不打开浏览器，只显示网址
         #[arg(long)]
         no_browser: bool,
+    },
+    /// 远程桌面：把本机的 VNC / RDP 发布出去，或者用本机的查看器打开另一台设备的桌面
+    ///
+    /// 例：在 home 上 nexus desktop share；在别的设备上 nexus desktop open home
+    Desktop {
+        #[command(subcommand)]
+        cmd: desktop::DesktopCmd,
     },
     /// 文件：工作区（版本化的内容树）。路径写作 <工作区>:/<路径>，例如 work:/src/main.rs
     Drive {
@@ -1055,6 +1063,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
         Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
+        Cmd::Desktop { cmd } => return desktop::run(cmd, ctl, sink).await,
         Cmd::Ssh { .. } => {
             let args = match ssh_args(cmd) {
                 Ok(a) => a,
@@ -2605,22 +2614,7 @@ async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen
     };
     let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
     sink.out(format!("{node}/{name} → {local}（按 Ctrl-C 停止）\n").as_bytes());
-    let conns = futures_util::stream::FuturesUnordered::new();
-    tokio::pin!(conns);
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((socket, _)) = accepted else { continue };
-                let (node, name) = (node.to_string(), name.to_string());
-                conns.push(async move {
-                    let Ok(mut session) = open_connect(ctl, &node, &name).await else { return };
-                    let (mut rd, mut wr) = socket.into_split();
-                    pipe(&mut session, &mut rd, &mut wr).await;
-                });
-            }
-            Some(()) = futures_util::StreamExt::next(&mut conns), if !conns.is_empty() => {}
-        }
-    }
+    forward_forever(ctl, &listener, node, name).await
 }
 
 /// `nexus open`：服务的网址。给了路径就用它；否则用服务说明里第一个 `http://{addr}` 开头的值；都没有就是根路径。
@@ -2662,18 +2656,16 @@ async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u1
     if node.is_empty() || name.is_empty() {
         return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("要打开的应当写成 <设备>/<服务>[/<路径>]：{target}"));
     }
-    match open_connect(ctl, node, name).await {
-        Ok(probe) => drop(probe.tx.try_send(Input::CloseStdin)),
+    let info = match service_info(ctl, node, name).await {
+        Ok(info) => info,
         Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
+    };
+    if desktop::is_desktop(&info.proto) {
+        if path.is_some() {
+            return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("远程桌面没有路径：nexus open {node}/{name}"));
+        }
+        return desktop::serve(ctl, node, name, &info.proto, port, browser, sink).await;
     }
-    let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
-        Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
-        Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
-        _ => None,
-    };
-    let Some(info) = info else {
-        return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("{node} 上没有你能用的服务 {name}"));
-    };
     if info.proto != "http" {
         let msg = format!("{node}/{name} 不是网页服务（协议 {}）：用 nexus connect {node}/{name} 连接它", info.proto);
         return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
@@ -2693,15 +2685,34 @@ async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u1
             sink.err(format!("打不开浏览器（{e}）：在浏览器里手动打开上面的网址\n").as_bytes());
         }
     }
+    forward_forever(ctl, &listener, node, name).await
+}
+
+/// 先确认服务能用（存在、有授权、发布方的程序在运行），再读它的说明。
+async fn service_info<C: Ctl>(ctl: &C, node: &str, name: &str) -> Result<nexus_wire::ServiceInfo, (i32, &'static str, String)> {
+    let probe = open_connect(ctl, node, name).await?;
+    drop(probe.tx.try_send(Input::CloseStdin));
+    let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
+        Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
+        Ok(CtlResponse::Error(e)) => {
+            let (code, kind) = exit_for(e.code);
+            return Err((code, kind, e.message));
+        }
+        _ => None,
+    };
+    info.ok_or_else(|| (EXIT_NOT_FOUND, "not_found", format!("{node} 上没有你能用的服务 {name}")))
+}
+
+/// 本机端口上的每个连接各自接到服务，直到被中断。
+async fn forward_forever<C: Ctl>(ctl: &C, listener: &tokio::net::TcpListener, node: &str, name: &str) -> i32 {
     let conns = futures_util::stream::FuturesUnordered::new();
     tokio::pin!(conns);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((socket, _)) = accepted else { continue };
-                let (node, name) = (node.to_string(), name.to_string());
                 conns.push(async move {
-                    let Ok(mut session) = open_connect(ctl, &node, &name).await else { return };
+                    let Ok(mut session) = open_connect(ctl, node, name).await else { return };
                     let (mut rd, mut wr) = socket.into_split();
                     pipe(&mut session, &mut rd, &mut wr).await;
                 });

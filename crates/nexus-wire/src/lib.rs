@@ -520,7 +520,7 @@ pub enum RouteExplanation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
-    /// `tcp` 或 `http`。
+    /// `tcp`、`http`，远程桌面是 `vnc` 或 `rdp`（M11.1）。
     pub proto: String,
     /// 使用方需要的环境变量，值里的 `{addr}` 由使用方换成它访问服务用的地址。
     pub env: Vec<(String, String)>,
