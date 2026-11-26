@@ -28,7 +28,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only PR runs cancel their predecessors: push-to-main and the nightly
+  # schedule share refs/heads/main, and cancelling a full run there would
+  # silently drop the all-lane backstop.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   plan:
@@ -39,6 +42,7 @@ jobs:
       full: ${{ steps.select.outputs.full }}
       compat: ${{ steps.select.outputs.compat }}
       web: ${{ steps.select.outputs.web }}
+      platforms: ${{ steps.select.outputs.platforms }}
     steps:
       - name: Check out with full history for PR merge-base diff
         uses: actions/checkout@v4
@@ -78,12 +82,19 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Cache core build
         uses: Swatinem/rust-cache@v2
         with:
           key: smoke
       - name: Unit tests for core protocol and network logic
-        run: cargo test --locked --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core
+        run: cargo test --locked --quiet -p nexus-core-proto -p nexus-wire -p nexus-term-proto -p nexus-net-core -p nexus-drive-core -p nexus-sys-sim -p nexus-web-core -p nexus-web
+      - name: Clippy for nexus-web
+        # crates/nexus-web is not covered by tools/ci.sh in PR mode: the
+        # planner sends nexus-web-only PRs to smoke+web, skipping the ci job
+        # that runs clippy --all-targets. Smoke is where it gets linted.
+        run: cargo clippy --locked -p nexus-web -- -D warnings
 
   ci:
     name: Full CI (tools/ci.sh)
@@ -245,6 +256,9 @@ jobs:
       - name: Build the page
         run: bash tools/build-web.sh
 
+      - name: Frontend unit tests
+        run: node --test web/share.test.mjs
+
       - name: Build nexus
         run: cargo build --release -p nexus-cli
 
@@ -254,10 +268,74 @@ jobs:
           npm install --no-audit --no-fund
           node run.mjs --nexus ../../target/release/nexus --dist ../../web/dist --chrome "$(command -v google-chrome)"
 
+  platforms:
+    # M11.3 (R81–R84): there are no macOS or Windows devices to test on, so
+    # the hosted runners stand in for them. Build nexus there, run the unit
+    # tests that are portable, then tools/platform_check.py: two daemons on
+    # the runner, join, exec, services, drive, a terminal session surviving a
+    # daemon restart, upgrade and rollback. Runners have admin rights, so the
+    # virtual NIC (utun / Wintun) and system DNS for .internal are real too.
+    name: ${{ matrix.name }} (platform check)
+    needs: plan
+    if: ${{ needs.plan.outputs.platforms == 'true' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-15
+            exe: nexus
+          - name: Windows
+            os: windows-2022
+            exe: nexus.exe
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: platforms
+
+      - name: Build nexus
+        shell: bash
+        run: cargo build --release --locked -p nexus-cli --bin nexus
+
+      - name: Portable unit tests
+        timeout-minutes: 20
+        # nexus-cli's scenario tests need nexus-testkit (Unix only); its unit
+        # tests and nexus-sys-real's tests (session holder transport) run here.
+        shell: bash
+        run: |
+          cargo test --release --locked -p nexus-sys-real
+          cargo test --release --locked -p nexus-cli --lib --bins
+
+      - name: Wintun next to nexus.exe
+        if: runner.os == 'Windows'
+        run: python tools/fetch_wintun.py target/release
+
+      - name: Two devices on this runner
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            sudo -E python3 tools/platform_check.py --bin target/release/${{ matrix.exe }} --tun
+          else
+            python tools/platform_check.py --bin target/release/${{ matrix.exe }} --tun
+          fi
+
   gate:
     name: Required CI gate
-    needs: [plan, sanity, smoke, ci, compat, web]
-    if: ${{ always() }}
+    needs: [plan, sanity, smoke, ci, compat, web, platforms]
+    # always() would also run on superseded runs and turn the gate red for a
+    # run that was replaced, not for a real failure. !cancelled() still runs
+    # the gate when a needed job fails, but not when the run itself was cut.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

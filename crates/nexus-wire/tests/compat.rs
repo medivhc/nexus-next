@@ -129,6 +129,28 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         Request::ShareDriveRead { token: [8; 16], path: "/a.txt".into(), max: 1024 },
         Request::ShareServiceConnect { token: [8; 16] },
         Request::ShareSessionWatch { token: [8; 16], size: Size { cols: 80, rows: 24 } },
+        Request::VaultPush {
+            name: "api_key".into(),
+            entry: Some(VaultCipherEntry {
+                name: "api_key".into(),
+                version: 1,
+                updated_at: Timestamp(100),
+                devices: vec!["home".into()],
+                sealed: vec![1, 2, 3],
+            }),
+        },
+        Request::VaultPull,
+        Request::RootRotate {
+            rotation: nexus_core_proto::roster::RootRotation {
+                old_root: SecretKey::from_seed([1; 32]).public(),
+                new_root: SecretKey::from_seed([2; 32]).public(),
+                version: 8,
+            }
+            .sign(&SecretKey::from_seed([1; 32])),
+            roster: roster(),
+            addrs: vec![(node(3), "hint".into())],
+        },
+        Request::SvcDatagram { name: "dns".into() },
     ];
     all.into_iter()
         .map(|r| {
@@ -160,6 +182,10 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::ShareDriveRead { .. } => "request.share_drive_read",
                 Request::ShareServiceConnect { .. } => "request.share_service_connect",
                 Request::ShareSessionWatch { .. } => "request.share_session_watch",
+                Request::VaultPush { .. } => "request.vault_push",
+                Request::VaultPull => "request.vault_pull",
+                Request::RootRotate { .. } => "request.root_rotate",
+                Request::SvcDatagram { .. } => "request.svc_datagram",
             };
             (name, r)
         })
@@ -205,6 +231,13 @@ fn response_samples() -> Vec<(&'static str, Response)> {
         }),
         Response::ShareDriveEntries(vec![ShareDriveEntry { name: "a.txt".into(), kind: "file".into(), size: 5, target: None }]),
         Response::ShareDriveFile { size: 5, bytes: b"hello".to_vec(), truncated: false },
+        Response::VaultEntries(vec![VaultCipherEntry {
+            name: "api_key".into(),
+            version: 1,
+            updated_at: Timestamp(100),
+            devices: vec!["home".into()],
+            sealed: vec![1, 2, 3],
+        }]),
     ];
     all.into_iter()
         .map(|r| {
@@ -226,6 +259,7 @@ fn response_samples() -> Vec<(&'static str, Response)> {
                 Response::ShareOpened(_) => "response.share_opened",
                 Response::ShareDriveEntries(_) => "response.share_drive_entries",
                 Response::ShareDriveFile { .. } => "response.share_drive_file",
+                Response::VaultEntries(_) => "response.vault_entries",
             };
             (name, r)
         })

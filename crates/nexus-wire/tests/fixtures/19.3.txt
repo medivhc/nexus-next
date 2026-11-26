@@ -1,0 +1,4 @@
+# 协议 19.3 新增的消息的编码（tests/compat.rs 生成，不要手改）
+request.vault_pull 1c
+request.vault_push 1b076170695f6b657901076170695f6b657901640104686f6d6503010203
+response.vault_entries 1101076170695f6b657901640104686f6d6503010203

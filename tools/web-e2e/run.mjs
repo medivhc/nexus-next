@@ -1,10 +1,10 @@
 // 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
 // laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
-// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、浏览器里不留存储。
+// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、硬件能力、临时分享、浏览器里不留存储。
 //
 // 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 //
-// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71
+// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71, R72, R73
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -102,7 +102,9 @@ try {
   nexus("home", ["publish", "web", "--port", sitePort, "--proto", "http", "--json"]);
   log("网络就绪");
 
-  browser = await chromium.launch({ executablePath: opt.chrome, args: ["--no-sandbox"] });
+  // 假的摄像头和麦克风，权限弹窗自动同意（硬件能力，R72）。
+  browser = await chromium.launch({ executablePath: opt.chrome,
+    args: ["--no-sandbox", "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"] });
   const context = await browser.newContext();
   const page = await context.newPage();
   page.on("console", (m) => { if (m.type() === "error") console.log("页面错误：", m.text()); });
@@ -187,6 +189,34 @@ try {
   await page.waitForSelector("#device-list li");
   log("浏览工作区、预览、下载");
 
+  // 硬件能力（R72，FP-8.3-05）：页面上逐项开启；页面显示的命令原样在设备上能用；关闭后立即拒绝。
+  await context.grantPermissions(["geolocation", "camera", "microphone"], { origin: pageUrl });
+  await context.setGeolocation({ latitude: 31.2304, longitude: 121.4737, accuracy: 12.5 });
+  const hwCmd = (await page.textContent("#hw-cmd")).trim().split("\n");
+  if (!hwCmd[0].startsWith("nexus hw ls ") || !hwCmd[1].startsWith("nexus hw capture ")) throw new Error(`页面上的命令：${hwCmd}`);
+  const run = (cmd) => nexus("home", [...cmd.split(/\s+/).slice(1), "--json"]);
+  if (run(hwCmd[0]).capabilities.length !== 0) throw new Error("默认应当一项都不开放");
+  await page.click("#hw-location");
+  await page.waitForSelector("#hw-location:has-text('关闭')");
+  await page.click("#hw-camera");
+  await page.waitForSelector("#hw-camera:has-text('关闭')");
+  const caps = run(hwCmd[0]).capabilities;
+  if ([...caps].sort().join() !== "camera,location") throw new Error(`开放的能力：${caps}`);
+  const loc = run(hwCmd[1]);
+  if (Math.abs(loc.lat_e7 - 312304000) > 10 || Math.abs(loc.lon_e7 - 1214737000) > 10) throw new Error(`位置：${JSON.stringify(loc)}`);
+  const cam = run(hwCmd[1].replace(" location ", " camera "));
+  if (cam.mime !== "image/jpeg" || Buffer.from(cam.data_base64, "base64").subarray(0, 2).toString("hex") !== "ffd8") {
+    throw new Error(`照片：${cam.mime} ${cam.data_base64?.slice(0, 16)}`);
+  }
+  await waitFor("页面显示谁用过", async () => (await page.textContent("#hw-active")).length > 0);
+  await page.click("#hw-location");
+  await page.waitForSelector("#hw-location:has-text('开启')");
+  let refused = null;
+  try { run(hwCmd[1]); } catch (e) { refused = e.status; }
+  if (refused !== 105) throw new Error(`关闭位置后采集应当被拒绝（105），实际：${refused}`);
+  await page.click("#hw-camera");
+  log("硬件能力：开启、设备上取用、关闭");
+
   // 打开网页服务（R71，FP-8.2-03）：新标签页，相对路径的图片、绝对路径的脚本、绝对路径的链接都经 Nexus 到 home。
   const link = await page.waitForSelector("#device-list li:has-text('home') a.svc:has-text('web')", { timeout: 20000 });
   const [svcPage] = await Promise.all([context.waitForEvent("page"), link.click()]);
@@ -225,6 +255,58 @@ try {
   // 重新打开后是登录界面：没有任何东西能恢复之前的登录。
   if (await after.isVisible("#device-list li")) throw new Error("重新打开页面后不应当直接看到设备");
   log("关闭后不留存储");
+
+  // 临时分享（M9.1，R73，FP-9.1-04）：使用全新无登录浏览器上下文，验证目录/文件预览、页内网页服务、只读终端与撤销失效状态。
+  const guestCtx = await browser.newContext();
+  try {
+    // 1. 文件/目录分享（含剩余次数与过期时间、目录导航与文件预览）
+    const driveShare = nexus("laptop", ["share", "create", "--drive", "work:/notes", "--ttl", "1h", "--max-uses", "2", "--json"]);
+    const drivePage = await guestCtx.newPage();
+    drivePage.on("pageerror", (e) => console.log("分享页异常：", e.message));
+    await drivePage.goto(driveShare.url);
+    await drivePage.waitForSelector("#share-view:not([hidden])", { timeout: 20000 });
+    await drivePage.waitForSelector("#share-body .share-file-list a:has-text('hello.txt')", { timeout: 20000 });
+    const driveMeta = await drivePage.textContent("#share-meta");
+    if (!driveMeta.includes("剩余 1 次") || !driveMeta.includes("过期时间")) {
+      throw new Error(`分享元信息缺少剩余次数或过期时间：${driveMeta}`);
+    }
+    await drivePage.click("#share-body .share-file-list a:has-text('hello.txt')");
+    await waitFor("分享文件预览", async () => (await drivePage.textContent("#share-body .share-preview-text")).includes("hello from the workspace"), 20000);
+    await drivePage.close();
+
+    // 2. 网页服务分享（页内 iframe，验证 GuestSession.http_fetch 返回 headers 与 reason）
+    const svcShare = nexus("home", ["share", "create", "--service", "web", "--ttl", "1h", "--json"]);
+    const svcSharePage = await guestCtx.newPage();
+    svcSharePage.on("pageerror", (e) => console.log("服务分享页异常：", e.message));
+    await svcSharePage.goto(svcShare.url);
+    const frameEl = await svcSharePage.waitForSelector("#share-body iframe.share-service-frame", { timeout: 20000 });
+    const frame = await frameEl.contentFrame();
+    if (!frame) throw new Error("网页服务分享 iframe 未挂载");
+    await frame.waitForSelector("#msg:has-text('script ran')", { timeout: 20000 });
+    await svcSharePage.close();
+
+    // 3. 只读终端分享（验证 GuestSession.watch_terminal 输出）
+    const termShare = nexus("home", ["share", "create", "--terminal", "main", "--ttl", "1h", "--json"]);
+    const termSharePage = await guestCtx.newPage();
+    termSharePage.on("pageerror", (e) => console.log("终端分享页异常：", e.message));
+    await termSharePage.goto(termShare.url);
+    await termSharePage.waitForSelector("#share-body .share-xterm .xterm-rows", { timeout: 20000 });
+    await waitFor("只读终端输出", async () => {
+      const text = await termSharePage.$eval("#share-body .share-xterm .xterm-rows", (e) => e.innerText);
+      return text.includes("back-42") || text.includes("$");
+    }, 20000);
+    await termSharePage.close();
+
+    // 4. 撤销后打开显示失效状态
+    nexus("home", ["share", "revoke", svcShare.id, "--json"]);
+    const revokedPage = await guestCtx.newPage();
+    await revokedPage.goto(svcShare.url);
+    await revokedPage.waitForSelector("#share-body .share-state[data-state='expired']", { timeout: 20000 });
+    await revokedPage.close();
+    log("临时分享（文件/目录、网页服务、只读终端、撤销失效）");
+  } finally {
+    await guestCtx.close();
+  }
 
   // 体积预算（FP-2.5-04）。
   const wasm = new Uint8Array(await fetch(`${pageUrl}/pkg/nexus_web_bg.wasm`).then((r) => r.arrayBuffer()));

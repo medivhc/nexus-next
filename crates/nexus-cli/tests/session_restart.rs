@@ -78,3 +78,42 @@ scenario! {
         drop(quick);
     },
 }
+
+scenario! {
+    name: session_is_restored_after_device_reboot,
+    covers: "R90",
+    nodes: ["laptop", "home"],
+    sim: (pending "要真的结束持有进程和常驻程序"),
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let proj = w.home_dir("home").join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj = proj.canonicalize().unwrap().display().to_string();
+        let t = w.term("laptop", &["ssh", "home"]).await;
+        t.expect_prompt().await;
+        t.send(&format!("cd {proj} && {}", say("before"))).await;
+        t.expect_line("before").await;
+        let created = w.cli_ok("laptop", &["session", "ls", "home"]).await["sessions"][0]["created_at_ms"].clone();
+        // 持有进程定时把屏幕和工作目录记下来。
+        w.run_for(Duration::from_secs(2)).await;
+
+        // FP-11.5-02：设备重启（会话里的程序都没了）：会话恢复，客户端自动接回。
+        w.reboot("home", &["--local-only"]).await;
+        t.expect_contains_within("会话已恢复", Duration::from_secs(20)).await;
+        assert!(t.screen().lines().any(|l| l.trim_end() == "before"), "重启前的屏幕应当还在：\n{}", t.screen());
+        t.send("pwd\r").await;
+        t.expect_line(&proj).await;
+        let ls = w.cli_ok("laptop", &["session", "ls", "home"]).await;
+        assert_eq!(ls["sessions"][0]["name"], "main", "{ls}");
+        assert_eq!(ls["sessions"][0]["created_at_ms"], created, "{ls}");
+
+        // FP-11.5-03：恢复的会话正常退出后就结束了，再重启也不会回来。
+        t.send("exit 4\r").await;
+        assert_eq!(t.wait_exit().await, 4);
+        w.reboot("home", &["--local-only"]).await;
+        let ls = w.cli_ok("laptop", &["session", "ls", "home"]).await;
+        assert_eq!(ls["sessions"].as_array().map(Vec::len), Some(0), "{ls}");
+        assert_eq!(sessions_dir_entries(&w, "home"), Vec::<String>::new());
+    },
+}

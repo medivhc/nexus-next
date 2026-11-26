@@ -448,11 +448,16 @@ pub mod tree {
 
     /// 按文件三方合并：只有一边改的取那一边；两边改得不同时保留 `ours`，`theirs` 的版本另存为
     /// `<路径>.conflict-<label>`（一边删除、另一边修改时同样）。返回合并后的根和冲突的路径。
-    /// 合并结果里不保留空目录。
+    /// 空目录（M11.5）和文件一样参与三方合并：一边新建或删掉的空目录照办；放进了文件的目录随文件存在。
     pub fn merge(store: &mut impl Store, base: Option<Hash>, ours: Hash, theirs: Hash, label: &str) -> Result<(Hash, Vec<String>), DriveError> {
-        let b = base.map(|h| files(store, h)).transpose()?.unwrap_or_default();
-        let o = files(store, ours)?;
-        let t = files(store, theirs)?;
+        let leaves = |store: &mut _, h| -> Result<BTreeMap<String, Entry>, DriveError> {
+            let mut out = BTreeMap::new();
+            collect_leaves(store, h, "", &mut out)?;
+            Ok(out)
+        };
+        let b = base.map(|h| leaves(store, h)).transpose()?.unwrap_or_default();
+        let o = leaves(store, ours)?;
+        let t = leaves(store, theirs)?;
         let paths: std::collections::BTreeSet<&String> = b.keys().chain(o.keys()).chain(t.keys()).collect();
         // Reserve all input leaf names (and their implied directories) before
         // generating conflict copies, regardless of their iteration order.
@@ -498,6 +503,25 @@ pub mod tree {
             root = set(store, root, &parts, e)?;
         }
         Ok((root, conflicts))
+    }
+
+    /// 文件、符号链接和空目录（空目录是一个没有项的 `Entry::Dir`）。合并用。
+    fn collect_leaves(store: &impl Store, root: Hash, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Result<(), DriveError> {
+        let t = load(store, root)?;
+        if t.entries.is_empty() && !prefix.is_empty() {
+            out.insert(prefix.to_string(), Entry::Dir { tree: root });
+            return Ok(());
+        }
+        for (name, e) in t.entries {
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            match e {
+                Entry::Dir { tree } => collect_leaves(store, tree, &path, out)?,
+                e => {
+                    out.insert(path, e);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

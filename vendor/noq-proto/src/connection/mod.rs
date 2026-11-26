@@ -3314,14 +3314,17 @@ impl Connection {
         self.set_loss_detection_timer(now, path_id);
     }
 
-    /// NEXUS: 除了 `path_id`，还有没有已验证、没放弃、可用（Available）且没有出现过超时的路径。
+    /// NEXUS: 除了 `path_id`，还有没有健康的路径（已验证、没放弃、没有出现过超时）可以接手它的数据。
+    ///
+    /// 不论 Available 还是 Backup（M11.4）：Available 的路径都可疑时，Backup 的路径（经中继的路径、计费的接口）
+    /// 本来就会接手新数据（见 `scheduling_info`）；这里让在途的数据也马上转过去、可疑的路径不再发新数据。
+    /// 原来只看 Available：直连都断时在途的数据要等直连路径被放弃（5 秒）才在中继上重发。
     fn nexus_has_healthy_path_besides(&self, path_id: PathId) -> bool {
         self.paths.iter().any(|(id, path)| {
             *id != path_id
                 && self.remote_cids.contains_key(id)
                 && !self.abandoned_paths.contains(id)
                 && path.data.validated
-                && path.data.nexus_status() == PathStatus::Available
                 && path.data.pto_count == 0
         })
     }

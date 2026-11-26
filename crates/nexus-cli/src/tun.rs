@@ -1,4 +1,4 @@
-//! 完整节点的虚拟网卡（M3.4）：在网卡上运行用户态协议栈，TCP 连接和发给名字服务的查询交给节点。
+//! 完整节点的虚拟网卡（M3.4）：在网卡上运行用户态协议栈，TCP 连接、UDP 数据报（M11.5）和发给名字服务的查询交给节点。
 //! 网卡的地址只覆盖完整节点的网段：只有发往本机临时地址（以及名字服务）的包会进来。
 
 use nexus_net_core::fakeip::FakePool;
@@ -14,22 +14,52 @@ use tokio::sync::{mpsc, oneshot};
 
 /// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
 #[cfg(target_os = "android")]
-pub fn start(_: &str, _: &FakePool, _: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
+pub fn start(_: &str, _: &FakePool, _: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
     Err(io::Error::other("Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun"))
 }
 
-/// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
+/// 建网卡、启动协议栈，让系统把 `.internal` 交给名字服务。返回网卡实际的名字（macOS 上可能由系统分配），
+/// 和名字解析配置的守卫：常驻程序正常退出时撤掉配置。网卡在常驻程序退出时随之消失。
 #[cfg(not(target_os = "android"))]
-pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
+pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
     let (_, prefix) = pool.network();
-    let dev = tun_rs::DeviceBuilder::new()
-        .name(name)
-        .ipv4(pool.gateway(), prefix, None)
-        .mtu(1500)
-        .build_async()?;
+    let mut builder = tun_rs::DeviceBuilder::new();
+    if let Some(n) = device_name(name) {
+        builder = builder.name(n);
+    }
+    builder = builder.ipv4(pool.gateway(), prefix, None).mtu(1500);
+    #[cfg(windows)]
+    {
+        builder = builder.wintun_file(wintun_path()?).description("Nexus");
+    }
+    let dev = builder.build_async()?;
+    let actual = dev.name().unwrap_or_else(|_| name.to_string());
     run_stack(dev, pool, entry)?;
-    configure_resolver(name, pool);
-    Ok(())
+    let guard = configure_resolver(&actual, pool);
+    Ok((actual, guard))
+}
+
+/// 给网卡的名字。macOS 的 utun 只能叫 `utunN`：给的不是这样时不指定，由系统分配（M11.3）。
+#[cfg(not(target_os = "android"))]
+fn device_name(name: &str) -> Option<&str> {
+    if cfg!(target_os = "macos") && !name.starts_with("utun") {
+        return None;
+    }
+    Some(name)
+}
+
+/// Windows：Wintun 的驱动库和 nexus.exe 放在同一目录（发布包里有，M11.3）。
+#[cfg(windows)]
+fn wintun_path() -> io::Result<String> {
+    let exe = std::env::current_exe()?;
+    let dll = exe.with_file_name("wintun.dll");
+    if !dll.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("找不到 {}：它要和 nexus.exe 放在同一目录（Windows 的发布包里有）", dll.display()),
+        ));
+    }
+    Ok(dll.display().to_string())
 }
 
 /// 在别人建好的网卡上启动协议栈（Android：VpnService 建网卡、配地址和路由）。
@@ -51,7 +81,13 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
                 Ok(ipstack::IpStackStream::Udp(udp)) if udp.peer_addr().ip() == dns && udp.peer_addr().port() == 53 => {
                     tokio::spawn(serve_dns(udp, entry.clone()));
                 }
-                // 第一版只接 TCP 和名字服务。
+                // 其余的 UDP（M11.5）：交给节点按目标转发（只转发到 UDP 服务）。
+                Ok(ipstack::IpStackStream::Udp(udp)) => {
+                    let dst = udp.peer_addr();
+                    if entry.send(TunInbound::Udp { stream: Box::new(udp), dst }).is_err() {
+                        return;
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("nexus daemon: 虚拟网卡的协议栈停止了：{e}");
@@ -82,9 +118,23 @@ async fn serve_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSen
     }
 }
 
-/// 让系统把 .internal 交给名字服务。有 systemd-resolved 时自动配置；否则在日志里说明。
-#[cfg(not(target_os = "android"))]
-fn configure_resolver(name: &str, pool: &FakePool) {
+/// 名字解析配置的守卫：丢弃时撤掉 `configure_resolver` 加的配置（Linux 上配置随网卡消失，不用撤）。
+pub struct ResolverGuard {
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    undo: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        if let Some(undo) = self.undo.take() {
+            undo();
+        }
+    }
+}
+
+/// 让系统把 .internal 交给名字服务。Linux：有 systemd-resolved 时自动配置，否则在日志里说明。
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
     let dns = pool.dns().to_string();
     let ok = std::process::Command::new("resolvectl")
         .args(["dns", name, &dns])
@@ -100,6 +150,80 @@ fn configure_resolver(name: &str, pool: &FakePool) {
              （例如 dnsmasq 的 server=/internal/{dns}）"
         );
     }
+    ResolverGuard { undo: None }
+}
+
+/// macOS：`/etc/resolver/internal` 让系统把 .internal 交给名字服务（M11.3）。退出时删掉（还是我们写的那份时）。
+#[cfg(target_os = "macos")]
+fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
+    let dns = pool.dns().to_string();
+    let path = std::path::Path::new("/etc/resolver/internal");
+    let content = format!("# nexus：完整节点 {name}，常驻程序退出时删掉\nnameserver {dns}\n");
+    let written = std::fs::create_dir_all("/etc/resolver").and_then(|_| std::fs::write(path, &content));
+    match written {
+        Ok(()) => {
+            eprintln!("nexus daemon: 完整节点 {name}：.internal 的名字交给 {dns}（/etc/resolver/internal）");
+            ResolverGuard {
+                undo: Some(Box::new(move || {
+                    if std::fs::read_to_string(path).ok().as_deref() == Some(content.as_str()) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                })),
+            }
+        }
+        Err(e) => {
+            eprintln!("nexus daemon: 完整节点 {name}：写不了 /etc/resolver/internal（{e}）。名字服务在 {dns}");
+            ResolverGuard { undo: None }
+        }
+    }
+}
+
+/// Windows：名称解析策略表（NRPT）里一条注释为 `nexus` 的规则把 .internal 交给名字服务（M11.3）。
+/// 先删掉上次没正常退出留下的，退出时删掉。
+#[cfg(windows)]
+fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
+    let dns = pool.dns().to_string();
+    let add = format!(
+        "{REMOVE_NRPT}; Add-DnsClientNrptRule -Namespace '.internal' -NameServers '{dns}' -Comment '{NRPT_COMMENT}' | Out-Null; Clear-DnsClientCache"
+    );
+    match powershell(&add) {
+        Ok(()) => {
+            eprintln!("nexus daemon: 完整节点 {name}：.internal 的名字交给 {dns}（NRPT 规则，注释 {NRPT_COMMENT}）");
+            ResolverGuard {
+                undo: Some(Box::new(|| {
+                    let _ = powershell(REMOVE_NRPT);
+                })),
+            }
+        }
+        Err(e) => {
+            eprintln!("nexus daemon: 完整节点 {name}：加不了 NRPT 规则（{e}）。名字服务在 {dns}");
+            ResolverGuard { undo: None }
+        }
+    }
+}
+
+#[cfg(windows)]
+const NRPT_COMMENT: &str = "nexus";
+#[cfg(windows)]
+const REMOVE_NRPT: &str = "Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'nexus' } | Remove-DnsClientNrptRule -Force";
+
+#[cfg(windows)]
+fn powershell(script: &str) -> io::Result<()> {
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
+    eprintln!("nexus daemon: 完整节点 {name}：名字服务在 {}，请把 .internal 的查询交给它", pool.dns());
+    ResolverGuard { undo: None }
 }
 
 /// 协议栈上的一条 TCP 连接。关闭写方向时，协议栈要等发出的数据都被确认才发 FIN，

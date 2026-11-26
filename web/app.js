@@ -1,6 +1,7 @@
 // 网页节点的页面：通行密钥（浏览器的 WebAuthn）+ 网页节点核心（WebAssembly）+ 终端显示（xterm.js）。
 // 不使用任何浏览器存储：临时身份和登录凭证只在内存里，关掉页面即消失。
 import init, { Browser } from "./pkg/nexus_web.js";
+import { classifyShareError, mountShareView, normalizeReplyHeaders, renderStateBox } from "./share.mjs";
 
 const $ = (id) => document.getElementById(id);
 const show = (id) => { for (const s of ["enroll", "login", "share-view", "devices", "files", "terminal"]) $(s).hidden = s !== id; };
@@ -111,8 +112,57 @@ function renderHardwareStatus(session) {
   }
 }
 
+// 页面提供给网页节点核心的采集：摄像头拍一张，麦克风录几秒，位置取一次。只用已经同意开启时拿到的流。
+const MIC_CLIP_MS = 3000;
+
+async function captureHardware(kind) {
+  if (kind === "camera") {
+    const stream = hwStreams.camera;
+    if (!stream) throw new Error("摄像头没有开启");
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.srcObject = stream;
+    await video.play();
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+    video.pause();
+    video.srcObject = null;
+    const blob = await new Promise((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("拍照失败"))), "image/jpeg", 0.85),
+    );
+    return { mime: "image/jpeg", data: new Uint8Array(await blob.arrayBuffer()) };
+  }
+  if (kind === "microphone") {
+    const stream = hwStreams.microphone;
+    if (!stream) throw new Error("麦克风没有开启");
+    const rec = new MediaRecorder(stream);
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    const done = new Promise((resolve) => (rec.onstop = resolve));
+    const started = performance.now();
+    rec.start();
+    await new Promise((r) => setTimeout(r, MIC_CLIP_MS));
+    rec.stop();
+    await done;
+    const blob = new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+    return { mime: blob.type, duration_ms: Math.round(performance.now() - started), data: new Uint8Array(await blob.arrayBuffer()) };
+  }
+  if (kind === "location") {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 10000, maximumAge: 0 }),
+    );
+    return { lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy, timestamp: pos.timestamp };
+  }
+  throw new Error(`未知的硬件能力：${kind}`);
+}
+
 function hardwareControls(session) {
   renderHardwareStatus(session);
+  $("hw-cmd").textContent = `${session.hardware_command()}\n${session.hardware_command("location")}`;
+  session.hardware_serve(captureHardware, () => renderHardwareStatus(session));
   const toggle = async (kind) => {
     $("error").textContent = "";
     const enabled = new Set(JSON.parse(session.hardware_enabled()));
@@ -144,11 +194,12 @@ function hardwareControls(session) {
   addEventListener("pagehide", () => stopHardwareAll(session), { once: true });
 }
 
-// ---- 网页服务（M8.2）：在新标签页里打开，请求经转发程序（sw.js）交回这里，由网页节点核心发出。 ----
-// 令牌 → { device, service, jar }：令牌只在内存里，cookie 也只在内存里。
+// ---- 网页服务（M8.2 & M9.1）：请求经转发程序（sw.js）交回这里，由网页节点核心或访客分享会话发出。 ----
+// 令牌 → { device, service, jar } 或 { guest, name, jar }：令牌和 cookie 只在内存里。
 
 const services = new Map();
 let currentSession = null;
+let shareCleanup = null;
 
 function randomToken() {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -195,17 +246,29 @@ async function onForward(event) {
   const port = event.ports[0];
   if (!m || m.type !== "nexus-http" || !port) return;
   const svc = services.get(m.token);
-  if (!svc || !currentSession) { port.postMessage({ unknown: true }); return; }
+  if (!svc || (!svc.guest && !currentSession)) { port.postMessage({ unknown: true }); return; }
   const headers = m.headers.filter(([k]) => k.toLowerCase() !== "cookie");
   if (svc.jar.size) headers.push(["Cookie", [...svc.jar].map(([k, v]) => `${k}=${v}`).join("; ")]);
   try {
-    const r = await currentSession.http(svc.device, svc.service, m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
-    const replyHeaders = JSON.parse(r.headers());
+    let replyStatus, reason, replyHeaders, body;
+    if (svc.guest) {
+      const r = await svc.guest.http_fetch(m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
+      replyStatus = r.status;
+      reason = r.reason || "";
+      replyHeaders = normalizeReplyHeaders(r.headers);
+      body = r.body.buffer.slice(r.body.byteOffset, r.body.byteOffset + r.body.byteLength);
+    } else {
+      const r = await currentSession.http(svc.device, svc.service, m.method, m.path, JSON.stringify(headers), new Uint8Array(m.body));
+      replyStatus = r.status();
+      reason = r.reason();
+      replyHeaders = JSON.parse(r.headers());
+      body = r.body().buffer;
+    }
     for (const [k, v] of replyHeaders) if (k.toLowerCase() === "set-cookie") remember(svc.jar, v);
-    const body = r.body().buffer;
-    port.postMessage({ status: r.status(), reason: r.reason(), headers: replyHeaders, body }, [body]);
+    port.postMessage({ status: replyStatus, reason, headers: replyHeaders, body }, [body]);
   } catch (e) {
-    port.postMessage({ error: `${svc.device}/${svc.service}：${e && e.message ? e.message : e}`, status: 502 });
+    const label = svc.guest ? `分享/${svc.name}` : `${svc.device}/${svc.service}`;
+    port.postMessage({ error: `${label}：${e && e.message ? e.message : e}`, status: 502 });
   }
 }
 if (navigator.serviceWorker) navigator.serviceWorker.onmessage = onForward;
@@ -386,21 +449,92 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
-// 关闭页面：注销转发程序，清掉网页服务的页面可能留下的存储（R32）。
-addEventListener("pagehide", () => { currentSession = null; services.clear(); wipe(); });
-await wipe();
-await init();
+function createReadonlyTerminal(host) {
+  const term = new window.Terminal({ cursorBlink: false, disableStdin: true, fontSize: 14, scrollback: 2000 });
+  const fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(host);
+  fit.fit();
+  return {
+    get cols() { return term.cols; },
+    get rows() { return term.rows; },
+    write: (data) => term.write(data),
+    fit: () => fit.fit(),
+    dispose: () => term.dispose(),
+  };
+}
+
+function triggerBlobDownload(data, mime, name) {
+  const url = URL.createObjectURL(new Blob([data], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 async function openShare(link) {
+  if (shareCleanup) {
+    shareCleanup();
+    shareCleanup = null;
+  }
   show("share-view");
+  $("error").textContent = "";
+  $("who").textContent = "访客（只读）";
+  document.title = "临时分享 · Nexus";
+  $("share-title").textContent = "临时分享（只读）";
+  $("share-meta").innerHTML = "";
+  renderStateBox($("share-body"), {
+    kind: "loading",
+    title: "正在打开分享…",
+    detail: "正在连接分享设备并校验访问权限。",
+  });
   status("正在打开分享…");
   try {
     const browser = new Browser(relay);
     const guest = await browser.open_share(link);
     status("");
     const info = JSON.parse(guest.info());
-    $("share-meta").textContent = `设备 ${info.device} · 编号 ${info.id} · 只读分享`;
-  } catch (e) { status(""); fail(e); }
+    shareCleanup = await mountShareView({
+      guest,
+      info,
+      titleEl: $("share-title"),
+      metaEl: $("share-meta"),
+      bodyEl: $("share-body"),
+      helpers: {
+        setStatus: status,
+        ensureForwarder,
+        registerGuestService: (g, name) => {
+          const token = randomToken();
+          services.set(token, { guest: g, name, jar: new Map() });
+          return token;
+        },
+        unregisterGuestService: (token) => services.delete(token),
+        createObjectURL: (data, mime) => URL.createObjectURL(new Blob([data], { type: mime })),
+        revokeObjectURL: (url) => URL.revokeObjectURL(url),
+        triggerDownload: triggerBlobDownload,
+        createTerminal: createReadonlyTerminal,
+        addResizeListener: (fn) => addEventListener("resize", fn),
+        removeResizeListener: (fn) => removeEventListener("resize", fn),
+      },
+    });
+  } catch (e) {
+    status("");
+    renderStateBox($("share-body"), classifyShareError(e));
+  }
 }
+
+// 关闭页面：注销转发程序，清掉网页服务的页面可能留下的存储（R32）。
+addEventListener("pagehide", () => {
+  if (shareCleanup) { shareCleanup(); shareCleanup = null; }
+  currentSession = null;
+  services.clear();
+  wipe();
+});
+await wipe();
+await init();
 
 const hash = location.hash.slice(1);
 if (hash.startsWith("enroll=")) enroll(hash);

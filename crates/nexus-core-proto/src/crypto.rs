@@ -14,6 +14,8 @@ pub enum Purpose {
     SshHostKey,
     /// 设备在验证通行密钥之后签发的网页会话凭证。
     WebSession,
+    /// 旧根私钥签署的根密钥轮换交接证书（M10.1）。
+    RootRotation,
 }
 
 impl Purpose {
@@ -24,6 +26,7 @@ impl Purpose {
             Purpose::AgentAssertion => b"nexus/v1/agent-assertion\0",
             Purpose::SshHostKey => b"nexus/v1/ssh-host-key\0",
             Purpose::WebSession => b"nexus/v1/web-session\0",
+            Purpose::RootRotation => b"nexus/v1/root-rotation\0",
         }
     }
 }
@@ -80,6 +83,19 @@ impl SecretKey {
     /// 为某个用途签署一条消息。
     pub fn sign(&self, purpose: Purpose, msg: &[u8]) -> Signature {
         Signature::from_bytes(self.0.sign(&tagged(purpose, msg)).to_bytes())
+    }
+
+    /// 与对端公钥做 X25519 密钥协商，供对称加密派生共享秘密。
+    pub fn diffie_hellman(&self, peer: &PublicKey) -> Option<[u8; 32]> {
+        let vk = VerifyingKey::from_bytes(&peer.0).ok()?;
+        if vk.is_weak() {
+            return None;
+        }
+        let shared = vk.to_montgomery().mul_clamped(self.0.to_scalar_bytes()).to_bytes();
+        if shared.iter().fold(0u8, |acc, &b| acc | b) == 0 {
+            return None;
+        }
+        Some(shared)
     }
 }
 
@@ -143,5 +159,20 @@ mod tests {
         let sig = k.sign(Purpose::Roster, b"x");
         // 不是合法曲线点的公钥：校验失败而不是崩溃
         assert!(!PublicKey([0xff; 32]).verify(Purpose::Roster, b"x", &sig));
+    }
+
+    #[test]
+    fn diffie_hellman_is_symmetric_and_isolated_per_peer() {
+        let root = key(1);
+        let home = key(2);
+        let office = key(3);
+        let s_admin = root.diffie_hellman(&home.public()).unwrap();
+        let s_home = home.diffie_hellman(&root.public()).unwrap();
+        let s_office = office.diffie_hellman(&root.public()).unwrap();
+        assert_eq!(s_admin, s_home);
+        assert_ne!(s_admin, s_office);
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(root.diffie_hellman(&PublicKey(identity)).is_none());
     }
 }

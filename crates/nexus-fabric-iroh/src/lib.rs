@@ -18,6 +18,8 @@ use tokio::io::Join;
 #[cfg(not(target_arch = "wasm32"))]
 mod metered;
 #[cfg(not(target_arch = "wasm32"))]
+pub use metered::set_system_networks;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod rendezvous;
 
 /// 每条路径的心跳间隔。
@@ -144,6 +146,13 @@ impl IrohTransport {
             builder = builder.clear_ip_transports();
         } else if let Some(addr) = config.bind {
             builder = builder.clear_ip_transports().bind_addr(addr).map_err(io_err)?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let extra_roots = load_extra_ca_roots();
+            if !extra_roots.is_empty() {
+                builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::embedded().with_extra_roots(extra_roots));
+            }
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
@@ -462,9 +471,58 @@ impl Connection for IrohConn {
     }
 }
 
+/// 额外信任的根证书：`SSL_CERT_FILE` 指的文件，没有就用系统的证书包。
+///
+/// iroh 默认只信任编译进去的 Mozilla 根证书，企业代理、沙箱里的出站代理会用自己的根证书重新签发
+/// 中继和地址发现服务的证书，不加这些就连不上中继。它们只用来验证这些外部服务的 TLS 证书，
+/// 设备之间的连接仍靠设备密钥认证。
+#[cfg(not(target_arch = "wasm32"))]
+fn load_extra_ca_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) {
+        paths.push(std::path::PathBuf::from(path));
+    }
+    for fallback in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"] {
+        let path = std::path::PathBuf::from(fallback);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .map(|pem| parse_pem_certs(&pem))
+        .find(|certs| !certs.is_empty())
+        .unwrap_or_default()
+}
+
+/// PEM 里的所有证书；坏掉的条目跳过，不让一张坏证书拖累整个证书包。
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_pem_certs(pem: &[u8]) -> Vec<rustls_pki_types::CertificateDer<'static>> {
+    use rustls_pki_types::pem::PemObject;
+    rustls_pki_types::CertificateDer::pem_slice_iter(pem).filter_map(Result::ok).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 两张证书（内容不必是真的证书，PEM 解析只管 base64），中间夹着别的 PEM 块和注释。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parse_pem_certs_reads_every_certificate() {
+        let pem = b"# bundle\n-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n\
+-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n\
+-----BEGIN CERTIFICATE-----\nAwQF\nBgc=\n-----END CERTIFICATE-----\n";
+        let certs = parse_pem_certs(pem);
+        assert_eq!(certs.iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>(), vec![vec![0, 1, 2], vec![3, 4, 5, 6, 7]]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parse_pem_certs_without_certificates_is_empty() {
+        assert!(parse_pem_certs(b"not a pem file").is_empty());
+    }
 
     #[test]
     fn relay_hints_round_trip() {
