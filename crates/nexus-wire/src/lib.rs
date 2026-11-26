@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 3;
+pub const WIRE_MINOR: u16 = 4;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -148,6 +148,12 @@ pub enum Request {
     VaultPush { name: String, entry: Option<VaultCipherEntry> },
     /// Vault（M9.2）：成员设备向管理设备拉取自己被授权的所有密文条目。
     VaultPull,
+    /// 根密钥轮换（M10.1）：带着旧根签署的轮换证书和新根签署的新名册推送给各设备。
+    RootRotate {
+        rotation: nexus_core_proto::roster::SignedRootRotation,
+        roster: SignedRoster,
+        addrs: AddrHints,
+    },
 }
 
 /// 临时分享的目标（M9.1）：全部为只读访问。
@@ -280,6 +286,17 @@ pub struct VaultRotateItem {
     pub entries: Vec<String>,
 }
 
+/// 根密钥轮换完成后的报告（M10.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootRotateReport {
+    pub old_root: nexus_core_proto::PublicKey,
+    pub new_root: nexus_core_proto::PublicKey,
+    pub recovery_code: String,
+    pub roster_version: u64,
+    pub pushed: u32,
+    pub unreachable: Vec<String>,
+}
+
 /// 一条流承载的流量的类别。发送时交互优先：同一条连接上，批量流再满，终端和控制也先走。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrafficClass {
@@ -325,7 +342,8 @@ impl Request {
             | Request::ShareDriveRead { .. }
             | Request::ShareSessionWatch { .. }
             | Request::VaultPush { .. }
-            | Request::VaultPull => TrafficClass::Interactive,
+            | Request::VaultPull
+            | Request::RootRotate { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -748,6 +766,7 @@ pub enum CtlRequest {
     VaultRm { name: String },
     VaultSync,
     VaultRotateNeeded { device: Option<String> },
+    RootRotate,
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
     AnchorSet { url: Option<String> },
     AnchorShow,
@@ -822,6 +841,7 @@ pub enum CtlResponse {
     VaultValue { name: String, value: Vec<u8> },
     VaultList(Vec<VaultEntryInfo>),
     VaultRotateNeeded(Vec<VaultRotateItem>),
+    RootRotated(RootRotateReport),
     WebKeys(Vec<WebKeyInfo>),
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),
