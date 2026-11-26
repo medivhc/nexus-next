@@ -19,4 +19,24 @@ final class NexusCore {
 
     /** N1：将用户配置的绕过应用文本归一化为换行分隔包名，并强制包含自身包名防 VPN 环路。 */
     static native String nativeEffectiveBypass(String selfPackage, String rawLines);
+
+    /** N1：获取当前生效的路由规则列表（JSON）。 */
+    static native String nativeRouteList(String dataDir);
+
+    /** N1：解析并（在非 dryRun 时）导入 Clash/Mihomo 规则子集，返回审计报告 JSON。 */
+    static native String nativeRouteImport(
+        String dataDir, String yaml, String viaExit, String socks5, boolean replace, boolean dryRun
+    );
+
+    /** N1：一键回滚路由规则到上一份 LKG 快照（JSON）。 */
+    static native String nativeRouteRollback(String dataDir);
+
+    /** N1：删除指定 1-based 序号的路由规则（JSON）。 */
+    static native String nativeRouteRm(String dataDir, int index);
+
+    /** N1：查询任意主机:端口的路由去向解释（JSON）。 */
+    static native String nativeRouteExplain(String dataDir, String target);
+
+    /** N1：对当前路由规则执行静态冲突/遮蔽/无效上游审计（JSON）。 */
+    static native String nativeRouteAudit(String dataDir);
 }

@@ -974,7 +974,7 @@ where
 
 const DAEMON_HINT: &str = "，请先运行 nexus daemon";
 
-async fn call<C: Ctl>(ctl: &C, req: CtlRequest) -> io::Result<CtlResponse> {
+pub async fn call<C: Ctl>(ctl: &C, req: CtlRequest) -> io::Result<CtlResponse> {
     let mut session = ctl.open(req).await?;
     session
         .rx

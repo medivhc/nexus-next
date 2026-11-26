@@ -17,6 +17,7 @@ import android.os.ParcelFileDescriptor;
 import android.util.Log;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -24,23 +25,29 @@ import java.util.Map;
 
 /**
  * Nexus 的入口：单 VpnService 接管完整节点的网段和名字服务，支持按应用绕过与 N2 省电策略。
- *
- * - 系统里所有未绕过应用的名字查询都到 198.18.0.2：.internal 和规则里不直连的域名得到 198.18.x.x 的本机临时地址，
- *   经这个网卡进入核心；其余名字照常解析，连接不经过 VPN。
- * - 防环路保护（N1）：通过 NexusCore.nativeEffectiveBypass 合并用户配置的 app_bypass.txt 与本机包名，
- *   确保 Nexus 自身连接永远不经过自己的 VPN。
- * - 省电策略（N2）：默认采用 balanced 模式（不主动在有 Wi-Fi 时维持蜂窝电台）；仅在显式切换为 realtime
- *   或传入 --ez multipath true 时请求蜂窝网络，切回或停止时立即注销 NetworkCallback。
  */
 public class NexusVpnService extends VpnService {
     static final String ACTION_START = "link.bewith.nexus.START";
     static final String ACTION_STOP = "link.bewith.nexus.STOP";
+    static final String ACTION_REBUILD = "link.bewith.nexus.REBUILD";
     static final String ACTION_POWER_MODE = "link.bewith.nexus.POWER_MODE";
+    static final String BYPASS_FILE = "app_bypass.txt";
+    static final String POWER_MODE_FILE = "power_mode.txt";
     private static final String TAG = "nexus";
-    private static final String BYPASS_FILE = "app_bypass.txt";
 
     static {
         System.loadLibrary("nexus_android");
+    }
+
+    private static volatile boolean sRunning = false;
+    private static volatile String sPowerMode = "balanced";
+
+    static boolean isVpnRunning() {
+        return sRunning;
+    }
+
+    static String getActivePowerMode() {
+        return sPowerMode;
     }
 
     private native int nativeStart(String dataDir, String name, int tunFd, String relay, boolean discovery, String rendezvous);
@@ -49,7 +56,10 @@ public class NexusVpnService extends VpnService {
 
     private ParcelFileDescriptor tun;
     private ConnectivityManager cm;
-    private String currentPowerMode = "balanced";
+    private String lastName;
+    private String lastRelay = "default";
+    private boolean lastDiscovery = true;
+    private String lastRendezvous = "default";
     /** 系统的每个网络（不含 VPN）：接口名、是否计费。 */
     private final Map<Network, String> ifaces = new HashMap<>();
     private final Map<Network, Boolean> meteredNets = new HashMap<>();
@@ -58,21 +68,35 @@ public class NexusVpnService extends VpnService {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+        String action = intent == null ? null : intent.getAction();
+        if (ACTION_STOP.equals(action)) {
             shutdown();
             stopSelf();
             return START_NOT_STICKY;
         }
-        if (intent != null && ACTION_POWER_MODE.equals(intent.getAction())) {
+        if (ACTION_POWER_MODE.equals(action)) {
             String requested = intent.getStringExtra("power_mode");
             if (requested != null) {
-                applyPowerMode(requested);
+                applyPowerMode(requested, true);
             }
+            return START_STICKY;
+        }
+        if (ACTION_REBUILD.equals(action)) {
+            if (!sRunning) {
+                return START_NOT_STICKY;
+            }
+            shutdown();
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            startTunnel(lastName != null ? lastName : defaultName(), lastRelay, lastDiscovery, sPowerMode, lastRendezvous);
             return START_STICKY;
         }
         if (tun != null) {
             if (intent != null && intent.hasExtra("power_mode")) {
-                applyPowerMode(intent.getStringExtra("power_mode"));
+                applyPowerMode(intent.getStringExtra("power_mode"), true);
             }
             return START_STICKY;
         }
@@ -82,6 +106,18 @@ public class NexusVpnService extends VpnService {
         boolean discovery = intent == null || intent.getBooleanExtra("discovery", true);
         String powerMode = resolvePowerMode(intent);
         String rendezvous = intent != null && intent.getStringExtra("rendezvous") != null ? intent.getStringExtra("rendezvous") : "default";
+        if (!startTunnel(name, relay, discovery, powerMode, rendezvous)) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        return START_STICKY;
+    }
+
+    private boolean startTunnel(String name, String relay, boolean discovery, String powerMode, String rendezvous) {
+        lastName = name;
+        lastRelay = relay;
+        lastDiscovery = discovery;
+        lastRendezvous = rendezvous;
         try {
             Builder b = new Builder()
                 .setSession("Nexus")
@@ -93,18 +129,19 @@ public class NexusVpnService extends VpnService {
             tun = b.establish();
             if (tun == null) {
                 Log.e(TAG, "VPN 没有授权");
-                stopSelf();
-                return START_NOT_STICKY;
+                sRunning = false;
+                return false;
             }
             nativeStart(getFilesDir().getAbsolutePath(), name, tun.detachFd(), relay, discovery, rendezvous);
+            sRunning = true;
             watchNetworks(powerMode);
             Log.i(TAG, "已启动：" + name);
+            return true;
         } catch (PackageManager.NameNotFoundException | RuntimeException e) {
             Log.e(TAG, "无法启动", e);
             shutdown();
-            stopSelf();
+            return false;
         }
-        return START_STICKY;
     }
 
     @Override
@@ -126,8 +163,8 @@ public class NexusVpnService extends VpnService {
         if (intent != null && intent.hasExtra("multipath")) {
             return intent.getBooleanExtra("multipath", false) ? "realtime" : "balanced";
         }
-        // N2 默认平衡省电模式：不主动在有 Wi-Fi 时拉起蜂窝网络。
-        return "balanced";
+        String saved = readSmallFile(new File(getFilesDir(), POWER_MODE_FILE)).trim();
+        return saved.isEmpty() ? "balanced" : saved;
     }
 
     private void applyDisallowedApps(Builder b) throws PackageManager.NameNotFoundException {
@@ -158,7 +195,7 @@ public class NexusVpnService extends VpnService {
         }
     }
 
-    private static String readSmallFile(File file) {
+    static String readSmallFile(File file) {
         if (!file.exists() || !file.isFile()) {
             return "";
         }
@@ -168,6 +205,14 @@ public class NexusVpnService extends VpnService {
             return n > 0 ? new String(buf, 0, n, StandardCharsets.UTF_8) : "";
         } catch (IOException e) {
             return "";
+        }
+    }
+
+    static void writeSmallFile(File file, String content) {
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w(TAG, "写入文件失败：" + file.getName(), e);
         }
     }
 
@@ -207,13 +252,16 @@ public class NexusVpnService extends VpnService {
             }
         };
         cm.registerNetworkCallback(all, watch);
-        applyPowerMode(powerMode);
+        applyPowerMode(powerMode, false);
     }
 
-    private void applyPowerMode(String requested) {
+    private void applyPowerMode(String requested, boolean persist) {
         String normalized = requested == null ? "balanced" : requested.trim().toLowerCase();
         boolean wantCellular = NexusCore.nativeShouldKeepCellular(normalized);
-        currentPowerMode = wantCellular ? "realtime" : ("powersave".equals(normalized) ? "powersave" : "balanced");
+        sPowerMode = wantCellular ? "realtime" : ("powersave".equals(normalized) ? "powersave" : "balanced");
+        if (persist) {
+            writeSmallFile(new File(getFilesDir(), POWER_MODE_FILE), sPowerMode);
+        }
         if (cm == null) {
             return;
         }
@@ -227,31 +275,27 @@ public class NexusVpnService extends VpnService {
                 try {
                     cm.requestNetwork(cellular, keepCellular);
                 } catch (RuntimeException e) {
-                    // 没有蜂窝网络的设备（平板、模拟器）或没有权限：只用现有的网络。
                     Log.w(TAG, "不能请求蜂窝网络", e);
                     keepCellular = null;
                 }
             }
-            Log.i(TAG, "电源模式：" + currentPowerMode + "（已请求保持蜂窝）");
+            Log.i(TAG, "电源模式：" + sPowerMode + "（已请求保持蜂窝）");
         } else {
             if (keepCellular != null) {
                 try {
                     cm.unregisterNetworkCallback(keepCellular);
                 } catch (RuntimeException ignored) {
-                    // 已经注销过
                 }
                 keepCellular = null;
             }
-            Log.i(TAG, "电源模式：" + currentPowerMode + "（不主动保持蜂窝）");
+            Log.i(TAG, "电源模式：" + sPowerMode + "（不主动保持蜂窝）");
         }
     }
 
-    /** 系统认为计费（没有 NOT_METERED，也不是临时不计费）。 */
     static boolean isMetered(NetworkCapabilities caps) {
         if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) {
             return false;
         }
-        // API 30 起：运营商临时不计费（例如 5G 不限量时段）。
         return Build.VERSION.SDK_INT < 30 || !caps.hasCapability(25 /* NET_CAPABILITY_TEMPORARILY_NOT_METERED */);
     }
 
@@ -278,13 +322,13 @@ public class NexusVpnService extends VpnService {
     }
 
     private void shutdown() {
+        sRunning = false;
         if (cm != null) {
             for (ConnectivityManager.NetworkCallback cb : new ConnectivityManager.NetworkCallback[] {watch, keepCellular}) {
                 if (cb != null) {
                     try {
                         cm.unregisterNetworkCallback(cb);
                     } catch (RuntimeException ignored) {
-                        // 已经注销过
                     }
                 }
             }
@@ -292,7 +336,7 @@ public class NexusVpnService extends VpnService {
             keepCellular = null;
         }
         nativeStop();
-        tun = null; // 描述符已交给核心，核心停止时关闭
+        tun = null;
     }
 
     private void foreground() {
