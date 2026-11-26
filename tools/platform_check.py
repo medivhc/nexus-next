@@ -203,20 +203,33 @@ class Term:
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.buf = bytearray()
         self.lock = threading.Lock()
+        self.wlock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
+        answered = 0
         while True:
             chunk = self.p.stdout.read1(65536)
             if not chunk:
                 return
             with self.lock:
                 self.buf += chunk
+                asked = self.buf.count(b"\x1b[6n")
+            # 像真的终端一样回答光标位置的查询：Windows 的伪终端（ConPTY）启动时先问，得到回答才开始输出。
+            while answered < asked:
+                answered += 1
+                try:
+                    with self.wlock:
+                        self.p.stdin.write(b"\x1b[1;1R")
+                        self.p.stdin.flush()
+                except OSError:
+                    return
 
     def send(self, text):
         try:
-            self.p.stdin.write(text.encode())
-            self.p.stdin.flush()
+            with self.wlock:
+                self.p.stdin.write(text.encode())
+                self.p.stdin.flush()
         except OSError:
             time.sleep(0.5)
             raise SystemExit(f"nexus ssh 已经退出（退出码 {self.p.poll()}），输出：{self.text()[-2000:]!r}")
