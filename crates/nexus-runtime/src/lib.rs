@@ -730,6 +730,12 @@ impl<T: Transport, S: System> Node<T, S> {
         save(&self.system, KEY_ROSTER, candidate).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(candidate.clone());
         self.roster_epoch.send_modify(|v| *v += 1);
+        let admin_of = |r: &SignedRoster| r.roster.devices.iter().find(|d| d.role == DeviceRole::Admin).map(|d| d.node_id);
+        if let (Some(old), Some(new)) = (current.as_ref().and_then(admin_of), admin_of(candidate)) {
+            if old != new {
+                self.note_admin_changed_for_vault(old);
+            }
+        }
         Ok(())
     }
 
@@ -3188,6 +3194,8 @@ impl<T: Transport, S: System> Node<T, S> {
         self.roster_epoch.send_modify(|v| *v += 1);
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
+        // 原来的 Vault 条目只在各台设备上：收回在线设备上的（离线的之后在这里 vault sync 再收）。
+        let _ = self.vault_collect().await;
         Ok(MembershipReport { name, node_id: me, roster_version: self.roster_version(), pushed, unreachable })
     }
 
