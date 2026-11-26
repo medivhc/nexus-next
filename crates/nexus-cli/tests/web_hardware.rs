@@ -177,3 +177,40 @@ scenario! {
         assert!(state.active_users().is_empty());
     },
 }
+
+scenario! {
+    name: web_hardware_page_shows_commands_that_work,
+    covers: "R72",
+    nodes: ["laptop", "home"],
+    real: yes,
+    run: |w: World| async move {
+        w.network("laptop", &["home"]).await;
+        let link = w.cli_ok("laptop", &["web", "enroll", "--label", "phone"]).await["url"].as_str().unwrap().to_string();
+        let browser = w.browser().await;
+        let mut auth = phone_passkey();
+        browser.enroll(&link, &auth).await.unwrap();
+        browser.login(&w, &link, &mut auth).await.unwrap();
+
+        // 页面上显示的命令原样复制到设备上就能用：不需要用户另外去找网页节点的标识和地址提示。
+        let ls_cmd = browser.hardware_command(None);
+        let capture_cmd = browser.hardware_command(Some(HardwareKind::Location));
+        assert!(ls_cmd.starts_with("nexus hw ls "), "{ls_cmd}");
+        assert!(capture_cmd.starts_with("nexus hw capture "), "{capture_cmd}");
+        let args = |cmd: &str| cmd.split_whitespace().skip(1).map(str::to_string).collect::<Vec<_>>();
+
+        let state = HardwareState::new();
+        state.enable(HardwareKind::Location);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let serve = browser.serve_hardware(state.clone(), FakeHardware, stop_rx, |_| {});
+        let test = async {
+            let ls_args = args(&ls_cmd);
+            let v = w.cli_ok("home", &ls_args.iter().map(String::as_str).collect::<Vec<_>>()).await;
+            assert_eq!(v["capabilities"], serde_json::json!(["location"]), "{v}");
+            let cap_args = args(&capture_cmd);
+            let loc = w.cli_ok("home", &cap_args.iter().map(String::as_str).collect::<Vec<_>>()).await;
+            assert_eq!(loc["lat_e7"], 312_304_000, "{loc}");
+            let _ = stop_tx.send(());
+        };
+        tokio::join!(serve, test);
+    },
+}

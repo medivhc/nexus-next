@@ -18,7 +18,15 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
 
 pub struct RealSystem {
     dir: PathBuf,
@@ -28,7 +36,6 @@ pub struct RealSystem {
     exec_env: Vec<(String, String)>,
 }
 
-#[cfg(unix)]
 pub mod holder;
 
 impl RealSystem {
@@ -47,11 +54,9 @@ impl RealSystem {
         Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None, exec_env: Vec::new() })
     }
 
-    /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2）。只在 Unix 上。
+    /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2；Windows 见 M11.3）。
     pub fn with_session_holder(mut self, exe: PathBuf) -> Self {
-        if cfg!(unix) {
-            self.session_holder = Some(exe);
-        }
+        self.session_holder = Some(exe);
         self
     }
 
@@ -118,7 +123,6 @@ impl System for RealSystem {
     }
 
     fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
-        #[cfg(unix)]
         if let Some(exe) = &self.session_holder {
             return holder::spawn(exe, &self.dir, name, size, created_at, false).map(RealTerm::Held);
         }
@@ -127,7 +131,6 @@ impl System for RealSystem {
     }
 
     async fn adopt_ptys(&self) -> Vec<nexus_sys::AdoptedPty<RealTerm>> {
-        #[cfg(unix)]
         if self.session_holder.is_some() {
             return holder::adopt(self.session_holder.as_deref().expect("上面判断过"), &self.dir)
                 .into_iter()
@@ -237,7 +240,7 @@ impl System for RealSystem {
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().expect("有上级目录"))?;
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = unique_tmp(&path);
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)
     }
@@ -248,7 +251,7 @@ impl System for RealSystem {
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let path = self.path(key)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp(&path);
         use std::io::Write;
         #[cfg(unix)]
         {
@@ -263,6 +266,14 @@ impl System for RealSystem {
             file.write_all(value)?;
         }
         std::fs::rename(tmp, path)
+    }
+
+    fn store_delete(&self, key: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -369,7 +380,6 @@ const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_millis(3
 /// 终端：在本进程里，或者由持有进程管理（M7.2）。
 pub enum RealTerm {
     Local(RealPty),
-    #[cfg(unix)]
     Held(holder::HeldPty),
 }
 
@@ -377,28 +387,24 @@ impl Pty for RealTerm {
     async fn next_event(&mut self) -> PtyEvent {
         match self {
             RealTerm::Local(p) => p.next_event().await,
-            #[cfg(unix)]
             RealTerm::Held(p) => p.next_event().await,
         }
     }
     fn write(&mut self, data: Vec<u8>) {
         match self {
             RealTerm::Local(p) => p.write(data),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.write(data),
         }
     }
     fn resize(&mut self, size: Size) {
         match self {
             RealTerm::Local(p) => p.resize(size),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.resize(size),
         }
     }
     fn kill(&mut self) {
         match self {
             RealTerm::Local(p) => p.kill(),
-            #[cfg(unix)]
             RealTerm::Held(p) => p.kill(),
         }
     }
@@ -432,18 +438,18 @@ impl RealPty {
         #[cfg(unix)]
         let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
         #[cfg(windows)]
-        let shell = std::env::var("ComSpec")
-            .ok()
-            .and_then(|p| {
-                if std::path::Path::new(&p).file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe")) {
-                    Some(p)
-                } else if std::path::Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
-                    Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into())
-                } else {
-                    Some(p)
-                }
-            })
-            .unwrap_or_else(|| "cmd.exe".into());
+        let shell = {
+            // 有 Windows PowerShell 就用它，否则用 ComSpec（通常是 cmd.exe）。
+            const POWERSHELL: &str = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+            let comspec = std::env::var("ComSpec").ok().filter(|s| !s.is_empty());
+            let is_powershell = |p: &str| std::path::Path::new(p).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe"));
+            match comspec {
+                Some(p) if is_powershell(&p) => p,
+                _ if std::path::Path::new(POWERSHELL).exists() => POWERSHELL.to_string(),
+                Some(p) => p,
+                None => "cmd.exe".to_string(),
+            }
+        };
 
         let mut cmd = portable_pty::CommandBuilder::new(shell);
         #[cfg(unix)]
@@ -507,7 +513,7 @@ impl RealPty {
 
 impl RealPty {
     /// shell 的进程号。
-    #[cfg(unix)]
+    #[allow(dead_code)]
     pub(crate) fn pid(&self) -> Option<u32> {
         self.pid
     }

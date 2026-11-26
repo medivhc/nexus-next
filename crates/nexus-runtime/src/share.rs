@@ -99,7 +99,7 @@ impl<T: Transport, S: System> Node<T, S> {
                     .get(&ws)
                     .cloned()
                     .ok_or_else(|| err(ErrorCode::NotFound, format!("本机上没有工作区 {ws}")))?;
-                let cas = Cas(&self.system);
+                let cas = Cas::new(&self.system);
                 match tree::lookup(&cas, ws_state.work, &parts).map_err(|e| internal(format!("{e:?}")))? {
                     Some(_) => {}
                     None => return Err(err(ErrorCode::NotFound, format!("{ws}:/{} 不存在", parts.join("/")))),
@@ -285,7 +285,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 .get(ws)
                 .cloned()
                 .ok_or_else(|| err(ErrorCode::NotFound, format!("工作区 {ws} 不存在")))?;
-            let cas = Cas(&self.system);
+            let cas = Cas::new(&self.system);
             let base_entry = tree::lookup(&cas, ws_state.work, &full_parts)
                 .map_err(|e| internal(format!("{e:?}")))?
                 .ok_or_else(|| err(ErrorCode::NotFound, "分享的路径已不存在"))?;
@@ -348,7 +348,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 .get(ws)
                 .cloned()
                 .ok_or_else(|| err(ErrorCode::NotFound, format!("工作区 {ws} 不存在")))?;
-            let cas = Cas(&self.system);
+            let cas = Cas::new(&self.system);
             let base_entry = tree::lookup(&cas, ws_state.work, &full_parts)
                 .map_err(|e| internal(format!("{e:?}")))?
                 .ok_or_else(|| err(ErrorCode::NotFound, "分享的路径已不存在"))?;

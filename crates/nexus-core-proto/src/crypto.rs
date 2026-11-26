@@ -14,6 +14,8 @@ pub enum Purpose {
     SshHostKey,
     /// 设备在验证通行密钥之后签发的网页会话凭证。
     WebSession,
+    /// 旧根私钥签署的根密钥轮换交接证书（M10.1）。
+    RootRotation,
 }
 
 impl Purpose {
@@ -24,6 +26,7 @@ impl Purpose {
             Purpose::AgentAssertion => b"nexus/v1/agent-assertion\0",
             Purpose::SshHostKey => b"nexus/v1/ssh-host-key\0",
             Purpose::WebSession => b"nexus/v1/web-session\0",
+            Purpose::RootRotation => b"nexus/v1/root-rotation\0",
         }
     }
 }

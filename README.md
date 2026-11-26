@@ -7,7 +7,7 @@
 
 ## 现在能做什么
 
-已完成路线的阶段 0–5，`FEATURES.md` 里的 75 条需求都已实现并有测试：
+已完成路线的阶段 0–9（M7.0 真实网络验证除外），`FEATURES.md` 里的 75 条需求（R00–R74）都已实现并有测试：
 
 | 阶段 | 内容 |
 | --- | --- |
@@ -17,10 +17,11 @@
 | 4 | 文件：版本化工作区、跨设备同步与分叉合并、Linux 挂载、预读 |
 | 5 | 多条网络：断一条不断会话、交互流量冗余、批量分摊、计费网络 |
 | 6 | 易用性：短加入码（`7KQ4M-9XZ21`，经碰头服务）、更短的长加入码；用恢复码恢复管理设备 |
-| 7（进行中） | 日常可用：新旧版本互通（设备可以一台一台升级）；终端会话在常驻程序重启后保留；`nexus upgrade`（自动换回） |
-| 8–9（进行中） | 网页浏览工作区、页内/新标签页打开网页服务、临时分享（文件/目录、网页服务、只读终端，访客免登录打开 `#share=...`） |
+| 7 | 日常可用：新旧版本互通（设备可以一台一台升级）；终端会话在常驻程序重启后保留；`nexus upgrade`（自动换回、推给其他设备）；`nexus open` |
+| 8 | 网页节点补齐：浏览工作区、新标签页打开网页服务、逐项同意后开放摄像头/麦克风/位置 |
+| 9 | 分享与凭据：临时分享（文件/目录、网页服务、只读终端，访客免登录打开 `#share=...`）；Vault（秘密加密后只同步到授权设备，按条目授权，取用有记录） |
 
-还没做：凭据同步（Vault）、硬件能力发布（浏览器端接线）、远程桌面。已知限制见手册的第 17 节。
+还没做：远程桌面、Android 应用内加入、Windows 的虚拟网卡。已知限制见手册的第 19 节。
 **还没有在两台不同网络的真实设备上验证过**，步骤见 `docs/real-network-check.md`。
 
 ## 上手
@@ -46,12 +47,12 @@ nexus ssh-config >> ~/.ssh/config        # 之后 ssh/scp/git 用 home.nexus
 | 文档 | 内容 |
 | --- | --- |
 | [docs/manual.md](docs/manual.md) | 用户手册：怎么工作、从零开始的三台设备、所有命令、维护和排查 |
-| [FEATURES.md](FEATURES.md) | 需求（R01–R61）和实现状态 |
+| [FEATURES.md](FEATURES.md) | 需求（R00–R74）和实现状态 |
 | [docs/anchor.md](docs/anchor.md) | 在 VPS 上部署锚点 |
 | [docs/unified-entry.md](docs/unified-entry.md) | 统一入口、路由规则、出口、`nexus run`、完整节点的细节 |
 | [docs/android.md](docs/android.md) | Android 应用的构建、安装和加入 |
 | [docs/real-network-check.md](docs/real-network-check.md) | 在两台真实设备上验证的清单 |
-| [docs/roadmap.md](docs/roadmap.md) | 之后的开发计划：和产品文档的差距、阶段 7–9 |
+| [docs/roadmap.md](docs/roadmap.md) | 开发计划：和产品文档的差距、阶段 7–9 和之后 |
 | [docs/protocol.md](docs/protocol.md) | 协议与版本兼容：改协议时的规则（开发者） |
 | [web/README.md](web/README.md) | 网页节点的页面：构建、本机试用、浏览器端到端测试 |
 | [vendor/README.md](vendor/README.md) | iroh 和 noq 的分支：改了什么、为什么（多路径） |

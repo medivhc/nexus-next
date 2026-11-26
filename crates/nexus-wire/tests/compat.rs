@@ -140,6 +140,16 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             }),
         },
         Request::VaultPull,
+        Request::RootRotate {
+            rotation: nexus_core_proto::roster::RootRotation {
+                old_root: SecretKey::from_seed([1; 32]).public(),
+                new_root: SecretKey::from_seed([2; 32]).public(),
+                version: 8,
+            }
+            .sign(&SecretKey::from_seed([1; 32])),
+            roster: roster(),
+            addrs: vec![(node(3), "hint".into())],
+        },
         Request::SvcDatagram { name: "dns".into() },
     ];
     all.into_iter()
@@ -174,6 +184,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::ShareSessionWatch { .. } => "request.share_session_watch",
                 Request::VaultPush { .. } => "request.vault_push",
                 Request::VaultPull => "request.vault_pull",
+                Request::RootRotate { .. } => "request.root_rotate",
                 Request::SvcDatagram { .. } => "request.svc_datagram",
             };
             (name, r)

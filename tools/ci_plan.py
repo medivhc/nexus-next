@@ -17,6 +17,9 @@ class Plan:
     full: bool = False
     compat: bool = False
     web: bool = False
+    # M11.3：在 macOS 和 Windows 的 runner 上编译并跑 tools/platform_check.py（代替真机）。
+    # 和 compat 一样只看会进 nexus 二进制的改动；macOS 的 runner 按 10 倍计时，文档和网页改动不跑。
+    platforms: bool = False
 
 
 DOC_DIRS = ("docs/", "tasks/")
@@ -58,7 +61,7 @@ def is_document(path: str) -> bool:
 def classify(paths: list[str], event: str) -> Plan:
     if event != "pull_request":
         # Main, nightly, and manual runs are the full-coverage backstop.
-        return Plan(smoke=True, full=True, compat=True, web=True)
+        return Plan(smoke=True, full=True, compat=True, web=True, platforms=True)
 
     smoke = full = compat = web = False
     for path in paths:
@@ -115,7 +118,7 @@ def classify(paths: list[str], event: str) -> Plan:
             continue
         # Unknown/new directory: fail closed by running everything.
         full = compat = web = True
-    return Plan(smoke=smoke, full=full, compat=compat, web=web)
+    return Plan(smoke=smoke, full=full, compat=compat, web=web, platforms=compat)
 
 
 def changed_files(base: str, head: str) -> list[str]:

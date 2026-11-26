@@ -3,7 +3,7 @@
 Nexus 把你的所有设备组成一个整体。每台设备上运行一个常驻程序，设备之间按名字互相访问；
 你和你的 agent 用同一套身份使用任何一台设备上的终端、服务、网络和文件。不需要配地址、端口或 SSH 密钥。
 
-本手册按当前实现（阶段 0–5，见 `FEATURES.md`）写成。第一次用，先读第 2 节（怎么工作）和第 3 节（从零开始），
+本手册按当前实现（阶段 0–9，到 M9.2 为止，见 `FEATURES.md` 和 `docs/roadmap.md`）写成。第一次用，先读第 2 节（怎么工作）和第 3 节（从零开始），
 之后的章节是按功能的参考。每条命令都有 `--help`，加 `--json` 得到结构化输出。
 
 > 手册里写成 ` ```sh laptop ` 这类带设备名的代码块，CI 每次都会在本机起几台设备、照着从上到下执行一遍
@@ -23,11 +23,13 @@ Nexus 把你的所有设备组成一个整体。每台设备上运行一个常�
 10. [完整节点（虚拟网卡）](#10-完整节点虚拟网卡)
 11. [锚点与网页节点](#11-锚点与网页节点)
 12. [文件（Drive）](#12-文件drive)
-13. [多条网络](#13-多条网络)
-14. [Android](#14-android)
-15. [排查问题](#15-排查问题)
-16. [退出码](#16-退出码)
-17. [已知限制](#17-已知限制)
+13. [临时分享](#13-临时分享)
+14. [Vault（秘密）](#14-vault秘密)
+15. [多条网络](#15-多条网络)
+16. [Android](#16-android)
+17. [排查问题](#17-排查问题)
+18. [退出码](#18-退出码)
+19. [已知限制](#19-已知限制)
 
 ---
 
@@ -43,6 +45,8 @@ Nexus 把你的所有设备组成一个整体。每台设备上运行一个常�
 | 存储设备 | 执行过 `nexus drive serve on` 的设备，保存工作区的完整副本。锚点通常兼做存储设备 |
 | agent | 由管理设备签发的身份，有范围和期限，只能做凭据里授权的事 |
 | 网页节点 | 浏览器用通行密钥登录后成为的临时节点 |
+| 临时分享 | 一条限时、限次、只读的链接，不在网络里的人用它在浏览器里看一个文件或目录、一个网页服务或一个终端会话 |
+| Vault | 你自己的秘密（密码、令牌），加密后只放在你指定的设备上，按条目授权给 agent |
 
 授权写作 `能力@资源`，例如 `term.exec@home`、`svc.connect@home/svc/web`。名册里你自己的设备之间默认互相可用；
 agent 和网页登录只能用授权里写明的。经过一台设备的每次访问（包括被拒绝的）都记在那台设备的审计记录里。
@@ -97,6 +101,8 @@ agent 和网页登录只能用授权里写明的。经过一台设备的每次�
 | `root_key.bin` | 网络根密钥，**只在管理设备上有** |
 | `roster.bin`、`root_pub.bin` | 名册和根公钥 |
 | `agents.bin` | 管理设备签发过的 agent |
+| `shares-v1.bin` | 这台设备创建的临时分享（到期时间、次数、是否撤销） |
+| `vault-v1.bin` | 这台设备被授权的 Vault 条目（只有密文）；管理设备上还有每条给过哪些设备 |
 | `drive-v2.bin`、`cas/` | 工作区的提交、目录和本机有的文件内容 |
 | `ctl.sock` | 命令行和常驻程序之间的控制套接字 |
 | `upgrade.json` | 最近一次升级的状态（`nexus upgrade --status`） |
@@ -271,14 +277,19 @@ vps 有域名（例如 `bewith.link`）时，把它设为锚点：它在 443 端
 
 - 每台设备的常驻程序要一直开着：配成开机自启（第 4 节）。
 - 新设备重复第二步。设备丢了：在 laptop 上 `nexus device revoke <设备>`。
-- 网络有两个出口（例如有线和 5G）时什么都不用配，见第 13 节。
+- 网络有两个出口（例如有线和 5G）时什么都不用配，见第 15 节。
 
 ## 4. 安装、运行与维护
 
-### 下载预编译版本（Linux）
+### 下载预编译版本
 
-仓库的 Releases 页面有每个版本的静态二进制：`linux-x86_64` 和 `linux-aarch64`（ARM 服务器、树莓派），
-不依赖系统库，任何发行版都能用。压缩包里有 `nexus`、本手册和许可证。
+仓库的 Releases 页面有每个版本的预编译版本，压缩包里有 `nexus`、本手册和许可证：
+
+- Linux：`linux-x86_64` 和 `linux-aarch64`（ARM 服务器、树莓派），静态二进制，不依赖系统库，任何发行版都能用；
+- macOS：`macos-aarch64`（Apple 芯片）和 `macos-x86_64`（Intel），装法同 Linux；没有签名，第一次运行被拦时
+  `xattr -d com.apple.quarantine /usr/local/bin/nexus`；
+- Windows：`windows-x86_64.zip`，解开后 `nexus.exe` 和 `wintun.dll`（虚拟网卡用）放在同一个目录，把这个目录加到 PATH。
+  数据目录默认在 `%LOCALAPPDATA%\nexus`（其他系统是 `~/.local/share/nexus`）。
 
 ```sh
 tar xzf nexus-0.1.0-linux-x86_64.tar.gz
@@ -298,7 +309,8 @@ cargo build --release -p nexus-cli      # 二进制在 target/release/nexus
 sudo install target/release/nexus /usr/local/bin/
 ```
 
-挂载和多路径只在 Linux 上可用；macOS 和 Windows 还没有试过能不能编译。
+挂载和多路径只在 Linux 上可用。macOS 和 Windows 上其余功能都有（包括完整节点、会话保持、升级），
+但只在 GitHub 的 macOS、Windows runner 上自动检查过（`tools/platform_check.py`），还没有在真机上用过。
 
 ### 运行常驻程序
 
@@ -368,7 +380,8 @@ nexus upgrade --rollback                                # 换回上一个版本
 `nexus upgrade --status` 里写着原因。新版本启动就崩溃时，要有 systemd 这样的管理程序把它重新拉起来：拉起 3 次还没确认就换回。
 
 常驻程序要能写它的二进制所在的目录（装在 `/usr/local/bin` 时常驻程序要以 root 运行，或者把 nexus 装在自己的目录里）。
-目前只在 Linux 和其他 Unix 上；数据目录里的密钥、名册和工作区都保留。不用 `nexus upgrade` 也可以：停掉常驻程序，换二进制，再启动。
+Windows 上也可以：原来的留作 `nexus.prev.exe`，重新启动后常驻程序的进程号会变（Windows 不能原地换进程），
+`--file` 给 `.zip` 发布包或 `nexus.exe` 都行。数据目录里的密钥、名册和工作区都保留。不用 `nexus upgrade` 也可以：停掉常驻程序，换二进制，再启动。
 
 **从一台设备升级其他设备**：新版本只要下载到一台设备上，经 Nexus 送到其他设备：
 
@@ -397,7 +410,7 @@ nexus upgrade --file nexus-0.2.0-linux-x86_64.tar.gz                  # 最后�
 
 ### 备份
 
-- 管理设备：离线保存恢复码就够了（第 2 节）；要保留签发过的 agent 列表，再备份数据目录里的 `agents.bin`。
+- 管理设备：离线保存恢复码就够了（第 2 节）；要保留签发过的 agent 列表和 Vault 条目，再备份数据目录里的 `agents.bin` 和 `vault-v1.bin`。
 - 其他设备不需要备份身份：丢了就 `nexus device revoke` 再重新加入。工作区里的内容只要提交过并且有存储设备，就在存储设备上。
 
 ### 移除一台设备
@@ -493,6 +506,7 @@ nexus agent revoke builder               # 标签，或者 agent 的完整标识
 | `svc.connect` | `设备/svc/服务名` | 连接发布的服务 |
 | `net.exit` | `设备/exit` | 经这台设备的出口出去 |
 | `drive.read` / `drive.write` | `设备/drive/工作区` | 读、写工作区 |
+| `vault.read` | `设备/vault/条目` | 在那台设备上 `nexus vault get` / `ls` 这个条目（第 14 节） |
 
 能力末尾的星号匹配一组（`term.session.*`）；资源的一段写成星号匹配任意一段（`drive.read@*/drive/work`），
 末尾的两个星号匹配其下的一切（`node.info@**`）。
@@ -552,6 +566,41 @@ nexus run --use home/llm -- sh -c 'echo $OPENAI_BASE_URL'   # 开好端口、按
 `nexus run` 还会设置 `NEXUS_SVC_<设备>_<服务>=127.0.0.1:<端口>`（名字转成大写，其他字符换成 `_`）；
 可以给多个 `--use`；程序退出后端口关闭，退出码就是程序的退出码。
 
+### 远程桌面
+
+Nexus 不自己传画面，而是让现成的远程桌面（VNC 或 RDP）经 Nexus 的网络连起来：被看的设备上打开系统自带的
+屏幕共享或装一个 VNC 服务端，Nexus 把它发布成服务；看的设备上 Nexus 开一个本机端口，启动现成的查看器。
+连接经过 Nexus（加密、按身份判定、有审计），远程桌面服务端不需要对外开端口。
+
+先在被看的设备上打开远程桌面服务端：
+
+- macOS：系统设置 → 通用 → 共享 → 打开「屏幕共享」（VNC，端口 5900；登录用这台 Mac 的账户）。
+- Windows（专业版）：设置 → 系统 → 远程桌面（RDP，端口 3389）。家庭版没有，可以装一个 VNC 服务端。
+- Linux：`wayvnc 127.0.0.1`（Wayland）、`x11vnc -localhost -usepw`（X11），或者 GNOME 设置里的远程桌面（RDP）。
+
+能只监听本机（127.0.0.1）的就只监听本机：经 Nexus 的连接都从本机进来。
+下面两段分别在被看的设备（home）和看的设备（laptop）上运行。
+
+```sh
+nexus desktop share                        # 依次试本机的 5900、5901、3389，认出 VNC 或 RDP，发布成 home/desktop
+nexus desktop share --port 5902 --proto vnc --name screen2   # 别的端口；给了 --proto 就不识别
+```
+
+```sh
+nexus desktop ls                           # 在线设备上能用的远程桌面
+nexus desktop open home                    # 开本机端口、启动查看器（前台运行，Ctrl-C 停止）
+nexus desktop open home/screen2 --no-viewer --port 5999   # 只开端口，自己用查看器连 127.0.0.1:5999
+```
+
+`nexus desktop open` 显示的地址是 `vnc://127.0.0.1:<端口>` 或 `rdp://127.0.0.1:<端口>`。查看器：设置了
+`NEXUS_DESKTOP_VIEWER` 就执行它（地址作为最后一个参数）；否则 macOS 用系统的「屏幕共享」或 Windows App，
+Windows 用 `mstsc`（RDP）或 `vncviewer`（VNC），Linux 依次试 `vncviewer`、`remmina`、`xdg-open`（VNC）或
+`xfreerdp3`、`xfreerdp`、`remmina`（RDP）。找不到查看器时照样服务，并说明手动连哪个地址。
+`nexus open home/desktop` 遇到远程桌面也是一样。也可以不用 `nexus desktop share`，直接
+`nexus publish desktop --port 5900 --proto vnc`。
+
+远程桌面服务端自己的登录（VNC 密码、系统账户）照常要输；Nexus 只负责连通。网页里还不能看远程桌面。
+
 ## 9. 统一入口、路由与出口
 
 ### 本机统一入口
@@ -604,6 +653,11 @@ curl http://web.home.internal/           # 不设代理，任何程序都能用
 - 发给 `--proto udp` 服务的临时地址（任何端口）的 UDP 数据报转发到那个服务，回应原路送回；每个程序（源端口）
   各自一路，60 秒没有数据报就结束（M11.5）。数据报不超过一个包（约 1400 字节以内最稳）。
 - 规则里的域名（出口、上游代理）只转发 TCP；发给它们的 UDP 不转发。不接管默认路由。
+- macOS：`sudo nexus daemon --tun nexus0`。网卡由系统分配成 `utunN`（`nexus status` 里看实际的名字）；
+  `.internal` 的名字经 `/etc/resolver/internal` 交给名字服务，常驻程序正常退出时删掉。
+- Windows：以管理员身份运行 `nexus daemon --tun nexus0`，`wintun.dll` 要和 `nexus.exe` 在同一目录。
+  `.internal` 的名字经名称解析策略表（NRPT）里一条注释为 `nexus` 的规则交给名字服务：启动时加（顺带删掉上次留下的），
+  正常退出时删。手动删：`Get-DnsClientNrptRule | Where-Object Comment -eq nexus | Remove-DnsClientNrptRule -Force`。
 - `nexus status` 显示虚拟网卡、网段和名字服务的地址。`--cidr` 规则只在统一入口生效。
 
 ## 11. 锚点与网页节点
@@ -632,7 +686,7 @@ nexus anchor show
 ### 网页节点
 
 浏览器不用装任何东西，用通行密钥登录后成为一个临时节点，可以看到被授权的设备、进入它们的终端会话
-（行为和 `nexus ssh` 一样）、打开被授权的网页服务、浏览被授权的工作区。浏览器的所有流量都经锚点的中继。
+（行为和 `nexus ssh` 一样）、打开被授权的网页服务、浏览被授权的工作区，还可以在你逐项同意后把浏览器所在设备的摄像头、麦克风、位置开放给自己的设备。浏览器的所有流量都经锚点的中继。
 
 ```sh laptop
 nexus web enroll --label phone --page http://localhost:8080   # 管理设备上：输出登记链接（默认 10 分钟内有效）
@@ -651,6 +705,7 @@ nexus web ls
 | 断网 | 自动重连会话 |
 | 网页服务 | 设备后面列出它的网页服务，点开在新标签页打开 |
 | 工作区 | 能读的工作区列在设备下面：逐级浏览目录，文本和图片直接预览（只取开头 1 MiB），任何文件都能下载；只读 |
+| 硬件 | 摄像头、麦克风、位置默认都关着，逐项开启；页面显示哪台设备在用 |
 
 **网页服务**：设备后面列出它上面用 `--proto http` 发布的服务，点开在新标签页里打开（地址是 `/svc/<随机令牌>/`），
 页面里的请求都经 Nexus 到那个服务；登录的页面要一直开着。服务设置的 cookie 只记在登录页面的内存里，
@@ -664,6 +719,26 @@ nexus web ls
 nexus web enroll --label phone --grant 'term.session.*@**' --grant 'node.info@**' --grant 'drive.read@**' --grant 'svc.connect@**'
 nexus web enroll --label kiosk --grant 'node.info@**' --grant 'drive.read@anchor/drive/docs'   # 只能看 anchor 上的 docs
 ```
+
+### 硬件能力（摄像头、麦克风、位置）
+
+登录后的页面有「本机硬件」一栏。摄像头、麦克风、位置三项**默认都关着**，每项要单独点「开启」，再在浏览器的权限弹窗里同意。
+开了的那一项，名册里的设备可以取用：摄像头拍一张、麦克风录一小段、位置报一次坐标。
+
+- 页面上实时显示哪台设备正在用、最近谁用过。
+- 点「关闭」或者关掉、离开页面，立即停止采集，之后的请求一律拒绝。
+- 不在名册里的节点什么都拿不到；没开的那项也拿不到（105）。
+
+设备上用 `nexus hw` 取用。参数是网页节点这次登录的临时标识和地址提示，**页面上「本机硬件」下面直接给出了这两条命令**，
+复制到任何一台设备上执行就行：
+
+```sh
+nexus hw ls <网页节点标识> --hint <地址提示>                  # 开了哪几项
+nexus hw capture <网页节点标识> location --hint <地址提示>    # 换成 camera、microphone 也行；--json 里带原始数据（base64）
+```
+
+摄像头拍一张 JPEG，麦克风录 3 秒，位置给经纬度和精度。标识每次登录都不一样，重新登录后要用页面上新的命令。
+agent 不能用 `nexus hw`。
 
 ### 页面放在哪
 
@@ -756,7 +831,79 @@ nexus drive prefetch work --all             # 取整个工作区（之后可以�
 
 agent 读写工作区要有 `drive.read` / `drive.write`，`drive ls` 只列出它能读的工作区。
 
-## 13. 多条网络
+## 13. 临时分享
+
+把一个文件或目录、一个用 `--proto http` 发布的网页服务、或一个正在运行的终端会话，用一条链接临时给不在网络里的人看。
+访客不需要通行密钥，在浏览器里打开链接就能用；一切都是**只读**的。分享只能分享**本机**上的东西。
+
+```sh laptop
+nexus share create --drive work:/notes --ttl 30m --max-uses 3     # 工作区里的文件或目录
+nexus share ls                                                    # 编号、类型、用了几次、是否撤销
+```
+
+```sh
+nexus share create --service web --ttl 2h                         # 本机发布的网页服务
+nexus share create --terminal main --ttl 1h                       # 本机的终端会话：访客只能看，按键被忽略
+nexus share revoke <编号>                                         # 立即失效，访客已经打开的页面断开
+```
+
+`create` 输出编号和链接（`https://<页面>/#share=…`）：页面默认是锚点（`nexus anchor set`），没有锚点时是 `https://bewith.link`，
+用 `--page` 改。链接里带着随机令牌，拿到链接的人就能用，按密码一样对待。
+
+| | |
+| --- | --- |
+| 期限 | `--ttl`，默认 1 小时；过期后打开显示已失效 |
+| 次数 | `--max-uses <N>`：每打开一次链接算一次，用完即失效；不设则不限 |
+| 文件或目录 | 只能看分享的那个路径之内：分享单个文件时看不到别的文件，分享目录时出不去；文本和图片预览，可以下载 |
+| 网页服务 | 页面里直接打开，和网页节点打开服务的限制一样（第 11 节） |
+| 终端 | 实时看到屏幕和输出；访客的按键和窗口大小都不送到会话里，会话本身不受影响 |
+| 记录 | 每次打开和访问（包括过期、次数用完、已撤销、越界被拒的）都记在本机的 `nexus audit` 里，主体写作 `share:<编号>` |
+
+- 访客的流量和网页节点一样经锚点的中继到这台设备，所以这台设备要开着。
+- 分享的是这台设备上工作区的**当前内容**（包括还没提交的改动），不是存储设备上的版本；
+  这台设备上还没取到的内容，先 `nexus drive prefetch`（第 12 节）。
+- 只有创建分享的设备能列出和撤销它；agent 不能创建分享。
+
+## 14. Vault（秘密）
+
+Vault 保存你自己的秘密（API 令牌、密码），只放在你指定的设备上，网络上和磁盘上都只有密文；agent 要按条目授权才能读，
+每次取用都有记录。写入、修改和删除只能在管理设备上做。
+
+```sh laptop
+echo -n 'sk-old' | nexus vault put openai-key --device home --device vps   # 管理设备上：写入，给 home 和 vps（管理设备自己总在内）
+nexus vault put openai-key --value 'sk-new' --device home                  # 同名再写一次就是轮换：版本 +1，vps 上的副本被擦掉
+nexus vault ls                                                             # 本机能看到的条目、版本、给了哪些设备
+```
+
+```sh home
+nexus vault get openai-key               # 被授权的设备上：解密输出（每次都记进 nexus audit）
+nexus vault sync                         # 写入时不在线的设备：从管理设备取回自己被授权的条目
+```
+
+```sh
+nexus vault rm openai-key                # 管理设备上：删除，并通知各设备擦掉
+```
+
+- 条目名只能用字母、数字、`-` 和 `_`。不给 `--value` 时从标准输入读，避免秘密留在 shell 历史里。
+- 写入时管理设备把条目分别加密推给每台被授权的设备；没被授权的设备磁盘上不会有它，`vault sync` 也取不到。
+- agent 要有 `vault.read@<设备>/vault/<条目>` 才能在那台设备上读（例如 `--grant 'vault.read@home/vault/openai-key'`），
+  `vault ls` 只列出它被授权的条目；agent 不能写入或删除。读取被拒绝的尝试也记入审计。
+
+**吊销设备后要轮换哪些秘密**：管理设备记着每个条目给过哪些设备。`nexus device revoke <设备>` 的输出里列出那台设备接触过的条目，
+之后随时可以再查：
+
+```sh laptop
+nexus vault rotate-needed                # 所有已吊销设备接触过、还没轮换的条目
+nexus vault rotate-needed --device old-laptop
+```
+
+去对应的服务里换掉那个秘密，再 `nexus vault put` 写入新值，它就从清单里消失。
+
+**换了管理设备之后**（用恢复码，第 2 节）：条目原来只在原来的管理设备和被授权的设备上。`nexus recover` 时新的管理设备
+从在线的设备收回它们持有的条目（它有根密钥，解得开）；当时不在线的设备，等它上线后在新管理设备上 `nexus vault sync` 再收。
+在这之前，其他设备上的 `nexus vault sync` 只更新、不删除本机的条目，不会因为新管理设备的清单短而丢掉秘密。
+
+## 15. 多条网络
 
 设备有多个网络接口（例如有线和 5G）时，到另一台设备的连接同时经过每个接口：
 
@@ -779,15 +926,16 @@ nexus iface wlan0 --metered on           # 手动设置：on、off，或 auto �
 
 什么都不用配。目前在 Linux 上可用；两边都要是这个版本。
 
-## 14. Android
+## 16. Android
 
 Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，手机上的任何应用都能按名字访问服务
 （`http://web.home.internal/`），规则里送去出口的域名经出口设备出去，其余流量照常走手机自己的网络。
 
-构建和安装见 `docs/android.md`。目前加入网络要用调试版系统上的命令行完成（应用界面上的加入流程还没做），
+构建和安装见 `docs/android.md`。打开应用、同意 VPN 授权后，屏幕上显示短加入码和二维码，
+在管理设备上 `nexus device approve <短码>`（或扫二维码，把扫出的文字交给它）即可加入，屏幕随后显示已加入的设备。
 多路径和计费网络的识别在 Android 上还没做。
 
-## 15. 排查问题
+## 17. 排查问题
 
 | 现象 | 看什么、怎么办 |
 | --- | --- |
@@ -803,6 +951,8 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 | 连服务报 108「本机程序没有在运行」 | 服务所在设备上，发布的端口没有程序在监听 |
 | 某个域名走错了路 | `nexus route explain <主机:端口>` |
 | 数据在哪、是否只有一份 | `nexus drive where <路径>` |
+| 访客说分享链接打不开、已失效 | 在创建它的设备上 `nexus share ls`：撤销了、次数用完或过了 `--ttl`；那台设备要开着 |
+| `vault get` 报不存在（109） | 本机没被授权这个条目，或写入时本机不在线：`nexus vault sync` |
 | 管理设备丢了 | 在任何一台还在的设备上 `nexus recover <恢复码>`（第 2 节） |
 | 退出码 110「版本较旧」 | 说明里那台设备不认识这项新功能：升级它（`nexus ls` 能看到每台设备的版本） |
 | 连不上、报协议版本不兼容 | 两台设备的协议主版本不同：一起升级到同一个发布 |
@@ -810,7 +960,7 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 
 跨网络的实际表现（直连还是中继、上手要多久）可以按 `docs/real-network-check.md` 的清单测一遍。
 
-## 16. 退出码
+## 18. 退出码
 
 | 码 | 含义 |
 | --- | --- |
@@ -823,20 +973,25 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 | 106 | 当前状态不允许（例如没有分叉时 merge、同步时分叉） |
 | 107 | 输入不合法 |
 | 108 | 连不上目标设备或服务 |
-| 109 | 不存在（工作区、文件、服务、预读清单、接口、短加入码） |
+| 109 | 不存在（工作区、文件、服务、预读清单、接口、短加入码、分享、Vault 条目） |
 | 110 | 版本不够新：对方（或本机）不认识这个请求，说明里写着哪台设备要升级 |
 | 124 / 125 / 127 | `exec`：超时 / 输出超限 / 无法启动 |
 
 出错时，标准错误上是一行 JSON：`{"error": <类别>, "message": <说明>}`。
 
-## 17. 已知限制
+## 19. 已知限制
 
 - **还没有在真实的跨网络设备上验证过**：自动化测试都在同一台机器上（回环地址或网络命名空间）。
-- 不能更换网络根密钥：恢复码或管理设备被别人拿到时只能重新建网络。恢复后看不到原来签发的 agent 列表（第 2 节）。
-- 设备重启后终端会话会恢复，但里面原来运行的程序不保留（shell 重新启动，见第 6 节）；在 Windows 和 Android 上，常驻程序重启时会话会结束。
+- 恢复后看不到原来签发的 agent 列表（第 2 节）。
+- 设备重启后终端会话会恢复，但里面原来运行的程序不保留（shell 重新启动，见第 6 节；只有 Linux 上会回到原来的工作目录）；在 Android 上，常驻程序重启时会话会结束。
 - 完整节点和 Android 只把 UDP 转发到发布成 `--proto udp` 的服务；出口和上游代理只转发 TCP；不接管全部流量。
 - 挂载只支持 Linux；没有硬链接、扩展属性、文件锁。
 - 多路径和计费网络识别只支持 Linux；两条链路的批量吞吐约为一条的 1.5 倍；经中继的路径没有测过。
-- 网页节点目前只有终端和状态查看；文件浏览、打开发布的网页服务、发布摄像头等硬件能力还没做。
-- 预编译版本只有 Linux（x86_64、aarch64）；没有安装包。`nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），Windows 上还不支持。
-- 还没有：凭据同步（Vault）、临时分享、硬件能力发布、远程桌面。
+- 网页节点打开网页服务时不支持 WebSocket 和流式回应，页面里写死 `localhost:<端口>` 的完整网址到不了服务（第 11 节）。
+- 网页节点的硬件能力：开了的那一项名册里的任何设备都能取用，没有再按设备细分；只能拍照、录一小段、取一次位置，没有连续的视频或音频流。
+- 临时分享只读，只能分享本机上的东西；`nexus share ls` 不显示是否已过期。
+- Vault 只能在管理设备上写入，写入时不在线的设备要等管理设备在线时 `nexus vault sync`。
+  用恢复码换了管理设备后，「吊销后要轮换哪些条目」的记录留在原来的管理设备上，新的管理设备从收回的条目重新开始记。
+- 预编译版本有 Linux、macOS、Windows，但没有安装包，macOS 版没有签名；macOS 和 Windows 只在 CI 的 runner 上检查过，没在真机上用过。
+  `nexus upgrade` 不会自己下载新版本（先下载到一台设备上，再用 `--to`/`--all` 送到其他设备），送的包要和那台设备的系统相同。
+- 远程桌面只是让现成的 VNC / RDP 经 Nexus 连通：网页里还不能看；没有在真实的 macOS 屏幕共享、Windows 远程桌面上验证过。

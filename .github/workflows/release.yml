@@ -1,9 +1,15 @@
-# Prebuilt binaries: pushing a tag vX.Y.Z builds static Linux binaries of
-# `nexus` and publishes them as a GitHub release.
+# Prebuilt binaries: pushing a tag vX.Y.Z builds `nexus` for Linux, macOS and
+# Windows and publishes them as a GitHub release.
 #
-# - Targets: x86_64 and aarch64, musl, statically linked (runs on any Linux
+# - Linux: x86_64 and aarch64, musl, statically linked (runs on any Linux
 #   distribution). Both are cross-built on one x86_64 runner with
 #   cargo-zigbuild; the x86_64 binary is smoke-tested on the runner.
+# - macOS (M11.3, R81): aarch64 and x86_64, built on a macOS runner; the
+#   aarch64 binary is smoke-tested there. .tar.gz like Linux.
+# - Windows (M11.3, R82): x86_64 MSVC with the C runtime linked statically
+#   (no VC++ redistributable needed), smoke-tested on the runner. A .zip with
+#   nexus.exe, wintun.dll (checksum-verified by tools/fetch_wintun.py) and
+#   Wintun's license.
 # - The tag must match the workspace version in Cargo.toml (v0.1.0 <-> 0.1.0).
 # - Each archive holds the binary, LICENSE, README.md and docs/manual.md;
 #   SHA256SUMS covers all archives.
@@ -100,9 +106,129 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  build-macos:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            name: macos-aarch64
+          - target: x86_64-apple-darwin
+            name: macos-x86_64
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then tag="${{ github.ref_name }}"; else tag="${{ github.event.inputs.tag }}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then echo "version=${tag#v}" >> "$GITHUB_OUTPUT"; else echo "version=dev" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag || github.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p nexus-cli --bin nexus --target ${{ matrix.target }}
+
+      - name: Check the binary
+        run: |
+          bin=target/${{ matrix.target }}/release/nexus
+          file "$bin"
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then
+            file "$bin" | grep -q arm64
+            out=$("$bin" --version); echo "$out"
+            if [ "${{ steps.tag.outputs.version }}" != dev ]; then test "$out" = "nexus ${{ steps.tag.outputs.version }}"; fi
+            "$bin" --help > /dev/null
+          else
+            file "$bin" | grep -q x86_64
+          fi
+
+      - name: Package
+        run: |
+          d=nexus-${{ steps.tag.outputs.version }}-${{ matrix.name }}
+          mkdir -p "dist/$d"
+          cp target/${{ matrix.target }}/release/nexus LICENSE README.md "dist/$d/"
+          cp docs/manual.md "dist/$d/manual.md"
+          tar -C dist -czf "dist/$d.tar.gz" "$d"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build x86_64-pc-windows-msvc
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then tag="${{ github.ref_name }}"; else tag="${{ github.event.inputs.tag }}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then echo "version=${tag#v}" >> "$GITHUB_OUTPUT"; else echo "version=dev" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag || github.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: Build
+        run: cargo build --release --locked -p nexus-cli --bin nexus
+
+      - name: Check the binary
+        run: |
+          out=$(target/release/nexus.exe --version | tr -d '\r'); echo "$out"
+          if [ "${{ steps.tag.outputs.version }}" != dev ]; then test "$out" = "nexus ${{ steps.tag.outputs.version }}"; fi
+          target/release/nexus.exe --help > /dev/null
+
+      - name: Package
+        run: |
+          d=nexus-${{ steps.tag.outputs.version }}-windows-x86_64
+          mkdir -p "dist/$d"
+          cp target/release/nexus.exe LICENSE README.md "dist/$d/"
+          cp docs/manual.md "dist/$d/manual.md"
+          python tools/fetch_wintun.py "dist/$d"
+          cd dist && 7z a -tzip "$d.zip" "$d" > /dev/null && ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, build-macos, build-windows]
     if: github.event_name == 'push' || github.event.inputs.tag != ''
     runs-on: ubuntu-24.04
     steps:
@@ -114,23 +240,25 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz | tee SHA256SUMS
+          sha256sum *.tar.gz *.zip | tee SHA256SUMS
 
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          notes="预编译的 Linux 静态二进制（x86_64、aarch64，任何发行版都能用）。
+          notes="预编译的二进制：Linux（x86_64、aarch64，静态链接，任何发行版都能用）、macOS（Apple 芯片、Intel）、Windows（x86_64）。
 
-          安装：
-              tar xzf nexus-<版本>-linux-<架构>.tar.gz
-              sudo install nexus-<版本>-linux-<架构>/nexus /usr/local/bin/
+          Linux、macOS：
+              tar xzf nexus-<版本>-<系统>-<架构>.tar.gz
+              sudo install nexus-<版本>-<系统>-<架构>/nexus /usr/local/bin/
+          macOS 上第一次运行如果被拦（没有签名）：xattr -d com.apple.quarantine /usr/local/bin/nexus
+          Windows：解开 nexus-<版本>-windows-x86_64.zip，nexus.exe 和 wintun.dll 放在同一个目录（虚拟网卡要用 wintun.dll）。
 
           用法见压缩包里的 manual.md。所有设备要用同一个版本。校验：sha256sum -c SHA256SUMS"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
               --title "Nexus $TAG" --notes "$notes"
           fi
