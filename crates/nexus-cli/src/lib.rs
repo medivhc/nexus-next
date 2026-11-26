@@ -17,13 +17,13 @@ pub use unix_ctl::UnixCtl;
 
 use clap::{Parser, Subcommand};
 use nexus_core_proto::roster::DeviceRole;
-use nexus_core_proto::PathKind;
+use nexus_core_proto::{PathKind, Timestamp};
 use nexus_net_core::route;
 use nexus_runtime::CtlClient;
 use nexus_wire::RouteExplanation;
 use nexus_wire::{
-    AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, Size,
-    StatusReport, WireError,
+    AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, ShareRecord,
+    ShareStatus, Size, StatusReport, WireError,
 };
 use serde_json::{json, Value};
 use std::future::Future;
@@ -524,7 +524,7 @@ pub enum ShareCmd {
         #[arg(long)]
         json: bool,
     },
-    /// 列出本机的所有临时分享及其剩余次数/撤销状态
+    /// 列出本机的所有临时分享及其状态（有效/已过期/已用尽/已撤销）
     Ls {
         #[arg(long)]
         json: bool,
@@ -1299,36 +1299,22 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
         }
         CtlResponse::Shares(list) => {
-            if json {
-                let items: Vec<Value> = list
-                    .iter()
-                    .map(|s| {
-                        json!({
-                            "id": s.id,
-                            "kind": s.target.kind_str(),
-                            "created_at_ms": s.created_at.0,
-                            "expires_at_ms": s.expires_at.0,
-                            "max_uses": s.max_uses,
-                            "uses": s.uses,
-                            "revoked": s.revoked,
-                        })
-                    })
-                    .collect();
-                format!("{}\n", json!({ "shares": items }))
-            } else if list.is_empty() {
-                "没有临时分享。\n".into()
+            let now = if list.is_empty() {
+                Timestamp(0)
             } else {
-                list.iter()
-                    .map(|s| {
-                        let status = if s.revoked { "已撤销" } else { "有效" };
-                        let uses = match s.max_uses {
-                            Some(m) => format!("{}/{m}", s.uses),
-                            None => format!("{}（不限次数）", s.uses),
-                        };
-                        format!("{}  {}  已用 {uses}  {status}\n", s.id, s.target.kind_str())
-                    })
-                    .collect()
-            }
+                match call(ctl, CtlRequest::Status).await {
+                    Ok(CtlResponse::Status(st)) => match st.info {
+                        Some(info) => info.now,
+                        None => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序没有返回当前时间"),
+                    },
+                    Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
+                    Ok(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
+                    Err(e) => {
+                        return fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"));
+                    }
+                }
+            };
+            if json { shares_json(&list, now) } else { shares_text(&list, now) }
         }
         CtlResponse::ShareRevoked(s) => {
             if json {
@@ -1839,6 +1825,51 @@ fn agents_text(list: &[AgentInfo]) -> String {
         .map(|a| {
             let state = if a.revoked { "已撤销" } else { "有效" };
             format!("{:<16} {}  {}  {}\n", a.label, &nexus_core_proto::NodeId(a.agent_id.0).to_string()[..8], state, a.grants.join(" "))
+        })
+        .collect()
+}
+
+fn share_status_label(status: ShareStatus) -> &'static str {
+    match status {
+        ShareStatus::Active => "有效",
+        ShareStatus::Expired => "已过期",
+        ShareStatus::Exhausted => "已用尽",
+        ShareStatus::Revoked => "已撤销",
+    }
+}
+
+fn shares_json(list: &[ShareRecord], now: Timestamp) -> String {
+    let items: Vec<Value> = list
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "kind": s.target.kind_str(),
+                "created_at_ms": s.created_at.0,
+                "expires_at_ms": s.expires_at.0,
+                "max_uses": s.max_uses,
+                "uses": s.uses,
+                "revoked": s.revoked,
+                "expired": s.is_expired(now),
+                "state": s.status_at(now).as_str(),
+            })
+        })
+        .collect();
+    format!("{}\n", json!({ "shares": items }))
+}
+
+fn shares_text(list: &[ShareRecord], now: Timestamp) -> String {
+    if list.is_empty() {
+        return "没有临时分享。\n".into();
+    }
+    list.iter()
+        .map(|s| {
+            let status = share_status_label(s.status_at(now));
+            let uses = match s.max_uses {
+                Some(m) => format!("{}/{m}", s.uses),
+                None => format!("{}（不限次数）", s.uses),
+            };
+            format!("{}  {}  已用 {uses}  {status}\n", s.id, s.target.kind_str())
         })
         .collect()
 }
@@ -3115,5 +3146,61 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), want);
         }
         assert_eq!(base64(&[0xff, 0x00, b'x']), "/wB4");
+    }
+
+    #[test]
+    fn shares_formatters_report_empty_and_all_states() {
+        assert_eq!(shares_text(&[], Timestamp(0)), "没有临时分享。\n");
+        let empty_json: Value = serde_json::from_str(&shares_json(&[], Timestamp(0))).unwrap();
+        assert_eq!(empty_json, json!({ "shares": [] }));
+
+        let now = Timestamp(5_000);
+        let record = |id: &str, expires_at: u64, max_uses: Option<u32>, uses: u32, revoked: bool| ShareRecord {
+            id: id.into(),
+            target: nexus_wire::ShareTarget::Service { name: "web".into() },
+            created_at: Timestamp(1_000),
+            expires_at: Timestamp(expires_at),
+            max_uses,
+            uses,
+            revoked,
+        };
+        let list = vec![
+            record("s_active", 9_000, None, 0, false),
+            record("s_expired", 5_000, Some(3), 1, false),
+            record("s_exhausted", 9_000, Some(2), 2, false),
+            record("s_revoked", 9_000, None, 0, true),
+            record("s_rev_exp", 4_000, Some(1), 1, true),
+        ];
+
+        let text = shares_text(&list, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "s_active  service  已用 0（不限次数）  有效");
+        assert_eq!(lines[1], "s_expired  service  已用 1/3  已过期");
+        assert_eq!(lines[2], "s_exhausted  service  已用 2/2  已用尽");
+        assert_eq!(lines[3], "s_revoked  service  已用 0（不限次数）  已撤销");
+        assert_eq!(lines[4], "s_rev_exp  service  已用 1/1  已撤销");
+
+        let v: Value = serde_json::from_str(&shares_json(&list, now)).unwrap();
+        let shares = v["shares"].as_array().unwrap();
+        assert_eq!(shares.len(), 5);
+        assert_eq!(
+            shares[0],
+            json!({
+                "id": "s_active",
+                "kind": "service",
+                "created_at_ms": 1_000,
+                "expires_at_ms": 9_000,
+                "max_uses": null,
+                "uses": 0,
+                "revoked": false,
+                "expired": false,
+                "state": "active",
+            })
+        );
+        assert_eq!((shares[1]["revoked"].as_bool(), shares[1]["expired"].as_bool(), shares[1]["state"].as_str()), (Some(false), Some(true), Some("expired")));
+        assert_eq!((shares[2]["revoked"].as_bool(), shares[2]["expired"].as_bool(), shares[2]["state"].as_str()), (Some(false), Some(false), Some("exhausted")));
+        assert_eq!((shares[3]["revoked"].as_bool(), shares[3]["expired"].as_bool(), shares[3]["state"].as_str()), (Some(true), Some(false), Some("revoked")));
+        assert_eq!((shares[4]["revoked"].as_bool(), shares[4]["expired"].as_bool(), shares[4]["state"].as_str()), (Some(true), Some(true), Some("revoked")));
     }
 }

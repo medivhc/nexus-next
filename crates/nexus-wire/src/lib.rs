@@ -243,6 +243,44 @@ pub struct ShareRecord {
     pub revoked: bool,
 }
 
+/// 一条临时分享在指定时刻的状态（R93）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareStatus {
+    Active,
+    Expired,
+    Exhausted,
+    Revoked,
+}
+
+impl ShareStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareStatus::Active => "active",
+            ShareStatus::Expired => "expired",
+            ShareStatus::Exhausted => "exhausted",
+            ShareStatus::Revoked => "revoked",
+        }
+    }
+}
+
+impl ShareRecord {
+    pub fn is_expired(&self, now: Timestamp) -> bool {
+        now >= self.expires_at
+    }
+
+    pub fn status_at(&self, now: Timestamp) -> ShareStatus {
+        if self.revoked {
+            ShareStatus::Revoked
+        } else if self.is_expired(now) {
+            ShareStatus::Expired
+        } else if self.max_uses.is_some_and(|max| self.uses >= max) {
+            ShareStatus::Exhausted
+        } else {
+            ShareStatus::Active
+        }
+    }
+}
+
 /// 创建临时分享的结果（M9.1）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareCreatedReport {
@@ -1251,5 +1289,53 @@ mod tests {
         dec.push(&3u32.to_le_bytes());
         dec.push(&[0xff, 0xff, 0xff]);
         assert_eq!(dec.next_frame::<Response>(), Err(FrameError::Malformed));
+    }
+
+    // covers: R93
+    #[test]
+    fn share_record_status_and_precedence() {
+        let make = |expires_at: u64, max_uses: Option<u32>, uses: u32, revoked: bool| ShareRecord {
+            id: "abcd1234".into(),
+            target: ShareTarget::Service { name: "web".into() },
+            created_at: Timestamp(1000),
+            expires_at: Timestamp(expires_at),
+            max_uses,
+            uses,
+            revoked,
+        };
+
+        let active = make(2000, Some(3), 1, false);
+        assert!(!active.is_expired(Timestamp(1999)));
+        assert_eq!(active.status_at(Timestamp(1999)), ShareStatus::Active);
+        assert_eq!(ShareStatus::Active.as_str(), "active");
+
+        assert!(active.is_expired(Timestamp(2000)));
+        assert_eq!(active.status_at(Timestamp(2000)), ShareStatus::Expired);
+        assert_eq!(ShareStatus::Expired.as_str(), "expired");
+
+        let exhausted = make(2000, Some(2), 2, false);
+        assert!(!exhausted.is_expired(Timestamp(1500)));
+        assert_eq!(exhausted.status_at(Timestamp(1500)), ShareStatus::Exhausted);
+        assert_eq!(ShareStatus::Exhausted.as_str(), "exhausted");
+
+        let unlimited = make(2000, None, 999, false);
+        assert_eq!(unlimited.status_at(Timestamp(1500)), ShareStatus::Active);
+
+        let revoked_only = make(2000, Some(3), 0, true);
+        assert!(!revoked_only.is_expired(Timestamp(1500)));
+        assert_eq!(revoked_only.status_at(Timestamp(1500)), ShareStatus::Revoked);
+        assert_eq!(ShareStatus::Revoked.as_str(), "revoked");
+
+        let expired_and_exhausted = make(2000, Some(1), 1, false);
+        assert!(expired_and_exhausted.is_expired(Timestamp(2000)));
+        assert_eq!(expired_and_exhausted.status_at(Timestamp(2000)), ShareStatus::Expired);
+
+        let revoked_and_expired = make(2000, Some(1), 0, true);
+        assert!(revoked_and_expired.is_expired(Timestamp(2500)));
+        assert_eq!(revoked_and_expired.status_at(Timestamp(2500)), ShareStatus::Revoked);
+
+        let revoked_expired_exhausted = make(2000, Some(1), 1, true);
+        assert!(revoked_expired_exhausted.is_expired(Timestamp(2500)));
+        assert_eq!(revoked_expired_exhausted.status_at(Timestamp(2500)), ShareStatus::Revoked);
     }
 }
