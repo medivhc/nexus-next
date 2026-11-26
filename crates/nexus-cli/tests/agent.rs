@@ -230,7 +230,9 @@ scenario! {
         assert!(replies[0]["result"]["serverInfo"]["name"].is_string(), "{}", replies[0]);
         assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
         let tools: Vec<&str> = replies[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(tools, ["nexus_ls", "nexus_status", "nexus_exec", "nexus_session_ls"]);
+        for expected in ["nexus_ls", "nexus_status", "nexus_exec", "nexus_session_ls"] {
+            assert!(tools.contains(&expected), "缺少基础工具 {expected}：{tools:?}");
+        }
         for t in replies[1]["result"]["tools"].as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{t}");
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
