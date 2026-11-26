@@ -8,6 +8,7 @@ pub mod app;
 pub mod ctl_endpoint;
 pub mod daemon;
 pub mod desktop;
+pub mod doctor;
 pub mod drive;
 pub mod tun;
 pub mod upgrade;
@@ -374,6 +375,12 @@ pub enum Cmd {
     Status {
         /// 节点的名字或标识；省略时为本机
         node: Option<String>,
+        /// 以 JSON 输出
+        #[arg(long)]
+        json: bool,
+    },
+    /// 一键体检：汇总本机常驻程序、设备在线状态、连接路径、版本兼容性与名字解析，并给出下一步建议
+    Doctor {
         /// 以 JSON 输出
         #[arg(long)]
         json: bool,
@@ -977,6 +984,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             return exec(ctl, CtlRequest::Exec { node: node.clone(), spec }, *json, stdin, sink).await;
         }
         Cmd::Status { node: None, json } => (CtlRequest::Status, *json),
+        Cmd::Doctor { json } => return doctor::run(ctl, *json, sink).await,
         Cmd::Path { device, json } => (CtlRequest::Paths { device: device.clone() }, *json),
         Cmd::Upgrade { status: true, json, .. } => (CtlRequest::UpgradeStatus, *json),
         Cmd::Upgrade { rollback: true, json, .. } => (CtlRequest::UpgradeRollback, *json),
