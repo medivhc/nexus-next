@@ -283,6 +283,7 @@ vps 有域名（例如 `bewith.link`）时，把它设为锚点：它在 443 端
 - macOS：`macos-aarch64`（Apple 芯片）和 `macos-x86_64`（Intel），装法同 Linux；没有签名，第一次运行被拦时
   `xattr -d com.apple.quarantine /usr/local/bin/nexus`；
 - Windows：`windows-x86_64.zip`，解开后 `nexus.exe` 和 `wintun.dll`（虚拟网卡用）放在同一个目录，把这个目录加到 PATH。
+  数据目录默认在 `%LOCALAPPDATA%\nexus`（其他系统是 `~/.local/share/nexus`）。
 
 ```sh
 tar xzf nexus-0.1.0-linux-x86_64.tar.gz

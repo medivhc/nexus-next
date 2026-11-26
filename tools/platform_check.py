@@ -214,8 +214,12 @@ class Term:
                 self.buf += chunk
 
     def send(self, text):
-        self.p.stdin.write(text.encode())
-        self.p.stdin.flush()
+        try:
+            self.p.stdin.write(text.encode())
+            self.p.stdin.flush()
+        except OSError:
+            time.sleep(0.5)
+            raise SystemExit(f"nexus ssh 已经退出（退出码 {self.p.poll()}），输出：{self.text()[-2000:]!r}")
 
     def text(self):
         with self.lock:
@@ -413,7 +417,8 @@ def main():
     args = ap.parse_args()
     v = subprocess.run([args.bin, "--version"], capture_output=True, text=True)
     print(f"{v.stdout.strip()} on {sys.platform}")
-    tmp = os.path.realpath(tempfile.mkdtemp(prefix="nexus-platform-"))
+    # macOS 的域套接字路径最长 104 字节，默认的临时目录（/var/folders/...）太长：用 /tmp。
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="nexus-pc-", dir=None if WINDOWS else "/tmp"))
     a = Dev(tmp, "laptop", args.bin)
     b = Dev(tmp, "home", args.bin)
     b.own_binary()
@@ -432,6 +437,10 @@ def main():
         if not ok:
             for d in (a, b):
                 print(f"\n=== {d.name} 的日志 ===\n{d.log()}")
+                sess = os.path.join(d.data, "sessions")
+                for f in sorted(os.listdir(sess)) if os.path.isdir(sess) else []:
+                    if f.endswith(".log"):
+                        print(f"--- {d.name} sessions/{f} ---\n{open(os.path.join(sess, f), errors='replace').read()[-2000:]}")
         for d in (a, b):
             try:
                 d.stop()

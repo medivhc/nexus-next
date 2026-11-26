@@ -275,6 +275,11 @@ fn data_dir(cli: &Cli) -> PathBuf {
     if let Some(d) = std::env::var_os("NEXUS_DATA_DIR") {
         return d.into();
     }
+    // Windows 上没有 HOME：用 %LOCALAPPDATA%\nexus（M11.3）。
+    #[cfg(windows)]
+    if let Some(d) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(d).join("nexus");
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| ".".into());
     home.join(".local/share/nexus")
 }
