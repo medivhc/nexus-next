@@ -197,6 +197,11 @@ impl System for SimSystem {
         Ok(())
     }
 
+    fn store_delete(&self, key: &str) -> io::Result<()> {
+        self.disk.0.borrow_mut().remove(key);
+        Ok(())
+    }
+
     fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
         Ok(self.disk.0.borrow().get(&cas_key(hash)).cloned())
     }

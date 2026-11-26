@@ -18,7 +18,15 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+}
 
 pub struct RealSystem {
     dir: PathBuf,
@@ -221,7 +229,7 @@ impl System for RealSystem {
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().expect("有上级目录"))?;
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = unique_tmp(&path);
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)
     }
@@ -232,7 +240,7 @@ impl System for RealSystem {
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
         let path = self.path(key)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp(&path);
         use std::io::Write;
         #[cfg(unix)]
         {
@@ -247,6 +255,14 @@ impl System for RealSystem {
             file.write_all(value)?;
         }
         std::fs::rename(tmp, path)
+    }
+
+    fn store_delete(&self, key: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.path(key)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 

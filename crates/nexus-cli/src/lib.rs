@@ -320,6 +320,11 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: VaultCmd,
     },
+    /// 在管理设备上轮换网络的根密钥并生成新恢复码（无需重建网络，旧恢复码与旧根签发的 agent 立即失效）
+    RotateRoot {
+        #[arg(long)]
+        json: bool,
+    },
     Web {
         #[command(subcommand)]
         cmd: WebCmd,
@@ -989,6 +994,7 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         Cmd::Status { node: Some(n), json } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
         Cmd::Init { name, json } => (CtlRequest::Init { name: name.clone() }, *json),
         Cmd::Recover { code, json } => (CtlRequest::Recover { code: code.clone() }, *json),
+        Cmd::RotateRoot { json } => (CtlRequest::RootRotate, *json),
         Cmd::Join { json } => (CtlRequest::JoinStart, *json),
         Cmd::Device { cmd: DeviceCmd::Approve { code, name, json } } => {
             (CtlRequest::Approve { code: code.clone(), name: name.clone() }, *json)
@@ -1371,6 +1377,25 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     .iter()
                     .map(|i| format!("已吊销设备 {} 接触过、建议轮换的条目：{}\n", i.revoked_device, i.entries.join("、")))
                     .collect()
+            }
+        }
+        CtlResponse::RootRotated(r) => {
+            let v = json!({
+                "schema": JSON_SCHEMA,
+                "old_root": nexus_core_proto::NodeId(r.old_root.0).to_string(),
+                "new_root": nexus_core_proto::NodeId(r.new_root.0).to_string(),
+                "recovery_code": r.recovery_code,
+                "roster_version": r.roster_version,
+                "pushed": r.pushed,
+                "unreachable": r.unreachable,
+            });
+            if json {
+                doc(v)
+            } else {
+                format!(
+                    "已轮换网络根密钥（名册版本 {}，已通知 {} 台设备）。\n\n新恢复码（只显示这一次，请离线保存；旧恢复码已失效）：\n  {}\n",
+                    r.roster_version, r.pushed, r.recovery_code
+                )
             }
         }
         CtlResponse::WebEnroll(r) => {
