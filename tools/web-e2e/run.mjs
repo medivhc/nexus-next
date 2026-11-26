@@ -1,10 +1,10 @@
 // 浏览器端到端测试（测试方案 L4）：真实的 Chromium + 虚拟认证器 + 两台设备的常驻程序。
 // laptop 同时是开发用的锚点（--anchor-dev）：在同一个端口上提供页面和中继，浏览器的一切流量都经它。
-// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、临时分享、浏览器里不留存储。
+// 只覆盖关键路径：登记、登录、进会话、输入输出、离开后会话还在、浏览工作区和下载、打开网页服务、硬件能力、临时分享、浏览器里不留存储。
 //
 // 用法：node run.mjs --nexus <nexus 可执行文件> --dist <web/dist> [--chrome <路径>] [--page-port 8080]
 //
-// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71, R73
+// covers: R28, R29, R30, R32, R34, R35, R36, R70, R71, R72, R73
 import { chromium } from "playwright-core";
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
@@ -102,7 +102,9 @@ try {
   nexus("home", ["publish", "web", "--port", sitePort, "--proto", "http", "--json"]);
   log("网络就绪");
 
-  browser = await chromium.launch({ executablePath: opt.chrome, args: ["--no-sandbox"] });
+  // 假的摄像头和麦克风，权限弹窗自动同意（硬件能力，R72）。
+  browser = await chromium.launch({ executablePath: opt.chrome,
+    args: ["--no-sandbox", "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"] });
   const context = await browser.newContext();
   const page = await context.newPage();
   page.on("console", (m) => { if (m.type() === "error") console.log("页面错误：", m.text()); });
@@ -186,6 +188,34 @@ try {
   await page.click("#files-back");
   await page.waitForSelector("#device-list li");
   log("浏览工作区、预览、下载");
+
+  // 硬件能力（R72，FP-8.3-05）：页面上逐项开启；页面显示的命令原样在设备上能用；关闭后立即拒绝。
+  await context.grantPermissions(["geolocation", "camera", "microphone"], { origin: pageUrl });
+  await context.setGeolocation({ latitude: 31.2304, longitude: 121.4737, accuracy: 12.5 });
+  const hwCmd = (await page.textContent("#hw-cmd")).trim().split("\n");
+  if (!hwCmd[0].startsWith("nexus hw ls ") || !hwCmd[1].startsWith("nexus hw capture ")) throw new Error(`页面上的命令：${hwCmd}`);
+  const run = (cmd) => nexus("home", [...cmd.split(/\s+/).slice(1), "--json"]);
+  if (run(hwCmd[0]).capabilities.length !== 0) throw new Error("默认应当一项都不开放");
+  await page.click("#hw-location");
+  await page.waitForSelector("#hw-location:has-text('关闭')");
+  await page.click("#hw-camera");
+  await page.waitForSelector("#hw-camera:has-text('关闭')");
+  const caps = run(hwCmd[0]).capabilities;
+  if ([...caps].sort().join() !== "camera,location") throw new Error(`开放的能力：${caps}`);
+  const loc = run(hwCmd[1]);
+  if (Math.abs(loc.lat_e7 - 312304000) > 10 || Math.abs(loc.lon_e7 - 1214737000) > 10) throw new Error(`位置：${JSON.stringify(loc)}`);
+  const cam = run(hwCmd[1].replace(" location ", " camera "));
+  if (cam.mime !== "image/jpeg" || Buffer.from(cam.data_base64, "base64").subarray(0, 2).toString("hex") !== "ffd8") {
+    throw new Error(`照片：${cam.mime} ${cam.data_base64?.slice(0, 16)}`);
+  }
+  await waitFor("页面显示谁用过", async () => (await page.textContent("#hw-active")).length > 0);
+  await page.click("#hw-location");
+  await page.waitForSelector("#hw-location:has-text('开启')");
+  let refused = null;
+  try { run(hwCmd[1]); } catch (e) { refused = e.status; }
+  if (refused !== 105) throw new Error(`关闭位置后采集应当被拒绝（105），实际：${refused}`);
+  await page.click("#hw-camera");
+  log("硬件能力：开启、设备上取用、关闭");
 
   // 打开网页服务（R71，FP-8.2-03）：新标签页，相对路径的图片、绝对路径的脚本、绝对路径的链接都经 Nexus 到 home。
   const link = await page.waitForSelector("#device-list li:has-text('home') a.svc:has-text('web')", { timeout: 20000 });

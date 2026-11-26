@@ -85,6 +85,10 @@ pub trait System {
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
     /// 原子地写入一个小的持久化值。
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()>;
+    /// 删除一个持久化值；键不存在时视为成功。
+    fn store_delete(&self, _key: &str) -> io::Result<()> {
+        Ok(())
+    }
     /// 在一份只追加的日志末尾写一条记录（审计用）。记录本身由调用方编码。
     ///
     /// 写入后会超过 `max_bytes` 时，先把当前内容轮转为旧日志（替换更早的旧日志），
@@ -129,6 +133,7 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
     fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
+    fn store_delete(&self, key: &str) -> io::Result<()> { (**self).store_delete(key) }
     fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> { (**self).append_log(name, record, max_bytes) }
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
     fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }

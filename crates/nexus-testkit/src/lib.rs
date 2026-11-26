@@ -200,7 +200,11 @@ impl World {
                     turmoil::repair(node, other.as_str());
                 }
             }
-            Inner::Real(_) => panic!("真实后端无法让被杀掉的节点原样恢复"),
+            Inner::Real(real) => {
+                let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
+                real.spawn_daemon(node, &["--local-only"]);
+                real.wait_ready(node, &["--local-only"]);
+            }
         }
     }
 }
@@ -713,6 +717,12 @@ impl Browser {
     pub fn hint(&self) -> String {
         let node = self.node();
         on_node!(node, n => n.hint())
+    }
+
+    /// 页面上显示的 `nexus hw` 命令（M8.3）。
+    pub fn hardware_command(&self, kind: Option<nexus_web_core::HardwareKind>) -> String {
+        let node = self.node();
+        on_node!(node, n => n.hardware_command(kind))
     }
 
     /// 启动网页节点的硬件能力服务循环（M8.3）。
