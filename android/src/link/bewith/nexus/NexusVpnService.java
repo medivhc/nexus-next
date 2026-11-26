@@ -37,7 +37,7 @@ public class NexusVpnService extends VpnService {
         System.loadLibrary("nexus_android");
     }
 
-    private static native int nativeStart(String dataDir, String name, int tunFd, String relay, boolean discovery, String rendezvous);
+    private native int nativeStart(String dataDir, String name, int tunFd, String relay, boolean discovery, String rendezvous);
     private static native void nativeStop();
     private static native void nativeSetNetworks(String[] names, boolean[] metered);
 
