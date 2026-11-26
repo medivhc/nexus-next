@@ -240,6 +240,8 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
     save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // 被要求结束（会话被 kill、数据目录没了）：shell 因此退出时会话真的结束。
     let mut killing = false;
+    // 正在后台写的状态（同一时间只写一份）。
+    let mut saving: Option<tokio::task::JoinHandle<io::Result<()>>> = None;
     let mut term = Terminate::new()?;
     let (down_tx, mut down_rx) = mpsc::channel::<(u64, Down)>(256);
     let mut conn: Option<(u64, mpsc::Sender<Up>, tokio::task::JoinHandle<()>)> = None;
@@ -321,6 +323,10 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
                 PtyEvent::Exited(status) => {
                     // shell 自己退出、或者是我们结束的：会话结束。被别人用信号结束的（关机时）：留着状态，下次恢复。
                     _cleanup.3 = killing || status.signal.is_none();
+                    // 等正在写的状态写完，再由 Cleanup 删掉它：否则写完的改名会把刚删的文件又放回去。
+                    if let Some(h) = saving.take() {
+                        let _ = h.await;
+                    }
                     if let Some((_, up_tx, writer)) = conn.take() {
                         let exited = Up::Exited { code: status.code, signal: status.signal };
                         if tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(exited)).await.is_ok() {
@@ -332,10 +338,10 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
                     break;
                 }
             },
-            // 放在接受连接和终端输出之后：记状态要写盘（同步的），不能挡在它们前面。
+            // 放在接受连接和终端输出之后，写盘（含 fsync）放到阻塞线程里：都不能挡住终端的输入输出。
             // 特别是 Windows 的 ConPTY 启动时先问光标位置、得到回答才输出，这个询问要赶在常驻程序连上之后转过去。
             _ = save.tick() => {
-                if dirty {
+                if dirty && !saving.as_ref().is_some_and(|h| !h.is_finished()) {
                     let state = Saved {
                         version: STATE_VERSION,
                         created_at_ms: created_at.0,
@@ -344,14 +350,18 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
                         screen: screen.restore(),
                         saved_at_ms: now_ms(),
                     };
-                    if store_state(&dir, name, &state).is_ok() {
-                        dirty = false;
-                    }
+                    // 写失败时下一次有输出会再标记、再写。
+                    dirty = false;
+                    let (dir, name) = (dir.clone(), name.to_string());
+                    saving = Some(tokio::task::spawn_blocking(move || store_state(&dir, &name, &state)));
                 }
             }
             // 关机时系统先发 SIGTERM：留着记下的状态，下次恢复。
             _ = term.recv() => {
                 _cleanup.3 = false;
+                if let Some(h) = saving.take() {
+                    let _ = h.await;
+                }
                 return Ok(());
             }
         }
