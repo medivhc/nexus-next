@@ -243,6 +243,59 @@ impl SignedRoster {
     }
 }
 
+/// 根密钥轮换声明（M10.1）：把网络的信任根从 `old_root` 切换到 `new_root`，在名册版本 `version` 生效。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootRotation {
+    pub old_root: PublicKey,
+    pub new_root: PublicKey,
+    pub version: u64,
+}
+
+/// 由旧根私钥签名的根密钥轮换证书（M10.1）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedRootRotation {
+    pub rotation: RootRotation,
+    pub old_sig: Signature,
+}
+
+impl RootRotation {
+    pub fn sign(self, old_root: &SecretKey) -> SignedRootRotation {
+        let old_sig = old_root.sign(Purpose::RootRotation, &canonical(&self));
+        SignedRootRotation { rotation: self, old_sig }
+    }
+}
+
+/// 校验一次根密钥轮换（M10.1）：
+/// 1. `rotation.old_root` 必须等于本机当前信任的 `trusted_root`，且 `old_sig` 必须由旧根私钥有效签署；
+/// 2. `new_roster` 的根必须等于 `rotation.new_root`、版本号等于 `rotation.version` 且严格大于当前名册版本；
+/// 3. `new_roster` 本身必须由新根私钥有效签署且内容自洽。
+pub fn verify_root_rotation<'a>(
+    trusted_root: &PublicKey,
+    current: Option<&SignedRoster>,
+    rotation: &SignedRootRotation,
+    new_roster: &'a SignedRoster,
+) -> Result<&'a Roster, RosterError> {
+    let r = &rotation.rotation;
+    if r.old_root != *trusted_root || r.new_root == *trusted_root {
+        return Err(RosterError::WrongRoot);
+    }
+    if !trusted_root.verify(Purpose::RootRotation, &canonical(r), &rotation.old_sig) {
+        return Err(RosterError::BadSignature);
+    }
+    if new_roster.roster.root != r.new_root {
+        return Err(RosterError::WrongRoot);
+    }
+    if new_roster.roster.version != r.version {
+        return Err(RosterError::BadSignature);
+    }
+    if let Some(cur) = current {
+        if r.version <= cur.roster.version {
+            return Err(RosterError::NotNewer { current: cur.roster.version, candidate: r.version });
+        }
+    }
+    new_roster.verify(&r.new_root)
+}
+
 /// 是否应当用 `candidate` 替换 `current`。
 pub fn accept_update(
     current: Option<&SignedRoster>,
@@ -350,5 +403,29 @@ mod tests {
         assert!(r.device_by_name("office").is_none());
         assert!(r.is_agent_revoked(&agent));
         assert!(!r.is_agent_revoked(&SecretKey::from_seed([8; 32]).public()));
+    }
+
+    #[test]
+    fn root_rotation_requires_both_old_and_new_signatures() {
+        // covers: R75
+        let old_root = SecretKey::from_seed([1; 32]);
+        let new_root = SecretKey::from_seed([2; 32]);
+        let attacker = SecretKey::from_seed([9; 32]);
+        let v1 = roster(1, vec![dev(1, "laptop")]).sign(&old_root);
+
+        let mut r2 = roster(2, vec![dev(1, "laptop")]);
+        r2.root = new_root.public();
+        let v2 = r2.clone().sign(&new_root);
+
+        let rot = RootRotation { old_root: old_root.public(), new_root: new_root.public(), version: 2 }.sign(&old_root);
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &rot, &v2).map(|r| r.version), Ok(2));
+
+        // 攻击者不知道旧根私钥，伪造轮换证书被拒
+        let forged_rot = RootRotation { old_root: old_root.public(), new_root: new_root.public(), version: 2 }.sign(&attacker);
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &forged_rot, &v2), Err(RosterError::BadSignature));
+
+        // 攻击者篡改新名册签名被拒
+        let forged_roster = r2.sign(&attacker);
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &rot, &forged_roster), Err(RosterError::BadSignature));
     }
 }

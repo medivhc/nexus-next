@@ -72,16 +72,36 @@ impl DriveState {
     }
 }
 
-/// 接缝上的对象存储。写失败时对象缺失，之后读到时报告为 `Missing`。
-pub(crate) struct Cas<'a, S>(pub &'a S);
+/// 接缝上的对象存储。记录首次写入错误，调用方在推进工作区根之前必须通过 [`Cas::finish`] 检查。
+pub(crate) struct Cas<'a, S> {
+    sys: &'a S,
+    err: Option<io::Error>,
+}
+
+impl<'a, S: System> Cas<'a, S> {
+    pub(crate) fn new(sys: &'a S) -> Self {
+        Self { sys, err: None }
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), WireError> {
+        match self.err.take() {
+            Some(e) => Err(internal(format!("写入对象存储失败：{e}"))),
+            None => Ok(()),
+        }
+    }
+}
 
 impl<S: System> Store for Cas<'_, S> {
     fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
-        self.0.cas_get(&hash.0).ok().flatten()
+        self.sys.cas_get(&hash.0).ok().flatten()
     }
     fn put(&mut self, bytes: Vec<u8>) -> Hash {
         let h = Hash::of(&bytes);
-        let _ = self.0.cas_put(&h.0, &bytes);
+        if self.err.is_none() {
+            if let Err(e) = self.sys.cas_put(&h.0, &bytes) {
+                self.err = Some(e);
+            }
+        }
         h
     }
 }
@@ -211,7 +231,9 @@ impl<T: Transport, S: System> Node<T, S> {
     fn insert_ws(&self, name: &str, replicas: Vec<String>) -> Result<(), WireError> {
         let mut state = self.drive_state.borrow_mut();
         if !state.workspaces.contains_key(name) {
-            let work = tree::empty(&mut Cas(&self.system));
+            let mut cas = Cas::new(&self.system);
+            let work = tree::empty(&mut cas);
+            cas.finish()?;
             state.workspaces.insert(name.to_string(), WsState { head: None, work, replicas, remote: None });
         }
         save(&self.system, KEY_DRIVE, &*state).map_err(internal)
@@ -245,7 +267,7 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn commit(&self, hash: Hash) -> Result<Commit, WireError> {
-        Cas(&self.system)
+        Cas::new(&self.system)
             .get(&hash)
             .and_then(|b| Commit::decode(&b))
             .ok_or_else(|| internal(format!("本机缺少提交 {}", hash.short())))
@@ -253,7 +275,7 @@ impl<T: Transport, S: System> Node<T, S> {
 
     fn changes(&self, ws: &WsState) -> Result<Vec<DriveChange>, WireError> {
         let base = self.head_tree(ws)?;
-        let d = tree::diff(&Cas(&self.system), base, ws.work).map_err(|e| internal(format!("{e:?}")))?;
+        let d = tree::diff(&Cas::new(&self.system), base, ws.work).map_err(|e| internal(format!("{e:?}")))?;
         Ok(d.into_iter().map(|c| DriveChange { kind: kind_name(c.kind).into(), path: c.path }).collect())
     }
 
@@ -297,7 +319,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
         let root = self.root(&ws, at)?;
-        let cas = Cas(&self.system);
+        let cas = Cas::new(&self.system);
         let entry = tree::lookup(&cas, root, &p.parts).map_err(|e| tree_err(e, &p))?;
         let entries = match entry {
             None => return Err(err(ErrorCode::NotFound, format!("没有 {p}"))),
@@ -315,7 +337,7 @@ impl<T: Transport, S: System> Node<T, S> {
             let p = parse(path)?;
             let ws = self.ws(&p.ws)?;
             let root = self.root(&ws, at)?;
-            let cas = Cas(&self.system);
+            let cas = Cas::new(&self.system);
             match tree::lookup(&cas, root, &p.parts).map_err(|e| tree_err(e, &p))? {
                 None => Err(err(ErrorCode::NotFound, format!("没有 {p}"))),
                 Some(Entry::Dir { .. }) => Err(err(ErrorCode::InvalidInput, format!("{p} 是目录"))),
@@ -368,7 +390,7 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidInput, "要写的是文件，不是工作区的根"));
         }
         self.ws(&p.ws)?;
-        let mut cas = Cas(&self.system);
+        let mut cas = Cas::new(&self.system);
         let mut chunker = Chunker::default();
         // 块边读边存，内存里只留清单。
         let mut chunks: Vec<ChunkRef> = Vec::new();
@@ -390,6 +412,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let manifest = FileManifest { size: chunks.iter().map(|c| c.len as u64).sum(), chunks };
         let size = manifest.size;
         let mh = cas.put(manifest.encode());
+        cas.finish()?;
         self.drive_set(path, Entry::File { manifest: mh, size, exec })?;
         Ok(DriveResponse::Written { path: p.to_string(), size })
     }
@@ -401,7 +424,9 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidInput, "不能替换工作区的根"));
         }
         let ws = self.ws(&p.ws)?;
-        let work = tree::set(&mut Cas(&self.system), ws.work, &p.parts, entry).map_err(|e| tree_err(e, &p))?;
+        let mut cas = Cas::new(&self.system);
+        let work = tree::set(&mut cas, ws.work, &p.parts, entry).map_err(|e| tree_err(e, &p))?;
+        cas.finish()?;
         self.update_ws(&p.ws, |w| w.work = work)?;
         Ok(work)
     }
@@ -409,11 +434,13 @@ impl<T: Transport, S: System> Node<T, S> {
     fn drive_rm(&self, path: &str, recursive: bool) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        let work = tree::remove(&mut Cas(&self.system), ws.work, &p.parts, recursive).map_err(|e| match e {
+        let mut cas = Cas::new(&self.system);
+        let work = tree::remove(&mut cas, ws.work, &p.parts, recursive).map_err(|e| match e {
             DriveError::IsADirectory if !p.parts.is_empty() => err(ErrorCode::InvalidInput, format!("{p} 是目录：删除目录要加 -r")),
             DriveError::IsADirectory => err(ErrorCode::InvalidInput, "不能删除工作区的根"),
             e => tree_err(e, &p),
         })?;
+        cas.finish()?;
         self.update_ws(&p.ws, |w| w.work = work)?;
         Ok(DriveResponse::Removed { path: p.to_string() })
     }
@@ -421,10 +448,12 @@ impl<T: Transport, S: System> Node<T, S> {
     fn drive_mkdir(&self, path: &str) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        if tree::lookup(&Cas(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.is_some() {
+        if tree::lookup(&Cas::new(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.is_some() {
             return Err(err(ErrorCode::InvalidInput, format!("{p} 已经存在")));
         }
-        let tree = tree::empty(&mut Cas(&self.system));
+        let mut cas = Cas::new(&self.system);
+        let tree = tree::empty(&mut cas);
+        cas.finish()?;
         self.drive_set(path, Entry::Dir { tree })?;
         Ok(DriveResponse::Done { path: p.to_string() })
     }
@@ -441,18 +470,19 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidInput, format!("不能把 {a} 移到它自己里面")));
         }
         let ws = self.ws(&a.ws)?;
-        let store = &mut Cas(&self.system);
-        let entry = tree::lookup(store, ws.work, &a.parts).map_err(|e| tree_err(e, &a))?.ok_or_else(|| tree_err(DriveError::NotFound, &a))?;
+        let mut cas = Cas::new(&self.system);
+        let entry = tree::lookup(&cas, ws.work, &a.parts).map_err(|e| tree_err(e, &a))?.ok_or_else(|| tree_err(DriveError::NotFound, &a))?;
         if a.parts == b.parts {
             return Ok(DriveResponse::Done { path: b.to_string() });
         }
-        if let Some(Entry::Dir { tree }) = tree::lookup(store, ws.work, &b.parts).map_err(|e| tree_err(e, &b))? {
-            if !tree::load(store, tree).map_err(|e| tree_err(e, &b))?.entries.is_empty() {
+        if let Some(Entry::Dir { tree }) = tree::lookup(&cas, ws.work, &b.parts).map_err(|e| tree_err(e, &b))? {
+            if !tree::load(&cas, tree).map_err(|e| tree_err(e, &b))?.entries.is_empty() {
                 return Err(err(ErrorCode::InvalidInput, format!("{b} 是非空目录")));
             }
         }
-        let work = tree::remove(store, ws.work, &a.parts, true).map_err(|e| tree_err(e, &a))?;
-        let work = tree::set(store, work, &b.parts, entry).map_err(|e| tree_err(e, &b))?;
+        let work = tree::remove(&mut cas, ws.work, &a.parts, true).map_err(|e| tree_err(e, &a))?;
+        let work = tree::set(&mut cas, work, &b.parts, entry).map_err(|e| tree_err(e, &b))?;
+        cas.finish()?;
         self.update_ws(&a.ws, |w| w.work = work)?;
         Ok(DriveResponse::Done { path: b.to_string() })
     }
@@ -460,7 +490,7 @@ impl<T: Transport, S: System> Node<T, S> {
     fn drive_chmod(&self, path: &str, exec: bool) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        match tree::lookup(&Cas(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))? {
+        match tree::lookup(&Cas::new(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))? {
             Some(Entry::File { manifest, size, .. }) => {
                 self.drive_set(path, Entry::File { manifest, size, exec })?;
                 Ok(DriveResponse::Done { path: p.to_string() })
@@ -487,7 +517,9 @@ impl<T: Transport, S: System> Node<T, S> {
             time_ms: self.system.now().0,
             message,
         };
-        let h = Cas(&self.system).put(commit.encode());
+        let mut cas = Cas::new(&self.system);
+        let h = cas.put(commit.encode());
+        cas.finish()?;
         self.update_ws(name, |w| w.head = Some(h))?;
         let sync = self.push(name).await;
         Ok(DriveResponse::Committed { commit: h.to_string(), sync })
@@ -549,7 +581,7 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 从 `head` 可以到达的对象（提交、树、清单，`chunks` 时还有块），以及其中本机没有的。
     fn closure(&self, head: Hash, chunks: bool) -> (Vec<Hash>, Vec<Hash>) {
-        let cas = Cas(&self.system);
+        let cas = Cas::new(&self.system);
         let mut seen = std::collections::BTreeSet::new();
         let mut missing = Vec::new();
         let mut queue = vec![(head, 'c')];
@@ -768,7 +800,8 @@ impl<T: Transport, S: System> Node<T, S> {
         let work = if Some(ws.work) == old_tree || (old_tree.is_none() && self.changes(&ws)?.is_empty()) {
             new_tree
         } else {
-            let (merged, conflicts) = tree::merge(&mut Cas(&self.system), old_tree, ws.work, new_tree, "remote")
+            let mut cas = Cas::new(&self.system);
+            let (merged, conflicts) = tree::merge(&mut cas, old_tree, ws.work, new_tree, "remote")
                 .map_err(|e| internal(format!("{e:?}")))?;
             if !conflicts.is_empty() {
                 return Err(err(
@@ -776,6 +809,7 @@ impl<T: Transport, S: System> Node<T, S> {
                     format!("本机未提交的改动和同步来的修改冲突（{}）：先提交本机的改动再同步", conflicts.join("、")),
                 ));
             }
+            cas.finish()?;
             merged
         };
         self.update_ws(name, |w| {
@@ -800,7 +834,8 @@ impl<T: Transport, S: System> Node<T, S> {
         let theirs = self.commit(remote)?;
         let base_tree = base.map(|b| self.commit(b).map(|c| c.tree)).transpose()?;
         let ours_tree = self.commit(local)?.tree;
-        let (merged, conflicts) = tree::merge(&mut Cas(&self.system), base_tree, ours_tree, theirs.tree, &theirs.device)
+        let mut cas = Cas::new(&self.system);
+        let (merged, conflicts) = tree::merge(&mut cas, base_tree, ours_tree, theirs.tree, &theirs.device)
             .map_err(|e| match e {
                 DriveError::Missing(_) => err(ErrorCode::Unreachable, "合并需要的目录结构不在本机：先同步"),
                 e => internal(format!("{e:?}")),
@@ -812,7 +847,8 @@ impl<T: Transport, S: System> Node<T, S> {
             time_ms: self.system.now().0,
             message: format!("合并 {} 的修改", theirs.device),
         };
-        let h = Cas(&self.system).put(commit.encode());
+        let h = cas.put(commit.encode());
+        cas.finish()?;
         self.update_ws(name, |w| {
             w.head = Some(h);
             w.work = merged;
@@ -880,7 +916,7 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn drive_prefetch(&self, name: &str, profile: Option<String>, all: bool) -> Result<nexus_wire::DrivePrefetch, WireError> {
         let ws = self.ws(name)?;
         let files: Vec<String> = if all {
-            tree::files(&Cas(&self.system), ws.work).map_err(|e| internal(format!("{e:?}")))?.into_keys().collect()
+            tree::files(&Cas::new(&self.system), ws.work).map_err(|e| internal(format!("{e:?}")))?.into_keys().collect()
         } else {
             self.find_profile(name, &ws, profile.as_deref().unwrap_or("default")).await?
         };
@@ -888,7 +924,7 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut manifests = Vec::new();
         for f in &files {
             let parts: Vec<String> = f.split('/').map(str::to_string).collect();
-            if let Ok(Some(Entry::File { manifest, .. })) = tree::lookup(&Cas(&self.system), ws.work, &parts) {
+            if let Ok(Some(Entry::File { manifest, .. })) = tree::lookup(&Cas::new(&self.system), ws.work, &parts) {
                 manifests.push(manifest);
             }
         }
@@ -898,7 +934,7 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let (mut missing, mut seen, mut total, mut fetched) = (Vec::new(), std::collections::BTreeSet::new(), 0u64, 0u64);
         for m in &manifests {
-            let Some(m) = Cas(&self.system).get(m).and_then(|b| FileManifest::decode(&b)) else { continue };
+            let Some(m) = Cas::new(&self.system).get(m).and_then(|b| FileManifest::decode(&b)) else { continue };
             for c in m.chunks {
                 total += c.len as u64;
                 if seen.insert(c.hash) && !self.system.cas_has(&c.hash.0).unwrap_or(false) {
@@ -916,7 +952,7 @@ impl<T: Transport, S: System> Node<T, S> {
     fn drive_where(&self, path: &str) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        let cas = Cas(&self.system);
+        let cas = Cas::new(&self.system);
         let entry = tree::lookup(&cas, ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.ok_or_else(|| err(ErrorCode::NotFound, format!("没有 {p}")))?;
         let manifests: Vec<Hash> = match entry {
             Entry::File { manifest, .. } => vec![manifest],
@@ -1015,7 +1051,11 @@ impl<T: Transport, S: System> Node<T, S> {
         for _ in 0..count {
             let Ok(bytes) = read_msg::<_, Vec<u8>>(&mut stream).await else { return };
             let h = Hash::of(&bytes);
-            let _ = self.system.cas_put(&h.0, &bytes);
+            if let Err(e) = self.system.cas_put(&h.0, &bytes) {
+                let _ = write_response(&mut stream, &Response::Error(internal(format!("写入对象存储失败：{e}")))).await;
+                let _ = stream.shutdown().await;
+                return;
+            }
         }
         let head = Hash(head);
         let resp = (|| {

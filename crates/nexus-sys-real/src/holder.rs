@@ -101,6 +101,9 @@ pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io
     rt.block_on(hold(data_dir, name, size, created_at))
 }
 
+/// 发给常驻程序的消息排队等待的上限。
+const UP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) -> io::Result<()> {
     let dir = sessions_dir(data_dir);
     transport::private_dir(&dir)?;
@@ -123,8 +126,8 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
     // 只用来保持当前屏幕：它要发给客户端的东西（包括回答终端查询）由常驻程序那边的状态机做。
     let mut screen = nexus_term_proto::Session::new(size, u64::MAX);
     let mut size = size.clamped();
-    let (down_tx, mut down_rx) = mpsc::unbounded_channel::<(u64, Down)>();
-    let mut conn: Option<(u64, transport::WriteHalf)> = None;
+    let (down_tx, mut down_rx) = mpsc::channel::<(u64, Down)>(256);
+    let mut conn: Option<(u64, mpsc::Sender<Up>, tokio::task::JoinHandle<()>)> = None;
     let mut next_conn = 0u64;
     // 套接字文件被删掉了（数据目录被清掉了，比如测试结束）：没有常驻程序能再找到这个会话，结束它。
     let mut check = tokio::time::interval(Duration::from_secs(5));
@@ -137,27 +140,39 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                 }
             }
             Some(stream) = accepted.recv() => {
-                // 新连上的常驻程序取代旧的（旧的多半已经不在了）。
+                // 新连上的常驻程序取代旧的（旧的多半已经不在了）；写端放到独立任务，避免慢消费阻塞主循环。
                 let (mut rd, mut wr) = stream.into_split();
                 next_conn += 1;
                 let id = next_conn;
                 let hello = Up::Hello { version: HOLDER_VERSION, size, created_at_ms: created_at.0 };
                 let restore = Up::Output(screen.restore());
-                if wr.write_all(&encode(&hello)).await.is_err() || wr.write_all(&encode(&restore)).await.is_err() {
-                    continue;
-                }
-                conn = Some((id, wr));
+                let (up_tx, mut up_rx) = mpsc::channel::<Up>(256);
+                let _ = up_tx.try_send(hello);
+                let _ = up_tx.try_send(restore);
+                let writer = tokio::spawn(async move {
+                    while let Some(msg) = up_rx.recv().await {
+                        let is_exit = matches!(msg, Up::Exited { .. });
+                        if wr.write_all(&encode(&msg)).await.is_err() {
+                            return;
+                        }
+                        if is_exit {
+                            let _ = wr.shutdown().await;
+                            return;
+                        }
+                    }
+                });
+                conn = Some((id, up_tx, writer));
                 let tx = down_tx.clone();
                 tokio::spawn(async move {
                     while let Ok(msg) = read_frame::<Down, _>(&mut rd).await {
-                        if tx.send((id, msg)).is_err() {
+                        if tx.send((id, msg)).await.is_err() {
                             return;
                         }
                     }
                 });
             }
             Some((id, msg)) = down_rx.recv() => {
-                if conn.as_ref().map(|(c, _)| *c) != Some(id) {
+                if conn.as_ref().map(|(c, _, _)| *c) != Some(id) {
                     continue;
                 }
                 match msg {
@@ -173,16 +188,23 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
             event = pty.next_event() => match event {
                 PtyEvent::Output(bytes) => {
                     let _ = screen.handle(nexus_term_proto::Event::PtyOutput(bytes.clone()));
-                    if let Some((_, wr)) = conn.as_mut() {
-                        if wr.write_all(&encode(&Up::Output(bytes))).await.is_err() {
+                    if let Some((_, up_tx, _)) = conn.as_ref() {
+                        // 缓冲满时先等一会儿（正常的背压，比如一次输出很多），对端断开或长时间不读才丢弃连接，
+                        // 这样既不会因为一阵大输出断开，也不会被卡死的常驻程序永远挡住 PTY 读取与新常驻程序接管。
+                        let sent = tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(Up::Output(bytes))).await;
+                        if !matches!(sent, Ok(Ok(()))) {
                             conn = None;
                         }
                     }
                 }
                 PtyEvent::Exited(status) => {
-                    if let Some((_, mut wr)) = conn.take() {
-                        let _ = wr.write_all(&encode(&Up::Exited { code: status.code, signal: status.signal })).await;
-                        let _ = wr.shutdown().await;
+                    if let Some((_, up_tx, writer)) = conn.take() {
+                        let exited = Up::Exited { code: status.code, signal: status.signal };
+                        if tokio::time::timeout(UP_SEND_TIMEOUT, up_tx.send(exited)).await.is_ok() {
+                            drop(up_tx);
+                            // 等写端任务把退出消息真正写出去再结束进程，否则运行时退出时它会被直接丢掉。
+                            let _ = tokio::time::timeout(UP_SEND_TIMEOUT, writer).await;
+                        }
                     }
                     break;
                 }
@@ -291,11 +313,12 @@ pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Ti
     transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     if sock.exists() {
-        // 上一次留下的：还活着就是同名的会话已经在了。
-        if transport::connect(&sock).is_ok() {
+        // 只看持有进程是否还活着，不真正连上去：连上会让持有进程换成这个连接，踢掉正在用它的常驻程序。
+        if transport::holder_alive(&sock, &pid_path(&dir, name)) {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("会话 {name} 的持有进程已经在运行")));
         }
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(pid_path(&dir, name));
     }
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}.log")))?;
     let mut cmd = std::process::Command::new(exe);
@@ -325,6 +348,7 @@ pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Ti
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(io::Error::new(io::ErrorKind::TimedOut, "持有进程没有就绪"));
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -392,6 +416,14 @@ mod transport {
 
     pub fn connect(sock: &Path) -> io::Result<std::os::unix::net::UnixStream> {
         std::os::unix::net::UnixStream::connect(sock)
+    }
+
+    /// 持有进程还活着：按 pid 文件检查进程是否存在。
+    pub fn holder_alive(_sock: &Path, pid: &Path) -> bool {
+        std::fs::read_to_string(pid)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .is_some_and(|p| p > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok())
     }
 
     pub fn into_async(s: std::os::unix::net::UnixStream) -> io::Result<Stream> {
@@ -479,6 +511,15 @@ mod transport {
     pub fn into_async(s: std::net::TcpStream) -> io::Result<Stream> {
         s.set_nonblocking(true)?;
         Stream::from_std(s)
+    }
+
+    /// 持有进程还活着：端点上的端口还能连上。不发口令，持有进程核对口令超时后直接丢掉这个连接，
+    /// 不会换掉正在用它的常驻程序。
+    pub fn holder_alive(sock: &Path, _pid: &Path) -> bool {
+        let Some((addr, _)) = std::fs::read_to_string(sock).ok().as_deref().and_then(parse) else {
+            return false;
+        };
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
     }
 
     /// 自成一个进程组、不开窗口：常驻程序被 Ctrl-C 或被结束时，持有进程不受影响。
