@@ -235,7 +235,8 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
     let mut size = size.clamped();
     // 屏幕或尺寸变了，下次定时记下来。
     let mut dirty = true;
-    let mut save = tokio::time::interval(SAVE_EVERY);
+    // 第一次也等一个间隔：刚启动时先让常驻程序连上。
+    let mut save = tokio::time::interval_at(tokio::time::Instant::now() + SAVE_EVERY, SAVE_EVERY);
     save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // 被要求结束（会话被 kill、数据目录没了）：shell 因此退出时会话真的结束。
     let mut killing = false;
@@ -253,26 +254,6 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
                     killing = true;
                     pty.kill();
                 }
-            }
-            _ = save.tick() => {
-                if dirty {
-                    let state = Saved {
-                        version: STATE_VERSION,
-                        created_at_ms: created_at.0,
-                        size,
-                        cwd: shell_cwd(pty.pid()),
-                        screen: screen.restore(),
-                        saved_at_ms: now_ms(),
-                    };
-                    if store_state(&dir, name, &state).is_ok() {
-                        dirty = false;
-                    }
-                }
-            }
-            // 关机时系统先发 SIGTERM：留着记下的状态，下次恢复。
-            _ = term.recv() => {
-                _cleanup.3 = false;
-                return Ok(());
             }
             Some(stream) = accepted.recv() => {
                 // 新连上的常驻程序取代旧的（旧的多半已经不在了）；写端放到独立任务，避免慢消费阻塞主循环。
@@ -351,6 +332,28 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, re
                     break;
                 }
             },
+            // 放在接受连接和终端输出之后：记状态要写盘（同步的），不能挡在它们前面。
+            // 特别是 Windows 的 ConPTY 启动时先问光标位置、得到回答才输出，这个询问要赶在常驻程序连上之后转过去。
+            _ = save.tick() => {
+                if dirty {
+                    let state = Saved {
+                        version: STATE_VERSION,
+                        created_at_ms: created_at.0,
+                        size,
+                        cwd: shell_cwd(pty.pid()),
+                        screen: screen.restore(),
+                        saved_at_ms: now_ms(),
+                    };
+                    if store_state(&dir, name, &state).is_ok() {
+                        dirty = false;
+                    }
+                }
+            }
+            // 关机时系统先发 SIGTERM：留着记下的状态，下次恢复。
+            _ = term.recv() => {
+                _cleanup.3 = false;
+                return Ok(());
+            }
         }
     }
     // Windows：关掉伪终端（ClosePseudoConsole）可能要等控制台主机退出、迟迟不返回。shell 已经结束了，
