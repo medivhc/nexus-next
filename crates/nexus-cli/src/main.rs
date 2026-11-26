@@ -42,7 +42,6 @@ fn main() {
     }
     let data_dir = data_dir(&cli);
     // 终端会话的持有进程（M7.2）：自己建运行时，shell 退出才返回。
-    #[cfg(unix)]
     if let Cmd::SessionHold { name, cols, rows, created_at_ms } = &cli.cmd {
         let size = nexus_sys_real::Size { cols: *cols, rows: *rows };
         let r = nexus_sys_real::holder::run(&data_dir, name, size, nexus_core_proto::Timestamp(*created_at_ms));
@@ -235,10 +234,23 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
                 }
             }
         });
+        // Windows 没有 SIGWINCH：每半秒看一次窗口大小，变了就告诉对方。
         #[cfg(windows)]
-        {
-            // Windows 没有 SIGWINCH，不做窗口大小跟踪。
-        }
+        tokio::spawn(async move {
+            let mut last = current();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let now = current();
+                if now != last {
+                    last = now;
+                    if let Some(size) = now {
+                        if tx.send(size).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
     if crossterm::terminal::enable_raw_mode().is_err() {
         Terminal.err("nexus ssh: 无法把终端切换到原始模式\n".as_bytes());
@@ -258,6 +270,11 @@ fn data_dir(cli: &Cli) -> PathBuf {
     }
     if let Some(d) = std::env::var_os("NEXUS_DATA_DIR") {
         return d.into();
+    }
+    // Windows 上没有 HOME：用 %LOCALAPPDATA%\nexus（M11.3）。
+    #[cfg(windows)]
+    if let Some(d) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(d).join("nexus");
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| ".".into());
     home.join(".local/share/nexus")

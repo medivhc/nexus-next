@@ -3,7 +3,7 @@
 本文档只描述系统对外可观察的行为，不描述实现方式。每条需求有一个稳定的编号，
 测试用 `covers` 标注它验证了哪些编号，`tools/check.py` 检查两者是否对得上。
 
-范围：阶段 0–5（节点与设备、终端、agent、网页节点、统一网络、文件、多路径），以及之后的易用性改进（M6）、日常可用（M7）、网页节点补齐（M8：网页里浏览工作区、打开网页服务、硬件能力）、分享与凭据（M9：临时分享、Vault）、根密钥轮换与完整 MCP（M10）、远程桌面（M11.1）和 Android 应用内加入（M11.2），共 R00–R80。状态里注明完成它的里程碑；
+范围：阶段 0–5（节点与设备、终端、agent、网页节点、统一网络、文件、多路径），以及之后的易用性改进（M6）、日常可用（M7）、网页节点补齐（M8：网页里浏览工作区、打开网页服务、硬件能力）、分享与凭据（M9：临时分享、Vault）、根密钥轮换与完整 MCP（M10）、远程桌面（M11.1）、Android 应用内加入（M11.2）和 macOS / Windows 版本（M11.3），共 R00–R84。状态里注明完成它的里程碑；
 用法见 `docs/manual.md`，各里程碑的功能点见 `docs/feature-points/`。
 
 ## 节点与设备
@@ -406,6 +406,33 @@
 ### R61 多路径的衡量
 - 状态：已实现（M5.3：docs/measurements/M5.md；有延迟的链路在 GitHub 的 runner 上测）
 - 断开一条路径时交互流量中断了多久；一条路径丢包时交互延迟的变化；两条路径时的批量吞吐；有测量记录。
+
+## 平台
+
+### R81 macOS 版本
+- 状态：已实现（M11.3：在 GitHub 的 macOS、Windows runner 上验证，没有真机）
+- 发布时同时有 macOS 的预编译版本（Apple 芯片和 Intel 各一个 `.tar.gz`），在 macOS 上编译、在 macOS 上检查过能运行。
+- 常驻程序、加入网络、终端（`ssh`、`exec`、`session`）、服务（`publish`、`connect`、`run --use`）、工作区同步、
+  完整节点（`--tun`，用系统的 utun 网卡，`.internal` 的名字交给常驻程序：`/etc/resolver/internal`）都可用；
+  挂载、多路径和计费网络识别不在 macOS 上。
+
+### R82 Windows 版本
+- 状态：已实现（M11.3：在 GitHub 的 macOS、Windows runner 上验证，没有真机）
+- 发布时同时有 Windows（x86_64）的预编译版本：一个 `.zip`，里面有 `nexus.exe` 和虚拟网卡要用的 `wintun.dll`
+  （及其许可证），在 Windows 上编译、在 Windows 上检查过能运行。
+- 和 macOS 一样的功能范围；本机的控制入口用命名管道和回环 TCP（`ctl.sock` 是写着端点的文件）。
+
+### R83 Windows 的虚拟网卡
+- 状态：已实现（M11.3：在 GitHub 的 macOS、Windows runner 上验证，没有真机）
+- Windows 上 `nexus daemon --tun nexus0` 用 Wintun 建网卡（要管理员权限，`wintun.dll` 和 `nexus.exe` 在同一目录），
+  系统里的程序不设代理按 `<服务>.<设备>.internal` 访问服务，行为同 R43。
+- `.internal` 的名字由系统交给常驻程序的名字服务（名称解析策略表 NRPT 里的一条，常驻程序启动时加、正常退出时删）。
+
+### R84 Windows 的升级与会话保持
+- 状态：已实现（M11.3：在 GitHub 的 macOS、Windows runner 上验证，没有真机）
+- Windows 上终端会话也由独立的持有进程管理，常驻程序重启（包括升级）后会话还在，行为同 R66。
+- Windows 上 `nexus upgrade --file <.zip 或 nexus.exe>` 可用，行为同 R67：检查、换上、重新启动、确认或换回；
+  原来的二进制留作 `nexus.prev.exe`。重新启动后常驻程序的进程号会变（Windows 不能原地换进程）。
 
 ## 工程约束
 

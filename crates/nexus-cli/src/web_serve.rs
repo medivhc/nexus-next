@@ -151,6 +151,7 @@ mod tests {
         std::fs::write(root.join("index.html"), "i").unwrap();
         std::fs::write(root.join("pkg/a b.js"), "a").unwrap();
         std::fs::write(tmp.join("secret"), "s").unwrap();
+        #[cfg(unix)]
         let _ = std::os::unix::fs::symlink(tmp.join("secret"), root.join("link"));
         let root = std::fs::canonicalize(&root).unwrap();
 
