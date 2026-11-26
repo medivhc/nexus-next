@@ -24,6 +24,7 @@ fn holder_accepts_reconnects_and_exits() {
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
+        eprintln!("持有进程就绪，第一次连上");
         // 第一次连上：会话名、尺寸、创建时间都对。
         let first = holder::adopt(&data);
         assert_eq!(first.len(), 1, "应当找到一个会话");
@@ -33,9 +34,11 @@ fn holder_accepts_reconnects_and_exits() {
         // 断开（常驻程序退出）再连上（新的常驻程序）：会话还在。
         drop(first);
         tokio::time::sleep(Duration::from_millis(200)).await;
+        eprintln!("断开，再连上");
         let mut again = holder::adopt(&data);
         assert_eq!(again.len(), 1, "断开之后应当还能连上");
         let mut pty = again.remove(0).pty;
+        eprintln!("结束会话");
         pty.kill();
         let exited = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
@@ -47,6 +50,12 @@ fn holder_accepts_reconnects_and_exits() {
         .await;
         assert!(exited.is_ok(), "结束会话之后应当收到退出");
     });
+    // 持有进程在 shell 结束后要自己结束（限时：卡住时测试失败，而不是一直挂着）。
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !held.is_finished() {
+        assert!(Instant::now() < deadline, "shell 结束 20 秒后持有进程还没有结束");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     held.join().unwrap().unwrap();
     assert!(!sock.exists(), "持有进程退出时应当删掉端点");
 }

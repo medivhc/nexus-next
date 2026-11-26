@@ -184,11 +184,16 @@ async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp) ->
                         let _ = wr.write_all(&encode(&Up::Exited { code: status.code, signal: status.signal })).await;
                         let _ = wr.shutdown().await;
                     }
-                    return Ok(());
+                    break;
                 }
             },
         }
     }
+    // Windows：关掉伪终端（ClosePseudoConsole）可能要等控制台主机退出、迟迟不返回。shell 已经结束了，
+    // 在另一个线程里关，持有进程不用等它（进程退出时一并结束）。
+    #[cfg(windows)]
+    std::thread::spawn(move || drop(pty));
+    Ok(())
 }
 
 // ------------------------------------------------------------------ 常驻程序这一边

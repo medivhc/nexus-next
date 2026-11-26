@@ -285,7 +285,7 @@ jobs:
       matrix:
         include:
           - name: macOS
-            os: macos-14
+            os: macos-15
             exe: nexus
           - name: Windows
             os: windows-2022
@@ -307,6 +307,7 @@ jobs:
         run: cargo build --release --locked -p nexus-cli --bin nexus
 
       - name: Portable unit tests
+        timeout-minutes: 20
         # nexus-cli's scenario tests need nexus-testkit (Unix only); its unit
         # tests and nexus-sys-real's tests (session holder transport) run here.
         shell: bash
@@ -319,6 +320,7 @@ jobs:
         run: python tools/fetch_wintun.py target/release
 
       - name: Two devices on this runner
+        timeout-minutes: 20
         shell: bash
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
