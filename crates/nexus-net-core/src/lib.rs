@@ -7,6 +7,7 @@ pub mod app_policy;
 pub mod diag;
 pub mod dns_policy;
 pub mod import;
+pub mod path_selector;
 pub mod policy;
 pub mod power;
 
