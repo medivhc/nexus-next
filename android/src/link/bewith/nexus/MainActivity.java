@@ -1297,8 +1297,7 @@ public class MainActivity extends Activity {
                                   .append(" [").append(e.optString("ingress")).append("] ")
                                   .append(e.optString("target")).append(" -> ")
                                   .append(e.optString("decision")).append(" (")
-                                  .append(e.optString("result")).append(")
-");
+                                  .append(e.optString("result")).append(")\n");
                             }
                             flowEventsText.setText(sb.toString().trim());
                         } catch (JSONException e) {
