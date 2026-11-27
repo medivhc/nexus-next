@@ -4,7 +4,10 @@
 #![forbid(unsafe_code)]
 
 pub mod app_policy;
+pub mod diag;
+pub mod dns_policy;
 pub mod import;
+pub mod policy;
 pub mod power;
 
 use core::net::IpAddr;

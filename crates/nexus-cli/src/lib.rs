@@ -239,6 +239,16 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: RouteCmd,
     },
+    /// DNS 改写与广告/追踪域名过滤（N3）
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCmd,
+    },
+    /// 查看本地脱敏连接与 DNS 观测事件（N3）
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCmd,
+    },
     /// 在本机运行一个程序，它用到的服务先在本机开好端口，并按服务的说明设置环境变量
     ///
     /// 例：nexus run --use home/llm -- python app.py
@@ -808,6 +818,68 @@ pub enum RouteCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum DnsCmd {
+    /// 新增或更新一条 DNS 改写/过滤/白名单规则
+    #[command(group = clap::ArgGroup::new("dns_action").required(true))]
+    Add {
+        /// 规则唯一标识（同名覆盖）
+        #[arg(long)]
+        id: String,
+        /// 匹配域名及所有子域名
+        #[arg(long, conflicts_with = "domain_exact")]
+        domain: Option<String>,
+        /// 仅精确匹配该域名
+        #[arg(long, conflicts_with = "domain")]
+        domain_exact: Option<String>,
+        /// 拦截并返回 NXDOMAIN
+        #[arg(long, group = "dns_action")]
+        block: bool,
+        /// 拦截并返回空 NOERROR（NODATA）
+        #[arg(long, group = "dns_action")]
+        nodata: bool,
+        /// 白名单放行（优先于过滤规则）
+        #[arg(long, group = "dns_action")]
+        allow: bool,
+        /// 自定义 DNS 改写 IP 地址（支持 IPv4/IPv6）
+        #[arg(long = "override", value_name = "IP", group = "dns_action")]
+        override_ip: Option<String>,
+        /// 改写记录 TTL（秒，默认 60）
+        #[arg(long, default_value_t = 60)]
+        ttl: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除指定 ID 的 DNS 规则
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出全部 DNS 规则
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 解释指定域名的 DNS 管线判定结果
+    Explain {
+        domain: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlowCmd {
+    /// 列出最近本地脱敏连接与 DNS 事件
+    Ls {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum AgentCmd {
     /// 签发一份 agent 凭据
     ///
@@ -1143,6 +1215,36 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         Cmd::Route { cmd: RouteCmd::Rollback { json } } => (CtlRequest::RouteRollback, *json),
         Cmd::Route { cmd: RouteCmd::Audit { json } } => (CtlRequest::RouteAudit, *json),
+        Cmd::Dns { cmd: DnsCmd::Add { id, domain, domain_exact, block, nodata, allow, override_ip, ttl, json } } => {
+            let matcher = match (domain, domain_exact) {
+                (Some(d), None) => route::Matcher::parse_domain(d),
+                (None, Some(d)) => route::Matcher::parse_domain_exact(d),
+                _ => Err("需要 --domain 或 --domain-exact".to_string()),
+            };
+            let matcher = match matcher {
+                Ok(m) => m,
+                Err(msg) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg),
+            };
+            let action = if *block {
+                nexus_net_core::dns_policy::DnsAction::BlockNxdomain
+            } else if *nodata {
+                nexus_net_core::dns_policy::DnsAction::BlockNodata
+            } else if *allow {
+                nexus_net_core::dns_policy::DnsAction::Allow
+            } else if let Some(ip_str) = override_ip {
+                match ip_str.parse::<std::net::IpAddr>() {
+                    Ok(ip) => nexus_net_core::dns_policy::DnsAction::Override { ips: vec![ip], ttl: *ttl },
+                    Err(_) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("IP 地址不合法：{ip_str}")),
+                }
+            } else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", "需要指定 DNS 动作");
+            };
+            (CtlRequest::DnsRuleAdd { rule: nexus_net_core::dns_policy::DnsRule { id: id.clone(), matcher, action } }, *json)
+        }
+        Cmd::Dns { cmd: DnsCmd::Rm { id, json } } => (CtlRequest::DnsRuleRm { id: id.clone() }, *json),
+        Cmd::Dns { cmd: DnsCmd::Ls { json } } => (CtlRequest::DnsRuleList, *json),
+        Cmd::Dns { cmd: DnsCmd::Explain { domain, json } } => (CtlRequest::DnsExplain { domain: domain.clone() }, *json),
+        Cmd::Flow { cmd: FlowCmd::Ls { limit, json } } => (CtlRequest::FlowRecent { limit: *limit }, *json),
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
         Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
@@ -1544,6 +1646,20 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     "已回滚到上一版规则快照\n".into()
                 }
             }
+            Cmd::Dns { cmd: DnsCmd::Add { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "saved": id }))
+                } else {
+                    format!("已保存 DNS 规则 {id}\n")
+                }
+            }
+            Cmd::Dns { cmd: DnsCmd::Rm { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": id }))
+                } else {
+                    format!("已删除 DNS 规则 {id}\n")
+                }
+            }
             Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
@@ -1588,6 +1704,34 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
 ", i.message));
                 }
                 out
+            }
+        }
+        CtlResponse::DnsRules(rules) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "rules": rules }))
+            } else if rules.is_empty() {
+                "暂无自定义 DNS 规则\n".into()
+            } else {
+                rules.iter().map(|r| format!("{:<20} {:<28} {:?}\n", r.id, r.matcher.to_string(), r.action)).collect()
+            }
+        }
+        CtlResponse::DnsExplained(decision) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "result": decision }))
+            } else {
+                format!("{decision:?}\n")
+            }
+        }
+        CtlResponse::Flows(events) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "events": events }))
+            } else if events.is_empty() {
+                "暂无本地流事件记录\n".into()
+            } else {
+                events
+                    .iter()
+                    .map(|e| format!("#{:<4} [{:<8}] {:<30} {:<24} {}\n", e.flow_id, e.ingress, e.target, e.decision, e.result))
+                    .collect()
             }
         }
         CtlResponse::RouteAudit(audit) => {
