@@ -846,6 +846,12 @@ pub enum CtlRequest {
     DnsExplain { domain: String },
     /// 查询本地脱敏流事件日志（N3）。
     FlowRecent { limit: u32 },
+    /// 新增或更新显式 HTTP 代理变换规则（N6）。
+    HttpRuleAdd { rule: nexus_net_core::http_rewrite::HttpRule },
+    /// 删除显式 HTTP 代理变换规则（N6）。
+    HttpRuleRm { id: String },
+    /// 列出全部显式 HTTP 代理变换规则（N6）。
+    HttpRuleList,
     /// 开放或关闭本机的出口。
     ExitSet { enabled: bool },
     ExitShow,
@@ -919,6 +925,7 @@ pub enum CtlResponse {
     DnsRules(Vec<nexus_net_core::dns_policy::DnsRule>),
     DnsExplained(nexus_net_core::dns_policy::DnsDecision),
     Flows(Vec<nexus_net_core::diag::FlowEvent>),
+    HttpRules(Vec<nexus_net_core::http_rewrite::HttpRule>),
     Exit { enabled: bool },
     Tun(Option<TunReport>),
     Drive(DriveResponse),

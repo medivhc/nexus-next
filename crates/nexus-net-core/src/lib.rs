@@ -6,6 +6,7 @@
 pub mod app_policy;
 pub mod diag;
 pub mod dns_policy;
+pub mod http_rewrite;
 pub mod import;
 pub mod path_selector;
 pub mod policy;
