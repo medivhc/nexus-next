@@ -6,7 +6,7 @@
 //!
 //! 这里有 unsafe：JNI 导出函数要求不改名（`no_mangle`），网卡来自一个原始文件描述符。
 
-use jni::objects::{JBooleanArray, JClass, JObjectArray, JString};
+use jni::objects::{JBooleanArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 use nexus_cli::daemon;
@@ -147,7 +147,7 @@ fn string(env: &mut JNIEnv, s: &JString) -> String {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
     mut env: JNIEnv,
-    _class: JClass,
+    _this: JObject,
     data_dir: JString,
     name: JString,
     tun_fd: jint,
@@ -155,6 +155,24 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
     discovery: jboolean,
     rendezvous: JString,
 ) -> jint {
+    #[cfg(target_os = "android")]
+    {
+        static INIT_CTX: std::sync::Once = std::sync::Once::new();
+        INIT_CTX.call_once(|| {
+            let ctx = env
+                .call_method(&_this, "getApplicationContext", "()Landroid/content/Context;", &[])
+                .ok()
+                .and_then(|v| v.l().ok())
+                .unwrap_or_else(|| env.new_local_ref(&_this).unwrap());
+            if let (Ok(vm), Ok(global)) = (env.get_java_vm(), env.new_global_ref(ctx)) {
+                let vm_ptr = vm.get_java_vm_pointer().cast();
+                let ctx_ptr = global.as_raw().cast();
+                std::mem::forget(global);
+                // SAFETY: Android 上只初始化一次，vm 与 Application Context 的全局引用在进程生命周期内有效。
+                unsafe { ndk_context::initialize_android_context(vm_ptr, ctx_ptr) };
+            }
+        });
+    }
     let (data_dir, name, relay) = (string(&mut env, &data_dir), string(&mut env, &name), string(&mut env, &relay));
     let rendezvous = string(&mut env, &rendezvous);
     match start(data_dir.into(), name, tun_fd, relay, discovery != 0, rendezvous) {

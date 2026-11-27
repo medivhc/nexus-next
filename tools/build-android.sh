@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 ABIS=("${@:-x86_64}")
 SDK=${ANDROID_HOME:-$HOME/android-sdk}
 NDK=${ANDROID_NDK_HOME:-$(ls -d "$SDK"/ndk/* | sort -V | tail -1)}
-BT=$SDK/build-tools/34.0.0
+BT=${ANDROID_BUILD_TOOLS:-$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)}
 JAR=$SDK/platforms/android-34/android.jar
 API=26
 LLVM=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin

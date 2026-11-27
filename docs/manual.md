@@ -838,7 +838,7 @@ agent 读写工作区要有 `drive.read` / `drive.write`，`drive ls` 只列出�
 
 ```sh laptop
 nexus share create --drive work:/notes --ttl 30m --max-uses 3     # 工作区里的文件或目录
-nexus share ls                                                    # 编号、类型、用了几次、是否撤销
+nexus share ls                                                    # 编号、类型、用了几次、状态（有效/已过期/已用尽/已撤销）
 ```
 
 ```sh
@@ -942,6 +942,15 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 
 ## 17. 排查问题
 
+先运行一键体检，汇总本机常驻程序、各设备在线状态、连接路径、版本兼容性和 `.internal` 名字解析，并直接给出下一步建议：
+
+```sh laptop
+nexus doctor
+nexus doctor --json
+```
+
+每项检查显示 `ok`、`warn` 或 `fail`；没有 `fail` 时退出码为 `0`（只有 `warn` 仍为 `0`），存在 `fail` 时退出码为 `1`。
+
 | 现象 | 看什么、怎么办 |
 | --- | --- |
 | 命令报退出码 101 | 本机的常驻程序没在运行，或 `--data-dir` / `NEXUS_DATA_DIR` 和常驻程序不一致 |
@@ -969,7 +978,8 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 
 | 码 | 含义 |
 | --- | --- |
-| 0 | 成功 |
+| 0 | 成功（`nexus doctor` 无失败项，含仅有警告时也为 0） |
+| 1 | `nexus doctor` 发现至少一项检查失败 |
 | 101 | 连不上本机的常驻程序 |
 | 102 | 用法错误 |
 | 103 | 不认识这台设备 |
@@ -994,7 +1004,7 @@ Android 上是一个应用（`link.bewith.nexus`）：系统的 VPN 是入口，
 - 多路径和计费网络识别支持 Linux 和 Android；Android 上的多路径只在 redroid 里测过（两条 veth 链路），还没有在有 Wi-Fi 和 5G 的真机上测过。
 - 网页节点打开网页服务时不支持 WebSocket 和流式回应，页面里写死 `localhost:<端口>` 的完整网址到不了服务（第 11 节）。
 - 网页节点的硬件能力：开了的那一项名册里的任何设备都能取用，没有再按设备细分；只能拍照、录一小段、取一次位置，没有连续的视频或音频流。
-- 临时分享只读，只能分享本机上的东西；`nexus share ls` 不显示是否已过期。
+- 临时分享只读，只能分享本机上的东西。
 - Vault 只能在管理设备上写入，写入时不在线的设备要等管理设备在线时 `nexus vault sync`。
   用恢复码换了管理设备后，「吊销后要轮换哪些条目」的记录留在原来的管理设备上，新的管理设备从收回的条目重新开始记。
 - 预编译版本有 Linux、macOS、Windows，但没有安装包，macOS 版没有签名；macOS 和 Windows 只在 CI 的 runner 上检查过，没在真机上用过。

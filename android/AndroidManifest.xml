@@ -2,8 +2,8 @@
 <!-- Nexus 的 Android 外壳：一个 VpnService 和一个用来授权、启动它的界面。核心在 libnexus_android.so 里。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="link.bewith.nexus"
-    android:versionCode="1"
-    android:versionName="0.3.6">
+    android:versionCode="2"
+    android:versionName="0.2.0">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
