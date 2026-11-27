@@ -468,7 +468,7 @@ pub async fn run<C: Ctl, K: Sink>(ctl: &C, json_out: bool, sink: &mut K) -> i32 
                         .min()
                 })
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| if st.name.is_empty() { "self" } else { st.name.as_str() })
+                .unwrap_or(if st.name.is_empty() { "self" } else { st.name.as_str() })
                 .to_string();
             let route_explain = match call(ctl, CtlRequest::RouteExplain { target: format!("probe.{probe_device}.internal:80") }).await {
                 Ok(CtlResponse::Explained(ex)) => Ok(ex),
