@@ -126,6 +126,7 @@ public class MainActivity extends Activity {
     private EditText explainInput;
     private TextView explainResultText;
     private TextView auditResultText;
+    private TextView flowEventsText;
     private TextView daemonLogText;
 
     private static final class AppEntry {
@@ -567,6 +568,7 @@ public class MainActivity extends Activity {
         } else if (idx == 2) {
             refreshRulesList();
         } else if (idx == 3) {
+            refreshFlowEvents();
             refreshDaemonLog();
         }
     }
@@ -1165,6 +1167,26 @@ public class MainActivity extends Activity {
         audCard.addView(audBtn);
         auditResultText = makeText(audCard, "audit_result", 13, false, COLOR_TEXT);
 
+        // N3 本地脱敏流事件卡
+        LinearLayout flowCard = makeCard(col);
+        LinearLayout flowHead = new LinearLayout(this);
+        flowHead.setOrientation(LinearLayout.HORIZONTAL);
+        flowHead.setGravity(Gravity.CENTER_VERTICAL);
+        TextView flowTitle = makeText(flowHead, "flow_title", 15, true, COLOR_TEXT);
+        flowTitle.setText("最近流与 DNS 观测（脱敏）");
+        ((LinearLayout.LayoutParams) flowTitle.getLayoutParams()).weight = 1f;
+        Button refreshFlowBtn = new Button(this);
+        refreshFlowBtn.setText("刷新事件");
+        refreshFlowBtn.setAllCaps(false);
+        styleButton(refreshFlowBtn, COLOR_BG, COLOR_TEXT);
+        refreshFlowBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { refreshFlowEvents(); }
+        });
+        flowHead.addView(refreshFlowBtn);
+        flowCard.addView(flowHead);
+        flowEventsText = makeText(flowCard, "flow_events", 11, false, COLOR_TEXT);
+        flowEventsText.setTypeface(Typeface.MONOSPACE);
+
         // 运行日志卡
         LinearLayout logCard = makeCard(col);
         LinearLayout logHead = new LinearLayout(this);
@@ -1240,6 +1262,47 @@ public class MainActivity extends Activity {
                             }
                         } catch (JSONException e) {
                             auditResultText.setText(raw);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private void refreshFlowEvents() {
+        final String dir = getFilesDir().getAbsolutePath();
+        flowEventsText.setText("加载中…");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                final String raw = NexusCore.nativeFlowRecent(dir, 15);
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            JSONObject obj = new JSONObject(raw);
+                            if (!obj.optBoolean("ok")) {
+                                flowEventsText.setText("未连接核心：" + obj.optString("error"));
+                                return;
+                            }
+                            JSONArray arr = obj.optJSONArray("events");
+                            if (arr == null || arr.length() == 0) {
+                                flowEventsText.setText("（暂无最近流/DNS 事件）");
+                                return;
+                            }
+                            StringBuilder sb = new StringBuilder();
+                            for (int i = 0; i < arr.length(); i++) {
+                                JSONObject e = arr.optJSONObject(i);
+                                sb.append("#").append(e.optLong("flow_id"))
+                                  .append(" [").append(e.optString("ingress")).append("] ")
+                                  .append(e.optString("target")).append(" -> ")
+                                  .append(e.optString("decision")).append(" (")
+                                  .append(e.optString("result")).append(")
+");
+                            }
+                            flowEventsText.setText(sb.toString().trim());
+                        } catch (JSONException e) {
+                            flowEventsText.setText(raw);
                         }
                     }
                 });

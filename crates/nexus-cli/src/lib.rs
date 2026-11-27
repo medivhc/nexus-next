@@ -2571,6 +2571,32 @@ fn mcp_tools() -> Value {
                 },
             },
         },
+        {
+            "name": "nexus_route_audit",
+            "description": "只读静态审计当前路由规则表（检测重复、被遮蔽规则及无效上游地址）。",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "nexus_dns_explain",
+            "description": "只读解释一个域名在 DNS 改写与过滤管线中的命中结果。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "domain": { "type": "string", "description": "要查询的域名，例如 ads.example.com" },
+                },
+                "required": ["domain"],
+            },
+        },
+        {
+            "name": "nexus_flow_summary",
+            "description": "只读查看本地脱敏流事件摘要（仅元数据，不含正文或凭据）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "description": "返回最近条数（默认 20）" },
+                },
+            },
+        },
     ])
 }
 
@@ -2737,6 +2763,15 @@ async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
         "nexus_audit" => {
             let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
             Cmd::Audit { limit, json: true }
+        }
+        "nexus_route_audit" => Cmd::Route { cmd: RouteCmd::Audit { json: true } },
+        "nexus_dns_explain" => match text("domain") {
+            Some(domain) => Cmd::Dns { cmd: DnsCmd::Explain { domain, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 domain" }), true),
+        },
+        "nexus_flow_summary" => {
+            let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(20);
+            Cmd::Flow { cmd: FlowCmd::Ls { limit, json: true } }
         }
         _ => return (json!({ "error": "usage", "message": format!("没有工具 {name}") }), true),
     };
