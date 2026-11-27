@@ -13,6 +13,7 @@ M7.1 起，同一协议主版本内的任何两个版本互相连得上（R65）
   19.3（M9.2）：加了 `VaultPush`、`VaultPull` 请求和 `VaultEntries` 回应。
   19.4（M10.1）：加了 `RootRotate` 请求。
   19.5（M11.5）：加了 `SvcDatagram` 请求（转发 UDP 服务的数据报，之后的帧是 2 字节大端长度 + 数据报）。
+  19.6（N1）：加了 `ExitDatagram` 请求（经出口转发公网 UDP，之后的帧和 `SvcDatagram` 相同）。
 - 软件版本（`Cargo.toml` 的 `version`，`nexus --version`）和协议版本是两回事：
   不改协议的发布不动 `WIRE_MINOR`。
 

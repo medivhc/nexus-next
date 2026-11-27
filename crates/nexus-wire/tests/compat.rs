@@ -151,6 +151,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             addrs: vec![(node(3), "hint".into())],
         },
         Request::SvcDatagram { name: "dns".into() },
+        Request::ExitDatagram { target: "203.0.113.7:3478".into() },
     ];
     all.into_iter()
         .map(|r| {
