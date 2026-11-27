@@ -119,7 +119,7 @@ def parse_features(root):
     reqs = {}
     current = None
     for line in (root / "FEATURES.md").read_text(encoding="utf-8").splitlines():
-        m = re.match(r"###\s+(R\d\d)\b", line)
+        m = re.match(r"###\s+(R\d{2,3})\b", line)
         if m:
             current = m.group(1)
             reqs[current] = None
@@ -142,8 +142,8 @@ def collect_covers(root):
     for path in files:
         if "target" in path.parts or "node_modules" in path.parts:
             continue
-        for m in re.finditer(r"covers:\s*\"?((?:R\d\d)(?:\s*,\s*R\d\d)*)", path.read_text(encoding="utf-8")):
-            for rid in re.findall(r"R\d\d", m.group(1)):
+        for m in re.finditer(r"covers:\s*\"?((?:R\d{2,3})(?:\s*,\s*R\d{2,3})*)", path.read_text(encoding="utf-8")):
+            for rid in re.findall(r"R\d{2,3}", m.group(1)):
                 found.setdefault(rid, []).append(str(path.relative_to(root)))
     return found
 
@@ -236,11 +236,11 @@ def self_test():
 
     def add_untested(tmp):
         p = tmp / "FEATURES.md"
-        p.write_text(p.read_text(encoding="utf-8") + "\n### R98 自检用的需求\n- 状态：已实现（自检）\n- 没有任何测试覆盖它。\n", encoding="utf-8")
-    expect("已实现的需求没有测试", add_untested, check_trace, "R98 标为已实现")
+        p.write_text(p.read_text(encoding="utf-8") + "\n### R998 自检用的需求\n- 状态：已实现（自检）\n- 没有任何测试覆盖它。\n", encoding="utf-8")
+    expect("已实现的需求没有测试", add_untested, check_trace, "R998 标为已实现")
     expect("测试引用不存在的需求",
-           append("crates/nexus-cli/tests/scenarios.rs", "\n// covers" + ": R" + "99\n"),
-           check_trace, "不存在的需求 R" + "99")
+           append("crates/nexus-cli/tests/scenarios.rs", "\n// covers" + ": R" + "999\n"),
+           check_trace, "不存在的需求 R" + "999")
 
     if license_ok("GPL-3.0") or not license_ok("MIT OR Apache-2.0") or license_ok("MIT AND GPL-3.0"):
         failures.append("许可证表达式的判断不正确")

@@ -4,7 +4,7 @@
 - **文档状态**：草案（v0.1）
 - **日期**：2026-11-26
 - **建议里程碑**：M12（接续已完成至 M11.5 的 [docs/roadmap.md](https://github.com/medivhc/nexus-next/blob/main/docs/roadmap.md)）
-- **拟新增需求编号**：R93–R97（接续 [FEATURES.md](https://github.com/medivhc/nexus-next/blob/main/FEATURES.md) 现有 R00–R92）
+- **拟新增需求编号**：R95–R99（接续 [FEATURES.md](https://github.com/medivhc/nexus-next/blob/main/FEATURES.md) 现有 R00–R94）
 
 ## 1. 产品背景与问题陈述（Problem Statement）
 
@@ -50,7 +50,7 @@ Nexus 的核心价值在于「把一个人的所有设备组成一个整体」�
 
 以下需求按 [FEATURES.md](https://github.com/medivhc/nexus-next/blob/main/FEATURES.md) 规范编号，并沿用 `docs/feature-points/` 的 `Given / When / Then` 格式编写。
 
-### R93 `ask` 授权级别与审批单状态机
+### R95 `ask` 授权级别与审批单状态机
 - **描述**：授权策略支持 `allow`、`ask`、`deny` 三态；命中 `ask` 时进入确定性状态机：`Pending → ApprovedOnce | ApprovedTtl | Denied | Expired | Cancelled`。
 - **优先级**：P0
 - **验收标准**：
@@ -58,7 +58,7 @@ Nexus 的核心价值在于「把一个人的所有设备组成一个整体」�
   - **When** `ci-bot` 发起 `nexus exec home -- uname -a`
   - **Then** 目标设备创建状态为 `Pending` 的审批单并挂起请求；若 `30s` 内无人处理，状态转为 `Expired`，`ci-bot` 收到退出码 `105` 及结构化错误 `{"error":"approval_timeout", ...}`。
 
-### R94 跨设备审批分发与多端单次裁决
+### R96 跨设备审批分发与多端单次裁决
 - **描述**：审批单实时暴露至用户的在线审批设备（默认管理设备，支持通过 `nexus device set-approver <dev> on|off` 扩展到常用手机或笔记本）；多端同时可见，首个有效裁决生效后其余端自动消单，禁止重复裁决。
 - **优先级**：P0
 - **验收标准**：
@@ -66,7 +66,7 @@ Nexus 的核心价值在于「把一个人的所有设备组成一个整体」�
   - **When** Agent 在 `home` 触发 `ask` 审批，用户在 `phone` 上批准「单次放行」
   - **Then** `home` 立即执行该命令并将结果返回 Agent；随后若 `laptop` 再对该审批单提交 `deny`，返回状态冲突（退出码 `106`）。
 
-### R95 临时提权（TTL 授权缓存）与撤销联动
+### R97 临时提权（TTL 授权缓存）与撤销联动
 - **描述**：审批时可选择临时提权（如 `--ttl 15m`），目标设备在内存中缓存该 `(agent_id, capability, resource)` 的临时放行令牌（不落盘持久化，重启失效）；一旦该 Agent 被撤销（R14）或提前执行 `nexus approval revoke-grant`，所有临时提权立即失效。
 - **优先级**：P0
 - **验收标准**：
@@ -74,7 +74,7 @@ Nexus 的核心价值在于「把一个人的所有设备组成一个整体」�
   - **When** 有效期内 `ci-bot` 再次执行命令
   - **Then** 第二次直接放行无需再次审批；若用户此时执行 `nexus agent revoke ci-bot`，随后的请求立即返回未授权（退出码 `105`）。
 
-### R96 MCP 协议透传 `reason` 与结构化等待/失败语义
+### R98 MCP 协议透传 `reason` 与结构化等待/失败语义
 - **描述**：`nexus mcp`（R76）中可能触发审批的工具新增可选字符串参数 `reason`（最长 256 字符），用于在审批卡片上向用户解释操作意图；当请求被拒或超时，`structuredContent` 明确区分 `denied`（无权限）、`denied_by_user`（被本人拒绝，含可选拒绝理由 `note`）与 `approval_timeout`（审批超时）。
 - **优先级**：P0
 - **验收标准**：
@@ -82,7 +82,7 @@ Nexus 的核心价值在于「把一个人的所有设备组成一个整体」�
   - **When** 审批端查看待审批列表并选择拒绝，附带理由 `"先跑单测再部署"`
   - **Then** 审批端展示完整 `reason`；MCP 工具返回 `isError: true`，且 `structuredContent` 包含 `code: "denied_by_user"` 与 `note: "先跑单测再部署"`。
 
-### R97 安全边界与全链路审计
+### R99 安全边界与全链路审计
 - **描述**：
   1. **防自批**：Agent 凭据本身严禁调用任何审批裁决接口（即使持有 `*@**` 也不生效），审批权仅限设备本人身份（或经通行密钥认证的网页节点）。
   2. **离线默认拒绝（Fail-Closed）**：等待超时后默认拒绝，绝不降级为自动放行。
