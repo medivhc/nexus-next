@@ -366,9 +366,18 @@ def main():
             if len(term_tick.arrivals) < 20:
                 failures.append(f"终端会话没有输出：{term.stderr.read() if term.poll() is not None else ''}")
         if "redundancy" in phases and term and len(term_tick.arrivals) >= 20:
+            links, _ = n.wait_links(2, 15)
+            if len(links) < 2:
+                failures.append(f"冗余测量前两条直连链路没有都恢复：{links}")
             busy, use = n.busy(2.0)
             other = "link2" if busy == "link1" else "link1"
             ratio = use[other] / max(use[busy], 1)
+            if ratio < 0.5:
+                # 故障转移刚恢复时，冗余发送可能还没重新用上第二条链路；等一轮探测后再测一次。
+                time.sleep(2)
+                busy, use = n.busy(2.0)
+                other = "link2" if busy == "link1" else "link1"
+                ratio = use[other] / max(use[busy], 1)
             print(f"交互冗余：终端输出时两秒内各链路的字节数 {use}（少的一条是多的一条的 {ratio:.0%}）")
             red = {"bytes": use}
             if ratio < 0.5:
