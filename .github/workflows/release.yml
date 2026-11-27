@@ -226,9 +226,65 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
+  build-android:
+    name: Build Android APK (arm64-v8a + x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = push ]; then tag="${{ github.ref_name }}"; else tag="${{ github.event.inputs.tag }}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ -n "$tag" ]; then echo "version=${tag#v}" >> "$GITHUB_OUTPUT"; else echo "version=dev" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag || github.sha }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android
+
+      - name: Ensure Android SDK components
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+          if [ ! -d "$SDK/ndk" ] || [ -z "$(ls -A "$SDK/ndk")" ]; then
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
+          fi
+
+      - name: Build Android APK
+        run: |
+          tools/build-android.sh arm64-v8a x86_64
+          mkdir -p dist
+          cp target/android/nexus.apk "dist/nexus-${{ steps.tag.outputs.version }}-android.apk"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*.apk
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: [build, build-macos, build-windows]
+    needs: [build, build-macos, build-windows, build-android]
     if: github.event_name == 'push' || github.event.inputs.tag != ''
     runs-on: ubuntu-24.04
     steps:
@@ -240,14 +296,14 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip | tee SHA256SUMS
+          sha256sum *.tar.gz *.zip *.apk | tee SHA256SUMS
 
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          notes="预编译的二进制：Linux（x86_64、aarch64，静态链接，任何发行版都能用）、macOS（Apple 芯片、Intel）、Windows（x86_64）。
+          notes="预编译的二进制：Linux（x86_64、aarch64，静态链接，任何发行版都能用）、macOS（Apple 芯片、Intel）、Windows（x86_64）、Android（APK，含 arm64-v8a 与 x86_64）。
 
           Linux、macOS：
               tar xzf nexus-<版本>-<系统>-<架构>.tar.gz
@@ -257,8 +313,8 @@ jobs:
 
           用法见压缩包里的 manual.md。所有设备要用同一个版本。校验：sha256sum -c SHA256SUMS"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.apk dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/*.apk dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" \
               --title "Nexus $TAG" --notes "$notes"
           fi
