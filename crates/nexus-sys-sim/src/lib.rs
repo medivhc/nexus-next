@@ -865,30 +865,6 @@ impl tokio::io::AsyncWrite for SimTcp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn logs_rotate_at_the_limit() {
-        let sys = SimSystem::new(SimDisk::default(), 1, SimClock::default());
-        nexus_sys::check_log_rotation(&sys);
-    }
-
-    #[test]
-    fn tokenize_and_unescape_behave_like_sh_and_printf() {
-        assert_eq!(tokenize(" echo  'a b' \"c\" d "), ["echo", "a b", "c", "d"]);
-        assert_eq!(tokenize("echo err >&2"), ["echo", "err", ">&2"]);
-        assert_eq!(unescape("\\377\\000x"), [0xff, 0x00, b'x']);
-        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(printf("%s%s\\n", &args(&["ab", "cd"])), b"abcd\n");
-        assert_eq!(printf("<%s>", &args(&["a", "b"])), b"<a><b>");
-        assert_eq!(printf("100%%", &[]), b"100%");
-        assert_eq!(printf("x%sy", &[]), b"xy");
-        assert_eq!(unescape("a\\nb\\\\"), b"a\nb\\");
-    }
-}
-
 struct SimUdp {
     addr: std::net::SocketAddr,
     hits: Rc<RefCell<BTreeMap<std::net::SocketAddr, usize>>>,
@@ -919,5 +895,30 @@ impl Datagram for SimUdp {
             *self.waker.borrow_mut() = Some(cx.waker().clone());
             std::task::Poll::Pending
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_rotate_at_the_limit() {
+        let sys = SimSystem::new(SimDisk::default(), 1, SimClock::default());
+        nexus_sys::check_log_rotation(&sys);
+    }
+
+    #[test]
+    fn tokenize_and_unescape_behave_like_sh_and_printf() {
+        assert_eq!(tokenize(" echo  'a b' \"c\" d "), ["echo", "a b", "c", "d"]);
+        assert_eq!(tokenize("echo err >&2"), ["echo", "err", ">&2"]);
+        assert_eq!(unescape("\\377\\000x"), [0xff, 0x00, b'x']);
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(printf("%s%s\\n", &args(&["ab", "cd"])), b"abcd\n");
+        assert_eq!(printf("<%s>", &args(&["a", "b"])), b"<a><b>");
+        assert_eq!(printf("100%%", &[]), b"100%");
+        assert_eq!(printf("x%sy", &[]), b"xy");
+        assert_eq!(unescape("a\\nb\\\\"), b"a\nb\\");
     }
 }
