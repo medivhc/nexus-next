@@ -69,11 +69,47 @@ Android 10 及以后可通过「按应用选择出口」为指定应用设置设
 
 ### 模拟器代理和切网回归
 
-先构建 x86_64 APK，再启动专用的 Android Emulator AVD。回归使用 Android 14（API 34）的 AOSP x86_64
-`userdebug` 镜像、默认开放的 `AndroidWifi` 和模拟蜂窝，要求 `adb root`。优先使用有 KVM 的宿主机。
+在独立 Linux 沙箱检出包含 `tools/android_proxy_e2e.py` 的同一个提交。安装 JDK 17、rustup 和
+Android SDK Command-line Tools 后，准备 SDK、x86_64 APK 和专用 AVD。使用 AOSP Android 14（API 34）
+x86_64 `userdebug` 镜像、默认开放的 `AndroidWifi` 和模拟蜂窝，要求 `adb root`。已验证的版本为
+Emulator `37.4.2`（构建号 `16982698`）、系统镜像修订版 `2`、Build Tools `34.0.0` 和 NDK `27.3.13750724`。
+`sdkmanager` 安装当前可用版本，复现时可用各组件目录里的 `source.properties` 核对修订号。
+需要固定 Emulator 版本时，使用 [Android Emulator 官方归档](https://developer.android.com/studio/emulator_archive)。
 
 ```sh
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+export ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+mkdir -p "$ANDROID_AVD_HOME"
+
+sdkmanager --sdk_root="$ANDROID_HOME" \
+  'platform-tools' 'emulator' 'platforms;android-34' 'build-tools;34.0.0' \
+  'ndk;27.3.13750724' 'system-images;android-34;default;x86_64'
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
+rustup target add x86_64-linux-android
+printf 'no\n' | avdmanager create avd -n Nexus_API34 -k 'system-images;android-34;default;x86_64'
 tools/build-android.sh x86_64
+```
+
+优先使用有 `/dev/kvm` 的宿主机。在设置了相同环境变量的终端运行以下命令。
+
+```sh
+"$ANDROID_HOME/emulator/emulator" -avd Nexus_API34 -port 5554 -no-window -no-snapshot
+```
+
+没有 KVM 的沙箱可用软件模拟。先完成 APK 构建，再启动模拟器，给 Android 系统服务留出启动时间。
+
+```sh
+ANDROID_I_WANT_MY_TCG=yes "$ANDROID_HOME/emulator/emulator" \
+  -avd Nexus_API34 -port 5554 -accel off -gpu swiftshader_indirect \
+  -cores 2 -memory 2560 -no-window -noaudio -no-boot-anim -no-snapshot -feature -Vulkan
+```
+
+在项目目录打开另一个终端，沿用相同的环境变量。ADB 可连接后，等 `sys.boot_completed` 返回 `1` 再启动测试。
+
+```sh
+adb -s emulator-5554 wait-for-device
+adb -s emulator-5554 shell getprop sys.boot_completed
 python3 tools/android_proxy_e2e.py --serial emulator-5554
 ```
 
@@ -90,9 +126,19 @@ python3 tools/android_proxy_e2e.py --serial emulator-5554
 
 ```sh
 # 在另一个终端启动 AVD，等待系统就绪
-"$ANDROID_HOME/emulator/emulator" -avd Nexus_API34 -netsim-args '--http-proxy=http://127.0.0.1:19185'
+"$ANDROID_HOME/emulator/emulator" -avd Nexus_API34 -port 5554 -no-window -no-snapshot \
+  -netsim-args '--http-proxy=http://127.0.0.1:19185'
 python3 tools/android_proxy_e2e.py --serial emulator-5554 --local-http-port 19185
 ```
+
+软件模拟时，在对应的启动命令末尾追加同一个 `-netsim-args` 参数。
+
+#### 持久化与跨沙箱复用
+
+在同一个沙箱里，把 `ANDROID_HOME` 和 `ANDROID_AVD_HOME` 放在该实例的持久存储。要保留 Android 内的应用与设置，
+以可写模式启动同一个 AVD 并正常关机。`-read-only` 模式下本次更改会在退出时丢弃，`-no-snapshot` 只关闭快速启动快照。
+独立沙箱按上面的步骤创建自己的 AVD。若平台支持发布可复用的环境模板，可以在模板中预装 SDK、NDK 和系统镜像，
+让每个沙箱生成自己的 ADB 密钥和 AVD 用户数据。
 
 独立 Nexus 节点的私有服务和设备出口可继续用 `tools/android_e2e.py` 验证。真机切网、后台恢复和功耗见
 [真实异网验收清单](real-network-check.md)。
