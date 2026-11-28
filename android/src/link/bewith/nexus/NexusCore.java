@@ -39,4 +39,10 @@ final class NexusCore {
 
     /** N1：对当前路由规则执行静态冲突/遮蔽/无效上游审计（JSON）。 */
     static native String nativeRouteAudit(String dataDir);
+
+    /** N3：解释域名在 DNS 改写与过滤管线中的命中结果（JSON）。 */
+    static native String nativeDnsExplain(String dataDir, String domain);
+
+    /** N3：查询本地脱敏流事件环形缓冲摘要（JSON）。 */
+    static native String nativeFlowRecent(String dataDir, int limit);
 }

@@ -473,6 +473,50 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteAudit(
     env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+
+fn dns_explain_json(data_dir: &std::path::Path, domain: &str) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::DnsExplain { domain: domain.trim().to_string() }) {
+        Ok(nexus_wire::CtlResponse::DnsExplained(d)) => serde_json::json!({ "ok": true, "summary": format!("{d:?}") }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn flow_recent_json(data_dir: &std::path::Path, limit: u32) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::FlowRecent { limit }) {
+        Ok(nexus_wire::CtlResponse::Flows(events)) => serde_json::json!({ "ok": true, "events": events }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeDnsExplain(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    domain: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let domain = string(&mut env, &domain);
+    let json = dns_explain_json(std::path::Path::new(&dir), &domain);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeFlowRecent(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    limit: jint,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = flow_recent_json(std::path::Path::new(&dir), limit.max(1) as u32);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     // covers: R79

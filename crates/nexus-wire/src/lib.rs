@@ -836,6 +836,22 @@ pub enum CtlRequest {
     RouteRollback,
     /// 对当前路由规则执行静态审计（N1）。
     RouteAudit,
+    /// 新增或更新一条 DNS 改写/过滤/白名单规则（N3）。
+    DnsRuleAdd { rule: nexus_net_core::dns_policy::DnsRule },
+    /// 删除指定 ID 的 DNS 规则（N3）。
+    DnsRuleRm { id: String },
+    /// 列出全部 DNS 规则（N3）。
+    DnsRuleList,
+    /// 解释指定域名的 DNS 策略命中结果（N3）。
+    DnsExplain { domain: String },
+    /// 查询本地脱敏流事件日志（N3）。
+    FlowRecent { limit: u32 },
+    /// 新增或更新显式 HTTP 代理变换规则（N6）。
+    HttpRuleAdd { rule: nexus_net_core::http_rewrite::HttpRule },
+    /// 删除显式 HTTP 代理变换规则（N6）。
+    HttpRuleRm { id: String },
+    /// 列出全部显式 HTTP 代理变换规则（N6）。
+    HttpRuleList,
     /// 开放或关闭本机的出口。
     ExitSet { enabled: bool },
     ExitShow,
@@ -906,6 +922,10 @@ pub enum CtlResponse {
     Explained(RouteExplanation),
     RouteImported { total: u32, audit: nexus_net_core::route::RuleAudit },
     RouteAudit(nexus_net_core::route::RuleAudit),
+    DnsRules(Vec<nexus_net_core::dns_policy::DnsRule>),
+    DnsExplained(nexus_net_core::dns_policy::DnsDecision),
+    Flows(Vec<nexus_net_core::diag::FlowEvent>),
+    HttpRules(Vec<nexus_net_core::http_rewrite::HttpRule>),
     Exit { enabled: bool },
     Tun(Option<TunReport>),
     Drive(DriveResponse),
