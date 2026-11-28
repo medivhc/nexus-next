@@ -79,7 +79,7 @@ M7.1 要先定下兼容规则：请求和回应带能力列表或可忽略的扩
 | M12.2 | 网页节点上的审批卡片和倒计时（R96） |
 | M12.3 | Android 上的通知和一键放行、拒绝（R96） |
 
-## 网络运行时：日常替代与省电（N0–N2）
+## 网络运行时：日常替代、省电与调试（N0–N6）
 
 设计见 `docs/design/network-runtime-n0-n2.md`，功能点见 `docs/feature-points/N1.md`、`N2.md`，测试用例见 `docs/test-cases/network-runtime-n0-n2-test-cases.md`。
 目标是让 Android 上的 Nexus 能替代日常用的 Clash / EasyTier，并且不再因为一直保持蜂窝网络而耗电。
@@ -89,6 +89,9 @@ M7.1 要先定下兼容规则：请求和回应带能力列表或可忽略的扩
 | N0（完成） | 对照现有代码核实差距（路由、出口、完整节点、Android 单 VPN、多路径） |
 | N1（完成） | 精确域名规则与规则审计（R100）、Clash / Mihomo 规则导入与回滚（R101）、经出口转发公网 UDP（R102，协议 19.6）、Android 按应用绕过（R103） |
 | N2（完成） | Android 电源模式，默认不保持蜂窝网络，一键停止（R104）；耗电对比待真机实测 |
+| N3 | DNS 改写与过滤（R105）、脱敏连接记录（R106）完成；出口的地域与固定约束（R107）只有纯逻辑，待接入运行时（`docs/feature-points/N3.md`） |
+| N5 | 按实测自适应选路（R108）只有纯逻辑，待接入运行时（`docs/feature-points/N5.md`） |
+| N6（完成） | 显式 HTTP 代理的调试改写（R109）、agent 只读的网络诊断与策略模拟（R110）（`docs/feature-points/N6.md`） |
 
 ## 建议的顺序
 

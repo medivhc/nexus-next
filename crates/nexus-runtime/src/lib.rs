@@ -19,6 +19,9 @@ use nexus_core_proto::roster::{accept_update, verify_root_rotation, Device, Devi
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
 use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
 use nexus_net_core::http::{self, BadRequest, ProxyRequest};
+use nexus_net_core::diag::{FailureClass, FlowEvent, FlowRing};
+use nexus_net_core::dns_policy::{self, DnsDecision, DnsRule, DnsRuleTable};
+use nexus_net_core::http_rewrite::{self, HttpRewriteOutcome, HttpRule, HttpRuleTable};
 use nexus_net_core::route::{self, Decision, Outbound, Rule};
 use nexus_net_core::fakeip::FakePool;
 use nexus_net_core::{dns, sniff, socks5, Entry, Host, RouteTable, Target, SERVICE_SUFFIX};
@@ -297,6 +300,8 @@ const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
 const KEY_ROUTES: &str = "routes";
 const KEY_ROUTES_LKG: &str = "routes_lkg";
+const KEY_DNS_RULES: &str = "dns_rules";
+const KEY_HTTP_RULES: &str = "http_rules";
 const KEY_EXIT: &str = "exit";
 /// 用户对网络接口是否计费的设置（M5.2）：接口名 → 是否计费。
 const KEY_METERED: &str = "metered-v1";
@@ -578,6 +583,9 @@ pub struct Node<T, S: System> {
     exit_enabled: Cell<bool>,
     /// 本机的路由规则（M3.2）。
     routes: RefCell<RouteTable>,
+    dns_rules: RefCell<DnsRuleTable>,
+    http_rules: RefCell<HttpRuleTable>,
+    flows: RefCell<FlowRing>,
     proxy_tx: mpsc::UnboundedSender<ProxyStream>,
     proxy_rx: RefCell<Option<mpsc::UnboundedReceiver<ProxyStream>>>,
     /// 完整节点：虚拟网卡的名字和本机临时地址。
@@ -617,6 +625,8 @@ impl<T: Transport, S: System> Node<T, S> {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         let services = load::<_, Vec<PublishedService>>(&system, KEY_SERVICES)?.unwrap_or_default();
         let routes = load::<_, RouteTable>(&system, KEY_ROUTES)?.unwrap_or_default();
+        let dns_rules = load::<_, DnsRuleTable>(&system, KEY_DNS_RULES)?.unwrap_or_default();
+        let http_rules = load::<_, HttpRuleTable>(&system, KEY_HTTP_RULES)?.unwrap_or_default();
         let exit_enabled = load::<_, bool>(&system, KEY_EXIT)?.unwrap_or(false);
         let (proxy_tx, proxy_rx) = mpsc::unbounded_channel();
         let (tun_tx, tun_rx) = mpsc::unbounded_channel();
@@ -626,6 +636,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let metered = RefCell::new(load(&system, KEY_METERED)?.unwrap_or_default());
         Ok(Self {
             routes: RefCell::new(routes),
+            dns_rules: RefCell::new(dns_rules),
+            http_rules: RefCell::new(http_rules),
+            flows: RefCell::new(FlowRing::new(256)),
             exit_enabled: Cell::new(exit_enabled),
             proxy_tx,
             proxy_rx: RefCell::new(Some(proxy_rx)),
@@ -1371,6 +1384,14 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             CtlRequest::RouteRollback => self.route_rollback().map(|()| CtlResponse::Ok),
             CtlRequest::RouteAudit => Ok(CtlResponse::RouteAudit(route::audit_rules(&self.routes.borrow().rules))),
+            CtlRequest::DnsRuleAdd { rule } => self.dns_rule_add(rule).map(|()| CtlResponse::Ok),
+            CtlRequest::DnsRuleRm { id } => self.dns_rule_rm(&id).map(|()| CtlResponse::Ok),
+            CtlRequest::DnsRuleList => Ok(CtlResponse::DnsRules(self.dns_rules.borrow().rules.clone())),
+            CtlRequest::DnsExplain { domain } => Ok(CtlResponse::DnsExplained(dns_policy::evaluate_dns(&domain, &self.dns_rules.borrow().rules))),
+            CtlRequest::FlowRecent { limit } => Ok(CtlResponse::Flows(self.flows.borrow().recent(limit as usize))),
+            CtlRequest::HttpRuleAdd { rule } => self.http_rule_add(rule).map(|()| CtlResponse::Ok),
+            CtlRequest::HttpRuleRm { id } => self.http_rule_rm(&id).map(|()| CtlResponse::Ok),
+            CtlRequest::HttpRuleList => Ok(CtlResponse::HttpRules(self.http_rules.borrow().rules.clone())),
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
                 anchor: self.roster().and_then(|r| r.anchor),
                 roster_version: self.roster_version(),
@@ -2717,6 +2738,73 @@ impl<T: Transport, S: System> Node<T, S> {
         save(&self.system, KEY_ROUTES, &lkg).map_err(internal)
     }
 
+    fn dns_rule_add(&self, rule: DnsRule) -> Result<(), WireError> {
+        if rule.id.trim().is_empty() {
+            return Err(err(ErrorCode::InvalidInput, "DNS 规则 ID 不能为空"));
+        }
+        let mut table = self.dns_rules.borrow_mut();
+        if let Some(pos) = table.rules.iter().position(|r| r.id == rule.id) {
+            table.rules[pos] = rule;
+        } else {
+            table.rules.push(rule);
+        }
+        save(&self.system, KEY_DNS_RULES, &*table).map_err(internal)
+    }
+
+    fn http_rule_add(&self, rule: HttpRule) -> Result<(), WireError> {
+        if rule.id.trim().is_empty() {
+            return Err(err(ErrorCode::InvalidInput, "HTTP 规则 ID 不能为空"));
+        }
+        let mut table = self.http_rules.borrow_mut();
+        if let Some(pos) = table.rules.iter().position(|r| r.id == rule.id) {
+            table.rules[pos] = rule;
+        } else {
+            table.rules.push(rule);
+        }
+        save(&self.system, KEY_HTTP_RULES, &*table).map_err(internal)
+    }
+
+    fn http_rule_rm(&self, id: &str) -> Result<(), WireError> {
+        let mut table = self.http_rules.borrow_mut();
+        let before = table.rules.len();
+        table.rules.retain(|r| r.id != id);
+        if table.rules.len() == before {
+            return Err(err(ErrorCode::NotFound, format!("没有找到 HTTP 规则：{id}")));
+        }
+        save(&self.system, KEY_HTTP_RULES, &*table).map_err(internal)
+    }
+
+    fn dns_rule_rm(&self, id: &str) -> Result<(), WireError> {
+        let mut table = self.dns_rules.borrow_mut();
+        let before = table.rules.len();
+        table.rules.retain(|r| r.id != id);
+        if table.rules.len() == before {
+            return Err(err(ErrorCode::NotFound, format!("没有找到 DNS 规则：{id}")));
+        }
+        save(&self.system, KEY_DNS_RULES, &*table).map_err(internal)
+    }
+
+    fn record_flow(
+        &self,
+        ingress: &str,
+        target: &str,
+        decision: &str,
+        exit_id: Option<String>,
+        result: &str,
+        error_class: Option<FailureClass>,
+    ) {
+        self.flows.borrow_mut().record(FlowEvent {
+            flow_id: 0,
+            ts_ms: self.system.now().0,
+            ingress: ingress.into(),
+            target: target.into(),
+            decision: decision.into(),
+            exit_id,
+            result: result.into(),
+            error_class,
+        });
+    }
+
     fn route_explain(&self, target: &str) -> Result<RouteExplanation, WireError> {
         let t = Target::parse(target).ok_or_else(|| err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}")))?;
         let rules = self.routes.borrow().rules.clone();
@@ -2735,6 +2823,26 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         if self.tun.borrow().is_none() {
             return dns::error(&q, dns::SERVFAIL);
+        }
+        match dns_policy::evaluate_dns(&q.name, &self.dns_rules.borrow().rules) {
+            DnsDecision::BlockedNxdomain { rule_id } => {
+                self.record_flow("dns", &q.name, &format!("dns_block_nxdomain:{rule_id}"), None, "nxdomain", Some(FailureClass::Dns));
+                return dns::error(&q, dns::NXDOMAIN);
+            }
+            DnsDecision::BlockedNodata { rule_id } => {
+                self.record_flow("dns", &q.name, &format!("dns_block_nodata:{rule_id}"), None, "nodata", Some(FailureClass::Dns));
+                return dns::answer(&q, &[], DNS_TTL);
+            }
+            DnsDecision::Overridden { rule_id, ips, ttl } => {
+                self.record_flow("dns", &q.name, &format!("dns_override:{rule_id}"), None, "ok", None);
+                return dns::answer(&q, &ips, ttl);
+            }
+            DnsDecision::Allowed { rule_id } => {
+                self.record_flow("dns", &q.name, &format!("dns_allow:{rule_id}"), None, "pass", None);
+            }
+            DnsDecision::PrivateInternal | DnsDecision::Default => {
+                self.record_flow("dns", &q.name, "dns_default", None, "pass", None);
+            }
         }
         let target = Target { host: Host::Name(q.name.clone()), port: 0 };
         let capture = match route::decide(&target, &self.routes.borrow().rules) {
@@ -2929,7 +3037,21 @@ impl<T: Transport, S: System> Node<T, S> {
                 return client.shutdown().await;
             }
             Ok(ProxyRequest::Connect(t)) => (t, buf[end..].to_vec(), true),
-            Ok(ProxyRequest::Forward { target, head }) => (target, head, false),
+            Ok(ProxyRequest::Forward { target, head }) => {
+                let outcome = http_rewrite::apply_http_rules(&target, &head, &self.http_rules.borrow().rules);
+                match outcome {
+                    HttpRewriteOutcome::MockResponse { rule_id, bytes } => {
+                        self.record_flow("http-proxy", &target.to_string(), &format!("http_mock:{rule_id}"), None, "mock", None);
+                        client.write_all(&bytes).await?;
+                        return client.shutdown().await;
+                    }
+                    HttpRewriteOutcome::RewrittenForward { rule_id, target: new_target, head: new_head } => {
+                        self.record_flow("http-proxy", &target.to_string(), &format!("http_rewrite:{rule_id}"), None, "rewrite", None);
+                        (new_target, new_head, false)
+                    }
+                    HttpRewriteOutcome::PassThrough => (target, head, false),
+                }
+            }
         };
         match self.open_outbound(&target).await {
             Err(fail) => {

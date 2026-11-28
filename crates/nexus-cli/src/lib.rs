@@ -240,6 +240,21 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: RouteCmd,
     },
+    /// DNS 改写与广告/追踪域名过滤（N3）
+    Dns {
+        #[command(subcommand)]
+        cmd: DnsCmd,
+    },
+    /// 查看本地脱敏连接与 DNS 观测事件（N3）
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCmd,
+    },
+    /// 显式 HTTP 代理变换规则（Map Local / 重定向 / 故障注入，N6）
+    Http {
+        #[command(subcommand)]
+        cmd: HttpCmd,
+    },
     /// 在本机运行一个程序，它用到的服务先在本机开好端口，并按服务的说明设置环境变量
     ///
     /// 例：nexus run --use home/llm -- python app.py
@@ -815,6 +830,109 @@ pub enum RouteCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum DnsCmd {
+    /// 新增或更新一条 DNS 改写/过滤/白名单规则
+    #[command(group = clap::ArgGroup::new("dns_action").required(true))]
+    Add {
+        /// 规则唯一标识（同名覆盖）
+        #[arg(long)]
+        id: String,
+        /// 匹配域名及所有子域名
+        #[arg(long, conflicts_with = "domain_exact")]
+        domain: Option<String>,
+        /// 仅精确匹配该域名
+        #[arg(long, conflicts_with = "domain")]
+        domain_exact: Option<String>,
+        /// 拦截并返回 NXDOMAIN
+        #[arg(long, group = "dns_action")]
+        block: bool,
+        /// 拦截并返回空 NOERROR（NODATA）
+        #[arg(long, group = "dns_action")]
+        nodata: bool,
+        /// 白名单放行（优先于过滤规则）
+        #[arg(long, group = "dns_action")]
+        allow: bool,
+        /// 自定义 DNS 改写 IP 地址（支持 IPv4/IPv6）
+        #[arg(long = "override", value_name = "IP", group = "dns_action")]
+        override_ip: Option<String>,
+        /// 改写记录 TTL（秒，默认 60）
+        #[arg(long, default_value_t = 60)]
+        ttl: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除指定 ID 的 DNS 规则
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出全部 DNS 规则
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 解释指定域名的 DNS 管线判定结果
+    Explain {
+        domain: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlowCmd {
+    /// 列出最近本地脱敏连接与 DNS 事件
+    Ls {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HttpCmd {
+    /// 新增或更新显式 HTTP 变换规则
+    #[command(group = clap::ArgGroup::new("http_action").required(true))]
+    Add {
+        #[arg(long)]
+        id: String,
+        #[arg(long, conflicts_with = "domain_exact")]
+        domain: Option<String>,
+        #[arg(long, conflicts_with = "domain")]
+        domain_exact: Option<String>,
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Map Local 返回本地 JSON 模拟响应
+        #[arg(long, group = "http_action")]
+        mock_json: Option<String>,
+        /// Map Local HTTP 状态码（默认 200）
+        #[arg(long, default_value_t = 200)]
+        status: u16,
+        /// 重定向到目标服务（主机:端口）
+        #[arg(long, group = "http_action")]
+        redirect: Option<String>,
+        /// 开发环境故障注入状态码（例如 503）
+        #[arg(long, group = "http_action")]
+        fault: Option<u16>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除指定 ID 的 HTTP 变换规则
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 列出全部 HTTP 变换规则
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum AgentCmd {
     /// 签发一份 agent 凭据
     ///
@@ -1151,6 +1269,81 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         Cmd::Route { cmd: RouteCmd::Rollback { json } } => (CtlRequest::RouteRollback, *json),
         Cmd::Route { cmd: RouteCmd::Audit { json } } => (CtlRequest::RouteAudit, *json),
+        Cmd::Dns { cmd: DnsCmd::Add { id, domain, domain_exact, block, nodata, allow, override_ip, ttl, json } } => {
+            let matcher = match (domain, domain_exact) {
+                (Some(d), None) => route::Matcher::parse_domain(d),
+                (None, Some(d)) => route::Matcher::parse_domain_exact(d),
+                _ => Err("需要 --domain 或 --domain-exact".to_string()),
+            };
+            let matcher = match matcher {
+                Ok(m) => m,
+                Err(msg) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg),
+            };
+            let action = if *block {
+                nexus_net_core::dns_policy::DnsAction::BlockNxdomain
+            } else if *nodata {
+                nexus_net_core::dns_policy::DnsAction::BlockNodata
+            } else if *allow {
+                nexus_net_core::dns_policy::DnsAction::Allow
+            } else if let Some(ip_str) = override_ip {
+                match ip_str.parse::<std::net::IpAddr>() {
+                    Ok(ip) => nexus_net_core::dns_policy::DnsAction::Override { ips: vec![ip], ttl: *ttl },
+                    Err(_) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("IP 地址不合法：{ip_str}")),
+                }
+            } else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", "需要指定 DNS 动作");
+            };
+            (CtlRequest::DnsRuleAdd { rule: nexus_net_core::dns_policy::DnsRule { id: id.clone(), matcher, action } }, *json)
+        }
+        Cmd::Dns { cmd: DnsCmd::Rm { id, json } } => (CtlRequest::DnsRuleRm { id: id.clone() }, *json),
+        Cmd::Dns { cmd: DnsCmd::Ls { json } } => (CtlRequest::DnsRuleList, *json),
+        Cmd::Dns { cmd: DnsCmd::Explain { domain, json } } => (CtlRequest::DnsExplain { domain: domain.clone() }, *json),
+        Cmd::Flow { cmd: FlowCmd::Ls { limit, json } } => (CtlRequest::FlowRecent { limit: *limit }, *json),
+        Cmd::Http { cmd: HttpCmd::Add { id, domain, domain_exact, path, mock_json, status, redirect, fault, json } } => {
+            let host = match (domain, domain_exact) {
+                (Some(d), None) => route::Matcher::parse_domain(d),
+                (None, Some(d)) => route::Matcher::parse_domain_exact(d),
+                _ => Err("需要 --domain 或 --domain-exact".to_string()),
+            };
+            let host = match host {
+                Ok(m) => m,
+                Err(msg) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg),
+            };
+            let action = if let Some(body) = mock_json {
+                nexus_net_core::http_rewrite::HttpAction::MapLocal {
+                    status: *status,
+                    content_type: "application/json; charset=utf-8".into(),
+                    body: body.clone(),
+                }
+            } else if let Some(dest) = redirect {
+                let Some(t) = nexus_net_core::Target::parse(dest) else {
+                    return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("重定向目标应为 主机:端口：{dest}"));
+                };
+                let target_host = match t.host {
+                    nexus_net_core::Host::Name(n) => n,
+                    nexus_net_core::Host::Ip(ip) => ip.to_string(),
+                };
+                nexus_net_core::http_rewrite::HttpAction::RedirectTarget { target_host, target_port: t.port }
+            } else if let Some(code) = fault {
+                nexus_net_core::http_rewrite::HttpAction::FaultInject {
+                    status: *code,
+                    reason: String::new(),
+                    body: format!("injected fault {code}"),
+                }
+            } else {
+                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", "需要指定 HTTP 变换动作");
+            };
+            let rule = nexus_net_core::http_rewrite::HttpRule {
+                id: id.clone(),
+                host,
+                path_prefix: path.clone(),
+                enabled: true,
+                action,
+            };
+            (CtlRequest::HttpRuleAdd { rule }, *json)
+        }
+        Cmd::Http { cmd: HttpCmd::Rm { id, json } } => (CtlRequest::HttpRuleRm { id: id.clone() }, *json),
+        Cmd::Http { cmd: HttpCmd::Ls { json } } => (CtlRequest::HttpRuleList, *json),
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
         Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
@@ -1552,6 +1745,34 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     "已回滚到上一版规则快照\n".into()
                 }
             }
+            Cmd::Dns { cmd: DnsCmd::Add { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "saved": id }))
+                } else {
+                    format!("已保存 DNS 规则 {id}\n")
+                }
+            }
+            Cmd::Dns { cmd: DnsCmd::Rm { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": id }))
+                } else {
+                    format!("已删除 DNS 规则 {id}\n")
+                }
+            }
+            Cmd::Http { cmd: HttpCmd::Add { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "saved": id }))
+                } else {
+                    format!("已保存 HTTP 变换规则 {id}\n")
+                }
+            }
+            Cmd::Http { cmd: HttpCmd::Rm { id, .. } } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "removed": id }))
+                } else {
+                    format!("已删除 HTTP 变换规则 {id}\n")
+                }
+            }
             Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
@@ -1596,6 +1817,43 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
 ", i.message));
                 }
                 out
+            }
+        }
+        CtlResponse::DnsRules(rules) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "rules": rules }))
+            } else if rules.is_empty() {
+                "暂无自定义 DNS 规则\n".into()
+            } else {
+                rules.iter().map(|r| format!("{:<20} {:<28} {:?}\n", r.id, r.matcher.to_string(), r.action)).collect()
+            }
+        }
+        CtlResponse::DnsExplained(decision) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "result": decision }))
+            } else {
+                format!("{decision:?}\n")
+            }
+        }
+        CtlResponse::HttpRules(rules) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "rules": rules }))
+            } else if rules.is_empty() {
+                "暂无显式 HTTP 变换规则\n".into()
+            } else {
+                rules.iter().map(|r| format!("{:<18} {:<24} {:<16} {:?}\n", r.id, r.host.to_string(), r.path_prefix, r.action)).collect()
+            }
+        }
+        CtlResponse::Flows(events) => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "events": events }))
+            } else if events.is_empty() {
+                "暂无本地流事件记录\n".into()
+            } else {
+                events
+                    .iter()
+                    .map(|e| format!("#{:<4} [{:<8}] {:<30} {:<24} {}\n", e.flow_id, e.ingress, e.target, e.decision, e.result))
+                    .collect()
             }
         }
         CtlResponse::RouteAudit(audit) => {
@@ -2435,6 +2693,44 @@ fn mcp_tools() -> Value {
                 },
             },
         },
+        {
+            "name": "nexus_route_audit",
+            "description": "只读静态审计当前路由规则表（检测重复、被遮蔽规则及无效上游地址）。",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
+            "name": "nexus_dns_explain",
+            "description": "只读解释一个域名在 DNS 改写与过滤管线中的命中结果。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "domain": { "type": "string", "description": "要查询的域名，例如 ads.example.com" },
+                },
+                "required": ["domain"],
+            },
+        },
+        {
+            "name": "nexus_flow_summary",
+            "description": "只读查看本地脱敏流事件摘要（仅元数据，不含正文或凭据）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "description": "返回最近条数（默认 20）" },
+                },
+            },
+        },        {
+            "name": "nexus_policy_simulate",
+            "description": "在隔离纯逻辑环境中模拟验证 Clash/Mihomo 规则草案（只读，绝不修改生效配置），返回审计报告与测试目标预期路由。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rules_yaml": { "type": "string", "description": "待模拟的 Clash/Mihomo YAML 规则片段" },
+                    "default_exit": { "type": "string", "description": "可选：代理组映射到的出口设备" },
+                    "targets": { "type": "array", "items": { "type": "string" }, "description": "要模拟的目标列表（主机:端口）" },
+                },
+                "required": ["rules_yaml"],
+            },
+        },
     ])
 }
 
@@ -2601,6 +2897,50 @@ async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
         "nexus_audit" => {
             let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
             Cmd::Audit { limit, json: true }
+        }
+        "nexus_route_audit" => Cmd::Route { cmd: RouteCmd::Audit { json: true } },
+        "nexus_dns_explain" => match text("domain") {
+            Some(domain) => Cmd::Dns { cmd: DnsCmd::Explain { domain, json: true } },
+            None => return (json!({ "error": "usage", "message": "缺少 domain" }), true),
+        },
+        "nexus_flow_summary" => {
+            let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(20);
+            Cmd::Flow { cmd: FlowCmd::Ls { limit, json: true } }
+        }
+        "nexus_policy_simulate" => {
+            let Some(yaml) = text("rules_yaml") else {
+                return (json!({ "error": "usage", "message": "缺少 rules_yaml" }), true);
+            };
+            let opts = nexus_net_core::import::ImportOptions {
+                default_exit: text("default_exit"),
+                default_socks5: text("default_socks5"),
+            };
+            let report = nexus_net_core::import::parse_clash_rules(&yaml, &opts);
+            let audit = route::audit_rules(&report.imported);
+            let mut simulations = Vec::new();
+            if let Some(arr) = args.get("targets").and_then(Value::as_array) {
+                for t_val in arr {
+                    if let Some(t_str) = t_val.as_str() {
+                        let outcome = match nexus_net_core::Target::parse(t_str) {
+                            Some(t) => format!("{:?}", route::decide(&t, &report.imported)),
+                            None => "invalid_target".into(),
+                        };
+                        simulations.push(json!({ "target": t_str, "decision": outcome }));
+                    }
+                }
+            }
+            return (
+                json!({
+                    "schema": JSON_SCHEMA,
+                    "simulated": true,
+                    "imported": report.imported.len(),
+                    "skipped": report.skipped,
+                    "notes": report.notes,
+                    "audit": audit,
+                    "simulations": simulations,
+                }),
+                false,
+            );
         }
         _ => return (json!({ "error": "usage", "message": format!("没有工具 {name}") }), true),
     };
