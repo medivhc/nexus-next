@@ -23,7 +23,11 @@ const RELAY_BURST: u32 = 8 << 20;
 /// 交给中继的路径。
 fn is_relay_path(target: &str) -> bool {
     let path = target.split('?').next().unwrap_or("");
-    path == "/relay" || path.starts_with("/relay/") || path == "/ping" || path == "/generate_204" || path == "/healthz"
+    path == "/relay"
+        || path.starts_with("/relay/")
+        || path == "/ping"
+        || path == "/generate_204"
+        || path == "/healthz"
 }
 
 pub struct Anchor {
@@ -38,41 +42,81 @@ pub struct BadArgs(pub String);
 enum Tls {
     Dev,
     Manual(Arc<rustls::ServerConfig>),
-    Acme { domain: String, contact: Option<String>, staging: bool, cache: PathBuf },
+    Acme {
+        domain: String,
+        contact: Option<String>,
+        staging: bool,
+        cache: PathBuf,
+    },
 }
 
 /// 检查参数，起中继和前端。`data_dir` 用来缓存证书。
-pub async fn start(args: &AnchorArgs, data_dir: &Path) -> Result<Result<Anchor, io::Error>, BadArgs> {
+pub async fn start(
+    args: &AnchorArgs,
+    data_dir: &Path,
+) -> Result<Result<Anchor, io::Error>, BadArgs> {
     // 依赖里可能同时编进了几种加密实现：明确使用 ring。
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let page = args.page_dir.as_ref().ok_or_else(|| BadArgs("作为锚点运行需要 --page-dir（网页节点的页面目录）".into()))?;
+    let page = args
+        .page_dir
+        .as_ref()
+        .ok_or_else(|| BadArgs("作为锚点运行需要 --page-dir（网页节点的页面目录）".into()))?;
     let page = std::fs::canonicalize(page)
         .ok()
         .filter(|p| p.join("index.html").is_file())
         .ok_or_else(|| BadArgs(format!("{} 里没有 index.html", page.display())))?;
-    let parse = |s: &str, what: &str| s.parse::<SocketAddr>().map_err(|_| BadArgs(format!("{what} 应当是 地址:端口：{s}")));
+    let parse = |s: &str, what: &str| {
+        s.parse::<SocketAddr>()
+            .map_err(|_| BadArgs(format!("{what} 应当是 地址:端口：{s}")))
+    };
     let (listen, redirect, tls, url) = if let Some(dev) = &args.anchor_dev {
         let addr = parse(dev, "--anchor-dev")?;
         if !addr.ip().is_loopback() {
             return Err(BadArgs(format!("开发用的锚点只能监听本机地址：{dev}")));
         }
-        (addr, None, Tls::Dev, format!("http://localhost:{}", addr.port()))
+        (
+            addr,
+            None,
+            Tls::Dev,
+            format!("http://localhost:{}", addr.port()),
+        )
     } else {
-        let domain = args.anchor.clone().ok_or_else(|| BadArgs("缺少 --anchor 或 --anchor-dev".into()))?;
+        let domain = args
+            .anchor
+            .clone()
+            .ok_or_else(|| BadArgs("缺少 --anchor 或 --anchor-dev".into()))?;
         let url = format!("https://{domain}");
         if !nexus_core_proto::roster::valid_anchor_url(&url) {
             return Err(BadArgs(format!("域名不合法：{domain}")));
         }
         let tls = match (&args.tls_cert, &args.tls_key) {
-            (Some(cert), Some(key)) => Tls::Manual(Arc::new(manual_tls(cert, key).map_err(BadArgs)?)),
-            _ => Tls::Acme { domain, contact: args.acme_contact.clone(), staging: args.acme_staging, cache: data_dir.join("acme") },
+            (Some(cert), Some(key)) => {
+                Tls::Manual(Arc::new(manual_tls(cert, key).map_err(BadArgs)?))
+            }
+            _ => Tls::Acme {
+                domain,
+                contact: args.acme_contact.clone(),
+                staging: args.acme_staging,
+                cache: data_dir.join("acme"),
+            },
         };
-        (parse(&args.https_listen, "--https-listen")?, Some(parse(&args.http_listen, "--http-listen")?), tls, url)
+        (
+            parse(&args.https_listen, "--https-listen")?,
+            Some(parse(&args.http_listen, "--http-listen")?),
+            tls,
+            url,
+        )
     };
     Ok(run(page, listen, redirect, tls, url).await)
 }
 
-async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tls: Tls, url: String) -> io::Result<Anchor> {
+async fn run(
+    page: PathBuf,
+    listen: SocketAddr,
+    redirect: Option<SocketAddr>,
+    tls: Tls,
+    url: String,
+) -> io::Result<Anchor> {
     let mut rate = ClientRateLimit::new(NonZeroU32::new(RELAY_RATE).expect("非零"));
     rate.max_burst_bytes = NonZeroU32::new(RELAY_BURST);
     let mut limits = Limits::default();
@@ -81,12 +125,20 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
     relay_config.limits = limits;
     let mut config = ServerConfig::default();
     config.relay = Some(relay_config);
-    let relay = Server::spawn(config).await.map_err(|e| io::Error::other(format!("无法启动中继：{e}")))?;
-    let relay_addr = relay.http_addr().ok_or_else(|| io::Error::other("中继没有监听地址"))?;
+    let relay = Server::spawn(config)
+        .await
+        .map_err(|e| io::Error::other(format!("无法启动中继：{e}")))?;
+    let relay_addr = relay
+        .http_addr()
+        .ok_or_else(|| io::Error::other("中继没有监听地址"))?;
 
-    let listener = TcpListener::bind(listen).await.map_err(|e| io::Error::new(e.kind(), format!("无法监听 {listen}：{e}")))?;
+    let listener = TcpListener::bind(listen)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("无法监听 {listen}：{e}")))?;
     if let Some(addr) = redirect {
-        let http = TcpListener::bind(addr).await.map_err(|e| io::Error::new(e.kind(), format!("无法监听 {addr}：{e}")))?;
+        let http = TcpListener::bind(addr)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("无法监听 {addr}：{e}")))?;
         tokio::spawn(redirect_to_https(http, url.clone()));
     }
     let page = Arc::new(page);
@@ -95,7 +147,9 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
         Tls::Dev => {
             tokio::spawn(async move {
                 loop {
-                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else {
+                        break;
+                    };
                     let Ok((stream, peer)) = listener.accept().await else {
                         // 文件句柄耗尽等错误时别空转。
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -113,7 +167,9 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             let acceptor = tokio_rustls::TlsAcceptor::from(config);
             tokio::spawn(async move {
                 loop {
-                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else {
+                        break;
+                    };
                     let Ok((stream, peer)) = listener.accept().await else {
                         // 文件句柄耗尽等错误时别空转。
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -122,14 +178,21 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
                     let (page, acceptor) = (page.clone(), acceptor.clone());
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                        if let Ok(Ok(tls)) =
+                            tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                        {
                             let _ = front(tls, peer.ip(), &page, relay_addr).await;
                         }
                     });
                 }
             });
         }
-        Tls::Acme { domain, contact, staging, cache } => {
+        Tls::Acme {
+            domain,
+            contact,
+            staging,
+            cache,
+        } => {
             let mut acme = tokio_rustls_acme::AcmeConfig::new([domain])
                 .cache(tokio_rustls_acme::caches::DirCache::new(cache))
                 .directory_lets_encrypt(!staging);
@@ -138,7 +201,11 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             }
             let mut state = acme.state();
             let acceptor = state.acceptor();
-            let config = Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(state.resolver()));
+            let config = Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(state.resolver()),
+            );
             tokio::spawn(async move {
                 while let Some(event) = state.next().await {
                     match event {
@@ -149,7 +216,9 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
             });
             tokio::spawn(async move {
                 loop {
-                    let Ok(permit) = conn_limit.clone().acquire_owned().await else { break };
+                    let Ok(permit) = conn_limit.clone().acquire_owned().await else {
+                        break;
+                    };
                     let Ok((stream, peer)) = listener.accept().await else {
                         // 文件句柄耗尽等错误时别空转。
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -180,26 +249,42 @@ async fn run(page: PathBuf, listen: SocketAddr, redirect: Option<SocketAddr>, tl
 
 /// 锚点上的碰头服务的存储（整个进程一份）。
 fn rendezvous_store() -> &'static nexus_fabric_iroh::rendezvous::Store {
-    static STORE: std::sync::OnceLock<nexus_fabric_iroh::rendezvous::Store> = std::sync::OnceLock::new();
+    static STORE: std::sync::OnceLock<nexus_fabric_iroh::rendezvous::Store> =
+        std::sync::OnceLock::new();
     STORE.get_or_init(Default::default)
 }
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 读请求头，按路径交给中继或回应页面。
-async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, peer_ip: std::net::IpAddr, page: &Path, relay: SocketAddr) -> io::Result<()> {
+async fn front<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    peer_ip: std::net::IpAddr,
+    page: &Path,
+    relay: SocketAddr,
+) -> io::Result<()> {
     let head = tokio::time::timeout(HANDSHAKE_TIMEOUT, web_serve::read_head(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "请求头超时"))??;
     let (_, target) = web_serve::request_line(&head);
     if target.starts_with("/pkarr/") {
         // 碰头服务（M6.1）：新设备在自建网络里用 --rendezvous https://<锚点>/pkarr。
-        nexus_fabric_iroh::rendezvous::respond_with_ip(&mut stream, &head, rendezvous_store(), Some(peer_ip)).await
+        nexus_fabric_iroh::rendezvous::respond_with_ip(
+            &mut stream,
+            &head,
+            rendezvous_store(),
+            Some(peer_ip),
+        )
+        .await
     } else if is_relay_path(&target) {
         let mut upstream = TcpStream::connect(relay).await?;
         // 按连接上的第一个请求分流：不是协议升级的请求（探测）回应后必须关闭连接，
         // 否则浏览器复用这条连接请求页面时会落到中继那里。
-        let head = if is_upgrade(&head) { head } else { force_close(&head) };
+        let head = if is_upgrade(&head) {
+            head
+        } else {
+            force_close(&head)
+        };
         upstream.write_all(&head).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
         Ok(())
@@ -210,22 +295,36 @@ async fn front<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, peer_ip: std::n
 
 /// 请求头里是否要求协议升级（中继的 WebSocket 或 HTTP 升级）。
 fn is_upgrade(head: &[u8]) -> bool {
-    header_lines(head).any(|l| l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("upgrade")))
+    header_lines(head).any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("upgrade"))
+    })
 }
 
 fn header_lines(head: &[u8]) -> impl Iterator<Item = &str> {
-    let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(head.len());
-    std::str::from_utf8(&head[..end]).unwrap_or("").split("\r\n").skip(1)
+    let end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(head.len());
+    std::str::from_utf8(&head[..end])
+        .unwrap_or("")
+        .split("\r\n")
+        .skip(1)
 }
 
 /// 把请求头改成回应后关闭连接（去掉原有的 Connection 头，加上 `Connection: close`）。
 fn force_close(head: &[u8]) -> Vec<u8> {
-    let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else { return head.to_vec() };
+    let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return head.to_vec();
+    };
     let text = String::from_utf8_lossy(&head[..end]);
     let mut lines = text.split("\r\n");
     let mut out = String::from(lines.next().unwrap_or(""));
     for l in lines {
-        if !l.split_once(':').is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("connection")) {
+        if !l
+            .split_once(':')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("connection"))
+        {
             out.push_str("\r\n");
             out.push_str(l);
         }
@@ -239,12 +338,22 @@ fn force_close(head: &[u8]) -> Vec<u8> {
 /// 80 端口：一律重定向到 https。
 async fn redirect_to_https(listener: TcpListener, url: String) {
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { continue };
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
         let url = url.clone();
         tokio::spawn(async move {
-            let Ok(Ok(head)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, web_serve::read_head(&mut stream)).await else { return };
+            let Ok(Ok(head)) =
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, web_serve::read_head(&mut stream)).await
+            else {
+                return;
+            };
             let (_, target) = web_serve::request_line(&head);
-            let path = if target.starts_with('/') { target } else { "/".to_string() };
+            let path = if target.starts_with('/') {
+                target
+            } else {
+                "/".to_string()
+            };
             let reply = format!("HTTP/1.1 301 Moved Permanently\r\nLocation: {url}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             let _ = stream.write_all(reply.as_bytes()).await;
             let _ = stream.shutdown().await;
@@ -261,7 +370,8 @@ fn manual_tls(cert: &Path, key: &Path) -> Result<rustls::ServerConfig, String> {
     if chain.is_empty() {
         return Err(format!("{} 里没有证书", cert.display()));
     }
-    let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("读不了私钥 {}：{e}", key.display()))?;
+    let key = PrivateKeyDer::from_pem_file(key)
+        .map_err(|e| format!("读不了私钥 {}：{e}", key.display()))?;
     rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, key)
@@ -274,7 +384,14 @@ mod tests {
 
     #[test]
     fn relay_paths_go_to_the_relay() {
-        for p in ["/relay", "/relay?x=1", "/relay/x", "/ping", "/generate_204", "/healthz"] {
+        for p in [
+            "/relay",
+            "/relay?x=1",
+            "/relay/x",
+            "/ping",
+            "/generate_204",
+            "/healthz",
+        ] {
             assert!(is_relay_path(p), "{p}");
         }
         for p in ["/", "/index.html", "/relayx", "/pkg/relay", "/app.js"] {
@@ -286,8 +403,12 @@ mod tests {
     fn probes_are_forwarded_with_connection_close() {
         let head = b"GET /ping HTTP/1.1\r\nHost: x\r\nconnection: keep-alive\r\n\r\n";
         assert!(!is_upgrade(head));
-        assert_eq!(force_close(head), b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec());
-        let ws = b"GET /relay HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(
+            force_close(head),
+            b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec()
+        );
+        let ws =
+            b"GET /relay HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
         assert!(is_upgrade(ws));
     }
 }

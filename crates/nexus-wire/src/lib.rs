@@ -69,7 +69,10 @@ pub struct ResponseEnvelope {
 
 impl ResponseEnvelope {
     pub fn new(response: &Response) -> Self {
-        Self { minor: WIRE_MINOR, body: postcard::to_allocvec(response).expect("内存中的值总能编码") }
+        Self {
+            minor: WIRE_MINOR,
+            body: postcard::to_allocvec(response).expect("内存中的值总能编码"),
+        }
     }
 
     /// 解出回应；本机不认识时是说明对方版本较新的错误。
@@ -92,60 +95,121 @@ pub enum Request {
     /// 请求对方在名册比我新时把名册发过来。
     RosterSync,
     /// 把一份名册推给对方。
-    RosterPush { roster: SignedRoster, addrs: AddrHints },
+    RosterPush {
+        roster: SignedRoster,
+        addrs: AddrHints,
+    },
     /// 管理设备向正在等待加入的设备发出的邀请（只在加入协议上使用）。
-    JoinOffer { nonce: [u8; 16], roster: SignedRoster, addrs: AddrHints },
+    JoinOffer {
+        nonce: [u8; 16],
+        roster: SignedRoster,
+        addrs: AddrHints,
+    },
     /// 执行一条命令。对方先回 `Response::Ok` 或 `Response::Error`；之后调用方
     /// 发送 [`Input`]，对方发送 [`ExecEvent`]，直到 `ExecEvent::Exit`。
     Exec(ExecSpec),
     /// 网页节点（协议 nexus/web）：用一次性登记码登记一个新建的通行密钥。
-    WebEnroll { token: [u8; 16], credential: NewCredential },
+    WebEnroll {
+        token: [u8; 16],
+        credential: NewCredential,
+    },
     /// 网页节点：用通行密钥登录。挑战是 `login_challenge(issued_at, 浏览器的临时节点标识)`。
-    WebLogin { issued_at: Timestamp, assertion: nexus_core_proto::webauthn::WebAuthnAssertion },
+    WebLogin {
+        issued_at: Timestamp,
+        assertion: nexus_core_proto::webauthn::WebAuthnAssertion,
+    },
     /// 连上一个终端会话，不存在且 `create` 时创建。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后调用方发送 [`Input`]（`Stdin`、`Resize`、`Ack`、`Detach`），对方发送 [`ClientMsg`]。
-    SessionAttach { name: String, create: bool, size: Size },
+    SessionAttach {
+        name: String,
+        create: bool,
+        size: Size,
+    },
     /// 列出对方的终端会话。
     SessionList,
     /// 结束对方的一个终端会话。
-    SessionKill { name: String },
+    SessionKill {
+        name: String,
+    },
     /// 连到对方发布的一个服务。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后这条流就是到那个服务的字节流，任一方向结束发送即关闭那个方向。
-    SvcConnect { name: String },
+    SvcConnect {
+        name: String,
+    },
     /// 列出对方发布的、调用者能用的服务。
     SvcList,
     /// 经对方出去：对方连到 `target`（主机:端口），之后同 `SvcConnect`。对方要先开放出口。
-    ExitConnect { target: String },
+    ExitConnect {
+        target: String,
+    },
     /// Drive（M4.2）：对方是否是存储设备、它有哪些工作区和它们的头。
     DriveInfo,
     /// 请存储设备保存这个工作区。
-    DriveRegister { ws: String },
+    DriveRegister {
+        ws: String,
+    },
     /// 对象：回应 `Ok`，然后按顺序每个哈希一帧 `Option<Vec<u8>>`（没有时为空）。
-    DriveGet { ws: String, hashes: Vec<[u8; 32]> },
+    DriveGet {
+        ws: String,
+        hashes: Vec<[u8; 32]>,
+    },
     /// 对方缺哪些对象：回应 `DriveMissing`。
-    DriveHave { ws: String, hashes: Vec<[u8; 32]> },
+    DriveHave {
+        ws: String,
+        hashes: Vec<[u8; 32]>,
+    },
     /// 推一个新头：回应 `Ok` 之后送 `count` 帧对象（`Vec<u8>`），最后对方回应 `DrivePushed`。
-    DrivePush { ws: String, head: [u8; 32], count: u32 },
+    DrivePush {
+        ws: String,
+        head: [u8; 32],
+        count: u32,
+    },
     /// 保存预读清单（同名替换）：回应 `Ok`。
-    DriveProfilePut { ws: String, name: String, files: Vec<String> },
+    DriveProfilePut {
+        ws: String,
+        name: String,
+        files: Vec<String>,
+    },
     /// 取预读清单：回应 `DriveProfile`。
-    DriveProfileGet { ws: String, name: String },
+    DriveProfileGet {
+        ws: String,
+        name: String,
+    },
     /// 网页节点硬件能力（M8.3）：列出浏览器当前已显式同意开放的硬件能力。
     HardwareList,
     /// 网页节点硬件能力（M8.3）：采集一项硬件能力（摄像头/麦克风/位置）。
-    HardwareCapture { kind: HardwareKind },
+    HardwareCapture {
+        kind: HardwareKind,
+    },
     /// 临时分享（M9.1）：访客打开分享链接，校验令牌并扣减一次可用次数。
-    ShareOpen { token: [u8; 16] },
+    ShareOpen {
+        token: [u8; 16],
+    },
     /// 临时分享（M9.1）：访客列出被分享目录下的相对子路径。
-    ShareDriveList { token: [u8; 16], path: String },
+    ShareDriveList {
+        token: [u8; 16],
+        path: String,
+    },
     /// 临时分享（M9.1）：访客读取被分享文件（或被分享目录下的相对子路径）最多 `max` 字节。
-    ShareDriveRead { token: [u8; 16], path: String, max: u64 },
+    ShareDriveRead {
+        token: [u8; 16],
+        path: String,
+        max: u64,
+    },
     /// 临时分享（M9.1）：访客连接被分享的 HTTP 服务。
-    ShareServiceConnect { token: [u8; 16] },
+    ShareServiceConnect {
+        token: [u8; 16],
+    },
     /// 临时分享（M9.1）：访客只读观看被分享的终端会话。
-    ShareSessionWatch { token: [u8; 16], size: Size },
+    ShareSessionWatch {
+        token: [u8; 16],
+        size: Size,
+    },
     /// Vault（M9.2）：管理设备把一条加密后的秘密推送给被授权的设备（`entry: None` 表示擦除）。
-    VaultPush { name: String, entry: Option<VaultCipherEntry> },
+    VaultPush {
+        name: String,
+        entry: Option<VaultCipherEntry>,
+    },
     /// Vault（M9.2）：成员设备向管理设备拉取自己被授权的所有密文条目。
     VaultPull,
     /// 根密钥轮换（M10.1）：带着旧根签署的轮换证书和新根签署的新名册推送给各设备。
@@ -156,9 +220,14 @@ pub enum Request {
     },
     /// 连到对方发布的一个 UDP 服务（`--proto udp`，M11.5）。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后两个方向都是一串数据报帧：2 字节大端长度 + 数据报。任一方向结束发送即结束这条转发。
-    SvcDatagram { name: String },
-    /// 经已开放的出口收发 UDP，目标为 `主机:端口`。握手与数据报帧同 `SvcDatagram`。
-    ExitDatagram { target: String },
+    SvcDatagram {
+        name: String,
+    },
+    /// 经对方出口转发公网 UDP 数据报（N1）：对方先检验出口开放、授权与非本机地址，
+    /// 回应 `Response::Ok` 后使用与 `SvcDatagram` 相同的 2 字节大端长度前缀数据报帧。
+    ExitDatagram {
+        target: String,
+    },
 }
 
 /// 临时分享的目标（M9.1）：全部为只读访问。
@@ -296,12 +365,23 @@ pub struct ShareCreatedReport {
 /// 网页节点返回的一次硬件采集结果（M8.3）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HardwareCapture {
-    Camera { mime: String, data: Vec<u8> },
-    Microphone { mime: String, duration_ms: u32, data: Vec<u8> },
+    Camera {
+        mime: String,
+        data: Vec<u8>,
+    },
+    Microphone {
+        mime: String,
+        duration_ms: u32,
+        data: Vec<u8>,
+    },
     /// 经纬度采用 1e-7 度整数（精度约 1.1 cm），精度采用厘米整数，保持确定性与 Eq。
-    Location { lat_e7: i64, lon_e7: i64, accuracy_cm: u32, timestamp_ms: u64 },
+    Location {
+        lat_e7: i64,
+        lon_e7: i64,
+        accuracy_cm: u32,
+        timestamp_ms: u64,
+    },
 }
-
 
 /// Vault 密文条目（M9.2）：落盘与跨网传输均只含认证密文 `sealed`。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,12 +448,9 @@ impl Request {
             Request::Exec(_) => TrafficClass::Normal,
             Request::SvcConnect { .. }
             | Request::ExitConnect { .. }
-            | Request::ExitDatagram { .. }
             | Request::DriveGet { .. }
             | Request::DrivePush { .. }
-            | Request::ShareServiceConnect { .. } => {
-                TrafficClass::Bulk
-            }
+            | Request::ShareServiceConnect { .. } => TrafficClass::Bulk,
             Request::DriveInfo
             | Request::DriveRegister { .. }
             | Request::DriveHave { .. }
@@ -388,7 +465,7 @@ impl Request {
             | Request::VaultPush { .. }
             | Request::VaultPull
             | Request::RootRotate { .. } => TrafficClass::Interactive,
-            | Request::SvcDatagram { .. } => TrafficClass::Interactive,
+            Request::SvcDatagram { .. } | Request::ExitDatagram { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -407,64 +484,145 @@ impl Request {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriveRequest {
     /// `replicas` 为空时用网络里开了 serve 的设备。
-    Create { ws: String, replicas: Vec<String> },
+    Create {
+        ws: String,
+        replicas: Vec<String>,
+    },
     /// 本机是否作为存储设备；`on` 为空时只查询。
-    Serve { on: Option<bool> },
+    Serve {
+        on: Option<bool>,
+    },
     /// 和存储设备同步：取头和目录结构，快进、推送或报告分叉。
-    Sync { ws: String },
+    Sync {
+        ws: String,
+    },
     /// 把存储设备上的头合并进来（分叉时）。
-    Merge { ws: String },
+    Merge {
+        ws: String,
+    },
     /// 数据在哪里。
-    Where { path: String },
+    Where {
+        path: String,
+    },
     /// 本机知道的工作区。
     List,
     /// 列目录（对文件列出它自己）；`at` 为空时看工作树。
-    Ls { path: String, at: Option<String> },
+    Ls {
+        path: String,
+        at: Option<String>,
+    },
     /// 读文件：回应 `Ok`，然后 `PipeData`，最后 `PipeEnd`。
-    Cat { path: String, at: Option<String>, offset: u64, length: Option<u64> },
+    Cat {
+        path: String,
+        at: Option<String>,
+        offset: u64,
+        length: Option<u64>,
+    },
     /// 写文件：内容随后以 `Input::Stdin` 送来，`Input::CloseStdin` 结束。
-    Put { path: String, exec: bool },
-    Symlink { path: String, target: String },
+    Put {
+        path: String,
+        exec: bool,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
     /// 新建空目录。
-    Mkdir { path: String },
+    Mkdir {
+        path: String,
+    },
     /// 改名或移动（同一个工作区里），目标是文件时被替换。
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     /// 设或清文件的可执行位。
-    Chmod { path: String, exec: bool },
+    Chmod {
+        path: String,
+        exec: bool,
+    },
     /// 工作树的根（变了说明内容变了）。挂载用它发现同步进来的修改。
-    Stamp { ws: String },
+    Stamp {
+        ws: String,
+    },
     /// 开始（`name` 有值）或结束（`None`）记录读了哪些文件。结束时得到预读清单并交给存储设备。
-    Record { ws: String, name: Option<String> },
+    Record {
+        ws: String,
+        name: Option<String>,
+    },
     /// 按预读清单（`all` 时整个工作区）把文件内容提前取到本机。
-    Prefetch { ws: String, profile: Option<String>, all: bool },
-    Rm { path: String, recursive: bool },
+    Prefetch {
+        ws: String,
+        profile: Option<String>,
+        all: bool,
+    },
+    Rm {
+        path: String,
+        recursive: bool,
+    },
     /// 未提交的改动。
-    Status { ws: String },
-    Commit { ws: String, message: String },
-    Log { ws: String },
+    Status {
+        ws: String,
+    },
+    Commit {
+        ws: String,
+        message: String,
+    },
+    Log {
+        ws: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DriveResponse {
-    Created { ws: String },
+    Created {
+        ws: String,
+    },
     Workspaces(Vec<WorkspaceInfo>),
-    Entries { path: String, entries: Vec<DriveEntryInfo> },
-    Written { path: String, size: u64 },
-    Removed { path: String },
+    Entries {
+        path: String,
+        entries: Vec<DriveEntryInfo>,
+    },
+    Written {
+        path: String,
+        size: u64,
+    },
+    Removed {
+        path: String,
+    },
     /// Mkdir、Rename、Chmod 完成。
-    Done { path: String },
-    Stamp { tree: [u8; 32] },
-    Recording { name: String },
+    Done {
+        path: String,
+    },
+    Stamp {
+        tree: [u8; 32],
+    },
+    Recording {
+        name: String,
+    },
     /// 记录结束：清单（按第一次读到的顺序）和保存了它的存储设备。
-    Profile { name: String, files: Vec<String>, saved_to: Vec<String> },
+    Profile {
+        name: String,
+        files: Vec<String>,
+        saved_to: Vec<String>,
+    },
     Prefetched(DrivePrefetch),
     Changes(Vec<DriveChange>),
     /// 提交，以及随后推给存储设备的结果。
-    Committed { commit: String, sync: DriveSyncReport },
+    Committed {
+        commit: String,
+        sync: DriveSyncReport,
+    },
     Log(Vec<DriveCommitInfo>),
-    Serving { on: bool },
+    Serving {
+        on: bool,
+    },
     Synced(DriveSyncReport),
-    Merged { commit: String, conflicts: Vec<String>, sync: DriveSyncReport },
+    Merged {
+        commit: String,
+        conflicts: Vec<String>,
+        sync: DriveSyncReport,
+    },
     Where(DriveWhere),
 }
 
@@ -556,9 +714,14 @@ pub enum RouteExplanation {
     /// 以 .internal 结尾但不是「服务.设备.internal」。
     BadInternalName,
     /// 命中第 `index` 条规则（从 1 开始）。
-    Rule { index: u32, rule: nexus_net_core::route::Rule },
+    Rule {
+        index: u32,
+        rule: nexus_net_core::route::Rule,
+    },
     /// 没有规则匹配。
-    Default { outbound: nexus_net_core::route::Outbound },
+    Default {
+        outbound: nexus_net_core::route::Outbound,
+    },
 }
 
 /// 一个发布的服务，给使用方看的部分（不含发布方的本机地址）。
@@ -662,25 +825,43 @@ pub struct ExecResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     NodeInfo(NodeInfo),
-    Roster { roster: Option<SignedRoster>, addrs: AddrHints },
+    Roster {
+        roster: Option<SignedRoster>,
+        addrs: AddrHints,
+    },
     Ok,
     Sessions(Vec<SessionInfo>),
     Services(Vec<ServiceInfo>),
     /// 通行密钥登记成功，带上它的名字。
-    WebEnrolled { label: String },
+    WebEnrolled {
+        label: String,
+    },
     /// 登录成功：网页会话凭证，以及这个通行密钥能看到的设备。
-    WebLoggedIn { session: nexus_core_proto::authz::SignedWebSession, devices: Vec<WebDevice> },
-    DriveInfo { serving: bool, workspaces: Vec<(String, Option<[u8; 32]>)> },
+    WebLoggedIn {
+        session: nexus_core_proto::authz::SignedWebSession,
+        devices: Vec<WebDevice>,
+    },
+    DriveInfo {
+        serving: bool,
+        workspaces: Vec<(String, Option<[u8; 32]>)>,
+    },
     DriveMissing(Vec<[u8; 32]>),
     /// 推送的结果：对方现在的头；`accepted` 为假时是分叉（或对方已经更新），要先同步。
-    DrivePushed { accepted: bool, head: Option<[u8; 32]> },
+    DrivePushed {
+        accepted: bool,
+        head: Option<[u8; 32]>,
+    },
     DriveProfile(Option<Vec<String>>),
     Error(WireError),
     HardwareList(Vec<HardwareKind>),
     HardwareCapture(HardwareCapture),
     ShareOpened(ShareInfo),
     ShareDriveEntries(Vec<ShareDriveEntry>),
-    ShareDriveFile { size: u64, bytes: Vec<u8>, truncated: bool },
+    ShareDriveFile {
+        size: u64,
+        bytes: Vec<u8>,
+        truncated: bool,
+    },
     VaultEntries(Vec<VaultCipherEntry>),
 }
 
@@ -714,7 +895,10 @@ pub struct WireError {
 
 impl WireError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -761,77 +945,171 @@ pub enum CtlRequest {
     /// 本机节点的状态。
     Status,
     /// 另一个节点的状态，按名字或标识指定。
-    RemoteStatus { node: String },
+    RemoteStatus {
+        node: String,
+    },
     /// 到其他设备的路径（M5.1）；`device` 为空时列出所有设备。
-    Paths { device: Option<String> },
+    Paths {
+        device: Option<String>,
+    },
     /// 换成新版本并重新启动（M7.3）。由常驻程序的外壳处理，不进节点。
-    Upgrade { file: String, confirm_ms: u64, force: bool },
+    Upgrade {
+        file: String,
+        confirm_ms: u64,
+        force: bool,
+    },
     UpgradeStatus,
     UpgradeRollback,
     /// 本机的网络接口和是否计费（M5.2）；`set` 时先改某个接口的设置（`None` 为自动识别）。
-    Interfaces { set: Option<(String, Option<bool>)> },
+    Interfaces {
+        set: Option<(String, Option<bool>)>,
+    },
     /// 在第一台设备上建立网络。
-    Init { name: Option<String> },
+    Init {
+        name: Option<String>,
+    },
     /// 用恢复码让本机成为管理设备（M6.2）。
-    Recover { code: String },
+    Recover {
+        code: String,
+    },
     /// 准备加入一个网络，返回加入码。
     JoinStart,
     /// 批准一台设备加入。
-    Approve { code: String, name: Option<String> },
+    Approve {
+        code: String,
+        name: Option<String>,
+    },
     /// 把一台设备移出名册。
-    Revoke { name: String },
+    Revoke {
+        name: String,
+    },
     /// 列出名册里的所有设备。
     List,
     /// 在某个节点上执行命令。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Exec`。
-    Exec { node: String, spec: ExecSpec },
+    Exec {
+        node: String,
+        spec: ExecSpec,
+    },
     /// 签发一份 agent 凭据（只能在管理设备上）。授权条目写作 `能力@资源`。
-    AgentIssue { label: String, grants: Vec<String>, ttl_ms: u64 },
+    AgentIssue {
+        label: String,
+        grants: Vec<String>,
+        ttl_ms: u64,
+    },
     /// 撤销一个 agent，按名字或标识指定。
-    AgentRevoke { agent: String },
+    AgentRevoke {
+        agent: String,
+    },
     AgentList,
     /// 本机的审计记录，最新的在后。
-    Audit { limit: Option<u32> },
+    Audit {
+        limit: Option<u32>,
+    },
     /// 本机 SSH 呈现层为某个设备使用的主机密钥（种子）。对同一台目标设备总是相同。
-    SshHostKey { node: String },
+    SshHostKey {
+        node: String,
+    },
     /// 发起通行密钥登记（只能在管理设备上）：`page` 是页面地址，它的主机名就是通行密钥的依赖方。
     /// `page` 为空时用名册里的锚点，没有锚点时用默认页面。
-    WebEnroll { label: String, grants: Vec<String>, ttl_ms: u64, page: Option<String> },
+    WebEnroll {
+        label: String,
+        grants: Vec<String>,
+        ttl_ms: u64,
+        page: Option<String>,
+    },
     WebList,
-    WebRevoke { label: String },
+    WebRevoke {
+        label: String,
+    },
     /// 列出网页节点当前开放的硬件能力（M8.3）。
-    HardwareList { node_id: NodeId, hint: String },
+    HardwareList {
+        node_id: NodeId,
+        hint: String,
+    },
     /// 从网页节点采集一项硬件能力（M8.3）。
-    HardwareCapture { node_id: NodeId, hint: String, kind: HardwareKind },
-    ShareCreate { target: ShareTarget, ttl_ms: u64, max_uses: Option<u32>, page: Option<String> },
+    HardwareCapture {
+        node_id: NodeId,
+        hint: String,
+        kind: HardwareKind,
+    },
+    ShareCreate {
+        target: ShareTarget,
+        ttl_ms: u64,
+        max_uses: Option<u32>,
+        page: Option<String>,
+    },
     ShareList,
-    ShareRevoke { id: String },
-    VaultPut { name: String, value: Vec<u8>, devices: Vec<String> },
-    VaultGet { name: String },
+    ShareRevoke {
+        id: String,
+    },
+    VaultPut {
+        name: String,
+        value: Vec<u8>,
+        devices: Vec<String>,
+    },
+    VaultGet {
+        name: String,
+    },
     VaultList,
-    VaultRm { name: String },
+    VaultRm {
+        name: String,
+    },
     VaultSync,
-    VaultRotateNeeded { device: Option<String> },
+    VaultRotateNeeded {
+        device: Option<String>,
+    },
     RootRotate,
     /// 设置（`None` 为清除）名册里的锚点。只能在管理设备上。
-    AnchorSet { url: Option<String> },
+    AnchorSet {
+        url: Option<String>,
+    },
     AnchorShow,
     /// 在本机发布一个服务：本机地址只留在本机。
-    Publish { name: String, addr: core::net::SocketAddr, proto: String, env: Vec<(String, String)> },
-    Unpublish { name: String },
+    Publish {
+        name: String,
+        addr: core::net::SocketAddr,
+        proto: String,
+        env: Vec<(String, String)>,
+    },
+    Unpublish {
+        name: String,
+    },
     /// 列出一台设备上调用者能用的服务。
-    Services { node: String },
+    Services {
+        node: String,
+    },
     /// 连到一台设备上的服务。回应 `Ok` 之后，调用方发送 `Input::Stdin` / `Input::CloseStdin`，
     /// 常驻程序发送 `PipeData`，服务结束发送时发送 `PipeEnd`。
-    Connect { node: String, name: String },
+    Connect {
+        node: String,
+        name: String,
+    },
     /// 路由规则：加在最后。
-    RouteAdd { rule: nexus_net_core::route::Rule },
+    RouteAdd {
+        rule: nexus_net_core::route::Rule,
+    },
     /// 删除第 `index` 条（从 1 开始）。
-    RouteRm { index: u32 },
+    RouteRm {
+        index: u32,
+    },
     RouteList,
     /// 说明 `target`（主机:端口）会走哪里。
-    RouteExplain { target: String },
+    RouteExplain {
+        target: String,
+    },
+    /// 批量导入路由规则（N1）：导入前自动保存当前规则为 LKG 快照，并返回静态审计结果。
+    RouteImport {
+        rules: Vec<nexus_net_core::route::Rule>,
+        replace: bool,
+    },
+    /// 回滚路由规则到上一份 LKG 快照（N1）。
+    RouteRollback,
+    /// 对当前路由规则执行静态审计（N1）。
+    RouteAudit,
     /// 开放或关闭本机的出口。
-    ExitSet { enabled: bool },
+    ExitSet {
+        enabled: bool,
+    },
     ExitShow,
     /// 完整节点的虚拟网卡（不是完整节点时为空）。
     TunShow,
@@ -839,11 +1117,19 @@ pub enum CtlRequest {
     Drive(DriveRequest),
     /// 连上某个节点上的终端会话。之后命令行发送 [`Input`]，常驻程序发送 `CtlResponse::Session`。
     /// `create`：会话不存在时新建。重新连上时为 false（M7.2：会话已经结束时不悄悄换成一个新的）。
-    Attach { node: String, session: String, size: Size, create: bool },
-    SessionList { node: String },
-    SessionKill { node: String, session: String },
-    /// 本机批量导入路由规则，按顺序追加，任何一条非法时都不写入。
-    RouteAddMany { rules: Vec<nexus_net_core::route::Rule> },
+    Attach {
+        node: String,
+        session: String,
+        size: Size,
+        create: bool,
+    },
+    SessionList {
+        node: String,
+    },
+    SessionKill {
+        node: String,
+        session: String,
+    },
 }
 
 /// 最近一次升级（M7.3）。
@@ -867,7 +1153,12 @@ pub enum CtlResponse {
     Interfaces(Vec<IfaceInfo>),
     Init(InitReport),
     /// 长加入码；短加入码（M6.1）在没有碰头服务时为 None，原因在 `short_code_error`。
-    JoinCode { code: String, short_code: Option<String>, short_code_error: Option<String>, expires_at: Timestamp },
+    JoinCode {
+        code: String,
+        short_code: Option<String>,
+        short_code_error: Option<String>,
+        expires_at: Timestamp,
+    },
     Membership(MembershipReport),
     List(Vec<ListEntry>),
     Exec(ExecEvent),
@@ -885,7 +1176,10 @@ pub enum CtlResponse {
     Shares(Vec<ShareRecord>),
     ShareRevoked(ShareRecord),
     VaultPut(VaultEntryInfo),
-    VaultValue { name: String, value: Vec<u8> },
+    VaultValue {
+        name: String,
+        value: Vec<u8>,
+    },
     VaultList(Vec<VaultEntryInfo>),
     VaultRotateNeeded(Vec<VaultRotateItem>),
     RootRotated(RootRotateReport),
@@ -893,14 +1187,28 @@ pub enum CtlResponse {
     WebRevoked(MembershipReport),
     Anchor(AnchorReport),
     /// 发布成功，带上服务的路径（例如 `home/web`）。
-    Published { path: String },
-    Services { node: String, services: Vec<ServiceInfo> },
+    Published {
+        path: String,
+    },
+    Services {
+        node: String,
+        services: Vec<ServiceInfo>,
+    },
     PipeData(Vec<u8>),
     PipeEnd,
-    RouteAdded { index: u32 },
+    RouteAdded {
+        index: u32,
+    },
     Routes(Vec<nexus_net_core::route::Rule>),
     Explained(RouteExplanation),
-    Exit { enabled: bool },
+    RouteImported {
+        total: u32,
+        audit: nexus_net_core::route::RuleAudit,
+    },
+    RouteAudit(nexus_net_core::route::RuleAudit),
+    Exit {
+        enabled: bool,
+    },
     Tun(Option<TunReport>),
     Drive(DriveResponse),
     Ok,
@@ -1076,7 +1384,12 @@ impl JoinCode {
             Some(b) if !self.addr.is_empty() && hex_encode(&b) == self.addr => HintBytes::Hex(b),
             _ => HintBytes::Text(self.addr.clone()),
         };
-        let body = JoinCodeBytes { node_id: self.node_id, nonce: self.nonce, name: self.name.clone(), addr };
+        let body = JoinCodeBytes {
+            node_id: self.node_id,
+            nonce: self.nonce,
+            name: self.name.clone(),
+            addr,
+        };
         let mut bytes = postcard::to_allocvec(&body).expect("内存中的值总能编码");
         let check = join_check(&bytes);
         bytes.extend_from_slice(&check);
@@ -1096,22 +1409,35 @@ impl JoinCode {
             HintBytes::Hex(bytes) => hex_encode(&bytes),
             HintBytes::Text(t) => t,
         };
-        Some(JoinCode { node_id: b.node_id, nonce: b.nonce, name: b.name, addr })
+        Some(JoinCode {
+            node_id: b.node_id,
+            nonce: b.nonce,
+            name: b.name,
+            addr,
+        })
     }
 
     pub fn encode(&self) -> String {
-        format!("{JOIN_CODE_PREFIX}{}", nexus_core_proto::joincode::base32_encode(&self.to_bytes()))
+        format!(
+            "{JOIN_CODE_PREFIX}{}",
+            nexus_core_proto::joincode::base32_encode(&self.to_bytes())
+        )
     }
 
     pub fn decode(s: &str) -> Option<Self> {
         let s = s.trim();
-        let body = s.get(..JOIN_CODE_PREFIX.len()).filter(|p| p.eq_ignore_ascii_case(JOIN_CODE_PREFIX)).map(|_| &s[JOIN_CODE_PREFIX.len()..])?;
+        let body = s
+            .get(..JOIN_CODE_PREFIX.len())
+            .filter(|p| p.eq_ignore_ascii_case(JOIN_CODE_PREFIX))
+            .map(|_| &s[JOIN_CODE_PREFIX.len()..])?;
         Self::from_bytes(&nexus_core_proto::joincode::base32_decode(body)?)
     }
 
     /// 文本看起来是长加入码（而不是短加入码）。
     pub fn looks_like(s: &str) -> bool {
-        s.trim().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("nxj2") || p.eq_ignore_ascii_case("nxj1"))
+        s.trim()
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("nxj2") || p.eq_ignore_ascii_case("nxj1"))
     }
 }
 
@@ -1226,7 +1552,14 @@ mod tests {
     #[test]
     fn decoder_handles_byte_at_a_time_and_back_to_back_frames() {
         let mut bytes = encode(&sample()).unwrap();
-        bytes.extend(encode(&RequestHeader::new(0, nexus_core_proto::authz::Principal::Device, &Request::NodeInfo)).unwrap());
+        bytes.extend(
+            encode(&RequestHeader::new(
+                0,
+                nexus_core_proto::authz::Principal::Device,
+                &Request::NodeInfo,
+            ))
+            .unwrap(),
+        );
         let mut dec = FrameDecoder::default();
         let mut got_first = false;
         let mut got_second = false;
@@ -1243,13 +1576,26 @@ mod tests {
 
     #[test]
     fn join_code_round_trip_and_rejects_garbage() {
-        let code = JoinCode { node_id: NodeId([5; 32]), nonce: [6; 16], name: "home".into(), addr: "x".into() };
+        let code = JoinCode {
+            node_id: NodeId([5; 32]),
+            nonce: [6; 16],
+            name: "home".into(),
+            addr: "x".into(),
+        };
         let text = code.encode();
         assert!(text.starts_with("nxj2-"));
         assert_eq!(JoinCode::decode(&text), Some(code.clone()));
         assert_eq!(JoinCode::decode(&format!("  {text}\n")), Some(code.clone()));
         assert_eq!(JoinCode::decode(&text.to_uppercase()), Some(code));
-        for bad in ["", "nxj2-", "nxj2-zz", "nxj2-abc", "xxxx-00", "nxj1-00", &text[..text.len() - 2]] {
+        for bad in [
+            "",
+            "nxj2-",
+            "nxj2-zz",
+            "nxj2-abc",
+            "xxxx-00",
+            "nxj1-00",
+            &text[..text.len() - 2],
+        ] {
             assert_eq!(JoinCode::decode(bad), None, "{bad:?}");
         }
     }
@@ -1259,20 +1605,45 @@ mod tests {
     fn join_code_is_compact() {
         // 地址提示的样子和 iroh 驱动给的一样：一段十六进制（端点地址：身份、中继、两个直连地址）。
         let hint = hex_encode(&(0..110u8).collect::<Vec<_>>());
-        let code = JoinCode { node_id: NodeId([0xab; 32]), nonce: [7; 16], name: "office-pc".into(), addr: hint.clone() };
+        let code = JoinCode {
+            node_id: NodeId([0xab; 32]),
+            nonce: [7; 16],
+            name: "office-pc".into(),
+            addr: hint.clone(),
+        };
         let text = code.encode();
-        assert!(text[5..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{text}");
-        let old = format!("nxj1-{}", hex_encode(&postcard::to_allocvec(&code).unwrap()));
-        assert!(text.len() * 10 <= old.len() * 6, "新 {} 个字符，旧 {} 个", text.len(), old.len());
+        assert!(
+            text[5..]
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+            "{text}"
+        );
+        let old = format!(
+            "nxj1-{}",
+            hex_encode(&postcard::to_allocvec(&code).unwrap())
+        );
+        assert!(
+            text.len() * 10 <= old.len() * 6,
+            "新 {} 个字符，旧 {} 个",
+            text.len(),
+            old.len()
+        );
         assert_eq!(JoinCode::decode(&text).unwrap().addr, hint);
         // 不是十六进制的提示（仿真里的主机名）原样保留。
-        let sim = JoinCode { addr: "home".into(), ..code.clone() };
+        let sim = JoinCode {
+            addr: "home".into(),
+            ..code.clone()
+        };
         assert_eq!(JoinCode::decode(&sim.encode()), Some(sim));
         for i in 5..text.len() {
             let mut b = text.clone().into_bytes();
             b[i] = if b[i] == b'a' { b'b' } else { b'a' };
             let changed = String::from_utf8(b).unwrap();
-            assert_ne!(JoinCode::decode(&changed), Some(code.clone()), "改第 {i} 个字符");
+            assert_ne!(
+                JoinCode::decode(&changed),
+                Some(code.clone()),
+                "改第 {i} 个字符"
+            );
         }
     }
 
@@ -1288,7 +1659,10 @@ mod tests {
     fn oversized_and_garbage_frames_are_errors_not_panics() {
         let mut dec = FrameDecoder::default();
         dec.push(&u32::MAX.to_le_bytes());
-        assert!(matches!(dec.next_frame::<Response>(), Err(FrameError::TooLarge(_))));
+        assert!(matches!(
+            dec.next_frame::<Response>(),
+            Err(FrameError::TooLarge(_))
+        ));
 
         let mut dec = FrameDecoder::default();
         dec.push(&3u32.to_le_bytes());
@@ -1328,19 +1702,31 @@ mod tests {
 
         let revoked_only = make(2000, Some(3), 0, true);
         assert!(!revoked_only.is_expired(Timestamp(1500)));
-        assert_eq!(revoked_only.status_at(Timestamp(1500)), ShareStatus::Revoked);
+        assert_eq!(
+            revoked_only.status_at(Timestamp(1500)),
+            ShareStatus::Revoked
+        );
         assert_eq!(ShareStatus::Revoked.as_str(), "revoked");
 
         let expired_and_exhausted = make(2000, Some(1), 1, false);
         assert!(expired_and_exhausted.is_expired(Timestamp(2000)));
-        assert_eq!(expired_and_exhausted.status_at(Timestamp(2000)), ShareStatus::Expired);
+        assert_eq!(
+            expired_and_exhausted.status_at(Timestamp(2000)),
+            ShareStatus::Expired
+        );
 
         let revoked_and_expired = make(2000, Some(1), 0, true);
         assert!(revoked_and_expired.is_expired(Timestamp(2500)));
-        assert_eq!(revoked_and_expired.status_at(Timestamp(2500)), ShareStatus::Revoked);
+        assert_eq!(
+            revoked_and_expired.status_at(Timestamp(2500)),
+            ShareStatus::Revoked
+        );
 
         let revoked_expired_exhausted = make(2000, Some(1), 1, true);
         assert!(revoked_expired_exhausted.is_expired(Timestamp(2500)));
-        assert_eq!(revoked_expired_exhausted.status_at(Timestamp(2500)), ShareStatus::Revoked);
+        assert_eq!(
+            revoked_expired_exhausted.status_at(Timestamp(2500)),
+            ShareStatus::Revoked
+        );
     }
 }

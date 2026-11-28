@@ -1,8 +1,8 @@
 use crate::{call, doc, fail_wire, Ctl, Sink, JSON_SCHEMA};
 use nexus_core_proto::PathKind;
 use nexus_wire::{
-    CtlRequest, CtlResponse, DevicePaths, ErrorCode, ListEntry, PathInfo, RouteExplanation, StatusReport, TunReport,
-    WIRE_MINOR, WIRE_VERSION,
+    CtlRequest, CtlResponse, DevicePaths, ErrorCode, ListEntry, PathInfo, RouteExplanation,
+    StatusReport, TunReport, WIRE_MINOR, WIRE_VERSION,
 };
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -43,15 +43,38 @@ pub struct CheckItem {
 
 impl CheckItem {
     fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self { name: name.into(), status: CheckStatus::Ok, detail: detail.into(), suggestion: None }
+        Self {
+            name: name.into(),
+            status: CheckStatus::Ok,
+            detail: detail.into(),
+            suggestion: None,
+        }
     }
 
-    fn warn(name: impl Into<String>, detail: impl Into<String>, suggestion: impl Into<String>) -> Self {
-        Self { name: name.into(), status: CheckStatus::Warn, detail: detail.into(), suggestion: Some(suggestion.into()) }
+    fn warn(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: CheckStatus::Warn,
+            detail: detail.into(),
+            suggestion: Some(suggestion.into()),
+        }
     }
 
-    fn fail(name: impl Into<String>, detail: impl Into<String>, suggestion: impl Into<String>) -> Self {
-        Self { name: name.into(), status: CheckStatus::Fail, detail: detail.into(), suggestion: Some(suggestion.into()) }
+    fn fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: CheckStatus::Fail,
+            detail: detail.into(),
+            suggestion: Some(suggestion.into()),
+        }
     }
 }
 
@@ -86,7 +109,11 @@ pub fn evaluate(snap: &DoctorSnapshot) -> DoctorReport {
 
     checks.push(check_daemon(local, &snap.cli_version));
 
-    let local_version = local.info.as_ref().map(|i| i.version.as_str()).unwrap_or(snap.cli_version.as_str());
+    let local_version = local
+        .info
+        .as_ref()
+        .map(|i| i.version.as_str())
+        .unwrap_or(snap.cli_version.as_str());
     let joined = local.info.as_ref().and_then(|i| i.roster_version).is_some();
 
     let mut online_peers: Vec<&ListEntry> = Vec::new();
@@ -114,13 +141,19 @@ pub fn evaluate(snap: &DoctorSnapshot) -> DoctorReport {
                             Some(ms) => format!("设备 {} 在线（往返 {ms} ms）", peer.report.name),
                             None => format!("设备 {} 在线", peer.report.name),
                         };
-                        checks.push(CheckItem::ok(format!("device:{}", peer.report.name), detail));
+                        checks.push(CheckItem::ok(
+                            format!("device:{}", peer.report.name),
+                            detail,
+                        ));
                         online_peers.push(peer);
                     } else {
                         checks.push(CheckItem::fail(
                             format!("device:{}", peer.report.name),
                             format!("设备 {} 离线", peer.report.name),
-                            format!("确认 {} 已运行 nexus daemon，并检查网络连接或中继设置", peer.report.name),
+                            format!(
+                                "确认 {} 已运行 nexus daemon，并检查网络连接或中继设置",
+                                peer.report.name
+                            ),
                         ));
                     }
                 }
@@ -134,12 +167,19 @@ pub fn evaluate(snap: &DoctorSnapshot) -> DoctorReport {
             ));
         }
         None => {
-            checks.push(CheckItem::warn("devices", "未获取到设备列表", "运行 nexus ls 检查设备列表"));
+            checks.push(CheckItem::warn(
+                "devices",
+                "未获取到设备列表",
+                "运行 nexus ls 检查设备列表",
+            ));
         }
     }
 
     let path_map: Result<HashMap<&str, &[PathInfo]>, Option<&str>> = match &snap.paths {
-        Some(Ok(list)) => Ok(list.iter().map(|d| (d.device.as_str(), d.paths.as_slice())).collect()),
+        Some(Ok(list)) => Ok(list
+            .iter()
+            .map(|d| (d.device.as_str(), d.paths.as_slice()))
+            .collect()),
         Some(Err(err)) => Err(Some(err.as_str())),
         None => Err(None),
     };
@@ -148,34 +188,58 @@ pub fn evaluate(snap: &DoctorSnapshot) -> DoctorReport {
     }
 
     checks.push(check_version(local_version, &online_peers));
-    checks.push(check_name_resolution(&snap.tun, &snap.route_explain, online_peers.first().map(|p| p.report.name.as_str()).unwrap_or(&local.name)));
+    checks.push(check_name_resolution(
+        &snap.tun,
+        &snap.route_explain,
+        online_peers
+            .first()
+            .map(|p| p.report.name.as_str())
+            .unwrap_or(&local.name),
+    ));
 
     finish(checks)
 }
 
 fn finish(checks: Vec<CheckItem>) -> DoctorReport {
-    let overall = checks.iter().map(|c| c.status).max().unwrap_or(CheckStatus::Ok);
+    let overall = checks
+        .iter()
+        .map(|c| c.status)
+        .max()
+        .unwrap_or(CheckStatus::Ok);
     DoctorReport { overall, checks }
 }
 
 fn check_daemon(local: &StatusReport, cli_version: &str) -> CheckItem {
     let Some(info) = &local.info else {
-        return CheckItem::warn("daemon", "本机常驻程序可达，但未返回版本信息", "运行 nexus status 检查本机常驻程序状态");
+        return CheckItem::warn(
+            "daemon",
+            "本机常驻程序可达，但未返回版本信息",
+            "运行 nexus status 检查本机常驻程序状态",
+        );
     };
     if info.version != cli_version {
         return CheckItem::warn(
             "daemon",
-            format!("本机 {} 常驻程序可达，但版本 {} 与命令行 {} 不一致", local.name, info.version, cli_version),
+            format!(
+                "本机 {} 常驻程序可达，但版本 {} 与命令行 {} 不一致",
+                local.name, info.version, cli_version
+            ),
             "重启或升级本机常驻程序，使常驻程序与命令行版本一致（nexus upgrade）",
         );
     }
     CheckItem::ok(
         "daemon",
-        format!("本机 {} 常驻程序可达，版本 {}（协议 {WIRE_VERSION}.{WIRE_MINOR}）", local.name, info.version),
+        format!(
+            "本机 {} 常驻程序可达，版本 {}（协议 {WIRE_VERSION}.{WIRE_MINOR}）",
+            local.name, info.version
+        ),
     )
 }
 
-fn check_peer_path(peer: &ListEntry, path_map: &Result<HashMap<&str, &[PathInfo]>, Option<&str>>) -> CheckItem {
+fn check_peer_path(
+    peer: &ListEntry,
+    path_map: &Result<HashMap<&str, &[PathInfo]>, Option<&str>>,
+) -> CheckItem {
     let name = &peer.report.name;
     let check_name = format!("path:{name}");
 
@@ -184,9 +248,21 @@ fn check_peer_path(peer: &ListEntry, path_map: &Result<HashMap<&str, &[PathInfo]
             if let Some(paths) = map.get(name.as_str()).filter(|p| !p.is_empty()) {
                 return evaluate_detailed_paths(&check_name, name, paths);
             }
-            evaluate_summary_path(&check_name, name, peer.report.path, peer.report.rtt_ms, None)
+            evaluate_summary_path(
+                &check_name,
+                name,
+                peer.report.path,
+                peer.report.rtt_ms,
+                None,
+            )
         }
-        Err(reason) => evaluate_summary_path(&check_name, name, peer.report.path, peer.report.rtt_ms, *reason),
+        Err(reason) => evaluate_summary_path(
+            &check_name,
+            name,
+            peer.report.path,
+            peer.report.rtt_ms,
+            *reason,
+        ),
     }
 }
 
@@ -198,7 +274,11 @@ fn evaluate_detailed_paths(check_name: &str, device: &str, paths: &[PathInfo]) -
     let min_rtt_ms = paths.iter().map(|p| p.rtt_us).min().unwrap_or(0) as f64 / 1000.0;
 
     if direct_count > 0 && unmetered_count > 0 {
-        let metered_note = if metered_count > 0 { format!("，含 {metered_count} 条计费路径") } else { String::new() };
+        let metered_note = if metered_count > 0 {
+            format!("，含 {metered_count} 条计费路径")
+        } else {
+            String::new()
+        };
         return CheckItem::ok(
             check_name,
             format!("直连（共 {total} 条路径，直连 {direct_count} 条{metered_note}，最低往返 {min_rtt_ms:.1} ms）"),
@@ -211,7 +291,11 @@ fn evaluate_detailed_paths(check_name: &str, device: &str, paths: &[PathInfo]) -
             "计费路径不承担批量传输；接入非计费网络或运行 nexus iface 调整计费标记",
         );
     }
-    let metered_note = if metered_count > 0 { format!("，含 {metered_count} 条计费路径") } else { String::new() };
+    let metered_note = if metered_count > 0 {
+        format!("，含 {metered_count} 条计费路径")
+    } else {
+        String::new()
+    };
     CheckItem::warn(
         check_name,
         format!("仅经中继连接（{total} 条路径{metered_note}，最低往返 {min_rtt_ms:.1} ms）"),
@@ -226,14 +310,24 @@ fn evaluate_summary_path(
     rtt_ms: Option<u64>,
     paths_err: Option<&str>,
 ) -> CheckItem {
-    let rtt_note = rtt_ms.map(|ms| format!("，往返 {ms} ms")).unwrap_or_default();
+    let rtt_note = rtt_ms
+        .map(|ms| format!("，往返 {ms} ms"))
+        .unwrap_or_default();
     if let Some(err) = paths_err {
         let base = match kind {
-            Some(PathKind::Direct) => format!("直连{rtt_note}，但无法读取多路径与计费明细（{err}）"),
-            Some(PathKind::Relay) => format!("经中继连接{rtt_note}，且无法读取多路径与计费明细（{err}）"),
+            Some(PathKind::Direct) => {
+                format!("直连{rtt_note}，但无法读取多路径与计费明细（{err}）")
+            }
+            Some(PathKind::Relay) => {
+                format!("经中继连接{rtt_note}，且无法读取多路径与计费明细（{err}）")
+            }
             None => format!("无法读取路径明细（{err}）"),
         };
-        return CheckItem::warn(check_name, base, format!("运行 nexus path {device} 检查连接路径"));
+        return CheckItem::warn(
+            check_name,
+            base,
+            format!("运行 nexus path {device} 检查连接路径"),
+        );
     }
     match kind {
         Some(PathKind::Direct) => CheckItem::ok(check_name, format!("直连{rtt_note}")),
@@ -293,13 +387,23 @@ fn check_version(local_version: &str, online_peers: &[&ListEntry]) -> CheckItem 
     let mut details = Vec::new();
     let mut suggestions = Vec::new();
     if !older.is_empty() {
-        let list = older.iter().map(|(n, v)| format!("{n}({v})")).collect::<Vec<_>>().join("、");
+        let list = older
+            .iter()
+            .map(|(n, v)| format!("{n}({v})"))
+            .collect::<Vec<_>>()
+            .join("、");
         let names = older.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(",");
         details.push(format!("较旧设备：{list}"));
-        suggestions.push(format!("升级较旧设备：nexus upgrade --to {names} --file <新版本>"));
+        suggestions.push(format!(
+            "升级较旧设备：nexus upgrade --to {names} --file <新版本>"
+        ));
     }
     if !newer.is_empty() {
-        let list = newer.iter().map(|(n, v)| format!("{n}({v})")).collect::<Vec<_>>().join("、");
+        let list = newer
+            .iter()
+            .map(|(n, v)| format!("{n}({v})"))
+            .collect::<Vec<_>>()
+            .join("、");
         details.push(format!("较新设备：{list}"));
         suggestions.push("升级本机以匹配较新设备：nexus upgrade --file <新版本>".to_string());
     }
@@ -312,7 +416,10 @@ fn check_version(local_version: &str, online_peers: &[&ListEntry]) -> CheckItem 
 
     CheckItem::warn(
         "version",
-        format!("本机 {local_version}（协议 {WIRE_VERSION}.{WIRE_MINOR}），{}", details.join("；")),
+        format!(
+            "本机 {local_version}（协议 {WIRE_VERSION}.{WIRE_MINOR}），{}",
+            details.join("；")
+        ),
         suggestions.join("；"),
     )
 }
@@ -327,7 +434,10 @@ fn check_name_resolution(
         Some(Ok(RouteExplanation::Service { .. })) => match tun {
             Some(Ok(Some(t))) => CheckItem::ok(
                 "name_resolution",
-                format!("完整节点名字服务可用（DNS {}，网卡 {}，网段 {}），.internal 服务路由正常", t.dns, t.name, t.net),
+                format!(
+                    "完整节点名字服务可用（DNS {}，网卡 {}，网段 {}），.internal 服务路由正常",
+                    t.dns, t.name, t.net
+                ),
             ),
             Some(Ok(None)) => CheckItem::ok(
                 "name_resolution",
@@ -375,7 +485,11 @@ fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub fn exit_code(report: &DoctorReport) -> i32 {
-    if report.overall == CheckStatus::Fail { 1 } else { 0 }
+    if report.overall == CheckStatus::Fail {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn format_text(report: &DoctorReport) -> String {
@@ -390,12 +504,20 @@ pub fn format_text(report: &DoctorReport) -> String {
             CheckStatus::Warn => warn += 1,
             CheckStatus::Fail => fail += 1,
         }
-        out.push_str(&format!("[{:<4}] {:<18} {}\n", item.status.badge(), item.name, item.detail));
+        out.push_str(&format!(
+            "[{:<4}] {:<18} {}\n",
+            item.status.badge(),
+            item.name,
+            item.detail
+        ));
         if let Some(suggestion) = &item.suggestion {
             out.push_str(&format!("       建议：{suggestion}\n"));
         }
     }
-    out.push_str(&format!("汇总：{}（通过 {ok}，警告 {warn}，失败 {fail}）\n", report.overall.as_str()));
+    out.push_str(&format!(
+        "汇总：{}（通过 {ok}，警告 {warn}，失败 {fail}）\n",
+        report.overall.as_str()
+    ));
     out
 }
 
@@ -468,9 +590,20 @@ pub async fn run<C: Ctl, K: Sink>(ctl: &C, json_out: bool, sink: &mut K) -> i32 
                         .min()
                 })
                 .filter(|s| !s.is_empty())
-                .unwrap_or(if st.name.is_empty() { "self" } else { st.name.as_str() })
+                .unwrap_or(if st.name.is_empty() {
+                    "self"
+                } else {
+                    st.name.as_str()
+                })
                 .to_string();
-            let route_explain = match call(ctl, CtlRequest::RouteExplain { target: format!("probe.{probe_device}.internal:80") }).await {
+            let route_explain = match call(
+                ctl,
+                CtlRequest::RouteExplain {
+                    target: format!("probe.{probe_device}.internal:80"),
+                },
+            )
+            .await
+            {
                 Ok(CtlResponse::Explained(ex)) => Ok(ex),
                 Ok(CtlResponse::Error(e)) => Err(e.message),
                 Ok(_) => Err("常驻程序的回应无法理解".to_string()),
@@ -488,7 +621,11 @@ pub async fn run<C: Ctl, K: Sink>(ctl: &C, json_out: bool, sink: &mut K) -> i32 
     };
 
     let report = evaluate(&snap);
-    let rendered = if json_out { format_json(&report) } else { format_text(&report) };
+    let rendered = if json_out {
+        format_json(&report)
+    } else {
+        format_text(&report)
+    };
     sink.out(rendered.as_bytes());
     exit_code(&report)
 }
@@ -499,7 +636,14 @@ mod tests {
     use nexus_core_proto::roster::DeviceRole;
     use nexus_core_proto::{NodeId, NodeInfo, Timestamp};
 
-    fn status_report(name: &str, version: Option<&str>, online: bool, path: Option<PathKind>, rtt_ms: Option<u64>, joined: bool) -> StatusReport {
+    fn status_report(
+        name: &str,
+        version: Option<&str>,
+        online: bool,
+        path: Option<PathKind>,
+        rtt_ms: Option<u64>,
+        joined: bool,
+    ) -> StatusReport {
         StatusReport {
             name: name.into(),
             node_id: NodeId([name.len() as u8; 32]),
@@ -520,17 +664,36 @@ mod tests {
 
     fn healthy_snapshot() -> DoctorSnapshot {
         let local = status_report("laptop", Some("0.1.0"), true, None, None, true);
-        let peer = status_report("home", Some("0.1.0"), true, Some(PathKind::Direct), Some(4), true);
+        let peer = status_report(
+            "home",
+            Some("0.1.0"),
+            true,
+            Some(PathKind::Direct),
+            Some(4),
+            true,
+        );
         DoctorSnapshot {
             cli_version: "0.1.0".into(),
             daemon: Ok(local.clone()),
             list: Some(Ok(vec![
-                ListEntry { report: local, is_self: true },
-                ListEntry { report: peer, is_self: false },
+                ListEntry {
+                    report: local,
+                    is_self: true,
+                },
+                ListEntry {
+                    report: peer,
+                    is_self: false,
+                },
             ])),
-            paths: Some(Ok(vec![DevicePaths { device: "home".into(), paths: vec![] }])),
+            paths: Some(Ok(vec![DevicePaths {
+                device: "home".into(),
+                paths: vec![],
+            }])),
             tun: Some(Ok(None)),
-            route_explain: Some(Ok(RouteExplanation::Service { device: "home".into(), service: "probe".into() })),
+            route_explain: Some(Ok(RouteExplanation::Service {
+                device: "home".into(),
+                service: "probe".into(),
+            })),
         }
     }
 
@@ -539,7 +702,10 @@ mod tests {
         let report = evaluate(&healthy_snapshot());
         assert_eq!(report.overall, CheckStatus::Ok);
         assert_eq!(exit_code(&report), 0);
-        assert!(report.checks.iter().all(|c| c.status == CheckStatus::Ok && c.suggestion.is_none()));
+        assert!(report
+            .checks
+            .iter()
+            .all(|c| c.status == CheckStatus::Ok && c.suggestion.is_none()));
 
         let json: Value = serde_json::from_str(&format_json(&report)).unwrap();
         assert_eq!(json["schema"], JSON_SCHEMA);
@@ -547,7 +713,10 @@ mod tests {
         assert_eq!(json["checks"].as_array().unwrap().len(), 5);
 
         let text = format_text(&report);
-        assert!(text.contains("汇总：ok（通过 5，警告 0，失败 0）"), "{text}");
+        assert!(
+            text.contains("汇总：ok（通过 5，警告 0，失败 0）"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -585,23 +754,55 @@ mod tests {
     fn offline_peer_marks_device_fail_and_omits_path_check() {
         let mut snap = healthy_snapshot();
         let local = status_report("laptop", Some("0.1.0"), true, None, None, true);
-        let home = status_report("home", Some("0.1.0"), true, Some(PathKind::Direct), Some(3), true);
+        let home = status_report(
+            "home",
+            Some("0.1.0"),
+            true,
+            Some(PathKind::Direct),
+            Some(3),
+            true,
+        );
         let office = status_report("office", None, false, None, None, true);
         snap.list = Some(Ok(vec![
-            ListEntry { report: local, is_self: true },
-            ListEntry { report: office, is_self: false },
-            ListEntry { report: home, is_self: false },
+            ListEntry {
+                report: local,
+                is_self: true,
+            },
+            ListEntry {
+                report: office,
+                is_self: false,
+            },
+            ListEntry {
+                report: home,
+                is_self: false,
+            },
         ]));
 
         let report = evaluate(&snap);
         assert_eq!(report.overall, CheckStatus::Fail);
         assert_eq!(exit_code(&report), 1);
 
-        let office_item = report.checks.iter().find(|c| c.name == "device:office").unwrap();
+        let office_item = report
+            .checks
+            .iter()
+            .find(|c| c.name == "device:office")
+            .unwrap();
         assert_eq!(office_item.status, CheckStatus::Fail);
-        assert!(office_item.suggestion.as_deref().unwrap().contains("office"));
+        assert!(office_item
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("office"));
         assert!(report.checks.iter().all(|c| c.name != "path:office"));
-        assert_eq!(report.checks.iter().find(|c| c.name == "path:home").unwrap().status, CheckStatus::Ok);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == "path:home")
+                .unwrap()
+                .status,
+            CheckStatus::Ok
+        );
     }
 
     #[test]
@@ -620,12 +821,19 @@ mod tests {
         let mut mixed = healthy_snapshot();
         mixed.paths = Some(Ok(vec![DevicePaths {
             device: "home".into(),
-            paths: vec![path(PathKind::Direct, 5_000, false), path(PathKind::Direct, 12_000, true)],
+            paths: vec![
+                path(PathKind::Direct, 5_000, false),
+                path(PathKind::Direct, 12_000, true),
+            ],
         }]));
         let r = evaluate(&mixed);
         let p = r.checks.iter().find(|c| c.name == "path:home").unwrap();
         assert_eq!(p.status, CheckStatus::Ok);
-        assert!(p.detail.contains("共 2 条路径") && p.detail.contains("含 1 条计费路径"), "{}", p.detail);
+        assert!(
+            p.detail.contains("共 2 条路径") && p.detail.contains("含 1 条计费路径"),
+            "{}",
+            p.detail
+        );
 
         let mut all_metered = healthy_snapshot();
         all_metered.paths = Some(Ok(vec![DevicePaths {
@@ -635,7 +843,14 @@ mod tests {
         let r = evaluate(&all_metered);
         assert_eq!(r.overall, CheckStatus::Warn);
         assert_eq!(exit_code(&r), 0);
-        assert_eq!(r.checks.iter().find(|c| c.name == "path:home").unwrap().status, CheckStatus::Warn);
+        assert_eq!(
+            r.checks
+                .iter()
+                .find(|c| c.name == "path:home")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
 
         let mut relay_only = healthy_snapshot();
         relay_only.paths = Some(Ok(vec![DevicePaths {
@@ -653,23 +868,53 @@ mod tests {
     fn version_check_suggests_upgrade_direction() {
         let mut older_snap = healthy_snapshot();
         let local = status_report("laptop", Some("0.2.0"), true, None, None, true);
-        let old_peer = status_report("home", Some("0.1.0"), true, Some(PathKind::Direct), Some(4), true);
+        let old_peer = status_report(
+            "home",
+            Some("0.1.0"),
+            true,
+            Some(PathKind::Direct),
+            Some(4),
+            true,
+        );
         older_snap.cli_version = "0.2.0".into();
         older_snap.daemon = Ok(local.clone());
         older_snap.list = Some(Ok(vec![
-            ListEntry { report: local.clone(), is_self: true },
-            ListEntry { report: old_peer, is_self: false },
+            ListEntry {
+                report: local.clone(),
+                is_self: true,
+            },
+            ListEntry {
+                report: old_peer,
+                is_self: false,
+            },
         ]));
         let r = evaluate(&older_snap);
         let v = r.checks.iter().find(|c| c.name == "version").unwrap();
         assert_eq!(v.status, CheckStatus::Warn);
-        assert!(v.suggestion.as_deref().unwrap().contains("nexus upgrade --to home"));
+        assert!(v
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("nexus upgrade --to home"));
 
         let mut newer_snap = older_snap;
-        let new_peer = status_report("home", Some("0.3.0"), true, Some(PathKind::Direct), Some(4), true);
+        let new_peer = status_report(
+            "home",
+            Some("0.3.0"),
+            true,
+            Some(PathKind::Direct),
+            Some(4),
+            true,
+        );
         newer_snap.list = Some(Ok(vec![
-            ListEntry { report: local, is_self: true },
-            ListEntry { report: new_peer, is_self: false },
+            ListEntry {
+                report: local,
+                is_self: true,
+            },
+            ListEntry {
+                report: new_peer,
+                is_self: false,
+            },
         ]));
         let r = evaluate(&newer_snap);
         let v = r.checks.iter().find(|c| c.name == "version").unwrap();
@@ -686,7 +931,11 @@ mod tests {
             dns: "198.18.0.2".into(),
         })));
         let r = evaluate(&with_tun);
-        let dns = r.checks.iter().find(|c| c.name == "name_resolution").unwrap();
+        let dns = r
+            .checks
+            .iter()
+            .find(|c| c.name == "name_resolution")
+            .unwrap();
         assert_eq!(dns.status, CheckStatus::Ok);
         assert!(dns.detail.contains("198.18.0.2"));
 
@@ -695,14 +944,28 @@ mod tests {
         let r = evaluate(&degraded);
         assert_eq!(r.overall, CheckStatus::Warn);
         assert_eq!(exit_code(&r), 0);
-        assert_eq!(r.checks.iter().find(|c| c.name == "name_resolution").unwrap().status, CheckStatus::Warn);
+        assert_eq!(
+            r.checks
+                .iter()
+                .find(|c| c.name == "name_resolution")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
 
         let mut broken = healthy_snapshot();
         broken.route_explain = Some(Ok(RouteExplanation::BadInternalName));
         let r = evaluate(&broken);
         assert_eq!(r.overall, CheckStatus::Fail);
         assert_eq!(exit_code(&r), 1);
-        assert_eq!(r.checks.iter().find(|c| c.name == "name_resolution").unwrap().status, CheckStatus::Fail);
+        assert_eq!(
+            r.checks
+                .iter()
+                .find(|c| c.name == "name_resolution")
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
     }
 
     #[test]
@@ -711,14 +974,28 @@ mod tests {
         let snap = DoctorSnapshot {
             cli_version: "0.1.0".into(),
             daemon: Ok(local.clone()),
-            list: Some(Ok(vec![ListEntry { report: local, is_self: true }])),
+            list: Some(Ok(vec![ListEntry {
+                report: local,
+                is_self: true,
+            }])),
             paths: Some(Ok(vec![])),
             tun: Some(Ok(None)),
-            route_explain: Some(Ok(RouteExplanation::Service { device: "laptop".into(), service: "probe".into() })),
+            route_explain: Some(Ok(RouteExplanation::Service {
+                device: "laptop".into(),
+                service: "probe".into(),
+            })),
         };
         let report = evaluate(&snap);
         assert_eq!(report.overall, CheckStatus::Warn);
         assert_eq!(exit_code(&report), 0);
-        assert_eq!(report.checks.iter().find(|c| c.name == "devices").unwrap().status, CheckStatus::Warn);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|c| c.name == "devices")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
     }
 }

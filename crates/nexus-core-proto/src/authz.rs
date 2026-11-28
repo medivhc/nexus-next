@@ -38,7 +38,10 @@ pub struct SignedWebSession {
 impl WebSession {
     pub fn sign(self, issuer: &SecretKey) -> SignedWebSession {
         let signature = issuer.sign(Purpose::WebSession, &canonical(&self));
-        SignedWebSession { session: self, signature }
+        SignedWebSession {
+            session: self,
+            signature,
+        }
     }
 }
 
@@ -75,7 +78,10 @@ impl AgentCert {
     /// 用根密钥签发。
     pub fn issue(self, root: &SecretKey) -> SignedAgentCert {
         let signature = root.sign(Purpose::AgentCert, &canonical(&self));
-        SignedAgentCert { cert: self, signature }
+        SignedAgentCert {
+            cert: self,
+            signature,
+        }
     }
 }
 
@@ -84,7 +90,10 @@ impl SignedAgentCert {
     pub fn validate(&self, roster: &Roster, now: Timestamp) -> Result<(), DenyReason> {
         use DenyReason::*;
         let c = &self.cert;
-        if !roster.root.verify(Purpose::AgentCert, &canonical(c), &self.signature) {
+        if !roster
+            .root
+            .verify(Purpose::AgentCert, &canonical(c), &self.signature)
+        {
             return Err(CertBadSignature);
         }
         if now < c.not_before {
@@ -102,7 +111,10 @@ impl SignedAgentCert {
     /// 这张证书的授权是否让它能看到 `path` 或 `path` 之下的东西。
     /// 只看授权条目，不检查证书本身是否有效；有效性由 [`decide`] 负责。
     pub fn can_see(&self, path: &ResourcePath) -> bool {
-        self.cert.grants.iter().any(|g| g.resource.may_match_within(path))
+        self.cert
+            .grants
+            .iter()
+            .any(|g| g.resource.may_match_within(path))
     }
 }
 
@@ -138,7 +150,11 @@ pub enum Principal {
     /// 对端设备以它自己的身份请求，代表用户本人。
     Device,
     /// 一个 agent，经由对端设备发出请求。
-    Agent { cert: SignedAgentCert, assertion: Assertion, signature: Signature },
+    Agent {
+        cert: SignedAgentCert,
+        assertion: Assertion,
+        signature: Signature,
+    },
     /// 网页登录：对端是浏览器，凭一张网页会话凭证。
     Web { session: SignedWebSession },
 }
@@ -259,10 +275,13 @@ pub fn decide(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &A
     };
     let principal = match principal {
         Principal::Device => PrincipalRef::Device(peer),
-        Principal::Agent { cert, .. } => {
-            PrincipalRef::Agent { id: cert.cert.agent, label: cert.cert.label.clone() }
-        }
-        Principal::Web { session } => PrincipalRef::Web { label: session.session.label.clone() },
+        Principal::Agent { cert, .. } => PrincipalRef::Agent {
+            id: cert.cert.agent,
+            label: cert.cert.label.clone(),
+        },
+        Principal::Web { session } => PrincipalRef::Web {
+            label: session.session.label.clone(),
+        },
     };
     let audit = AuditEvent {
         at: ctx.now,
@@ -275,20 +294,33 @@ pub fn decide(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &A
     Verdict { outcome, audit }
 }
 
-fn check(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &Action) -> Result<(), DenyReason> {
+fn check(
+    ctx: &Context<'_>,
+    peer: NodeId,
+    principal: &Principal,
+    action: &Action,
+) -> Result<(), DenyReason> {
     use DenyReason::*;
     if let Principal::Web { session } = principal {
         return check_web(ctx, peer, session, action);
     }
     // 设备和 agent：承载请求的设备必须在名册里。
     ctx.roster.device(peer).ok_or(PeerNotInRoster)?;
-    let Principal::Agent { cert, assertion, signature } = principal else {
+    let Principal::Agent {
+        cert,
+        assertion,
+        signature,
+    } = principal
+    else {
         // 名册内的设备代表用户本人。
         return Ok(());
     };
     let c = &cert.cert;
     cert.validate(ctx.roster, ctx.now)?;
-    if !c.agent.verify(Purpose::AgentAssertion, &canonical(assertion), signature) {
+    if !c
+        .agent
+        .verify(Purpose::AgentAssertion, &canonical(assertion), signature)
+    {
         return Err(AssertionBadSignature);
     }
     if assertion.target != ctx.me {
@@ -307,11 +339,20 @@ fn check(ctx: &Context<'_>, peer: NodeId, principal: &Principal, action: &Action
 }
 
 /// 网页会话：对端是浏览器而不是名册内的设备，凭签发设备的签名和名册里的通行密钥判定。
-fn check_web(ctx: &Context<'_>, peer: NodeId, s: &SignedWebSession, action: &Action) -> Result<(), DenyReason> {
+fn check_web(
+    ctx: &Context<'_>,
+    peer: NodeId,
+    s: &SignedWebSession,
+    action: &Action,
+) -> Result<(), DenyReason> {
     use DenyReason::*;
     let w = &s.session;
     ctx.roster.device(w.issuer).ok_or(IssuerNotInRoster)?;
-    if !w.issuer.public_key().verify(Purpose::WebSession, &canonical(w), &s.signature) {
+    if !w
+        .issuer
+        .public_key()
+        .verify(Purpose::WebSession, &canonical(w), &s.signature)
+    {
         return Err(SessionBadSignature);
     }
     if peer != w.browser {
@@ -326,7 +367,11 @@ fn check_web(ctx: &Context<'_>, peer: NodeId, s: &SignedWebSession, action: &Act
     if ctx.now >= w.not_after {
         return Err(SessionExpired);
     }
-    let key = ctx.roster.web_key(&w.label).filter(|k| k.credential_id == w.credential_id).ok_or(WebKeyRevoked)?;
+    let key = ctx
+        .roster
+        .web_key(&w.label)
+        .filter(|k| k.credential_id == w.credential_id)
+        .ok_or(WebKeyRevoked)?;
     if !key.grants.iter().any(|g| g.allows(action)) {
         return Err(NoMatchingGrant);
     }
@@ -349,7 +394,12 @@ mod tests {
         let roster = Roster {
             root: root.public(),
             version: 1,
-            devices: vec![Device { node_id: peer, name: "laptop".into(), role: DeviceRole::Member, added_at: Timestamp(0) }],
+            devices: vec![Device {
+                node_id: peer,
+                name: "laptop".into(),
+                role: DeviceRole::Member,
+                added_at: Timestamp(0),
+            }],
             revoked_agents: vec![],
             web_keys: vec![],
             anchor: None,
@@ -378,14 +428,32 @@ mod tests {
                 nonce: [0; 16],
             };
             let signature = assertion.sign(&agent);
-            let p = Principal::Agent { cert: cert.clone(), assertion, signature };
-            decide(&Context { roster: &roster, me, now }, peer, &p, &action).outcome
+            let p = Principal::Agent {
+                cert: cert.clone(),
+                assertion,
+                signature,
+            };
+            decide(
+                &Context {
+                    roster: &roster,
+                    me,
+                    now,
+                },
+                peer,
+                &p,
+                &action,
+            )
+            .outcome
         };
         for ok in [-299_999, -300_000, 0, 300_000] {
             assert_eq!(at(ok), Outcome::Allow, "偏差 {ok} 毫秒应当允许");
         }
         for stale in [-300_001, 300_001, -3_600_000] {
-            assert_eq!(at(stale), Outcome::Deny(DenyReason::Stale), "偏差 {stale} 毫秒应当拒绝");
+            assert_eq!(
+                at(stale),
+                Outcome::Deny(DenyReason::Stale),
+                "偏差 {stale} 毫秒应当拒绝"
+            );
         }
     }
 
@@ -407,7 +475,10 @@ mod tests {
         let mut g = ReplayGuard::default();
         assert!(g.is_empty());
         assert!(g.first_use(&a, &assertion(1, now.0), now));
-        assert!(!g.first_use(&a, &assertion(1, now.0), now), "同一个请求第二次使用");
+        assert!(
+            !g.first_use(&a, &assertion(1, now.0), now),
+            "同一个请求第二次使用"
+        );
         assert!(g.first_use(&a, &assertion(2, now.0), now), "不同的随机数");
         assert!(g.first_use(&b, &assertion(1, now.0), now), "不同的 agent");
         assert_eq!(g.len(), 3);

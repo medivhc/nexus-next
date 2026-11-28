@@ -10,10 +10,10 @@ pub mod daemon;
 pub mod desktop;
 pub mod doctor;
 pub mod drive;
-pub mod tun;
-pub mod upgrade;
 mod push;
+pub mod tun;
 mod unix_ctl;
+pub mod upgrade;
 pub use unix_ctl::UnixCtl;
 
 use clap::{Parser, Subcommand};
@@ -23,12 +23,13 @@ use nexus_net_core::route;
 use nexus_runtime::CtlClient;
 use nexus_wire::RouteExplanation;
 use nexus_wire::{
-    AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, ShareRecord,
-    ShareStatus, Size, StatusReport, WireError,
+    AgentCredential, AgentInfo, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode,
+    ExecEvent, ExecResult, ExecSpec, Input, ListEntry, SessionInfo, ShareRecord, ShareStatus, Size,
+    StatusReport, WireError,
 };
 use serde_json::{json, Value};
-use std::future::Future;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -71,7 +72,13 @@ pub struct Cli {
     pub data_dir: Option<PathBuf>,
     /// 以 agent 的身份执行：凭据文本（nxa1- 开头）或凭据文件的路径。也可以用环境变量 NEXUS_AGENT 给出。
     /// agent 只能看到和做凭据里授权的事，不能做管理操作
-    #[arg(long, global = true, env = "NEXUS_AGENT", value_name = "凭据或文件", hide_env_values = true)]
+    #[arg(
+        long,
+        global = true,
+        env = "NEXUS_AGENT",
+        value_name = "凭据或文件",
+        hide_env_values = true
+    )]
     pub agent: Option<String>,
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -120,7 +127,12 @@ pub enum Cmd {
         #[arg(long, value_name = "网卡名")]
         tun: Option<String>,
         /// 完整节点的网段：本机临时地址从这里分配，第三个地址是名字服务
-        #[arg(long, value_name = "地址/前缀", requires = "tun", default_value = "198.18.0.0/16")]
+        #[arg(
+            long,
+            value_name = "地址/前缀",
+            requires = "tun",
+            default_value = "198.18.0.0/16"
+        )]
         tun_net: String,
         #[command(flatten)]
         anchor: AnchorArgs,
@@ -424,7 +436,12 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
         /// 不升级本机，经 Nexus 把新版本送到这些设备并升级它们，一台一台地（逗号分隔或重复）
-        #[arg(long, value_name = "设备", value_delimiter = ',', conflicts_with = "all")]
+        #[arg(
+            long,
+            value_name = "设备",
+            value_delimiter = ',',
+            conflicts_with = "all"
+        )]
         to: Vec<String>,
         /// 不升级本机，升级其他所有在线的设备（按名字顺序，一台换回了就停）
         #[arg(long)]
@@ -739,8 +756,11 @@ pub enum RouteCmd {
     #[command(group = clap::ArgGroup::new("outbound").required(true))]
     Add {
         /// 匹配这个域名和它的子域名
-        #[arg(long, value_name = "域名", required_unless_present = "cidr", conflicts_with = "cidr")]
+        #[arg(long, value_name = "域名", conflicts_with_all = ["cidr", "domain_exact"])]
         domain: Option<String>,
+        /// 仅精确匹配这个域名本身（不含子域名）
+        #[arg(long, value_name = "域名", conflicts_with_all = ["cidr", "domain"])]
+        domain_exact: Option<String>,
         /// 匹配这个地址段，例如 10.0.0.0/8
         #[arg(long, value_name = "地址/前缀")]
         cidr: Option<String>,
@@ -777,6 +797,35 @@ pub enum RouteCmd {
     Explain {
         /// 主机:端口
         target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 从 Clash / Mihomo YAML 规则子集导入并输出审计报告（N1）
+    Import {
+        /// 规则文件路径
+        file: std::path::PathBuf,
+        /// 代理组默认映射到的 Nexus 出口设备
+        #[arg(long, value_name = "设备")]
+        via: Option<String>,
+        /// 代理组默认映射到的上游 SOCKS5 地址（主机:端口）
+        #[arg(long, value_name = "主机:端口")]
+        socks5: Option<String>,
+        /// 替换现有规则（默认追加）；替换前自动保存 LKG 快照
+        #[arg(long)]
+        replace: bool,
+        /// 仅解析并输出审计报告，不下发给常驻程序
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 回滚路由规则到上一份已验证的 LKG 快照（N1）
+    Rollback {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 对当前路由规则执行静态冲突/遮蔽/无效上游审计（N1）
+    Audit {
         #[arg(long)]
         json: bool,
     },
@@ -832,7 +881,8 @@ pub fn load_agent(text: &str) -> Result<AgentCredential, String> {
     } else {
         std::fs::read_to_string(text).map_err(|e| format!("读不了凭据文件 {text}：{e}"))?
     };
-    AgentCredential::decode(&content).ok_or_else(|| "凭据格式不对：应当是 nexus agent issue 输出的 nxa1- 开头的文本".to_string())
+    AgentCredential::decode(&content)
+        .ok_or_else(|| "凭据格式不对：应当是 nexus agent issue 输出的 nxa1- 开头的文本".to_string())
 }
 
 /// 解析 `30s`、`15m`、`4h`、`7d` 形式的时长，返回毫秒。
@@ -949,7 +999,7 @@ where
 
 const DAEMON_HINT: &str = "，请先运行 nexus daemon";
 
-async fn call<C: Ctl>(ctl: &C, req: CtlRequest) -> io::Result<CtlResponse> {
+pub async fn call<C: Ctl>(ctl: &C, req: CtlRequest) -> io::Result<CtlResponse> {
     let mut session = ctl.open(req).await?;
     session
         .rx
@@ -959,15 +1009,35 @@ async fn call<C: Ctl>(ctl: &C, req: CtlRequest) -> io::Result<CtlResponse> {
 }
 
 /// 执行一条客户端命令，返回退出码。`stdin` 只有 `exec` 会读取。
-pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &C, stdin: &mut R, sink: &mut K) -> i32 {
+pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
+    cmd: &Cmd,
+    ctl: &C,
+    stdin: &mut R,
+    sink: &mut K,
+) -> i32 {
     let (req, json) = match cmd {
         Cmd::Daemon { .. } => return fail(sink, EXIT_USAGE, "usage", "daemon 不是客户端命令"),
-        Cmd::Exec { node, timeout, max_output, cwd, env, json, command } => {
+        Cmd::Exec {
+            node,
+            timeout,
+            max_output,
+            cwd,
+            env,
+            json,
+            command,
+        } => {
             let mut pairs = Vec::new();
             for kv in env {
                 match kv.split_once('=') {
                     Some((k, v)) if !k.is_empty() => pairs.push((k.to_string(), v.to_string())),
-                    _ => return fail(sink, EXIT_USAGE, "usage", &format!("--env 的格式应为 名字=值：{kv}")),
+                    _ => {
+                        return fail(
+                            sink,
+                            EXIT_USAGE,
+                            "usage",
+                            &format!("--env 的格式应为 名字=值：{kv}"),
+                        )
+                    }
                 }
             }
             if timeout.is_some_and(|t| !(t > 0.0 && t.is_finite())) {
@@ -981,75 +1051,189 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 timeout_ms: timeout.map(|t| (t * 1000.0).ceil() as u64),
                 max_output: *max_output,
             };
-            return exec(ctl, CtlRequest::Exec { node: node.clone(), spec }, *json, stdin, sink).await;
+            return exec(
+                ctl,
+                CtlRequest::Exec {
+                    node: node.clone(),
+                    spec,
+                },
+                *json,
+                stdin,
+                sink,
+            )
+            .await;
         }
         Cmd::Status { node: None, json } => (CtlRequest::Status, *json),
         Cmd::Doctor { json } => return doctor::run(ctl, *json, sink).await,
-        Cmd::Path { device, json } => (CtlRequest::Paths { device: device.clone() }, *json),
-        Cmd::Upgrade { status: true, json, .. } => (CtlRequest::UpgradeStatus, *json),
-        Cmd::Upgrade { rollback: true, json, .. } => (CtlRequest::UpgradeRollback, *json),
-        Cmd::Upgrade { file, confirm_within, force, json, to, all, .. } => {
+        Cmd::Path { device, json } => (
+            CtlRequest::Paths {
+                device: device.clone(),
+            },
+            *json,
+        ),
+        Cmd::Upgrade {
+            status: true, json, ..
+        } => (CtlRequest::UpgradeStatus, *json),
+        Cmd::Upgrade {
+            rollback: true,
+            json,
+            ..
+        } => (CtlRequest::UpgradeRollback, *json),
+        Cmd::Upgrade {
+            file,
+            confirm_within,
+            force,
+            json,
+            to,
+            all,
+            ..
+        } => {
             let Some(confirm_ms) = parse_ttl(confirm_within) else {
-                return fail(sink, EXIT_USAGE, "usage", &format!("--confirm-within 的格式不对：{confirm_within}（例如 60s、5m）"));
+                return fail(
+                    sink,
+                    EXIT_USAGE,
+                    "usage",
+                    &format!("--confirm-within 的格式不对：{confirm_within}（例如 60s、5m）"),
+                );
             };
             if *all || !to.is_empty() {
                 let file = std::path::PathBuf::from(file.clone().unwrap_or_default());
-                let opts = push::Options { file, confirm_ms, force: *force, to: to.clone(), all: *all, json: *json };
+                let opts = push::Options {
+                    file,
+                    confirm_ms,
+                    force: *force,
+                    to: to.clone(),
+                    all: *all,
+                    json: *json,
+                };
                 return push::run(ctl, &opts, sink).await;
             }
             let file = file.clone().unwrap_or_default();
             // 常驻程序的工作目录不一定和这里一样：给它绝对路径。
-            let file = std::path::absolute(&file).map(|p| p.display().to_string()).unwrap_or(file);
-            (CtlRequest::Upgrade { file, confirm_ms, force: *force }, *json)
+            let file = std::path::absolute(&file)
+                .map(|p| p.display().to_string())
+                .unwrap_or(file);
+            (
+                CtlRequest::Upgrade {
+                    file,
+                    confirm_ms,
+                    force: *force,
+                },
+                *json,
+            )
         }
-        Cmd::Iface { name, metered, json } => {
+        Cmd::Iface {
+            name,
+            metered,
+            json,
+        } => {
             let set = match (name, metered.as_deref()) {
-                (Some(n), Some(m)) => Some((n.clone(), match m {
-                    "on" => Some(true),
-                    "off" => Some(false),
-                    _ => None,
-                })),
+                (Some(n), Some(m)) => Some((
+                    n.clone(),
+                    match m {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None,
+                    },
+                )),
                 _ => None,
             };
             (CtlRequest::Interfaces { set }, *json)
         }
-        Cmd::Status { node: Some(n), json } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
+        Cmd::Status {
+            node: Some(n),
+            json,
+        } => (CtlRequest::RemoteStatus { node: n.clone() }, *json),
         Cmd::Init { name, json } => (CtlRequest::Init { name: name.clone() }, *json),
         Cmd::Recover { code, json } => (CtlRequest::Recover { code: code.clone() }, *json),
         Cmd::RotateRoot { json } => (CtlRequest::RootRotate, *json),
         Cmd::Join { json } => (CtlRequest::JoinStart, *json),
-        Cmd::Device { cmd: DeviceCmd::Approve { code, name, json } } => {
-            (CtlRequest::Approve { code: code.clone(), name: name.clone() }, *json)
-        }
-        Cmd::Device { cmd: DeviceCmd::Revoke { name, json } } => (CtlRequest::Revoke { name: name.clone() }, *json),
+        Cmd::Device {
+            cmd: DeviceCmd::Approve { code, name, json },
+        } => (
+            CtlRequest::Approve {
+                code: code.clone(),
+                name: name.clone(),
+            },
+            *json,
+        ),
+        Cmd::Device {
+            cmd: DeviceCmd::Revoke { name, json },
+        } => (CtlRequest::Revoke { name: name.clone() }, *json),
         Cmd::Ls { node: None, json } => (CtlRequest::List, *json),
-        Cmd::Ls { node: Some(node), json } => (CtlRequest::Services { node: node.clone() }, *json),
-        Cmd::Publish { name, port, host, proto, env, json } => {
+        Cmd::Ls {
+            node: Some(node),
+            json,
+        } => (CtlRequest::Services { node: node.clone() }, *json),
+        Cmd::Publish {
+            name,
+            port,
+            host,
+            proto,
+            env,
+            json,
+        } => {
             let mut pairs = Vec::new();
             for kv in env {
                 match kv.split_once('=') {
                     Some((k, v)) => pairs.push((k.to_string(), v.to_string())),
-                    None => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("--env 的格式应为 名字=值：{kv}")),
+                    None => {
+                        return fail(
+                            sink,
+                            EXIT_INVALID_INPUT,
+                            "invalid_input",
+                            &format!("--env 的格式应为 名字=值：{kv}"),
+                        )
+                    }
                 }
             }
             let addr = std::net::SocketAddr::new(*host, *port);
-            (CtlRequest::Publish { name: name.clone(), addr, proto: proto.clone(), env: pairs }, *json)
+            (
+                CtlRequest::Publish {
+                    name: name.clone(),
+                    addr,
+                    proto: proto.clone(),
+                    env: pairs,
+                },
+                *json,
+            )
         }
         Cmd::Unpublish { name, json } => (CtlRequest::Unpublish { name: name.clone() }, *json),
         Cmd::Connect { target, listen } => {
-            let Some((node, name)) = target.split_once('/').filter(|(n, s)| !n.is_empty() && !s.is_empty()) else {
-                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("服务的路径应为 <设备>/<服务>：{target}"));
+            let Some((node, name)) = target
+                .split_once('/')
+                .filter(|(n, s)| !n.is_empty() && !s.is_empty())
+            else {
+                return fail(
+                    sink,
+                    EXIT_INVALID_INPUT,
+                    "invalid_input",
+                    &format!("服务的路径应为 <设备>/<服务>：{target}"),
+                );
             };
             return match listen {
                 None => connect_stdio(ctl, node, name, stdin, sink).await,
                 Some(addr) => connect_listen(ctl, node, name, addr, sink).await,
             };
         }
-        Cmd::Route { cmd: RouteCmd::Add { domain, cidr, reject, via, socks5, json, .. } } => {
-            let matcher = match (domain, cidr) {
-                (Some(d), _) => route::Matcher::parse_domain(d),
-                (None, Some(c)) => route::Matcher::parse_cidr(c),
-                (None, None) => Err("需要 --domain 或 --cidr".to_string()),
+        Cmd::Route {
+            cmd:
+                RouteCmd::Add {
+                    domain,
+                    domain_exact,
+                    cidr,
+                    reject,
+                    via,
+                    socks5,
+                    json,
+                    ..
+                },
+        } => {
+            let matcher = match (domain, domain_exact, cidr) {
+                (Some(d), _, _) => route::Matcher::parse_domain(d),
+                (None, Some(d), _) => route::Matcher::parse_domain_exact(d),
+                (None, None, Some(c)) => route::Matcher::parse_cidr(c),
+                (None, None, None) => Err("需要 --domain、--domain-exact 或 --cidr".to_string()),
             };
             let matcher = match matcher {
                 Ok(m) => m,
@@ -1061,21 +1245,138 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 (None, None) if *reject => route::Outbound::Reject,
                 (None, None) => route::Outbound::Direct,
             };
-            (CtlRequest::RouteAdd { rule: route::Rule { matcher, outbound } }, *json)
+            (
+                CtlRequest::RouteAdd {
+                    rule: route::Rule { matcher, outbound },
+                },
+                *json,
+            )
         }
-        Cmd::Exit { cmd: ExitCmd::On { json } } => (CtlRequest::ExitSet { enabled: true }, *json),
-        Cmd::Exit { cmd: ExitCmd::Off { json } } => (CtlRequest::ExitSet { enabled: false }, *json),
-        Cmd::Exit { cmd: ExitCmd::Status { json } } => (CtlRequest::ExitShow, *json),
-        Cmd::Route { cmd: RouteCmd::Rm { index, json } } => (CtlRequest::RouteRm { index: *index }, *json),
-        Cmd::Route { cmd: RouteCmd::Ls { json } } => (CtlRequest::RouteList, *json),
-        Cmd::Route { cmd: RouteCmd::Explain { target, json } } => {
+        Cmd::Exit {
+            cmd: ExitCmd::On { json },
+        } => (CtlRequest::ExitSet { enabled: true }, *json),
+        Cmd::Exit {
+            cmd: ExitCmd::Off { json },
+        } => (CtlRequest::ExitSet { enabled: false }, *json),
+        Cmd::Exit {
+            cmd: ExitCmd::Status { json },
+        } => (CtlRequest::ExitShow, *json),
+        Cmd::Route {
+            cmd: RouteCmd::Rm { index, json },
+        } => (CtlRequest::RouteRm { index: *index }, *json),
+        Cmd::Route {
+            cmd: RouteCmd::Ls { json },
+        } => (CtlRequest::RouteList, *json),
+        Cmd::Route {
+            cmd: RouteCmd::Explain { target, json },
+        } => {
             if nexus_net_core::Target::parse(target).is_none() {
-                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("目标应当写成 主机:端口：{target}"));
+                return fail(
+                    sink,
+                    EXIT_INVALID_INPUT,
+                    "invalid_input",
+                    &format!("目标应当写成 主机:端口：{target}"),
+                );
             }
-            (CtlRequest::RouteExplain { target: target.clone() }, *json)
+            (
+                CtlRequest::RouteExplain {
+                    target: target.clone(),
+                },
+                *json,
+            )
         }
+        Cmd::Route {
+            cmd:
+                RouteCmd::Import {
+                    file,
+                    via,
+                    socks5,
+                    replace,
+                    dry_run,
+                    json,
+                },
+        } => {
+            let text = match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(e) => {
+                    return fail(
+                        sink,
+                        EXIT_INVALID_INPUT,
+                        "invalid_input",
+                        &format!("无法读取规则文件 {}：{e}", file.display()),
+                    )
+                }
+            };
+            let opts = nexus_net_core::import::ImportOptions {
+                default_exit: via.clone(),
+                default_socks5: socks5.clone(),
+            };
+            let report = nexus_net_core::import::parse_clash_rules(&text, &opts);
+            let audit = route::audit_rules(&report.imported);
+            if *dry_run {
+                if *json {
+                    sink.out(
+                        doc(json!({
+                            "schema": JSON_SCHEMA,
+                            "dry_run": true,
+                            "imported": report.imported.len(),
+                            "skipped": report.skipped,
+                            "notes": report.notes,
+                            "audit": audit,
+                        }))
+                        .as_bytes(),
+                    );
+                } else {
+                    let mut out = format!(
+                        "试运行：可导入 {} 条，跳过 {} 条
+",
+                        report.imported.len(),
+                        report.skipped.len()
+                    );
+                    for s in &report.skipped {
+                        out.push_str(&format!(
+                            "  跳过 第{}行 {}: {}
+",
+                            s.line, s.raw, s.reason
+                        ));
+                    }
+                    for n in &report.notes {
+                        out.push_str(&format!(
+                            "  提示 {n}
+"
+                        ));
+                    }
+                    for i in &audit.issues {
+                        out.push_str(&format!(
+                            "  审计 {}
+",
+                            i.message
+                        ));
+                    }
+                    sink.out(out.as_bytes());
+                }
+                return 0;
+            }
+            (
+                CtlRequest::RouteImport {
+                    rules: report.imported,
+                    replace: *replace,
+                },
+                *json,
+            )
+        }
+        Cmd::Route {
+            cmd: RouteCmd::Rollback { json },
+        } => (CtlRequest::RouteRollback, *json),
+        Cmd::Route {
+            cmd: RouteCmd::Audit { json },
+        } => (CtlRequest::RouteAudit, *json),
         Cmd::Run { uses, command } => return run_with_services(ctl, uses, command, sink).await,
-        Cmd::Open { target, port, no_browser } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
+        Cmd::Open {
+            target,
+            port,
+            no_browser,
+        } => return open_in_browser(ctl, target, *port, !*no_browser, sink).await,
         Cmd::Drive { cmd } => return drive::run(cmd, ctl, stdin, sink).await,
         Cmd::Desktop { cmd } => return desktop::run(cmd, ctl, sink).await,
         Cmd::Ssh { .. } => {
@@ -1092,59 +1393,211 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             };
         }
         Cmd::Mcp => return mcp(ctl, stdin, sink).await,
-        Cmd::SshConfig | Cmd::SshProxy { .. } | Cmd::SessionHold { .. } | Cmd::ProtocolVersion | Cmd::Web { cmd: WebCmd::Serve { .. } } => {
-            return fail(sink, EXIT_USAGE, "usage", "这条命令只能由 nexus 程序直接运行")
+        Cmd::SshConfig
+        | Cmd::SshProxy { .. }
+        | Cmd::SessionHold { .. }
+        | Cmd::ProtocolVersion
+        | Cmd::Web {
+            cmd: WebCmd::Serve { .. },
+        } => {
+            return fail(
+                sink,
+                EXIT_USAGE,
+                "usage",
+                "这条命令只能由 nexus 程序直接运行",
+            )
         }
-        Cmd::Agent { cmd: AgentCmd::Issue { label, grants, ttl, json, .. } } => {
+        Cmd::Agent {
+            cmd:
+                AgentCmd::Issue {
+                    label,
+                    grants,
+                    ttl,
+                    json,
+                    ..
+                },
+        } => {
             let Some(ttl_ms) = parse_ttl(ttl) else {
-                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 4h：{ttl}"));
+                return fail(
+                    sink,
+                    EXIT_USAGE,
+                    "usage",
+                    &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 4h：{ttl}"),
+                );
             };
-            (CtlRequest::AgentIssue { label: label.clone(), grants: grants.clone(), ttl_ms }, *json)
+            (
+                CtlRequest::AgentIssue {
+                    label: label.clone(),
+                    grants: grants.clone(),
+                    ttl_ms,
+                },
+                *json,
+            )
         }
-        Cmd::Agent { cmd: AgentCmd::Revoke { who, json } } => (CtlRequest::AgentRevoke { agent: who.clone() }, *json),
-        Cmd::Agent { cmd: AgentCmd::Ls { json } } => (CtlRequest::AgentList, *json),
+        Cmd::Agent {
+            cmd: AgentCmd::Revoke { who, json },
+        } => (CtlRequest::AgentRevoke { agent: who.clone() }, *json),
+        Cmd::Agent {
+            cmd: AgentCmd::Ls { json },
+        } => (CtlRequest::AgentList, *json),
         Cmd::Audit { limit, json } => (CtlRequest::Audit { limit: *limit }, *json),
-        Cmd::Web { cmd: WebCmd::Enroll { label, grants, ttl, page, json } } => {
+        Cmd::Web {
+            cmd:
+                WebCmd::Enroll {
+                    label,
+                    grants,
+                    ttl,
+                    page,
+                    json,
+                },
+        } => {
             let Some(ttl_ms) = parse_ttl(ttl) else {
-                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 10m：{ttl}"));
+                return fail(
+                    sink,
+                    EXIT_USAGE,
+                    "usage",
+                    &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 10m：{ttl}"),
+                );
             };
-            (CtlRequest::WebEnroll { label: label.clone(), grants: grants.clone(), ttl_ms, page: page.clone() }, *json)
+            (
+                CtlRequest::WebEnroll {
+                    label: label.clone(),
+                    grants: grants.clone(),
+                    ttl_ms,
+                    page: page.clone(),
+                },
+                *json,
+            )
         }
-        Cmd::Hw { cmd: HwCmd::Ls { node_id, hint, json } } => {
+        Cmd::Hw {
+            cmd:
+                HwCmd::Ls {
+                    node_id,
+                    hint,
+                    json,
+                },
+        } => {
             let Ok(id) = node_id.parse() else {
-                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+                return fail(
+                    sink,
+                    EXIT_INVALID_INPUT,
+                    "invalid_input",
+                    &format!("节点标识格式不对：{node_id}"),
+                );
             };
-            (CtlRequest::HardwareList { node_id: id, hint: hint.clone() }, *json)
+            (
+                CtlRequest::HardwareList {
+                    node_id: id,
+                    hint: hint.clone(),
+                },
+                *json,
+            )
         }
-        Cmd::Hw { cmd: HwCmd::Capture { node_id, kind, hint, json } } => {
+        Cmd::Hw {
+            cmd:
+                HwCmd::Capture {
+                    node_id,
+                    kind,
+                    hint,
+                    json,
+                },
+        } => {
             let Ok(id) = node_id.parse() else {
-                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("节点标识格式不对：{node_id}"));
+                return fail(
+                    sink,
+                    EXIT_INVALID_INPUT,
+                    "invalid_input",
+                    &format!("节点标识格式不对：{node_id}"),
+                );
             };
             let Some(k) = nexus_wire::HardwareKind::parse(kind) else {
-                return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("硬件能力应为 camera、microphone 或 location：{kind}"));
+                return fail(
+                    sink,
+                    EXIT_INVALID_INPUT,
+                    "invalid_input",
+                    &format!("硬件能力应为 camera、microphone 或 location：{kind}"),
+                );
             };
-            (CtlRequest::HardwareCapture { node_id: id, hint: hint.clone(), kind: k }, *json)
+            (
+                CtlRequest::HardwareCapture {
+                    node_id: id,
+                    hint: hint.clone(),
+                    kind: k,
+                },
+                *json,
+            )
         }
-        Cmd::Share { cmd: ShareCmd::Create { drive, service, terminal, ttl, max_uses, page, json } } => {
+        Cmd::Share {
+            cmd:
+                ShareCmd::Create {
+                    drive,
+                    service,
+                    terminal,
+                    ttl,
+                    max_uses,
+                    page,
+                    json,
+                },
+        } => {
             let Some(ttl_ms) = parse_ttl(ttl) else {
-                return fail(sink, EXIT_USAGE, "usage", &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"));
+                return fail(
+                    sink,
+                    EXIT_USAGE,
+                    "usage",
+                    &format!("--ttl 的格式应为 数字加单位（s、m、h、d），例如 1h：{ttl}"),
+                );
             };
             let target = match (drive, service, terminal) {
                 (Some(d), None, None) => {
                     let Some((ws, p)) = d.split_once(":/") else {
-                        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("工作区路径应写成 <工作区>:/<路径>：{d}"));
+                        return fail(
+                            sink,
+                            EXIT_INVALID_INPUT,
+                            "invalid_input",
+                            &format!("工作区路径应写成 <工作区>:/<路径>：{d}"),
+                        );
                     };
-                    nexus_wire::ShareTarget::Drive { ws: ws.to_string(), path: format!("/{p}") }
+                    nexus_wire::ShareTarget::Drive {
+                        ws: ws.to_string(),
+                        path: format!("/{p}"),
+                    }
                 }
                 (None, Some(s), None) => nexus_wire::ShareTarget::Service { name: s.clone() },
                 (None, None, Some(t)) => nexus_wire::ShareTarget::Terminal { session: t.clone() },
-                _ => return fail(sink, EXIT_USAGE, "usage", "必须且只能指定 --drive、--service 或 --terminal 之一"),
+                _ => {
+                    return fail(
+                        sink,
+                        EXIT_USAGE,
+                        "usage",
+                        "必须且只能指定 --drive、--service 或 --terminal 之一",
+                    )
+                }
             };
-            (CtlRequest::ShareCreate { target, ttl_ms, max_uses: *max_uses, page: page.clone() }, *json)
+            (
+                CtlRequest::ShareCreate {
+                    target,
+                    ttl_ms,
+                    max_uses: *max_uses,
+                    page: page.clone(),
+                },
+                *json,
+            )
         }
-        Cmd::Share { cmd: ShareCmd::Ls { json } } => (CtlRequest::ShareList, *json),
-        Cmd::Share { cmd: ShareCmd::Revoke { id, json } } => (CtlRequest::ShareRevoke { id: id.clone() }, *json),
-        Cmd::Vault { cmd: VaultCmd::Put { name, value, devices, json } } => {
+        Cmd::Share {
+            cmd: ShareCmd::Ls { json },
+        } => (CtlRequest::ShareList, *json),
+        Cmd::Share {
+            cmd: ShareCmd::Revoke { id, json },
+        } => (CtlRequest::ShareRevoke { id: id.clone() }, *json),
+        Cmd::Vault {
+            cmd:
+                VaultCmd::Put {
+                    name,
+                    value,
+                    devices,
+                    json,
+                },
+        } => {
             let bytes = match value {
                 Some(v) => v.as_bytes().to_vec(),
                 None => {
@@ -1153,29 +1606,83 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     buf
                 }
             };
-            (CtlRequest::VaultPut { name: name.clone(), value: bytes, devices: devices.clone() }, *json)
+            (
+                CtlRequest::VaultPut {
+                    name: name.clone(),
+                    value: bytes,
+                    devices: devices.clone(),
+                },
+                *json,
+            )
         }
-        Cmd::Vault { cmd: VaultCmd::Get { name, json } } => (CtlRequest::VaultGet { name: name.clone() }, *json),
-        Cmd::Vault { cmd: VaultCmd::Ls { json } } => (CtlRequest::VaultList, *json),
-        Cmd::Vault { cmd: VaultCmd::Rm { name, json } } => (CtlRequest::VaultRm { name: name.clone() }, *json),
-        Cmd::Vault { cmd: VaultCmd::Sync { json } } => (CtlRequest::VaultSync, *json),
-        Cmd::Vault { cmd: VaultCmd::RotateNeeded { device, json } } => {
-            (CtlRequest::VaultRotateNeeded { device: device.clone() }, *json)
-        }
-        Cmd::Web { cmd: WebCmd::Ls { json } } => (CtlRequest::WebList, *json),
-        Cmd::Anchor { cmd: AnchorCmd::Set { url, clear, json } } => {
-            (CtlRequest::AnchorSet { url: if *clear { None } else { url.clone() } }, *json)
-        }
-        Cmd::Anchor { cmd: AnchorCmd::Show { json } } => (CtlRequest::AnchorShow, *json),
-        Cmd::Web { cmd: WebCmd::Revoke { label, json } } => (CtlRequest::WebRevoke { label: label.clone() }, *json),
-        Cmd::Session { cmd: SessionCmd::Ls { node, json } } => (CtlRequest::SessionList { node: node.clone() }, *json),
-        Cmd::Session { cmd: SessionCmd::Kill { node, session, json } } => {
-            (CtlRequest::SessionKill { node: node.clone(), session: session.clone() }, *json)
-        }
+        Cmd::Vault {
+            cmd: VaultCmd::Get { name, json },
+        } => (CtlRequest::VaultGet { name: name.clone() }, *json),
+        Cmd::Vault {
+            cmd: VaultCmd::Ls { json },
+        } => (CtlRequest::VaultList, *json),
+        Cmd::Vault {
+            cmd: VaultCmd::Rm { name, json },
+        } => (CtlRequest::VaultRm { name: name.clone() }, *json),
+        Cmd::Vault {
+            cmd: VaultCmd::Sync { json },
+        } => (CtlRequest::VaultSync, *json),
+        Cmd::Vault {
+            cmd: VaultCmd::RotateNeeded { device, json },
+        } => (
+            CtlRequest::VaultRotateNeeded {
+                device: device.clone(),
+            },
+            *json,
+        ),
+        Cmd::Web {
+            cmd: WebCmd::Ls { json },
+        } => (CtlRequest::WebList, *json),
+        Cmd::Anchor {
+            cmd: AnchorCmd::Set { url, clear, json },
+        } => (
+            CtlRequest::AnchorSet {
+                url: if *clear { None } else { url.clone() },
+            },
+            *json,
+        ),
+        Cmd::Anchor {
+            cmd: AnchorCmd::Show { json },
+        } => (CtlRequest::AnchorShow, *json),
+        Cmd::Web {
+            cmd: WebCmd::Revoke { label, json },
+        } => (
+            CtlRequest::WebRevoke {
+                label: label.clone(),
+            },
+            *json,
+        ),
+        Cmd::Session {
+            cmd: SessionCmd::Ls { node, json },
+        } => (CtlRequest::SessionList { node: node.clone() }, *json),
+        Cmd::Session {
+            cmd:
+                SessionCmd::Kill {
+                    node,
+                    session,
+                    json,
+                },
+        } => (
+            CtlRequest::SessionKill {
+                node: node.clone(),
+                session: session.clone(),
+            },
+            *json,
+        ),
     };
     let resp = match call(ctl, req).await {
         Err(e) => {
-            return fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"))
+            return fail(
+                sink,
+                EXIT_DAEMON_UNREACHABLE,
+                "daemon_unreachable",
+                &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"),
+            )
         }
         Ok(r) => r,
     };
@@ -1190,15 +1697,28 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         | CtlResponse::Drive(_) => {
             return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
         }
-        CtlResponse::Sessions(list) => if json { sessions_json(&list) } else { sessions_text(&list) },
+        CtlResponse::Sessions(list) => {
+            if json {
+                sessions_json(&list)
+            } else {
+                sessions_text(&list)
+            }
+        }
         CtlResponse::AgentIssued(r) => {
             let out = match cmd {
-                Cmd::Agent { cmd: AgentCmd::Issue { out, .. } } => out.clone(),
+                Cmd::Agent {
+                    cmd: AgentCmd::Issue { out, .. },
+                } => out.clone(),
                 _ => None,
             };
             if let Some(path) = &out {
                 if let Err(e) = write_private(path, &r.credential) {
-                    return fail(sink, EXIT_INTERNAL, "internal", &format!("写不了凭据文件 {}：{e}", path.display()));
+                    return fail(
+                        sink,
+                        EXIT_INTERNAL,
+                        "internal",
+                        &format!("写不了凭据文件 {}：{e}", path.display()),
+                    );
                 }
             }
             let agent_id = nexus_core_proto::NodeId(r.agent_id.0).to_string();
@@ -1219,7 +1739,12 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     Some(path) => format!("凭据已写入 {}。\n使用：NEXUS_AGENT={} nexus <命令>\n", path.display(), path.display()),
                     None => format!("凭据（含私钥，请像密码一样保管）：\n\n{}\n\n使用：NEXUS_AGENT=<凭据> nexus <命令>，或 nexus --agent <凭据> <命令>\n", r.credential),
                 };
-                format!("已签发 agent {}（{}），有效期至 {}。\n{how}", r.label, &agent_id[..8], local_time(r.not_after.0))
+                format!(
+                    "已签发 agent {}（{}），有效期至 {}。\n{how}",
+                    r.label,
+                    &agent_id[..8],
+                    local_time(r.not_after.0)
+                )
             }
         }
         CtlResponse::AgentRevoked(m) => {
@@ -1233,17 +1758,36 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     "unreachable": m.unreachable,
                 }))
             } else {
-                let mut s = format!("已撤销 agent {}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed);
+                let mut s = format!(
+                    "已撤销 agent {}，名册版本 {}，已通知 {} 台设备。\n",
+                    m.name, m.roster_version, m.pushed
+                );
                 if !m.unreachable.is_empty() {
-                    s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
+                    s.push_str(&format!(
+                        "暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n",
+                        m.unreachable.join("、")
+                    ));
                 }
-                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
-                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
-                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                if matches!(
+                    cmd,
+                    Cmd::Device {
+                        cmd: DeviceCmd::Revoke { .. }
+                    }
+                ) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) = call(
+                        ctl,
+                        CtlRequest::VaultRotateNeeded {
+                            device: Some(m.name.clone()),
+                        },
+                    )
+                    .await
                     {
                         for item in items {
                             if !item.entries.is_empty() {
-                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                                s.push_str(&format!(
+                                    "需要轮换的 Vault 条目：{}\n",
+                                    item.entries.join("、")
+                                ));
                             }
                         }
                     }
@@ -1251,7 +1795,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 s
             }
         }
-        CtlResponse::Agents(list) => if json { agents_json(&list) } else { agents_text(&list) },
+        CtlResponse::Agents(list) => {
+            if json {
+                agents_json(&list)
+            } else {
+                agents_text(&list)
+            }
+        }
         CtlResponse::HardwareList(list) => {
             let names: Vec<&str> = list.iter().map(|k| k.as_str()).collect();
             if json {
@@ -1268,10 +1818,19 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     nexus_wire::HardwareCapture::Camera { mime, data } => {
                         json!({ "kind": "camera", "mime": mime, "data_base64": base64(&data) })
                     }
-                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
+                    nexus_wire::HardwareCapture::Microphone {
+                        mime,
+                        duration_ms,
+                        data,
+                    } => {
                         json!({ "kind": "microphone", "mime": mime, "duration_ms": duration_ms, "data_base64": base64(&data) })
                     }
-                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, timestamp_ms } => {
+                    nexus_wire::HardwareCapture::Location {
+                        lat_e7,
+                        lon_e7,
+                        accuracy_cm,
+                        timestamp_ms,
+                    } => {
                         json!({ "kind": "location", "lat_e7": lat_e7, "lon_e7": lon_e7, "accuracy_cm": accuracy_cm, "timestamp_ms": timestamp_ms })
                     }
                 };
@@ -1281,11 +1840,28 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     nexus_wire::HardwareCapture::Camera { mime, data } => {
                         format!("camera ({mime}, {} bytes)\n", data.len())
                     }
-                    nexus_wire::HardwareCapture::Microphone { mime, duration_ms, data } => {
-                        format!("microphone ({mime}, {duration_ms}ms, {} bytes)\n", data.len())
+                    nexus_wire::HardwareCapture::Microphone {
+                        mime,
+                        duration_ms,
+                        data,
+                    } => {
+                        format!(
+                            "microphone ({mime}, {duration_ms}ms, {} bytes)\n",
+                            data.len()
+                        )
                     }
-                    nexus_wire::HardwareCapture::Location { lat_e7, lon_e7, accuracy_cm, .. } => {
-                        format!("location ({:.6}, {:.6}, ±{:.2}m)\n", lat_e7 as f64 / 1e7, lon_e7 as f64 / 1e7, accuracy_cm as f64 / 100.0)
+                    nexus_wire::HardwareCapture::Location {
+                        lat_e7,
+                        lon_e7,
+                        accuracy_cm,
+                        ..
+                    } => {
+                        format!(
+                            "location ({:.6}, {:.6}, ±{:.2}m)\n",
+                            lat_e7 as f64 / 1e7,
+                            lon_e7 as f64 / 1e7,
+                            accuracy_cm as f64 / 100.0
+                        )
                     }
                 }
             }
@@ -1313,16 +1889,34 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 match call(ctl, CtlRequest::Status).await {
                     Ok(CtlResponse::Status(st)) => match st.info {
                         Some(info) => info.now,
-                        None => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序没有返回当前时间"),
+                        None => {
+                            return fail(
+                                sink,
+                                EXIT_INTERNAL,
+                                "internal",
+                                "常驻程序没有返回当前时间",
+                            )
+                        }
                     },
                     Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
-                    Ok(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
+                    Ok(_) => {
+                        return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解")
+                    }
                     Err(e) => {
-                        return fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"));
+                        return fail(
+                            sink,
+                            EXIT_DAEMON_UNREACHABLE,
+                            "daemon_unreachable",
+                            &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"),
+                        );
                     }
                 }
             };
-            if json { shares_json(&list, now) } else { shares_text(&list, now) }
+            if json {
+                shares_json(&list, now)
+            } else {
+                shares_text(&list, now)
+            }
         }
         CtlResponse::ShareRevoked(s) => {
             if json {
@@ -1343,7 +1937,12 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     })
                 )
             } else {
-                format!("已保存 Vault 条目 {}（版本 {}，授权设备：{}）\n", info.name, info.version, info.devices.join("、"))
+                format!(
+                    "已保存 Vault 条目 {}（版本 {}，授权设备：{}）\n",
+                    info.name,
+                    info.version,
+                    info.devices.join("、")
+                )
             }
         }
         CtlResponse::VaultValue { name, value } => {
@@ -1388,7 +1987,13 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             } else {
                 items
                     .iter()
-                    .map(|i| format!("已吊销设备 {} 接触过、建议轮换的条目：{}\n", i.revoked_device, i.entries.join("、")))
+                    .map(|i| {
+                        format!(
+                            "已吊销设备 {} 接触过、建议轮换的条目：{}\n",
+                            i.revoked_device,
+                            i.entries.join("、")
+                        )
+                    })
                     .collect()
             }
         }
@@ -1413,7 +2018,9 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
         }
         CtlResponse::WebEnroll(r) => {
             if json {
-                doc(json!({ "schema": JSON_SCHEMA, "label": r.label, "url": r.url, "expires_at_ms": r.expires_at.0 }))
+                doc(
+                    json!({ "schema": JSON_SCHEMA, "label": r.label, "url": r.url, "expires_at_ms": r.expires_at.0 }),
+                )
             } else {
                 format!("在要用的设备上打开下面的链接，创建通行密钥后登记即完成（链接只能用一次）：\n\n{}\n", r.url)
             }
@@ -1428,7 +2035,9 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             } else if list.is_empty() {
                 "还没有登记通行密钥\n".to_string()
             } else {
-                list.iter().map(|k| format!("{:<16} {}  {}\n", k.label, k.rp_id, k.grants.join(" "))).collect()
+                list.iter()
+                    .map(|k| format!("{:<16} {}  {}\n", k.label, k.rp_id, k.grants.join(" ")))
+                    .collect()
             }
         }
         CtlResponse::WebRevoked(m) => {
@@ -1441,7 +2050,10 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     "unreachable": m.unreachable,
                 }))
             } else {
-                format!("已撤销通行密钥 {}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed)
+                format!(
+                    "已撤销通行密钥 {}，名册版本 {}，已通知 {} 台设备。\n",
+                    m.name, m.roster_version, m.pushed
+                )
             }
         }
         CtlResponse::Anchor(a) => {
@@ -1459,30 +2071,56 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     None => "没有设置锚点".to_string(),
                 };
                 match cmd {
-                    Cmd::Anchor { cmd: AnchorCmd::Set { .. } } => {
-                        format!("{what}。名册版本 {}，已通知 {} 台设备。\n", a.roster_version, a.pushed)
+                    Cmd::Anchor {
+                        cmd: AnchorCmd::Set { .. },
+                    } => {
+                        format!(
+                            "{what}。名册版本 {}，已通知 {} 台设备。\n",
+                            a.roster_version, a.pushed
+                        )
                     }
                     _ => format!("{what}\n"),
                 }
             }
         }
-        CtlResponse::Audit(records) => if json { audit_json(&records) } else { audit_text(&records) },
+        CtlResponse::Audit(records) => {
+            if json {
+                audit_json(&records)
+            } else {
+                audit_text(&records)
+            }
+        }
         CtlResponse::Ok => match cmd {
-            Cmd::Vault { cmd: VaultCmd::Rm { name, .. } } => {
+            Cmd::Route {
+                cmd: RouteCmd::Rollback { .. },
+            } => {
+                if json {
+                    doc(json!({ "schema": JSON_SCHEMA, "rolled_back": true }))
+                } else {
+                    "已回滚到上一版规则快照\n".into()
+                }
+            }
+            Cmd::Vault {
+                cmd: VaultCmd::Rm { name, .. },
+            } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "removed": name }))
                 } else {
                     format!("已删除 Vault 条目 {name}\n")
                 }
             }
-            Cmd::Session { cmd: SessionCmd::Kill { session, .. } } => {
+            Cmd::Session {
+                cmd: SessionCmd::Kill { session, .. },
+            } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "killed": session }))
                 } else {
                     format!("已结束会话 {session}\n")
                 }
             }
-            Cmd::Route { cmd: RouteCmd::Rm { index, .. } } => {
+            Cmd::Route {
+                cmd: RouteCmd::Rm { index, .. },
+            } => {
                 if json {
                     doc(json!({ "schema": JSON_SCHEMA, "removed": index }))
                 } else {
@@ -1498,6 +2136,55 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             }
             _ => String::new(),
         },
+        CtlResponse::RouteImported { total, audit } => {
+            if json {
+                doc(json!({ "schema": JSON_SCHEMA, "total": total, "audit": audit }))
+            } else if audit.is_clean() {
+                format!(
+                    "已导入规则（当前共 {total} 条，静态审计无冲突；已保存上一版 LKG 快照）
+"
+                )
+            } else {
+                let mut out = format!(
+                    "已导入规则（当前共 {total} 条，发现 {} 条审计提示；已保存上一版 LKG 快照）：
+",
+                    audit.issues.len()
+                );
+                for i in &audit.issues {
+                    out.push_str(&format!(
+                        "  - {}
+",
+                        i.message
+                    ));
+                }
+                out
+            }
+        }
+        CtlResponse::RouteAudit(audit) => {
+            if json {
+                doc(
+                    json!({ "schema": JSON_SCHEMA, "clean": audit.is_clean(), "issues": audit.issues }),
+                )
+            } else if audit.is_clean() {
+                "规则静态审计通过：无重复、无遮蔽、无无效上游
+"
+                .into()
+            } else {
+                let mut out = format!(
+                    "规则静态审计发现 {} 项问题：
+",
+                    audit.issues.len()
+                );
+                for i in &audit.issues {
+                    out.push_str(&format!(
+                        "  - {}
+",
+                        i.message
+                    ));
+                }
+                out
+            }
+        }
         CtlResponse::Exit { enabled } => {
             if json {
                 doc(json!({ "schema": JSON_SCHEMA, "exit": enabled }))
@@ -1519,18 +2206,36 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 let list: Vec<Value> = rules
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| outbound_json(&r.outbound, json!({ "index": i + 1, "match": r.matcher.to_string() })))
+                    .map(|(i, r)| {
+                        outbound_json(
+                            &r.outbound,
+                            json!({ "index": i + 1, "match": r.matcher.to_string() }),
+                        )
+                    })
                     .collect();
                 doc(json!({ "schema": JSON_SCHEMA, "rules": list }))
             } else if rules.is_empty() {
                 format!("没有路由规则：.{SERVICE_SUFFIX} 的名字去网络里的服务，其余直连\n")
             } else {
-                rules.iter().enumerate().map(|(i, r)| format!("{:>3}  {:<32} {}\n", i + 1, r.matcher.to_string(), r.outbound)).collect()
+                rules
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        format!(
+                            "{:>3}  {:<32} {}\n",
+                            i + 1,
+                            r.matcher.to_string(),
+                            r.outbound
+                        )
+                    })
+                    .collect()
             }
         }
         CtlResponse::Explained(e) => {
             let target = match cmd {
-                Cmd::Route { cmd: RouteCmd::Explain { target, .. } } => target.as_str(),
+                Cmd::Route {
+                    cmd: RouteCmd::Explain { target, .. },
+                } => target.as_str(),
                 _ => "",
             };
             if json {
@@ -1538,11 +2243,16 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     RouteExplanation::Service { device, service } => {
                         json!({ "outbound": "nexus", "rule": null, "device": device, "service": service })
                     }
-                    RouteExplanation::BadInternalName => json!({ "outbound": "invalid", "rule": null }),
-                    RouteExplanation::Rule { index, rule } => {
-                        outbound_json(&rule.outbound, json!({ "rule": index, "match": rule.matcher.to_string() }))
+                    RouteExplanation::BadInternalName => {
+                        json!({ "outbound": "invalid", "rule": null })
                     }
-                    RouteExplanation::Default { outbound } => outbound_json(outbound, json!({ "rule": null })),
+                    RouteExplanation::Rule { index, rule } => outbound_json(
+                        &rule.outbound,
+                        json!({ "rule": index, "match": rule.matcher.to_string() }),
+                    ),
+                    RouteExplanation::Default { outbound } => {
+                        outbound_json(outbound, json!({ "rule": null }))
+                    }
                 };
                 let mut v = v;
                 v["schema"] = json!(JSON_SCHEMA);
@@ -1550,14 +2260,21 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 doc(v)
             } else {
                 match &e {
-                    RouteExplanation::Service { device, service } => format!("{target} → 经 Nexus 到 {device} 上的服务 {service}\n"),
+                    RouteExplanation::Service { device, service } => {
+                        format!("{target} → 经 Nexus 到 {device} 上的服务 {service}\n")
+                    }
                     RouteExplanation::BadInternalName => {
                         format!("{target} → 不可用：.{SERVICE_SUFFIX} 的名字应当是 <服务>.<设备>.{SERVICE_SUFFIX}\n")
                     }
                     RouteExplanation::Rule { index, rule } => {
-                        format!("{target} → {}（第 {index} 条规则：{}）\n", rule.outbound, rule.matcher)
+                        format!(
+                            "{target} → {}（第 {index} 条规则：{}）\n",
+                            rule.outbound, rule.matcher
+                        )
                     }
-                    RouteExplanation::Default { outbound } => format!("{target} → {outbound}（没有规则匹配）\n"),
+                    RouteExplanation::Default { outbound } => {
+                        format!("{target} → {outbound}（没有规则匹配）\n")
+                    }
                 }
             }
         }
@@ -1573,7 +2290,8 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 let list: Vec<Value> = services
                     .iter()
                     .map(|s| {
-                        let env: serde_json::Map<String, Value> = s.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                        let env: serde_json::Map<String, Value> =
+                            s.env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
                         json!({
                             "name": s.name,
                             "path": format!("{node}/{}", s.name),
@@ -1602,9 +2320,17 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 Cmd::Iface { name: Some(n), .. } => Some(n.clone()),
                 _ => None,
             };
-            let list: Vec<_> = list.into_iter().filter(|i| only.as_ref().is_none_or(|n| &i.name == n)).collect();
+            let list: Vec<_> = list
+                .into_iter()
+                .filter(|i| only.as_ref().is_none_or(|n| &i.name == n))
+                .collect();
             if let (Some(n), true) = (&only, list.is_empty()) {
-                return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("本机没有启用的接口 {n}"));
+                return fail(
+                    sink,
+                    EXIT_NOT_FOUND,
+                    "not_found",
+                    &format!("本机没有启用的接口 {n}"),
+                );
             }
             if json {
                 let v: Vec<Value> = list
@@ -1621,15 +2347,25 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                         Some(_) => "手动设置",
                         None => "自动识别",
                     };
-                    let state = if i.metered { "计费：只承担交互和故障接管" } else { "不计费" };
-                    out.push_str(&format!("{:<12} {:<40} {state}（{how}）\n", i.name, i.addrs.join(" ")));
+                    let state = if i.metered {
+                        "计费：只承担交互和故障接管"
+                    } else {
+                        "不计费"
+                    };
+                    out.push_str(&format!(
+                        "{:<12} {:<40} {state}（{how}）\n",
+                        i.name,
+                        i.addrs.join(" ")
+                    ));
                 }
                 out
             }
         }
         CtlResponse::Upgrade(r) => {
             if json {
-                doc(json!({ "schema": JSON_SCHEMA, "state": r.state, "from": r.from, "to": r.to, "exe": r.exe, "message": r.message, "id": r.id }))
+                doc(
+                    json!({ "schema": JSON_SCHEMA, "state": r.state, "from": r.from, "to": r.to, "exe": r.exe, "message": r.message, "id": r.id }),
+                )
             } else {
                 match r.state.as_str() {
                     "pending" => format!(
@@ -1714,12 +2450,21 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             } else {
                 let mut out = status_text(&r);
                 if let Some(t) = &tun {
-                    out.push_str(&format!("  完整节点：虚拟网卡 {}，网段 {}，名字服务 {}\n", t.name, t.net, t.dns));
+                    out.push_str(&format!(
+                        "  完整节点：虚拟网卡 {}，网段 {}，名字服务 {}\n",
+                        t.name, t.net, t.dns
+                    ));
                 }
                 out
             }
         }
-        CtlResponse::List(entries) => if json { list_json(&entries) } else { list_text(&entries) },
+        CtlResponse::List(entries) => {
+            if json {
+                list_json(&entries)
+            } else {
+                list_text(&entries)
+            }
+        }
         CtlResponse::Init(r) => {
             let v = json!({
                 "schema": JSON_SCHEMA,
@@ -1737,13 +2482,19 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                 )
             }
         }
-        CtlResponse::JoinCode { code, short_code, short_code_error, expires_at } => if json {
-            doc(json!({
-                "schema": JSON_SCHEMA, "code": code, "short_code": short_code, "short_code_error": short_code_error,
-                "expires_at_ms": expires_at.0,
-            }))
-        } else {
-            match (short_code, short_code_error) {
+        CtlResponse::JoinCode {
+            code,
+            short_code,
+            short_code_error,
+            expires_at,
+        } => {
+            if json {
+                doc(json!({
+                    "schema": JSON_SCHEMA, "code": code, "short_code": short_code, "short_code_error": short_code_error,
+                    "expires_at_ms": expires_at.0,
+                }))
+            } else {
+                match (short_code, short_code_error) {
                 (Some(short), _) => format!(
                     "加入码（10 分钟内有效）：\n\n    {short}\n\n在管理设备上运行：nexus device approve {short}\n\n\
                      管理设备连不上碰头服务时，改用长加入码：\n{code}\n"
@@ -1754,7 +2505,8 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
                     why.unwrap_or_default()
                 ),
             }
-        },
+            }
+        }
         CtlResponse::Membership(m) => {
             let v = json!({
                 "schema": JSON_SCHEMA,
@@ -1767,17 +2519,36 @@ pub async fn run_client<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &Cmd, ctl: &
             if json {
                 doc(v)
             } else {
-                let mut s = format!("完成：{}，名册版本 {}，已通知 {} 台设备。\n", m.name, m.roster_version, m.pushed);
+                let mut s = format!(
+                    "完成：{}，名册版本 {}，已通知 {} 台设备。\n",
+                    m.name, m.roster_version, m.pushed
+                );
                 if !m.unreachable.is_empty() {
-                    s.push_str(&format!("暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n", m.unreachable.join("、")));
+                    s.push_str(&format!(
+                        "暂时没联系上：{}。它们会在下次与已更新的设备通信时得到新名册。\n",
+                        m.unreachable.join("、")
+                    ));
                 }
-                if matches!(cmd, Cmd::Device { cmd: DeviceCmd::Revoke { .. } }) {
-                    if let Ok(CtlResponse::VaultRotateNeeded(items)) =
-                        call(ctl, CtlRequest::VaultRotateNeeded { device: Some(m.name.clone()) }).await
+                if matches!(
+                    cmd,
+                    Cmd::Device {
+                        cmd: DeviceCmd::Revoke { .. }
+                    }
+                ) {
+                    if let Ok(CtlResponse::VaultRotateNeeded(items)) = call(
+                        ctl,
+                        CtlRequest::VaultRotateNeeded {
+                            device: Some(m.name.clone()),
+                        },
+                    )
+                    .await
                     {
                         for item in items {
                             if !item.entries.is_empty() {
-                                s.push_str(&format!("需要轮换的 Vault 条目：{}\n", item.entries.join("、")));
+                                s.push_str(&format!(
+                                    "需要轮换的 Vault 条目：{}\n",
+                                    item.entries.join("、")
+                                ));
                             }
                         }
                     }
@@ -1796,13 +2567,22 @@ fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
         f.write_all(text.as_bytes())?;
         f.write_all(b"\n")
     }
     #[cfg(windows)]
     {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         f.write_all(text.as_bytes())?;
         f.write_all(b"\n")
     }
@@ -1832,7 +2612,13 @@ fn agents_text(list: &[AgentInfo]) -> String {
     list.iter()
         .map(|a| {
             let state = if a.revoked { "已撤销" } else { "有效" };
-            format!("{:<16} {}  {}  {}\n", a.label, &nexus_core_proto::NodeId(a.agent_id.0).to_string()[..8], state, a.grants.join(" "))
+            format!(
+                "{:<16} {}  {}  {}\n",
+                a.label,
+                &nexus_core_proto::NodeId(a.agent_id.0).to_string()[..8],
+                state,
+                a.grants.join(" ")
+            )
         })
         .collect()
 }
@@ -1955,14 +2741,23 @@ fn audit_text(records: &[AuditRecord]) -> String {
             let e = &r.event;
             let who = match &e.principal {
                 PrincipalRef::Device(_) => r.peer_name.clone(),
-                PrincipalRef::Agent { label, .. } => format!("agent {label}（经由 {}）", r.peer_name),
+                PrincipalRef::Agent { label, .. } => {
+                    format!("agent {label}（经由 {}）", r.peer_name)
+                }
                 PrincipalRef::Web { label } => format!("网页 {label}"),
             };
             let outcome = match &e.outcome {
                 Outcome::Allow => "允许".to_string(),
                 Outcome::Deny(reason) => format!("拒绝：{}", deny_kind(reason)),
             };
-            format!("{}  {}  {} {}  {}\n", local_time(e.at.0), who, e.capability, e.resource, outcome)
+            format!(
+                "{}  {}  {} {}  {}\n",
+                local_time(e.at.0),
+                who,
+                e.capability,
+                e.resource,
+                outcome
+            )
         })
         .collect()
 }
@@ -1988,7 +2783,12 @@ fn sessions_text(list: &[SessionInfo]) -> String {
         return "没有会话\n".to_string();
     }
     list.iter()
-        .map(|s| format!("{:<16} {} 个客户端  {}x{}\n", s.name, s.clients, s.size.cols, s.size.rows))
+        .map(|s| {
+            format!(
+                "{:<16} {} 个客户端  {}x{}\n",
+                s.name, s.clients, s.size.cols, s.size.rows
+            )
+        })
         .collect()
 }
 
@@ -2005,19 +2805,34 @@ pub struct SshArgs {
 
 /// 从解析好的命令里取出 `nexus ssh` 的参数。
 pub fn ssh_args(cmd: &Cmd) -> Result<SshArgs, String> {
-    let Cmd::Ssh { node, session, size } = cmd else { return Err("不是 ssh 命令".into()) };
+    let Cmd::Ssh {
+        node,
+        session,
+        size,
+    } = cmd
+    else {
+        return Err("不是 ssh 命令".into());
+    };
     let parsed = match size {
         None => None,
         Some(text) => {
             let parse = || {
                 let (c, r) = text.split_once(['x', 'X'])?;
-                let size = Size { cols: c.trim().parse().ok()?, rows: r.trim().parse().ok()? };
+                let size = Size {
+                    cols: c.trim().parse().ok()?,
+                    rows: r.trim().parse().ok()?,
+                };
                 (size.cols > 0 && size.rows > 0).then_some(size)
             };
             Some(parse().ok_or_else(|| format!("--size 的格式应为 列x行，例如 80x24：{text}"))?)
         }
     };
-    Ok(SshArgs { node: node.clone(), session: session.clone(), size: parsed.unwrap_or(Size::DEFAULT), size_given: parsed.is_some() })
+    Ok(SshArgs {
+        node: node.clone(),
+        session: session.clone(),
+        size: parsed.unwrap_or(Size::DEFAULT),
+        size_given: parsed.is_some(),
+    })
 }
 
 /// `nexus ssh` 失败的原因。
@@ -2031,9 +2846,12 @@ pub enum SshError {
 /// 按 [`SshError`] 输出一行结构化的错误，返回退出码。
 pub fn ssh_fail<K: Sink>(sink: &mut K, e: &SshError) -> i32 {
     match e {
-        SshError::Daemon(e) => {
-            fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"))
-        }
+        SshError::Daemon(e) => fail(
+            sink,
+            EXIT_DAEMON_UNREACHABLE,
+            "daemon_unreachable",
+            &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"),
+        ),
         SshError::Remote(e) => fail_wire(sink, e),
     }
 }
@@ -2047,7 +2865,11 @@ pub const RECONNECT_FOR: Duration = Duration::from_secs(30);
 struct SinkWriter<'a, K: Sink>(&'a mut K);
 
 impl<K: Sink> AsyncWrite for SinkWriter<'_, K> {
-    fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         self.0.out(buf);
         Poll::Ready(Ok(buf.len()))
     }
@@ -2078,7 +2900,12 @@ pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let note = format!("\r\n[已断开，会话 {} 仍在运行]\r\n", args.session);
     loop {
         // 重新连上时不新建：会话已经结束（例如远端的程序在断开期间退出了）就照实说。
-        let req = CtlRequest::Attach { node: args.node.clone(), session: args.session.clone(), size, create: !connected_once };
+        let req = CtlRequest::Attach {
+            node: args.node.clone(),
+            session: args.session.clone(),
+            size,
+            create: !connected_once,
+        };
         let mut session = ctl.open(req).await.map_err(SshError::Daemon)?;
         // 发给常驻程序的消息先进本地队列，有空位时再发：这里从不因为发送而停下，
         // 总能继续读常驻程序的回应，两边不会互相等待。确认可以合并。
@@ -2158,7 +2985,9 @@ pub async fn ssh<C: Ctl, R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if since.elapsed() >= RECONNECT_FOR {
             return Err(SshError::Remote(lost));
         }
-        let _ = output.write_all("\r\n[连接中断，正在重连…]\r\n".as_bytes()).await;
+        let _ = output
+            .write_all("\r\n[连接中断，正在重连…]\r\n".as_bytes())
+            .await;
         let _ = output.flush().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -2332,8 +3161,16 @@ fn mcp_b64_encode(input: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
         out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(n & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -2374,9 +3211,13 @@ fn mcp_b64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
 
 fn mcp_parse_err(sink: &Captured, code: i32) -> (Value, bool) {
     let err = String::from_utf8_lossy(&sink.stderr);
-    let v = err.lines().last().and_then(|l| serde_json::from_str(l).ok()).unwrap_or_else(|| {
-        json!({ "error": "internal", "message": err.trim(), "exit_code": code })
-    });
+    let v = err
+        .lines()
+        .last()
+        .and_then(|l| serde_json::from_str(l).ok())
+        .unwrap_or_else(
+            || json!({ "error": "internal", "message": err.trim(), "exit_code": code }),
+        );
     (v, true)
 }
 
@@ -2388,19 +3229,41 @@ async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
     let mut raw_read_path: Option<String> = None;
 
     let cmd = match name {
-        "nexus_ls" => Cmd::Ls { node: None, json: true },
-        "nexus_status" => Cmd::Status { node: text("node"), json: true },
+        "nexus_ls" => Cmd::Ls {
+            node: None,
+            json: true,
+        },
+        "nexus_status" => Cmd::Status {
+            node: text("node"),
+            json: true,
+        },
         "nexus_services" => match text("node") {
-            Some(node) => Cmd::Ls { node: Some(node), json: true },
+            Some(node) => Cmd::Ls {
+                node: Some(node),
+                json: true,
+            },
             None => return (json!({ "error": "usage", "message": "缺少 node" }), true),
         },
         "nexus_session_ls" => match text("node") {
-            Some(node) => Cmd::Session { cmd: SessionCmd::Ls { node, json: true } },
+            Some(node) => Cmd::Session {
+                cmd: SessionCmd::Ls { node, json: true },
+            },
             None => return (json!({ "error": "usage", "message": "缺少 node" }), true),
         },
         "nexus_session_kill" => match (text("node"), text("session")) {
-            (Some(node), Some(session)) => Cmd::Session { cmd: SessionCmd::Kill { node, session, json: true } },
-            _ => return (json!({ "error": "usage", "message": "需要 node 和 session" }), true),
+            (Some(node), Some(session)) => Cmd::Session {
+                cmd: SessionCmd::Kill {
+                    node,
+                    session,
+                    json: true,
+                },
+            },
+            _ => {
+                return (
+                    json!({ "error": "usage", "message": "需要 node 和 session" }),
+                    true,
+                )
+            }
         },
         "nexus_exec" => {
             let command: Option<Vec<String>> = args
@@ -2409,27 +3272,52 @@ async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
                 .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect());
             let env: Vec<String> = match args.get("env") {
                 None | Some(Value::Null) => vec![],
-                Some(Value::Array(arr)) => match arr.iter().map(|v| v.as_str().map(str::to_string)).collect() {
-                    Some(v) => v,
-                    None => return (json!({ "error": "usage", "message": "env 必须是字符串数组" }), true),
-                },
-                Some(_) => return (json!({ "error": "usage", "message": "env 必须是字符串数组" }), true),
+                Some(Value::Array(arr)) => {
+                    match arr.iter().map(|v| v.as_str().map(str::to_string)).collect() {
+                        Some(v) => v,
+                        None => {
+                            return (
+                                json!({ "error": "usage", "message": "env 必须是字符串数组" }),
+                                true,
+                            )
+                        }
+                    }
+                }
+                Some(_) => {
+                    return (
+                        json!({ "error": "usage", "message": "env 必须是字符串数组" }),
+                        true,
+                    )
+                }
             };
             match (text("node"), command) {
                 (Some(node), Some(command)) if !command.is_empty() => Cmd::Exec {
                     node,
-                    timeout: Some(args.get("timeout_s").and_then(Value::as_f64).unwrap_or(300.0)),
+                    timeout: Some(
+                        args.get("timeout_s")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(300.0),
+                    ),
                     max_output: DEFAULT_MAX_OUTPUT,
                     cwd: text("cwd"),
                     env,
                     json: true,
                     command,
                 },
-                _ => return (json!({ "error": "usage", "message": "需要 node 和非空的 command 数组" }), true),
+                _ => {
+                    return (
+                        json!({ "error": "usage", "message": "需要 node 和非空的 command 数组" }),
+                        true,
+                    )
+                }
             }
         }
         "nexus_drive_ls" => Cmd::Drive {
-            cmd: drive::DriveCmd::Ls { path: text("path"), at: text("at"), json: true },
+            cmd: drive::DriveCmd::Ls {
+                path: text("path"),
+                at: text("at"),
+                json: true,
+            },
         },
         "nexus_drive_read" => match text("path") {
             Some(path) => {
@@ -2448,45 +3336,89 @@ async fn mcp_call<C: Ctl>(ctl: &C, name: &str, args: &Value) -> (Value, bool) {
         "nexus_drive_write" => match (text("path"), text("content"), text("content_base64")) {
             (Some(path), Some(content), None) => {
                 stdin_bytes = Some(content.into_bytes());
-                Cmd::Drive { cmd: drive::DriveCmd::Put { path, exec: flag("exec"), json: true } }
+                Cmd::Drive {
+                    cmd: drive::DriveCmd::Put {
+                        path,
+                        exec: flag("exec"),
+                        json: true,
+                    },
+                }
             }
             (Some(path), None, Some(b64)) => match mcp_b64_decode(&b64) {
                 Ok(bytes) => {
                     stdin_bytes = Some(bytes);
-                    Cmd::Drive { cmd: drive::DriveCmd::Put { path, exec: flag("exec"), json: true } }
+                    Cmd::Drive {
+                        cmd: drive::DriveCmd::Put {
+                            path,
+                            exec: flag("exec"),
+                            json: true,
+                        },
+                    }
                 }
                 Err(msg) => return (json!({ "error": "usage", "message": msg }), true),
             },
-            _ => return (json!({ "error": "usage", "message": "需要 path，且 content 与 content_base64 二选一" }), true),
+            _ => {
+                return (
+                    json!({ "error": "usage", "message": "需要 path，且 content 与 content_base64 二选一" }),
+                    true,
+                )
+            }
         },
         "nexus_drive_rm" => match text("path") {
-            Some(path) => Cmd::Drive { cmd: drive::DriveCmd::Rm { path, recursive: flag("recursive"), json: true } },
+            Some(path) => Cmd::Drive {
+                cmd: drive::DriveCmd::Rm {
+                    path,
+                    recursive: flag("recursive"),
+                    json: true,
+                },
+            },
             None => return (json!({ "error": "usage", "message": "缺少 path" }), true),
         },
         "nexus_drive_status" => match text("ws") {
-            Some(ws) => Cmd::Drive { cmd: drive::DriveCmd::Status { ws, json: true } },
+            Some(ws) => Cmd::Drive {
+                cmd: drive::DriveCmd::Status { ws, json: true },
+            },
             None => return (json!({ "error": "usage", "message": "缺少 ws" }), true),
         },
         "nexus_drive_commit" => match text("ws") {
             Some(ws) => Cmd::Drive {
-                cmd: drive::DriveCmd::Commit { ws, message: text("message").unwrap_or_default(), json: true },
+                cmd: drive::DriveCmd::Commit {
+                    ws,
+                    message: text("message").unwrap_or_default(),
+                    json: true,
+                },
             },
             None => return (json!({ "error": "usage", "message": "缺少 ws" }), true),
         },
         "nexus_drive_where" => match text("path") {
-            Some(path) => Cmd::Drive { cmd: drive::DriveCmd::Where { path, json: true } },
+            Some(path) => Cmd::Drive {
+                cmd: drive::DriveCmd::Where { path, json: true },
+            },
             None => return (json!({ "error": "usage", "message": "缺少 path" }), true),
         },
-        "nexus_path" => Cmd::Path { device: text("device"), json: true },
+        "nexus_path" => Cmd::Path {
+            device: text("device"),
+            json: true,
+        },
         "nexus_route_explain" => match text("target") {
-            Some(target) => Cmd::Route { cmd: RouteCmd::Explain { target, json: true } },
+            Some(target) => Cmd::Route {
+                cmd: RouteCmd::Explain { target, json: true },
+            },
             None => return (json!({ "error": "usage", "message": "缺少 target" }), true),
         },
         "nexus_audit" => {
-            let limit = args.get("limit").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok());
             Cmd::Audit { limit, json: true }
         }
-        _ => return (json!({ "error": "usage", "message": format!("没有工具 {name}") }), true),
+        _ => {
+            return (
+                json!({ "error": "usage", "message": format!("没有工具 {name}") }),
+                true,
+            )
+        }
     };
     let mut sink = Captured::default();
     // run_client 里也会调用到这里（nexus mcp），装箱以打断异步函数的递归。
@@ -2536,10 +3468,15 @@ async fn mcp<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, stdin: &mut R, sink
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Err(e) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } })),
+            Err(e) => Some(
+                json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": e.to_string() } }),
+            ),
             Ok(req) => {
                 let id = req.get("id").cloned();
-                let method = req.get("method").and_then(Value::as_str).unwrap_or_default();
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let result: Result<Value, (i64, String)> = match method {
                     "initialize" => Ok(json!({
@@ -2550,8 +3487,14 @@ async fn mcp<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, stdin: &mut R, sink
                     "ping" => Ok(json!({})),
                     "tools/list" => Ok(json!({ "tools": mcp_tools() })),
                     "tools/call" => {
-                        let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
-                        let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        let name = params
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let args = params
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
                         let (value, is_error) = mcp_call(ctl, name, &args).await;
                         Ok(json!({
                             "content": [{ "type": "text", "text": value.to_string() }],
@@ -2576,23 +3519,44 @@ async fn mcp<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, stdin: &mut R, sink
 }
 
 /// 打开到服务的一条连接：等常驻程序确认，返回会话。
-async fn open_connect<C: Ctl>(ctl: &C, node: &str, name: &str) -> Result<CtlClient, (i32, &'static str, String)> {
+async fn open_connect<C: Ctl>(
+    ctl: &C,
+    node: &str,
+    name: &str,
+) -> Result<CtlClient, (i32, &'static str, String)> {
     let mut session = ctl
-        .open(CtlRequest::Connect { node: node.to_string(), name: name.to_string() })
+        .open(CtlRequest::Connect {
+            node: node.to_string(),
+            name: name.to_string(),
+        })
         .await
-        .map_err(|e| (EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}")))?;
+        .map_err(|e| {
+            (
+                EXIT_DAEMON_UNREACHABLE,
+                "daemon_unreachable",
+                format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"),
+            )
+        })?;
     match session.rx.recv().await {
         Some(CtlResponse::Ok) => Ok(session),
         Some(CtlResponse::Error(e)) => {
             let (code, kind) = exit_for(e.code);
             Err((code, kind, e.message))
         }
-        _ => Err((EXIT_INTERNAL, "internal", "常驻程序的回应无法理解".to_string())),
+        _ => Err((
+            EXIT_INTERNAL,
+            "internal",
+            "常驻程序的回应无法理解".to_string(),
+        )),
     }
 }
 
 /// 在一条到服务的连接上搬运字节：`input` 的数据送到服务，服务的数据写到 `output`，直到两个方向都结束。
-async fn pipe<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(session: &mut CtlClient, input: &mut R, output: &mut W) {
+async fn pipe<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    session: &mut CtlClient,
+    input: &mut R,
+    output: &mut W,
+) {
     let mut buf = vec![0u8; 64 * 1024];
     let (mut reading, mut writing) = (true, true);
     let mut pending: Option<Input> = None;
@@ -2632,7 +3596,13 @@ async fn pipe<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(session: &mut CtlClie
 }
 
 /// `nexus connect <设备>/<服务>`：标准输入输出接到服务上。
-async fn connect_stdio<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, node: &str, name: &str, stdin: &mut R, sink: &mut K) -> i32 {
+async fn connect_stdio<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
+    ctl: &C,
+    node: &str,
+    name: &str,
+    stdin: &mut R,
+    sink: &mut K,
+) -> i32 {
     let mut session = match open_connect(ctl, node, name).await {
         Ok(s) => s,
         Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
@@ -2643,10 +3613,23 @@ async fn connect_stdio<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, node: &st
 }
 
 /// `nexus connect <设备>/<服务> --listen <地址>`：本机每个连接各自接到服务，直到被中断。
-async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen: &str, sink: &mut K) -> i32 {
+async fn connect_listen<C: Ctl, K: Sink>(
+    ctl: &C,
+    node: &str,
+    name: &str,
+    listen: &str,
+    sink: &mut K,
+) -> i32 {
     let addr: std::net::SocketAddr = match listen.parse() {
         Ok(a) => a,
-        Err(_) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("--listen 应当是 地址:端口：{listen}")),
+        Err(_) => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("--listen 应当是 地址:端口：{listen}"),
+            )
+        }
     };
     // 先确认服务能用，再开始监听：名字写错时立即报错。
     match open_connect(ctl, node, name).await {
@@ -2655,9 +3638,19 @@ async fn connect_listen<C: Ctl, K: Sink>(ctl: &C, node: &str, name: &str, listen
     }
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
-        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法监听 {addr}：{e}")),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("无法监听 {addr}：{e}"),
+            )
+        }
     };
-    let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string());
+    let local = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| addr.to_string());
     sink.out(format!("{node}/{name} → {local}（按 Ctrl-C 停止）\n").as_bytes());
     forward_forever(ctl, &listener, node, name).await
 }
@@ -2675,7 +3668,10 @@ fn open_url(addr: &str, path: Option<&str>, env: &[(String, String)]) -> String 
 
 /// 用 `$BROWSER` 或系统默认的浏览器打开网址。
 fn launch_browser(url: &str) -> io::Result<()> {
-    let mut cmd = match std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
+    let mut cmd = match std::env::var("BROWSER")
+        .ok()
+        .filter(|b| !b.trim().is_empty())
+    {
         Some(b) => std::process::Command::new(b),
         None if cfg!(target_os = "macos") => std::process::Command::new("open"),
         None if cfg!(windows) => {
@@ -2685,7 +3681,10 @@ fn launch_browser(url: &str) -> io::Result<()> {
         }
         None => std::process::Command::new("xdg-open"),
     };
-    cmd.arg(url).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn()?;
     // 不等它：有的浏览器一直不退出。退出了就收尾，避免留下僵尸进程。
     std::thread::spawn(move || {
@@ -2695,11 +3694,26 @@ fn launch_browser(url: &str) -> io::Result<()> {
 }
 
 /// `nexus open <设备>/<服务>[/<路径>]`：本机开端口接到网页服务，打开浏览器，直到被中断。
-async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u16>, browser: bool, sink: &mut K) -> i32 {
+async fn open_in_browser<C: Ctl, K: Sink>(
+    ctl: &C,
+    target: &str,
+    port: Option<u16>,
+    browser: bool,
+    sink: &mut K,
+) -> i32 {
     let mut parts = target.splitn(3, '/');
-    let (node, name, path) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next());
+    let (node, name, path) = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+        parts.next(),
+    );
     if node.is_empty() || name.is_empty() {
-        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("要打开的应当写成 <设备>/<服务>[/<路径>]：{target}"));
+        return fail(
+            sink,
+            EXIT_INVALID_INPUT,
+            "invalid_input",
+            &format!("要打开的应当写成 <设备>/<服务>[/<路径>]：{target}"),
+        );
     }
     let info = match service_info(ctl, node, name).await {
         Ok(info) => info,
@@ -2707,21 +3721,43 @@ async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u1
     };
     if desktop::is_desktop(&info.proto) {
         if path.is_some() {
-            return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("远程桌面没有路径：nexus open {node}/{name}"));
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("远程桌面没有路径：nexus open {node}/{name}"),
+            );
         }
         return desktop::serve(ctl, node, name, &info.proto, port, browser, sink).await;
     }
     if info.proto != "http" {
-        let msg = format!("{node}/{name} 不是网页服务（协议 {}）：用 nexus connect {node}/{name} 连接它", info.proto);
+        let msg = format!(
+            "{node}/{name} 不是网页服务（协议 {}）：用 nexus connect {node}/{name} 连接它",
+            info.proto
+        );
         return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
     }
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
         Ok(l) => l,
-        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法在本机开端口 {}：{e}", port.unwrap_or(0))),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("无法在本机开端口 {}：{e}", port.unwrap_or(0)),
+            )
+        }
     };
     let addr = match listener.local_addr() {
         Ok(a) => a.to_string(),
-        Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INTERNAL,
+                "internal",
+                &format!("无法在本机开端口：{e}"),
+            )
+        }
     };
     let url = open_url(&addr, path, &info.env);
     sink.out(format!("{node}/{name} → {url}（按 Ctrl-C 停止）\n").as_bytes());
@@ -2734,10 +3770,21 @@ async fn open_in_browser<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u1
 }
 
 /// 先确认服务能用（存在、有授权、发布方的程序在运行），再读它的说明。
-async fn service_info<C: Ctl>(ctl: &C, node: &str, name: &str) -> Result<nexus_wire::ServiceInfo, (i32, &'static str, String)> {
+async fn service_info<C: Ctl>(
+    ctl: &C,
+    node: &str,
+    name: &str,
+) -> Result<nexus_wire::ServiceInfo, (i32, &'static str, String)> {
     let probe = open_connect(ctl, node, name).await?;
     drop(probe.tx.try_send(Input::CloseStdin));
-    let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
+    let info = match call(
+        ctl,
+        CtlRequest::Services {
+            node: node.to_string(),
+        },
+    )
+    .await
+    {
         Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
         Ok(CtlResponse::Error(e)) => {
             let (code, kind) = exit_for(e.code);
@@ -2745,11 +3792,22 @@ async fn service_info<C: Ctl>(ctl: &C, node: &str, name: &str) -> Result<nexus_w
         }
         _ => None,
     };
-    info.ok_or_else(|| (EXIT_NOT_FOUND, "not_found", format!("{node} 上没有你能用的服务 {name}")))
+    info.ok_or_else(|| {
+        (
+            EXIT_NOT_FOUND,
+            "not_found",
+            format!("{node} 上没有你能用的服务 {name}"),
+        )
+    })
 }
 
 /// 本机端口上的每个连接各自接到服务，直到被中断。
-async fn forward_forever<C: Ctl>(ctl: &C, listener: &tokio::net::TcpListener, node: &str, name: &str) -> i32 {
+async fn forward_forever<C: Ctl>(
+    ctl: &C,
+    listener: &tokio::net::TcpListener,
+    node: &str,
+    name: &str,
+) -> i32 {
     let conns = futures_util::stream::FuturesUnordered::new();
     tokio::pin!(conns);
     loop {
@@ -2783,33 +3841,74 @@ fn outbound_json(o: &route::Outbound, mut v: Value) -> Value {
 }
 
 /// `nexus run`：为每个用到的服务在本机开一个临时端口，设置环境变量，运行程序，程序退出后关闭端口。
-async fn run_with_services<C: Ctl, K: Sink>(ctl: &C, uses: &[String], command: &[String], sink: &mut K) -> i32 {
+async fn run_with_services<C: Ctl, K: Sink>(
+    ctl: &C,
+    uses: &[String],
+    command: &[String],
+    sink: &mut K,
+) -> i32 {
     let mut env: Vec<(String, String)> = Vec::new();
     let mut listeners = Vec::new();
     for target in uses {
-        let Some((node, name)) = target.split_once('/').filter(|(n, s)| !n.is_empty() && !s.is_empty()) else {
-            return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("服务的路径应为 <设备>/<服务>：{target}"));
+        let Some((node, name)) = target
+            .split_once('/')
+            .filter(|(n, s)| !n.is_empty() && !s.is_empty())
+        else {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("服务的路径应为 <设备>/<服务>：{target}"),
+            );
         };
         // 先确认服务能用（存在、有授权、本机程序在运行），再读它的说明。
         match open_connect(ctl, node, name).await {
             Ok(probe) => drop(probe.tx.try_send(Input::CloseStdin)),
             Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
         }
-        let info = match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
-            Ok(CtlResponse::Services { services, .. }) => services.into_iter().find(|s| s.name == name),
+        let info = match call(
+            ctl,
+            CtlRequest::Services {
+                node: node.to_string(),
+            },
+        )
+        .await
+        {
+            Ok(CtlResponse::Services { services, .. }) => {
+                services.into_iter().find(|s| s.name == name)
+            }
             Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
             _ => None,
         };
         let Some(info) = info else {
-            return fail(sink, EXIT_NOT_FOUND, "not_found", &format!("{node} 上没有你能用的服务 {name}"));
+            return fail(
+                sink,
+                EXIT_NOT_FOUND,
+                "not_found",
+                &format!("{node} 上没有你能用的服务 {name}"),
+            );
         };
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
-            Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+            Err(e) => {
+                return fail(
+                    sink,
+                    EXIT_INTERNAL,
+                    "internal",
+                    &format!("无法在本机开端口：{e}"),
+                )
+            }
         };
         let addr = match listener.local_addr() {
             Ok(a) => a.to_string(),
-            Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+            Err(e) => {
+                return fail(
+                    sink,
+                    EXIT_INTERNAL,
+                    "internal",
+                    &format!("无法在本机开端口：{e}"),
+                )
+            }
         };
         let var = format!("NEXUS_SVC_{}_{}", env_key(node), env_key(name));
         env.push((var, addr.clone()));
@@ -2818,9 +3917,20 @@ async fn run_with_services<C: Ctl, K: Sink>(ctl: &C, uses: &[String], command: &
         }
         listeners.push((listener, node.to_string(), name.to_string()));
     }
-    let mut child = match tokio::process::Command::new(&command[0]).args(&command[1..]).envs(env).spawn() {
+    let mut child = match tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .envs(env)
+        .spawn()
+    {
         Ok(c) => c,
-        Err(e) => return fail(sink, EXIT_SPAWN_FAILED, "spawn_failed", &format!("无法启动 {}：{e}", command[0])),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_SPAWN_FAILED,
+                "spawn_failed",
+                &format!("无法启动 {}：{e}", command[0]),
+            )
+        }
     };
     let serve = futures_util::future::join_all(listeners.iter().map(|(listener, node, name)| async move {
         let conns = futures_util::stream::FuturesUnordered::new();
@@ -2860,15 +3970,34 @@ async fn run_with_services<C: Ctl, K: Sink>(ctl: &C, uses: &[String], command: &
 
 /// 环境变量名里用的形式：大写，其他字符换成 _。
 fn env_key(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// `nexus exec`：把本机标准输入送过去，把输出实时写出（或在 `--json` 时最后一次性输出）。
-async fn exec<C: Ctl, R: AsyncRead + Unpin, K: Sink>(ctl: &C, req: CtlRequest, json: bool, stdin: &mut R, sink: &mut K) -> i32 {
+async fn exec<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
+    ctl: &C,
+    req: CtlRequest,
+    json: bool,
+    stdin: &mut R,
+    sink: &mut K,
+) -> i32 {
     let mut session = match ctl.open(req).await {
         Ok(s) => s,
         Err(e) => {
-            return fail(sink, EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"))
+            return fail(
+                sink,
+                EXIT_DAEMON_UNREACHABLE,
+                "daemon_unreachable",
+                &format!("连不上本机的常驻程序（{e}）{DAEMON_HINT}"),
+            )
         }
     };
     let mut collected = Captured::default();
@@ -2932,11 +4061,19 @@ fn exec_exit_code<K: Sink>(r: &ExecResult, json: bool, sink: &mut K) -> i32 {
         }
     };
     if r.timed_out {
-        note(sink, "timed_out", format!("命令在 {} 毫秒后因超时被终止", r.duration_ms));
+        note(
+            sink,
+            "timed_out",
+            format!("命令在 {} 毫秒后因超时被终止", r.duration_ms),
+        );
         return EXIT_TIMED_OUT;
     }
     if r.truncated {
-        note(sink, "truncated", "命令的输出超过上限，已被终止；上面的输出不完整".to_string());
+        note(
+            sink,
+            "truncated",
+            "命令的输出超过上限，已被终止；上面的输出不完整".to_string(),
+        );
         return EXIT_TRUNCATED;
     }
     match (r.exit_code, r.signal) {
@@ -2959,7 +4096,11 @@ pub fn base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         for i in 0..4 {
             if i <= chunk.len() {
@@ -2971,7 +4112,6 @@ pub fn base64(bytes: &[u8]) -> String {
     }
     out
 }
-
 
 fn doc(v: Value) -> String {
     format!("{v}\n")
@@ -3018,7 +4158,11 @@ fn status_json(r: &StatusReport) -> Value {
 
 /// 本机常驻程序的版本：列表里本机那一项的。
 fn own_version(entries: &[ListEntry]) -> Option<&str> {
-    entries.iter().find(|e| e.is_self).and_then(|e| e.report.info.as_ref()).map(|i| i.version.as_str())
+    entries
+        .iter()
+        .find(|e| e.is_self)
+        .and_then(|e| e.report.info.as_ref())
+        .map(|i| i.version.as_str())
 }
 
 /// 这台设备的版本和本机不同（M7.1）。不在线、不知道版本时为 false。
@@ -3046,7 +4190,11 @@ fn list_json(entries: &[ListEntry]) -> String {
 fn status_text(r: &StatusReport) -> String {
     let mut out = format!("{}  {}", r.name, r.node_id.short());
     if let Some(role) = r.role {
-        out.push_str(if role == DeviceRole::Admin { "  管理设备" } else { "  成员" });
+        out.push_str(if role == DeviceRole::Admin {
+            "  管理设备"
+        } else {
+            "  成员"
+        });
     }
     out.push('\n');
     if !r.online {
@@ -3085,7 +4233,11 @@ fn list_text(entries: &[ListEntry]) -> String {
         } else if e.is_self {
             "本机".to_string()
         } else {
-            let path = if path_str(r.path) == Some("relay") { "中继" } else { "直连" };
+            let path = if path_str(r.path) == Some("relay") {
+                "中继"
+            } else {
+                "直连"
+            };
             match r.rtt_ms {
                 Some(ms) => format!("在线，{path}，{ms} 毫秒"),
                 None => format!("在线，{path}"),
@@ -3100,7 +4252,12 @@ fn list_text(entries: &[ListEntry]) -> String {
             Some(i) if version_differs(e, own) => format!("，版本 {}（和本机不同）", i.version),
             _ => String::new(),
         };
-        out.push_str(&format!("{:<16} {}  {:<8} {state}{version}\n", r.name, r.node_id.short(), role));
+        out.push_str(&format!(
+            "{:<16} {}  {:<8} {state}{version}\n",
+            r.name,
+            r.node_id.short(),
+            role
+        ));
     }
     out
 }
@@ -3109,10 +4266,22 @@ fn list_text(entries: &[ListEntry]) -> String {
 mod tests {
     #[test]
     fn open_url_prefers_path_then_template_then_root() {
-        let env = vec![("TOKEN".to_string(), "x".to_string()), ("BASE_URL".to_string(), "http://{addr}/v1".to_string())];
-        assert_eq!(super::open_url("127.0.0.1:9", Some("admin?tab=2"), &env), "http://127.0.0.1:9/admin?tab=2");
-        assert_eq!(super::open_url("127.0.0.1:9", None, &env), "http://127.0.0.1:9/v1");
-        assert_eq!(super::open_url("127.0.0.1:9", None, &[]), "http://127.0.0.1:9/");
+        let env = vec![
+            ("TOKEN".to_string(), "x".to_string()),
+            ("BASE_URL".to_string(), "http://{addr}/v1".to_string()),
+        ];
+        assert_eq!(
+            super::open_url("127.0.0.1:9", Some("admin?tab=2"), &env),
+            "http://127.0.0.1:9/admin?tab=2"
+        );
+        assert_eq!(
+            super::open_url("127.0.0.1:9", None, &env),
+            "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(
+            super::open_url("127.0.0.1:9", None, &[]),
+            "http://127.0.0.1:9/"
+        );
     }
 
     use super::*;
@@ -3139,18 +4308,46 @@ mod tests {
             },
             is_self,
         };
-        let entries = vec![entry("laptop", Some("0.2.0"), true), entry("home", Some("0.1.0"), false), entry("office", Some("0.2.0"), false), entry("nas", None, false)];
+        let entries = vec![
+            entry("laptop", Some("0.2.0"), true),
+            entry("home", Some("0.1.0"), false),
+            entry("office", Some("0.2.0"), false),
+            entry("nas", None, false),
+        ];
         let text = list_text(&entries);
-        assert!(text.lines().any(|l| l.starts_with("home") && l.contains("版本 0.1.0（和本机不同）")), "{text}");
-        assert!(!text.lines().any(|l| (l.starts_with("office") || l.starts_with("laptop") || l.starts_with("nas")) && l.contains("和本机不同")), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("home") && l.contains("版本 0.1.0（和本机不同）")),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|l| (l.starts_with("office")
+                || l.starts_with("laptop")
+                || l.starts_with("nas"))
+                && l.contains("和本机不同")),
+            "{text}"
+        );
         let v: Value = serde_json::from_str(&list_json(&entries)).unwrap();
-        let differs: Vec<bool> = v["devices"].as_array().unwrap().iter().map(|d| d["version_differs"].as_bool().unwrap()).collect();
+        let differs: Vec<bool> = v["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["version_differs"].as_bool().unwrap())
+            .collect();
         assert_eq!(differs, [false, true, false, false]);
     }
 
     #[test]
     fn base64_matches_rfc4648_examples() {
-        for (input, want) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
             assert_eq!(base64(input.as_bytes()), want);
         }
         assert_eq!(base64(&[0xff, 0x00, b'x']), "/wB4");
@@ -3163,15 +4360,18 @@ mod tests {
         assert_eq!(empty_json, json!({ "shares": [] }));
 
         let now = Timestamp(5_000);
-        let record = |id: &str, expires_at: u64, max_uses: Option<u32>, uses: u32, revoked: bool| ShareRecord {
-            id: id.into(),
-            target: nexus_wire::ShareTarget::Service { name: "web".into() },
-            created_at: Timestamp(1_000),
-            expires_at: Timestamp(expires_at),
-            max_uses,
-            uses,
-            revoked,
-        };
+        let record =
+            |id: &str, expires_at: u64, max_uses: Option<u32>, uses: u32, revoked: bool| {
+                ShareRecord {
+                    id: id.into(),
+                    target: nexus_wire::ShareTarget::Service { name: "web".into() },
+                    created_at: Timestamp(1_000),
+                    expires_at: Timestamp(expires_at),
+                    max_uses,
+                    uses,
+                    revoked,
+                }
+            };
         let list = vec![
             record("s_active", 9_000, None, 0, false),
             record("s_expired", 5_000, Some(3), 1, false),
@@ -3206,9 +4406,37 @@ mod tests {
                 "state": "active",
             })
         );
-        assert_eq!((shares[1]["revoked"].as_bool(), shares[1]["expired"].as_bool(), shares[1]["state"].as_str()), (Some(false), Some(true), Some("expired")));
-        assert_eq!((shares[2]["revoked"].as_bool(), shares[2]["expired"].as_bool(), shares[2]["state"].as_str()), (Some(false), Some(false), Some("exhausted")));
-        assert_eq!((shares[3]["revoked"].as_bool(), shares[3]["expired"].as_bool(), shares[3]["state"].as_str()), (Some(true), Some(false), Some("revoked")));
-        assert_eq!((shares[4]["revoked"].as_bool(), shares[4]["expired"].as_bool(), shares[4]["state"].as_str()), (Some(true), Some(true), Some("revoked")));
+        assert_eq!(
+            (
+                shares[1]["revoked"].as_bool(),
+                shares[1]["expired"].as_bool(),
+                shares[1]["state"].as_str()
+            ),
+            (Some(false), Some(true), Some("expired"))
+        );
+        assert_eq!(
+            (
+                shares[2]["revoked"].as_bool(),
+                shares[2]["expired"].as_bool(),
+                shares[2]["state"].as_str()
+            ),
+            (Some(false), Some(false), Some("exhausted"))
+        );
+        assert_eq!(
+            (
+                shares[3]["revoked"].as_bool(),
+                shares[3]["expired"].as_bool(),
+                shares[3]["state"].as_str()
+            ),
+            (Some(true), Some(false), Some("revoked"))
+        );
+        assert_eq!(
+            (
+                shares[4]["revoked"].as_bool(),
+                shares[4]["expired"].as_bool(),
+                shares[4]["state"].as_str()
+            ),
+            (Some(true), Some(true), Some("revoked"))
+        );
     }
 }

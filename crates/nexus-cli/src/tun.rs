@@ -4,9 +4,9 @@
 use nexus_net_core::fakeip::FakePool;
 use nexus_runtime::TunInbound;
 pub use nexus_runtime::TunRouting;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -16,14 +16,24 @@ use tokio::sync::{mpsc, oneshot};
 
 /// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
 #[cfg(target_os = "android")]
-pub fn start(_: &str, _: &FakePool, _: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
-    Err(io::Error::other("Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun"))
+pub fn start(
+    _: &str,
+    _: &FakePool,
+    _: mpsc::UnboundedSender<TunInbound>,
+) -> io::Result<(String, ResolverGuard)> {
+    Err(io::Error::other(
+        "Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun",
+    ))
 }
 
 /// 建网卡、启动协议栈，让系统把 `.internal` 交给名字服务。返回网卡实际的名字（macOS 上可能由系统分配），
 /// 和名字解析配置的守卫：常驻程序正常退出时撤掉配置。网卡在常驻程序退出时随之消失。
 #[cfg(not(target_os = "android"))]
-pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
+pub fn start(
+    name: &str,
+    pool: &FakePool,
+    entry: mpsc::UnboundedSender<TunInbound>,
+) -> io::Result<(String, ResolverGuard)> {
     let (_, prefix) = pool.network();
     let mut builder = tun_rs::DeviceBuilder::new();
     if let Some(n) = device_name(name) {
@@ -58,7 +68,10 @@ fn wintun_path() -> io::Result<String> {
     if !dll.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("找不到 {}：它要和 nexus.exe 放在同一目录（Windows 的发布包里有）", dll.display()),
+            format!(
+                "找不到 {}：它要和 nexus.exe 放在同一目录（Windows 的发布包里有）",
+                dll.display()
+            ),
         ));
     }
     Ok(dll.display().to_string())
@@ -69,7 +82,13 @@ pub type AppRouter = Arc<dyn Fn(u8, SocketAddr, SocketAddr) -> Option<TunRouting
 /// TUN activity is sampled at most once every two seconds.
 pub type TrafficObserver = Box<dyn Fn() + Send>;
 
-pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>, router: Option<AppRouter>, on_traffic: Option<TrafficObserver>) -> io::Result<()> {
+pub fn run_stack(
+    dev: tun_rs::AsyncDevice,
+    pool: &FakePool,
+    entry: mpsc::UnboundedSender<TunInbound>,
+    router: Option<AppRouter>,
+    on_traffic: Option<TrafficObserver>,
+) -> io::Result<()> {
     let mut config = ipstack::IpStackConfig::default();
     config.mtu(1500).map_err(io::Error::other)?;
     config.udp_timeout(Duration::from_secs(30));
@@ -85,11 +104,19 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
                 }
                 Ok(ipstack::IpStackStream::Tcp(tcp)) => {
                     let dst = tcp.peer_addr();
-                    let Some(routing) = classify_flow(&router, 6, tcp.local_addr(), dst).await else {
+                    let Some(routing) = classify_flow(&router, 6, tcp.local_addr(), dst).await
+                    else {
                         // ipstack resets active connections when the stream is dropped.
                         continue;
                     };
-                    if entry.send(TunInbound::Tcp { stream: Box::new(TunTcp::new(tcp)), dst, routing }).is_err() {
+                    if entry
+                        .send(TunInbound::Tcp {
+                            stream: Box::new(TunTcp::new(tcp)),
+                            dst,
+                            routing,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -99,8 +126,18 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
                 // 其余的 UDP：交给节点按目标转发到已发布服务或出口。
                 Ok(ipstack::IpStackStream::Udp(udp)) => {
                     let dst = udp.peer_addr();
-                    let Some(routing) = classify_flow(&router, 17, udp.local_addr(), dst).await else { continue };
-                    if entry.send(TunInbound::Udp { stream: Box::new(udp), dst, routing }).is_err() {
+                    let Some(routing) = classify_flow(&router, 17, udp.local_addr(), dst).await
+                    else {
+                        continue;
+                    };
+                    if entry
+                        .send(TunInbound::Udp {
+                            stream: Box::new(udp),
+                            dst,
+                            routing,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -115,47 +152,86 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
     Ok(())
 }
 
-async fn classify_flow(router: &Option<AppRouter>, protocol: u8, src: SocketAddr, dst: SocketAddr) -> Option<TunRouting> {
-    let Some(router) = router.clone() else { return Some(TunRouting::FakeIp) };
+async fn classify_flow(
+    router: &Option<AppRouter>,
+    protocol: u8,
+    src: SocketAddr,
+    dst: SocketAddr,
+) -> Option<TunRouting> {
+    let Some(router) = router.clone() else {
+        return Some(TunRouting::FakeIp);
+    };
     let transport = if protocol == 6 { "TCP" } else { "UDP" };
     if dst.port() == 853 {
         eprintln!("nexus daemon: {transport} {dst}：按应用接管时使用 VPN 的受控 DNS");
         return None;
     }
-    let routing = tokio::task::spawn_blocking(move || router(protocol, src, dst)).await.ok().flatten();
+    let routing = tokio::task::spawn_blocking(move || router(protocol, src, dst))
+        .await
+        .ok()
+        .flatten();
     if routing.is_none() {
         eprintln!("nexus daemon: {transport} {dst}：无法确认应用归属或共享 UID 的策略冲突");
     }
     routing
 }
 
-async fn dns_reply(entry: &mpsc::UnboundedSender<TunInbound>, query: Vec<u8>, full_capture: bool) -> Option<Vec<u8>> {
+async fn dns_reply(
+    entry: &mpsc::UnboundedSender<TunInbound>,
+    query: Vec<u8>,
+    full_capture: bool,
+) -> Option<Vec<u8>> {
     let (reply, answer) = oneshot::channel();
-    entry.send(TunInbound::Dns { query, full_capture, reply }).ok()?;
+    entry
+        .send(TunInbound::Dns {
+            query,
+            full_capture,
+            reply,
+        })
+        .ok()?;
     answer.await.ok()
 }
 
 /// 一个查询方（源端口）发来的查询：每个数据报是一个查询，逐个交给节点回答。
-async fn serve_udp_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSender<TunInbound>, full_capture: bool) {
+async fn serve_udp_dns(
+    mut udp: ipstack::IpStackUdpStream,
+    entry: mpsc::UnboundedSender<TunInbound>,
+    full_capture: bool,
+) {
     let mut buf = vec![0u8; 1500];
     loop {
         let n = match udp.read(&mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        let Some(a) = dns_reply(&entry, buf[..n].to_vec(), full_capture).await else { return };
+        let Some(a) = dns_reply(&entry, buf[..n].to_vec(), full_capture).await else {
+            return;
+        };
         if !a.is_empty() && udp.write_all(&a).await.is_err() {
             return;
         }
     }
 }
 
-async fn serve_tcp_dns(mut tcp: TunTcp, entry: mpsc::UnboundedSender<TunInbound>, full_capture: bool) {
+async fn serve_tcp_dns(
+    mut tcp: TunTcp,
+    entry: mpsc::UnboundedSender<TunInbound>,
+    full_capture: bool,
+) {
     while let Ok(size) = tcp.read_u16().await {
         let mut query = vec![0; usize::from(size)];
-        if tcp.read_exact(&mut query).await.is_err() { return }
-        let Some(answer) = dns_reply(&entry, query, full_capture).await else { return };
-        if answer.is_empty() || tcp.write_u16(answer.len() as u16).await.is_err() || tcp.write_all(&answer).await.is_err() { return }
+        if tcp.read_exact(&mut query).await.is_err() {
+            return;
+        }
+        let Some(answer) = dns_reply(&entry, query, full_capture).await else {
+            return;
+        };
+        if answer.is_empty()
+            || tcp.write_u16(answer.len() as u16).await.is_err()
+            || tcp.write_all(&answer).await.is_err()
+        {
+            return;
+        }
     }
 }
 
@@ -180,7 +256,15 @@ fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
     let ok = std::process::Command::new("resolvectl")
         .args(["dns", name, &dns])
         .status()
-        .and_then(|s| if s.success() { std::process::Command::new("resolvectl").args(["domain", name, "~internal"]).status() } else { Ok(s) })
+        .and_then(|s| {
+            if s.success() {
+                std::process::Command::new("resolvectl")
+                    .args(["domain", name, "~internal"])
+                    .status()
+            } else {
+                Ok(s)
+            }
+        })
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
@@ -200,7 +284,8 @@ fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
     let dns = pool.dns().to_string();
     let path = std::path::Path::new("/etc/resolver/internal");
     let content = format!("# nexus：完整节点 {name}，常驻程序退出时删掉\nnameserver {dns}\n");
-    let written = std::fs::create_dir_all("/etc/resolver").and_then(|_| std::fs::write(path, &content));
+    let written =
+        std::fs::create_dir_all("/etc/resolver").and_then(|_| std::fs::write(path, &content));
     match written {
         Ok(()) => {
             eprintln!("nexus daemon: 完整节点 {name}：.internal 的名字交给 {dns}（/etc/resolver/internal）");
@@ -257,13 +342,18 @@ fn powershell(script: &str) -> io::Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
+        Err(io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
-    eprintln!("nexus daemon: 完整节点 {name}：名字服务在 {}，请把 .internal 的查询交给它", pool.dns());
+    eprintln!(
+        "nexus daemon: 完整节点 {name}：名字服务在 {}，请把 .internal 的查询交给它",
+        pool.dns()
+    );
     ResolverGuard { undo: None }
 }
 
@@ -280,18 +370,30 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);
 
 impl TunTcp {
     fn new(inner: ipstack::IpStackTcpStream) -> Self {
-        Self { inner, tick: Box::pin(tokio::time::sleep(SHUTDOWN_RETRY)), deadline: None }
+        Self {
+            inner,
+            tick: Box::pin(tokio::time::sleep(SHUTDOWN_RETRY)),
+            deadline: None,
+        }
     }
 }
 
 impl AsyncRead for TunTcp {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for TunTcp {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -333,7 +435,10 @@ impl PacketPipe {
             while let Ok(n) = d.recv(&mut buf).await {
                 if let Some(report) = &on_traffic {
                     let now = tokio::time::Instant::now();
-                    if n != 0 && last_report.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2)) {
+                    if n != 0
+                        && last_report
+                            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2))
+                    {
                         last_report = Some(now);
                         report();
                     }
@@ -355,7 +460,11 @@ impl PacketPipe {
 }
 
 impl AsyncRead for PacketPipe {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(p)) => {
                 buf.put_slice(&p);
@@ -368,7 +477,11 @@ impl AsyncRead for PacketPipe {
 }
 
 impl AsyncWrite for PacketPipe {
-    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let _ = self.tx.send(buf.to_vec());
         Poll::Ready(Ok(buf.len()))
     }

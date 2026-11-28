@@ -8,7 +8,12 @@ fn names(v: &serde_json::Value) -> Vec<(String, String)> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| (e["name"].as_str().unwrap().to_string(), e["kind"].as_str().unwrap().to_string()))
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().to_string(),
+                e["kind"].as_str().unwrap().to_string(),
+            )
+        })
         .collect()
 }
 

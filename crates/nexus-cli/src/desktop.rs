@@ -2,8 +2,8 @@
 //! 使用方在本机开端口、启动现成的查看器，每个连接经 Nexus 到对方。功能点见 docs/feature-points/M11.1.md。
 
 use crate::{
-    call, doc, fail, fail_wire, forward_forever, service_info, Ctl, Sink, EXIT_INTERNAL, EXIT_INVALID_INPUT, EXIT_NOT_FOUND,
-    JSON_SCHEMA,
+    call, doc, fail, fail_wire, forward_forever, service_info, Ctl, Sink, EXIT_INTERNAL,
+    EXIT_INVALID_INPUT, EXIT_NOT_FOUND, JSON_SCHEMA,
 };
 use clap::Subcommand;
 use nexus_wire::{CtlRequest, CtlResponse, ServiceInfo};
@@ -58,8 +58,17 @@ pub(crate) fn is_desktop(proto: &str) -> bool {
 
 pub async fn run<C: Ctl, K: Sink>(cmd: &DesktopCmd, ctl: &C, sink: &mut K) -> i32 {
     match cmd {
-        DesktopCmd::Share { name, port, proto, json } => share(ctl, name, *port, proto.as_deref(), *json, sink).await,
-        DesktopCmd::Open { target, port, no_viewer } => open(ctl, target, *port, !*no_viewer, sink).await,
+        DesktopCmd::Share {
+            name,
+            port,
+            proto,
+            json,
+        } => share(ctl, name, *port, proto.as_deref(), *json, sink).await,
+        DesktopCmd::Open {
+            target,
+            port,
+            no_viewer,
+        } => open(ctl, target, *port, !*no_viewer, sink).await,
         DesktopCmd::Ls { json } => ls(ctl, *json, sink).await,
     }
 }
@@ -89,13 +98,17 @@ pub(crate) fn classify(first: &[u8]) -> Probe {
 }
 
 /// X.224 连接请求，带 RDP 协商（请求 TLS 和 CredSSP）。RDP 服务端先等它，才说话。
-const X224_CONNECTION_REQUEST: [u8; 19] =
-    [0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00];
+const X224_CONNECTION_REQUEST: [u8; 19] = [
+    0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03,
+    0x00, 0x00, 0x00,
+];
 
 /// 识别本机端口上的远程桌面服务端。`identify` 为假时只看连不连得上。
 async fn probe(port: u16, identify: bool) -> Probe {
     const WAIT: Duration = Duration::from_secs(1);
-    let Ok(Ok(mut s)) = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", port))).await else {
+    let Ok(Ok(mut s)) =
+        tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", port))).await
+    else {
         return Probe::Closed;
     };
     if !identify {
@@ -132,7 +145,14 @@ fn how_to_enable() -> &'static str {
     }
 }
 
-async fn share<C: Ctl, K: Sink>(ctl: &C, name: &str, port: Option<u16>, proto: Option<&str>, json: bool, sink: &mut K) -> i32 {
+async fn share<C: Ctl, K: Sink>(
+    ctl: &C,
+    name: &str,
+    port: Option<u16>,
+    proto: Option<&str>,
+    json: bool,
+    sink: &mut K,
+) -> i32 {
     let candidates: Vec<u16> = match port {
         Some(p) => vec![p],
         None => DEFAULT_PORTS.to_vec(),
@@ -159,52 +179,100 @@ async fn share<C: Ctl, K: Sink>(ctl: &C, name: &str, port: Option<u16>, proto: O
     }
     let Some((port, proto)) = found else {
         if let Some(p) = unknown {
-            let msg = format!("本机端口 {p} 上的服务认不出是 VNC 还是 RDP：用 --proto vnc 或 --proto rdp 指定");
+            let msg = format!(
+                "本机端口 {p} 上的服务认不出是 VNC 还是 RDP：用 --proto vnc 或 --proto rdp 指定"
+            );
             return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
         }
         let ports = match port {
             Some(p) => format!("端口 {p}"),
             None => "端口 5900、5901、3389".to_string(),
         };
-        let msg = format!("本机{ports}上没有在运行的远程桌面服务。{}；服务端用了别的端口时加 --port", how_to_enable());
+        let msg = format!(
+            "本机{ports}上没有在运行的远程桌面服务。{}；服务端用了别的端口时加 --port",
+            how_to_enable()
+        );
         return fail(sink, EXIT_NOT_FOUND, "not_found", &msg);
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let req = CtlRequest::Publish { name: name.to_string(), addr, proto: proto.to_string(), env: Vec::new() };
+    let req = CtlRequest::Publish {
+        name: name.to_string(),
+        addr,
+        proto: proto.to_string(),
+        env: Vec::new(),
+    };
     match call(ctl, req).await {
         Ok(CtlResponse::Published { path }) => {
             let device = path.split('/').next().unwrap_or_default().to_string();
             if json {
                 sink.out(doc(json!({ "schema": JSON_SCHEMA, "path": path, "proto": proto, "port": port })).as_bytes());
             } else {
-                let open = if name == "desktop" { device } else { path.clone() };
+                let open = if name == "desktop" {
+                    device
+                } else {
+                    path.clone()
+                };
                 sink.out(format!("已发布远程桌面 {path}（{proto}，本机端口 {port}）。其他设备：nexus desktop open {open}\n").as_bytes());
             }
             0
         }
         Ok(CtlResponse::Error(e)) => fail_wire(sink, &e),
         Ok(_) => fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
-        Err(e) => fail(sink, crate::EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）")),
+        Err(e) => fail(
+            sink,
+            crate::EXIT_DAEMON_UNREACHABLE,
+            "daemon_unreachable",
+            &format!("连不上本机的常驻程序（{e}）"),
+        ),
     }
 }
 
 // ---------- 看的一方：开端口、启动查看器 ----------
 
 /// 一台设备上能用的远程桌面。
-async fn desktops_on<C: Ctl>(ctl: &C, node: &str) -> Result<Vec<ServiceInfo>, nexus_wire::WireError> {
-    match call(ctl, CtlRequest::Services { node: node.to_string() }).await {
-        Ok(CtlResponse::Services { services, .. }) => Ok(services.into_iter().filter(|s| is_desktop(&s.proto)).collect()),
+async fn desktops_on<C: Ctl>(
+    ctl: &C,
+    node: &str,
+) -> Result<Vec<ServiceInfo>, nexus_wire::WireError> {
+    match call(
+        ctl,
+        CtlRequest::Services {
+            node: node.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(CtlResponse::Services { services, .. }) => Ok(services
+            .into_iter()
+            .filter(|s| is_desktop(&s.proto))
+            .collect()),
         Ok(CtlResponse::Error(e)) => Err(e),
-        _ => Err(nexus_wire::WireError { code: nexus_wire::ErrorCode::Internal, message: "常驻程序的回应无法理解".into() }),
+        _ => Err(nexus_wire::WireError {
+            code: nexus_wire::ErrorCode::Internal,
+            message: "常驻程序的回应无法理解".into(),
+        }),
     }
 }
 
-async fn open<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u16>, viewer: bool, sink: &mut K) -> i32 {
+async fn open<C: Ctl, K: Sink>(
+    ctl: &C,
+    target: &str,
+    port: Option<u16>,
+    viewer: bool,
+    sink: &mut K,
+) -> i32 {
     let parts: Vec<&str> = target.split('/').collect();
     let (node, name) = match parts.as_slice() {
         [node] if !node.is_empty() => (*node, None),
         [node, name] if !node.is_empty() && !name.is_empty() => (*node, Some(*name)),
-        _ => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("要打开的应当写成 <设备> 或 <设备>/<服务>：{target}")),
+        _ => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("要打开的应当写成 <设备> 或 <设备>/<服务>：{target}"),
+            )
+        }
     };
     let name = match name {
         Some(n) => n.to_string(),
@@ -215,13 +283,19 @@ async fn open<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u16>, viewer:
             };
             match found.as_slice() {
                 [] => {
-                    let msg = format!("{node} 上没有你能用的远程桌面：在 {node} 上运行 nexus desktop share");
+                    let msg = format!(
+                        "{node} 上没有你能用的远程桌面：在 {node} 上运行 nexus desktop share"
+                    );
                     return fail(sink, EXIT_NOT_FOUND, "not_found", &msg);
                 }
                 [one] => one.name.clone(),
                 many => {
-                    let names: Vec<String> = many.iter().map(|s| format!("{node}/{}", s.name)).collect();
-                    let msg = format!("{node} 上有不止一个远程桌面，写明要哪一个：{}", names.join("、"));
+                    let names: Vec<String> =
+                        many.iter().map(|s| format!("{node}/{}", s.name)).collect();
+                    let msg = format!(
+                        "{node} 上有不止一个远程桌面，写明要哪一个：{}",
+                        names.join("、")
+                    );
                     return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
                 }
             }
@@ -232,7 +306,10 @@ async fn open<C: Ctl, K: Sink>(ctl: &C, target: &str, port: Option<u16>, viewer:
         Err((code, kind, msg)) => return fail(sink, code, kind, &msg),
     };
     if !is_desktop(&info.proto) {
-        let msg = format!("{node}/{name} 不是远程桌面（协议 {}）：用 nexus open 或 nexus connect", info.proto);
+        let msg = format!(
+            "{node}/{name} 不是远程桌面（协议 {}）：用 nexus open 或 nexus connect",
+            info.proto
+        );
         return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &msg);
     }
     serve(ctl, node, &name, &info.proto, port, viewer, sink).await
@@ -250,11 +327,25 @@ pub(crate) async fn serve<C: Ctl, K: Sink>(
 ) -> i32 {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
         Ok(l) => l,
-        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("无法在本机开端口 {}：{e}", port.unwrap_or(0))),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("无法在本机开端口 {}：{e}", port.unwrap_or(0)),
+            )
+        }
     };
     let local = match listener.local_addr() {
         Ok(a) => a.port(),
-        Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("无法在本机开端口：{e}")),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INTERNAL,
+                "internal",
+                &format!("无法在本机开端口：{e}"),
+            )
+        }
     };
     let url = format!("{proto}://127.0.0.1:{local}");
     sink.out(format!("{node}/{name} → {url}（按 Ctrl-C 停止）\n").as_bytes());
@@ -313,7 +404,9 @@ fn manual_hint(proto: &str, port: u16) -> String {
 }
 
 fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<()> {
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn()?;
     // 不等它：查看器一直开着。退出了就收尾，避免留下僵尸进程。
     std::thread::spawn(move || {
@@ -324,8 +417,13 @@ fn spawn_detached(cmd: &mut std::process::Command) -> std::io::Result<()> {
 
 /// 启动查看器：`$NEXUS_DESKTOP_VIEWER`（地址作为最后一个参数），否则按系统挑第一个能启动的。
 fn launch_viewer(proto: &str, port: u16) -> std::io::Result<()> {
-    if let Some(v) = std::env::var("NEXUS_DESKTOP_VIEWER").ok().filter(|v| !v.trim().is_empty()) {
-        return spawn_detached(std::process::Command::new(v).arg(format!("{proto}://127.0.0.1:{port}")));
+    if let Some(v) = std::env::var("NEXUS_DESKTOP_VIEWER")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return spawn_detached(
+            std::process::Command::new(v).arg(format!("{proto}://127.0.0.1:{port}")),
+        );
     }
     let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "没有查看器");
     for argv in viewer_commands(os(), proto, port) {
@@ -344,7 +442,14 @@ async fn ls<C: Ctl, K: Sink>(ctl: &C, json: bool, sink: &mut K) -> i32 {
         Ok(CtlResponse::List(entries)) => entries,
         Ok(CtlResponse::Error(e)) => return fail_wire(sink, &e),
         Ok(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
-        Err(e) => return fail(sink, crate::EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", &format!("连不上本机的常驻程序（{e}）")),
+        Err(e) => {
+            return fail(
+                sink,
+                crate::EXIT_DAEMON_UNREACHABLE,
+                "daemon_unreachable",
+                &format!("连不上本机的常驻程序（{e}）"),
+            )
+        }
     };
     let mut rows: Vec<(String, ServiceInfo)> = Vec::new();
     for e in entries.iter().filter(|e| e.report.online || e.is_self) {
@@ -387,13 +492,29 @@ mod tests {
     fn viewers_follow_the_platform_table() {
         let first = |os, proto| viewer_commands(os, proto, 5555).remove(0).join(" ");
         assert_eq!(first("macos", "vnc"), "open vnc://127.0.0.1:5555");
-        assert_eq!(first("macos", "rdp"), "open rdp://full%20address=s:127.0.0.1:5555");
+        assert_eq!(
+            first("macos", "rdp"),
+            "open rdp://full%20address=s:127.0.0.1:5555"
+        );
         assert_eq!(first("windows", "vnc"), "vncviewer 127.0.0.1::5555");
         assert_eq!(first("windows", "rdp"), "mstsc /v:127.0.0.1:5555");
-        let linux_vnc: Vec<String> = viewer_commands("linux", "vnc", 5555).into_iter().map(|a| a[0].clone()).collect();
+        let linux_vnc: Vec<String> = viewer_commands("linux", "vnc", 5555)
+            .into_iter()
+            .map(|a| a[0].clone())
+            .collect();
         assert_eq!(linux_vnc, ["vncviewer", "remmina", "xdg-open"]);
-        let linux_rdp: Vec<String> = viewer_commands("linux", "rdp", 5555).into_iter().map(|a| a.join(" ")).collect();
-        assert_eq!(linux_rdp, ["xfreerdp3 /v:127.0.0.1:5555", "xfreerdp /v:127.0.0.1:5555", "remmina -c rdp://127.0.0.1:5555"]);
+        let linux_rdp: Vec<String> = viewer_commands("linux", "rdp", 5555)
+            .into_iter()
+            .map(|a| a.join(" "))
+            .collect();
+        assert_eq!(
+            linux_rdp,
+            [
+                "xfreerdp3 /v:127.0.0.1:5555",
+                "xfreerdp /v:127.0.0.1:5555",
+                "remmina -c rdp://127.0.0.1:5555"
+            ]
+        );
     }
 
     #[test]
@@ -411,7 +532,10 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut s, _)) = vnc.accept().await {
                 let _ = s.write_all(b"RFB 003.008\n").await;
-                tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(5)).await; drop(s) });
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    drop(s)
+                });
             }
         });
         // RDP：收到连接请求才回 TPKT

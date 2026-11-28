@@ -1,2 +1,2 @@
 # 协议 19.6 新增的消息的编码（tests/compat.rs 生成，不要手改）
-request.exit_datagram 1f0f6578616d706c652e636f6d3a343433
+request.exit_datagram 1f103230332e302e3131332e373a33343738

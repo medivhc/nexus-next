@@ -19,7 +19,11 @@ async fn enrolled(w: &World, label: &str, grants: &[&str], auth: &SoftAuthentica
     }
     let v = w.cli_ok("laptop", &args).await;
     let link = v["url"].as_str().expect("应当输出登记链接").to_string();
-    w.browser().await.enroll(&link, auth).await.expect("登记应当成功");
+    w.browser()
+        .await
+        .enroll(&link, auth)
+        .await
+        .expect("登记应当成功");
     link
 }
 
@@ -28,10 +32,21 @@ async fn setup(w: &World) {
     w.network("laptop", &["anchor"]).await;
     w.cli_ok("anchor", &["drive", "serve", "on"]).await;
     let big = pseudo_random(3 * 1024 * 1024, 7);
-    let dir = local_tree(&[("a.txt", b"alpha"), ("src/b.rs", b"fn b() {}\n"), ("logo.png", PNG), ("big.bin", &big)]);
+    let dir = local_tree(&[
+        ("a.txt", b"alpha"),
+        ("src/b.rs", b"fn b() {}\n"),
+        ("logo.png", PNG),
+        ("big.bin", &big),
+    ]);
     w.cli_ok("laptop", &["drive", "create", "work"]).await;
-    w.cli_ok("laptop", &["drive", "import", dir.path().to_str().unwrap(), "work:/"]).await;
-    let c = w.cli_ok("laptop", &["drive", "commit", "work", "-m", "first"]).await;
+    w.cli_ok(
+        "laptop",
+        &["drive", "import", dir.path().to_str().unwrap(), "work:/"],
+    )
+    .await;
+    let c = w
+        .cli_ok("laptop", &["drive", "commit", "work", "-m", "first"])
+        .await;
     assert_eq!(c["sync"]["state"], "pushed", "{c}");
 }
 

@@ -91,7 +91,10 @@ impl SecretKey {
         if vk.is_weak() {
             return None;
         }
-        let shared = vk.to_montgomery().mul_clamped(self.0.to_scalar_bytes()).to_bytes();
+        let shared = vk
+            .to_montgomery()
+            .mul_clamped(self.0.to_scalar_bytes())
+            .to_bytes();
         if shared.iter().fold(0u8, |acc, &b| acc | b) == 0 {
             return None;
         }
@@ -102,7 +105,9 @@ impl SecretKey {
 impl PublicKey {
     /// 校验签名。使用严格校验，拒绝弱公钥和非规范签名。
     pub fn verify(&self, purpose: Purpose, msg: &[u8], sig: &Signature) -> bool {
-        let Ok(key) = VerifyingKey::from_bytes(&self.0) else { return false };
+        let Ok(key) = VerifyingKey::from_bytes(&self.0) else {
+            return false;
+        };
         let sig = ed25519_dalek::Signature::from_bytes(&sig.to_bytes());
         key.verify_strict(&tagged(purpose, msg), &sig).is_ok()
     }

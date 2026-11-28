@@ -9,13 +9,19 @@ async fn issue(w: &World, label: &str, grants: &[&str]) -> String {
     for g in grants {
         args.extend(["--grant", g]);
     }
-    w.cli_ok("laptop", &args).await["credential"].as_str().expect("应当输出凭据").to_string()
+    w.cli_ok("laptop", &args).await["credential"]
+        .as_str()
+        .expect("应当输出凭据")
+        .to_string()
 }
 
 async fn services(w: &World, at: &str, node: &str) -> Vec<serde_json::Value> {
     let v = w.cli_ok(at, &["ls", node]).await;
     assert_eq!(v["node"], node, "{v}");
-    v["services"].as_array().expect("应当有 services 数组").clone()
+    v["services"]
+        .as_array()
+        .expect("应当有 services 数组")
+        .clone()
 }
 
 scenario! {

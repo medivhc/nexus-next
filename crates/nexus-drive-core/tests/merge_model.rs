@@ -8,7 +8,11 @@ fn file(store: &mut MemStore, text: &str) -> Entry {
     let bytes = text.as_bytes();
     store.put(bytes.to_vec());
     let manifest = store.put(FileManifest::from_chunks(&[bytes]).encode());
-    Entry::File { manifest, size: bytes.len() as u64, exec: false }
+    Entry::File {
+        manifest,
+        size: bytes.len() as u64,
+        exec: false,
+    }
 }
 
 fn snapshot(store: &mut MemStore, files: &BTreeMap<String, Entry>) -> Hash {
@@ -33,7 +37,11 @@ fn conflict_copy_preserves_existing_names_and_both_versions() {
                 } else {
                     format!("report.conflict-laptop-{i}")
                 };
-                let path = if directory { format!("{name}/child") } else { name };
+                let path = if directory {
+                    format!("{name}/child")
+                } else {
+                    name
+                };
                 shared.insert(path, file(&mut store, &format!("existing-{i}")));
             }
             let old = file(&mut store, "base");
@@ -49,7 +57,9 @@ fn conflict_copy_preserves_existing_names_and_both_versions() {
             let o = snapshot(&mut store, &ours);
             let t = snapshot(&mut store, &theirs);
             let (root, conflicts) = tree::merge(&mut store, Some(b), o, t, "laptop")
-                .unwrap_or_else(|err| panic!("counterexample: directory={directory}, count={count}: {err:?}"));
+                .unwrap_or_else(|err| {
+                    panic!("counterexample: directory={directory}, count={count}: {err:?}")
+                });
             assert_eq!(conflicts, vec!["report".to_string()]);
             let actual = tree::files(&store, root).unwrap();
             // The specification requires the original local file and ALL unchanged
@@ -59,7 +69,11 @@ fn conflict_copy_preserves_existing_names_and_both_versions() {
             for (path, entry) in shared {
                 assert_eq!(remaining.remove(&path), Some(entry), "lost existing {path}");
             }
-            assert_eq!(remaining.len(), 1, "counterexample: directory={directory}, count={count}");
+            assert_eq!(
+                remaining.len(),
+                1,
+                "counterexample: directory={directory}, count={count}"
+            );
             let (name, entry) = remaining.iter().next().unwrap();
             assert!(name.starts_with("report.conflict-laptop"), "{name}");
             assert_eq!(entry, &remote);

@@ -5,20 +5,21 @@
 
 use crate::{err, internal, load, save, CtlServer, Node};
 use nexus_drive_core::chunk::Chunker;
+use nexus_drive_core::history::{self, Relation};
 use nexus_drive_core::path::{valid_workspace, DrivePath};
 use nexus_drive_core::tree::{self, ChangeKind, DriveError, Entry, Store};
-use nexus_drive_core::history::{self, Relation};
 use nexus_drive_core::{ChunkRef, Commit, FileManifest, Hash};
 use nexus_fabric::{read_msg, read_response, write_msg, write_response, Transport};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use nexus_sys::System;
 use nexus_wire::{
-    AgentCredential, CtlResponse, DriveChange, DriveCommitInfo, DriveEntryInfo, DriveRequest, DriveResponse, DriveSyncReport, DriveWhere,
-    ErrorCode, Input, Request, Response, WireError, WorkspaceInfo,
+    AgentCredential, CtlResponse, DriveChange, DriveCommitInfo, DriveEntryInfo, DriveRequest,
+    DriveResponse, DriveSyncReport, DriveWhere, ErrorCode, Input, Request, Response, WireError,
+    WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 pub(crate) const KEY_DRIVE: &str = "drive-v2";
 /// 预读清单单独保存：工作区 → 名字 → 文件（按第一次读到的顺序）。
@@ -116,7 +117,8 @@ fn tree_err(e: DriveError, path: &DrivePath) -> WireError {
 }
 
 fn parse(path: &str) -> Result<DrivePath, WireError> {
-    path.parse::<DrivePath>().map_err(|m| err(ErrorCode::InvalidInput, m))
+    path.parse::<DrivePath>()
+        .map_err(|m| err(ErrorCode::InvalidInput, m))
 }
 
 fn kind_name(k: ChangeKind) -> &'static str {
@@ -129,10 +131,26 @@ fn kind_name(k: ChangeKind) -> &'static str {
 
 fn entry_info(name: String, e: &Entry) -> DriveEntryInfo {
     match e {
-        Entry::File { manifest, size, exec } => {
-            DriveEntryInfo { name, kind: "file".into(), size: *size, exec: *exec, target: None, content: Some(manifest.0) }
-        }
-        Entry::Dir { .. } => DriveEntryInfo { name, kind: "dir".into(), size: 0, exec: false, target: None, content: None },
+        Entry::File {
+            manifest,
+            size,
+            exec,
+        } => DriveEntryInfo {
+            name,
+            kind: "file".into(),
+            size: *size,
+            exec: *exec,
+            target: None,
+            content: Some(manifest.0),
+        },
+        Entry::Dir { .. } => DriveEntryInfo {
+            name,
+            kind: "dir".into(),
+            size: 0,
+            exec: false,
+            target: None,
+            content: None,
+        },
         Entry::Symlink { target } => DriveEntryInfo {
             name,
             kind: "symlink".into(),
@@ -145,13 +163,27 @@ fn entry_info(name: String, e: &Entry) -> DriveEntryInfo {
 }
 
 impl<T: Transport, S: System> Node<T, S> {
-    pub(crate) async fn drive(&self, req: DriveRequest, agent: Option<AgentCredential>, mut server: CtlServer) {
+    pub(crate) async fn drive(
+        &self,
+        req: DriveRequest,
+        agent: Option<AgentCredential>,
+        mut server: CtlServer,
+    ) {
         if let Err(e) = self.drive_allowed(&req, agent.as_ref()) {
             let _ = server.tx.send(CtlResponse::Error(e)).await;
             return;
         }
         let result = match req {
-            DriveRequest::Cat { path, at, offset, length } => return self.drive_cat(&path, at.as_deref(), offset, length, server).await,
+            DriveRequest::Cat {
+                path,
+                at,
+                offset,
+                length,
+            } => {
+                return self
+                    .drive_cat(&path, at.as_deref(), offset, length, server)
+                    .await
+            }
             DriveRequest::Put { path, exec } => self.drive_put(&path, exec, &mut server).await,
             DriveRequest::Create { ws, replicas } => self.drive_create(&ws, replicas).await,
             DriveRequest::List => self.drive_list(agent.as_ref()),
@@ -160,15 +192,20 @@ impl<T: Transport, S: System> Node<T, S> {
             DriveRequest::Merge { ws } => self.drive_merge(&ws).await,
             DriveRequest::Where { path } => self.drive_where(&path),
             DriveRequest::Ls { path, at } => self.drive_ls(&path, at.as_deref()),
-            DriveRequest::Symlink { path, target } => {
-                self.drive_set(&path, Entry::Symlink { target }).map(|_| DriveResponse::Written { path, size: 0 })
-            }
+            DriveRequest::Symlink { path, target } => self
+                .drive_set(&path, Entry::Symlink { target })
+                .map(|_| DriveResponse::Written { path, size: 0 }),
             DriveRequest::Mkdir { path } => self.drive_mkdir(&path),
             DriveRequest::Rename { from, to } => self.drive_rename(&from, &to),
             DriveRequest::Chmod { path, exec } => self.drive_chmod(&path, exec),
-            DriveRequest::Stamp { ws } => self.ws(&ws).map(|w| DriveResponse::Stamp { tree: w.work.0 }),
+            DriveRequest::Stamp { ws } => self
+                .ws(&ws)
+                .map(|w| DriveResponse::Stamp { tree: w.work.0 }),
             DriveRequest::Record { ws, name } => self.drive_record(&ws, name).await,
-            DriveRequest::Prefetch { ws, profile, all } => self.drive_prefetch(&ws, profile, all).await.map(DriveResponse::Prefetched),
+            DriveRequest::Prefetch { ws, profile, all } => self
+                .drive_prefetch(&ws, profile, all)
+                .await
+                .map(DriveResponse::Prefetched),
             DriveRequest::Rm { path, recursive } => self.drive_rm(&path, recursive),
             DriveRequest::Status { ws } => self.drive_status(&ws),
             DriveRequest::Commit { ws, message } => self.drive_commit(&ws, message).await,
@@ -192,14 +229,24 @@ impl<T: Transport, S: System> Node<T, S> {
 
     fn update_ws(&self, name: &str, f: impl FnOnce(&mut WsState)) -> Result<(), WireError> {
         let mut state = self.drive_state.borrow_mut();
-        let ws = state.workspaces.get_mut(name).ok_or_else(|| err(ErrorCode::NotFound, format!("没有工作区 {name}")))?;
+        let ws = state
+            .workspaces
+            .get_mut(name)
+            .ok_or_else(|| err(ErrorCode::NotFound, format!("没有工作区 {name}")))?;
         f(ws);
         save(&self.system, KEY_DRIVE, &*state).map_err(internal)
     }
 
-    async fn drive_create(&self, name: &str, replicas: Vec<String>) -> Result<DriveResponse, WireError> {
+    async fn drive_create(
+        &self,
+        name: &str,
+        replicas: Vec<String>,
+    ) -> Result<DriveResponse, WireError> {
         if !valid_workspace(name) {
-            return Err(err(ErrorCode::InvalidInput, format!("工作区名只能是小写字母、数字和连字符，1 到 32 个字符：{name}")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("工作区名只能是小写字母、数字和连字符，1 到 32 个字符：{name}"),
+            ));
         }
         if self.drive_state.borrow().workspaces.contains_key(name) {
             return Err(err(ErrorCode::InvalidInput, format!("已经有工作区 {name}")));
@@ -217,15 +264,31 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         for r in &replicas {
             let device = self.resolve(r)?;
-            match self.request(&device, Request::DriveRegister { ws: name.to_string() }, None).await {
+            match self
+                .request(
+                    &device,
+                    Request::DriveRegister {
+                        ws: name.to_string(),
+                    },
+                    None,
+                )
+                .await
+            {
                 Ok((Response::Ok, _)) => {}
                 Ok((Response::Error(e), _)) => return Err(e),
                 Ok(_) => return Err(internal("存储设备的回应无法理解")),
-                Err(e) => return Err(err(ErrorCode::Unreachable, format!("连不上存储设备 {r}：{e}"))),
+                Err(e) => {
+                    return Err(err(
+                        ErrorCode::Unreachable,
+                        format!("连不上存储设备 {r}：{e}"),
+                    ))
+                }
             }
         }
         self.insert_ws(name, replicas)?;
-        Ok(DriveResponse::Created { ws: name.to_string() })
+        Ok(DriveResponse::Created {
+            ws: name.to_string(),
+        })
     }
 
     fn insert_ws(&self, name: &str, replicas: Vec<String>) -> Result<(), WireError> {
@@ -234,17 +297,33 @@ impl<T: Transport, S: System> Node<T, S> {
             let mut cas = Cas::new(&self.system);
             let work = tree::empty(&mut cas);
             cas.finish()?;
-            state.workspaces.insert(name.to_string(), WsState { head: None, work, replicas, remote: None });
+            state.workspaces.insert(
+                name.to_string(),
+                WsState {
+                    head: None,
+                    work,
+                    replicas,
+                    remote: None,
+                },
+            );
         }
         save(&self.system, KEY_DRIVE, &*state).map_err(internal)
     }
 
     /// 网络里开了 serve 的其他设备（名字）。连不上的设备不算。
     async fn storage_devices(&self) -> Vec<String> {
-        let Some(roster) = self.roster() else { return Vec::new() };
-        let others: Vec<_> = roster.devices.into_iter().filter(|d| d.node_id != self.me()).collect();
+        let Some(roster) = self.roster() else {
+            return Vec::new();
+        };
+        let others: Vec<_> = roster
+            .devices
+            .into_iter()
+            .filter(|d| d.node_id != self.me())
+            .collect();
         let answers = futures_util::future::join_all(others.iter().map(|d| async move {
-            match tokio::time::timeout(PROBE_TIMEOUT, self.request(d, Request::DriveInfo, None)).await {
+            match tokio::time::timeout(PROBE_TIMEOUT, self.request(d, Request::DriveInfo, None))
+                .await
+            {
                 Ok(Ok((Response::DriveInfo { serving: true, .. }, _))) => Some(d.name.clone()),
                 _ => None,
             }
@@ -275,19 +354,35 @@ impl<T: Transport, S: System> Node<T, S> {
 
     fn changes(&self, ws: &WsState) -> Result<Vec<DriveChange>, WireError> {
         let base = self.head_tree(ws)?;
-        let d = tree::diff(&Cas::new(&self.system), base, ws.work).map_err(|e| internal(format!("{e:?}")))?;
-        Ok(d.into_iter().map(|c| DriveChange { kind: kind_name(c.kind).into(), path: c.path }).collect())
+        let d = tree::diff(&Cas::new(&self.system), base, ws.work)
+            .map_err(|e| internal(format!("{e:?}")))?;
+        Ok(d.into_iter()
+            .map(|c| DriveChange {
+                kind: kind_name(c.kind).into(),
+                path: c.path,
+            })
+            .collect())
     }
 
     fn drive_list(&self, agent: Option<&AgentCredential>) -> Result<DriveResponse, WireError> {
-        let all: Vec<(String, WsState)> = self.drive_state.borrow().workspaces.clone().into_iter().collect();
+        let all: Vec<(String, WsState)> = self
+            .drive_state
+            .borrow()
+            .workspaces
+            .clone()
+            .into_iter()
+            .collect();
         let mut out = Vec::new();
         for (name, ws) in all {
             if agent.is_some() && self.drive_agent_may(agent, &name, false).is_err() {
                 continue;
             }
             let changes = self.changes(&ws)?.len() as u32;
-            out.push(WorkspaceInfo { name, head: ws.head.map(|h| h.to_string()), changes });
+            out.push(WorkspaceInfo {
+                name,
+                head: ws.head.map(|h| h.to_string()),
+                changes,
+            });
         }
         Ok(DriveResponse::Workspaces(out))
     }
@@ -296,9 +391,14 @@ impl<T: Transport, S: System> Node<T, S> {
     fn find_commit(&self, ws: &WsState, prefix: &str) -> Result<Commit, WireError> {
         let prefix = prefix.to_ascii_lowercase();
         if prefix.len() < MIN_PREFIX || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(err(ErrorCode::InvalidInput, format!("提交号至少写 {MIN_PREFIX} 个十六进制字符：{prefix}")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("提交号至少写 {MIN_PREFIX} 个十六进制字符：{prefix}"),
+            ));
         }
-        let Some(head) = ws.head else { return Err(err(ErrorCode::NotFound, format!("没有提交 {prefix}"))) };
+        let Some(head) = ws.head else {
+            return Err(err(ErrorCode::NotFound, format!("没有提交 {prefix}")));
+        };
         let all = history::ancestors(&|h: &Hash| self.commit(*h).ok(), head)
             .map_err(|h| internal(format!("本机缺少提交 {}", h.short())))?;
         match all.into_iter().find(|h| h.to_string().starts_with(&prefix)) {
@@ -325,14 +425,27 @@ impl<T: Transport, S: System> Node<T, S> {
             None => return Err(err(ErrorCode::NotFound, format!("没有 {p}"))),
             Some(Entry::Dir { tree }) => {
                 let t = tree::load(&cas, tree).map_err(|e| tree_err(e, &p))?;
-                t.entries.iter().map(|(n, e)| entry_info(n.clone(), e)).collect()
+                t.entries
+                    .iter()
+                    .map(|(n, e)| entry_info(n.clone(), e))
+                    .collect()
             }
             Some(e) => vec![entry_info(p.parts.last().cloned().unwrap_or_default(), &e)],
         };
-        Ok(DriveResponse::Entries { path: p.to_string(), entries })
+        Ok(DriveResponse::Entries {
+            path: p.to_string(),
+            entries,
+        })
     }
 
-    async fn drive_cat(&self, path: &str, at: Option<&str>, offset: u64, length: Option<u64>, server: CtlServer) {
+    async fn drive_cat(
+        &self,
+        path: &str,
+        at: Option<&str>,
+        offset: u64,
+        length: Option<u64>,
+        server: CtlServer,
+    ) {
         let prepared = (|| {
             let p = parse(path)?;
             let ws = self.ws(&p.ws)?;
@@ -341,7 +454,10 @@ impl<T: Transport, S: System> Node<T, S> {
             match tree::lookup(&cas, root, &p.parts).map_err(|e| tree_err(e, &p))? {
                 None => Err(err(ErrorCode::NotFound, format!("没有 {p}"))),
                 Some(Entry::Dir { .. }) => Err(err(ErrorCode::InvalidInput, format!("{p} 是目录"))),
-                Some(Entry::Symlink { target }) => Err(err(ErrorCode::InvalidInput, format!("{p} 是指向 {target} 的符号链接"))),
+                Some(Entry::Symlink { target }) => Err(err(
+                    ErrorCode::InvalidInput,
+                    format!("{p} 是指向 {target} 的符号链接"),
+                )),
                 Some(Entry::File { manifest, .. }) => cas
                     .get(&manifest)
                     .and_then(|b| FileManifest::decode(&b))
@@ -360,9 +476,16 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         // 本机没有的块从存储设备取（只取这个范围用到的）。
         let spans = manifest.spans(offset, length.unwrap_or(u64::MAX));
-        let missing: Vec<Hash> = spans.iter().map(|s| s.hash).filter(|h| !self.system.cas_has(&h.0).unwrap_or(false)).collect();
+        let missing: Vec<Hash> = spans
+            .iter()
+            .map(|s| s.hash)
+            .filter(|h| !self.system.cas_has(&h.0).unwrap_or(false))
+            .collect();
         if !missing.is_empty() {
-            let ws = path.split_once(':').map(|(w, _)| w.to_string()).unwrap_or_default();
+            let ws = path
+                .split_once(':')
+                .map(|(w, _)| w.to_string())
+                .unwrap_or_default();
             if let Err(e) = self.fetch(&ws, &missing).await {
                 let _ = server.tx.send(CtlResponse::Error(e)).await;
                 return;
@@ -373,10 +496,19 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         for span in spans {
             let Some(chunk) = self.system.cas_get(&span.hash.0).ok().flatten() else {
-                let _ = server.tx.send(CtlResponse::Error(internal(format!("本机缺少块 {}", span.hash.short())))).await;
+                let _ = server
+                    .tx
+                    .send(CtlResponse::Error(internal(format!(
+                        "本机缺少块 {}",
+                        span.hash.short()
+                    ))))
+                    .await;
                 return;
             };
-            let part = chunk.get(span.from as usize..span.to as usize).unwrap_or_default().to_vec();
+            let part = chunk
+                .get(span.from as usize..span.to as usize)
+                .unwrap_or_default()
+                .to_vec();
             if server.tx.send(CtlResponse::PipeData(part)).await.is_err() {
                 return;
             }
@@ -384,7 +516,12 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = server.tx.send(CtlResponse::PipeEnd).await;
     }
 
-    async fn drive_put(&self, path: &str, exec: bool, server: &mut CtlServer) -> Result<DriveResponse, WireError> {
+    async fn drive_put(
+        &self,
+        path: &str,
+        exec: bool,
+        server: &mut CtlServer,
+    ) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         if p.parts.is_empty() {
             return Err(err(ErrorCode::InvalidInput, "要写的是文件，不是工作区的根"));
@@ -397,24 +534,42 @@ impl<T: Transport, S: System> Node<T, S> {
         let store = |new: Vec<Vec<u8>>, chunks: &mut Vec<ChunkRef>, cas: &mut Cas<S>| {
             for c in new {
                 let len = c.len() as u32;
-                chunks.push(ChunkRef { hash: cas.put(c), len });
+                chunks.push(ChunkRef {
+                    hash: cas.put(c),
+                    len,
+                });
             }
         };
         loop {
             match server.rx.recv().await {
                 Some(Input::Stdin(b)) => store(chunker.push(&b), &mut chunks, &mut cas),
                 Some(Input::CloseStdin) => break,
-                Some(Input::Cancel) | None => return Err(err(ErrorCode::InvalidInput, "写入被取消")),
+                Some(Input::Cancel) | None => {
+                    return Err(err(ErrorCode::InvalidInput, "写入被取消"))
+                }
                 Some(_) => {}
             }
         }
         store(chunker.finish(), &mut chunks, &mut cas);
-        let manifest = FileManifest { size: chunks.iter().map(|c| c.len as u64).sum(), chunks };
+        let manifest = FileManifest {
+            size: chunks.iter().map(|c| c.len as u64).sum(),
+            chunks,
+        };
         let size = manifest.size;
         let mh = cas.put(manifest.encode());
         cas.finish()?;
-        self.drive_set(path, Entry::File { manifest: mh, size, exec })?;
-        Ok(DriveResponse::Written { path: p.to_string(), size })
+        self.drive_set(
+            path,
+            Entry::File {
+                manifest: mh,
+                size,
+                exec,
+            },
+        )?;
+        Ok(DriveResponse::Written {
+            path: p.to_string(),
+            size,
+        })
     }
 
     /// 把工作树里的一项设成 `entry`。
@@ -436,26 +591,36 @@ impl<T: Transport, S: System> Node<T, S> {
         let ws = self.ws(&p.ws)?;
         let mut cas = Cas::new(&self.system);
         let work = tree::remove(&mut cas, ws.work, &p.parts, recursive).map_err(|e| match e {
-            DriveError::IsADirectory if !p.parts.is_empty() => err(ErrorCode::InvalidInput, format!("{p} 是目录：删除目录要加 -r")),
+            DriveError::IsADirectory if !p.parts.is_empty() => err(
+                ErrorCode::InvalidInput,
+                format!("{p} 是目录：删除目录要加 -r"),
+            ),
             DriveError::IsADirectory => err(ErrorCode::InvalidInput, "不能删除工作区的根"),
             e => tree_err(e, &p),
         })?;
         cas.finish()?;
         self.update_ws(&p.ws, |w| w.work = work)?;
-        Ok(DriveResponse::Removed { path: p.to_string() })
+        Ok(DriveResponse::Removed {
+            path: p.to_string(),
+        })
     }
 
     fn drive_mkdir(&self, path: &str) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        if tree::lookup(&Cas::new(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.is_some() {
+        if tree::lookup(&Cas::new(&self.system), ws.work, &p.parts)
+            .map_err(|e| tree_err(e, &p))?
+            .is_some()
+        {
             return Err(err(ErrorCode::InvalidInput, format!("{p} 已经存在")));
         }
         let mut cas = Cas::new(&self.system);
         let tree = tree::empty(&mut cas);
         cas.finish()?;
         self.drive_set(path, Entry::Dir { tree })?;
-        Ok(DriveResponse::Done { path: p.to_string() })
+        Ok(DriveResponse::Done {
+            path: p.to_string(),
+        })
     }
 
     fn drive_rename(&self, from: &str, to: &str) -> Result<DriveResponse, WireError> {
@@ -467,16 +632,29 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::InvalidInput, "不能移动工作区的根"));
         }
         if b.parts.len() > a.parts.len() && b.parts[..a.parts.len()] == a.parts[..] {
-            return Err(err(ErrorCode::InvalidInput, format!("不能把 {a} 移到它自己里面")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("不能把 {a} 移到它自己里面"),
+            ));
         }
         let ws = self.ws(&a.ws)?;
         let mut cas = Cas::new(&self.system);
-        let entry = tree::lookup(&cas, ws.work, &a.parts).map_err(|e| tree_err(e, &a))?.ok_or_else(|| tree_err(DriveError::NotFound, &a))?;
+        let entry = tree::lookup(&cas, ws.work, &a.parts)
+            .map_err(|e| tree_err(e, &a))?
+            .ok_or_else(|| tree_err(DriveError::NotFound, &a))?;
         if a.parts == b.parts {
-            return Ok(DriveResponse::Done { path: b.to_string() });
+            return Ok(DriveResponse::Done {
+                path: b.to_string(),
+            });
         }
-        if let Some(Entry::Dir { tree }) = tree::lookup(&cas, ws.work, &b.parts).map_err(|e| tree_err(e, &b))? {
-            if !tree::load(&cas, tree).map_err(|e| tree_err(e, &b))?.entries.is_empty() {
+        if let Some(Entry::Dir { tree }) =
+            tree::lookup(&cas, ws.work, &b.parts).map_err(|e| tree_err(e, &b))?
+        {
+            if !tree::load(&cas, tree)
+                .map_err(|e| tree_err(e, &b))?
+                .entries
+                .is_empty()
+            {
                 return Err(err(ErrorCode::InvalidInput, format!("{b} 是非空目录")));
             }
         }
@@ -484,16 +662,29 @@ impl<T: Transport, S: System> Node<T, S> {
         let work = tree::set(&mut cas, work, &b.parts, entry).map_err(|e| tree_err(e, &b))?;
         cas.finish()?;
         self.update_ws(&a.ws, |w| w.work = work)?;
-        Ok(DriveResponse::Done { path: b.to_string() })
+        Ok(DriveResponse::Done {
+            path: b.to_string(),
+        })
     }
 
     fn drive_chmod(&self, path: &str, exec: bool) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
-        match tree::lookup(&Cas::new(&self.system), ws.work, &p.parts).map_err(|e| tree_err(e, &p))? {
+        match tree::lookup(&Cas::new(&self.system), ws.work, &p.parts)
+            .map_err(|e| tree_err(e, &p))?
+        {
             Some(Entry::File { manifest, size, .. }) => {
-                self.drive_set(path, Entry::File { manifest, size, exec })?;
-                Ok(DriveResponse::Done { path: p.to_string() })
+                self.drive_set(
+                    path,
+                    Entry::File {
+                        manifest,
+                        size,
+                        exec,
+                    },
+                )?;
+                Ok(DriveResponse::Done {
+                    path: p.to_string(),
+                })
             }
             Some(_) => Err(err(ErrorCode::InvalidInput, format!("{p} 不是文件"))),
             None => Err(tree_err(DriveError::NotFound, &p)),
@@ -508,12 +699,17 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn drive_commit(&self, name: &str, message: String) -> Result<DriveResponse, WireError> {
         let ws = self.ws(name)?;
         if self.changes(&ws)?.is_empty() {
-            return Err(err(ErrorCode::InvalidInput, format!("工作区 {name} 没有可提交的改动")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("工作区 {name} 没有可提交的改动"),
+            ));
         }
         let commit = Commit {
             tree: ws.work,
             parents: ws.head.into_iter().collect(),
-            device: self.my_name().unwrap_or_else(|_| self.configured_name.clone()),
+            device: self
+                .my_name()
+                .unwrap_or_else(|_| self.configured_name.clone()),
             time_ms: self.system.now().0,
             message,
         };
@@ -522,7 +718,10 @@ impl<T: Transport, S: System> Node<T, S> {
         cas.finish()?;
         self.update_ws(name, |w| w.head = Some(h))?;
         let sync = self.push(name).await;
-        Ok(DriveResponse::Committed { commit: h.to_string(), sync })
+        Ok(DriveResponse::Committed {
+            commit: h.to_string(),
+            sync,
+        })
     }
 
     fn drive_log(&self, name: &str) -> Result<DriveResponse, WireError> {
@@ -532,7 +731,12 @@ impl<T: Transport, S: System> Node<T, S> {
         while let Some(h) = next {
             let c = self.commit(h)?;
             next = c.parents.first().copied();
-            out.push(DriveCommitInfo { commit: h.to_string(), message: c.message, device: c.device, time_ms: c.time_ms });
+            out.push(DriveCommitInfo {
+                commit: h.to_string(),
+                message: c.message,
+                device: c.device,
+                time_ms: c.time_ms,
+            });
         }
         Ok(DriveResponse::Log(out))
     }
@@ -542,20 +746,30 @@ impl<T: Transport, S: System> Node<T, S> {
 
 impl<T: Transport, S: System> Node<T, S> {
     /// agent 的本机请求：读要 drive.read，写要 drive.write（资源 `<本机>/drive/<工作区>`）；建工作区和 serve 是管理操作。
-    fn drive_allowed(&self, req: &DriveRequest, agent: Option<&AgentCredential>) -> Result<(), WireError> {
+    fn drive_allowed(
+        &self,
+        req: &DriveRequest,
+        agent: Option<&AgentCredential>,
+    ) -> Result<(), WireError> {
         if agent.is_none() {
             return Ok(());
         }
-        let ws_of = |p: &str| p.split_once(':').map_or(p.to_string(), |(w, _)| w.to_string());
+        let ws_of = |p: &str| {
+            p.split_once(':')
+                .map_or(p.to_string(), |(w, _)| w.to_string())
+        };
         match req {
-            DriveRequest::Create { .. } | DriveRequest::Serve { .. } => Err(err(ErrorCode::Denied, "agent 不能执行管理操作")),
+            DriveRequest::Create { .. } | DriveRequest::Serve { .. } => {
+                Err(err(ErrorCode::Denied, "agent 不能执行管理操作"))
+            }
             DriveRequest::List => Ok(()),
-            DriveRequest::Ls { path, .. } | DriveRequest::Cat { path, .. } | DriveRequest::Where { path } => {
-                self.drive_agent_may(agent, &ws_of(path), false)
-            }
-            DriveRequest::Status { ws } | DriveRequest::Log { ws } | DriveRequest::Stamp { ws } | DriveRequest::Prefetch { ws, .. } => {
-                self.drive_agent_may(agent, ws, false)
-            }
+            DriveRequest::Ls { path, .. }
+            | DriveRequest::Cat { path, .. }
+            | DriveRequest::Where { path } => self.drive_agent_may(agent, &ws_of(path), false),
+            DriveRequest::Status { ws }
+            | DriveRequest::Log { ws }
+            | DriveRequest::Stamp { ws }
+            | DriveRequest::Prefetch { ws, .. } => self.drive_agent_may(agent, ws, false),
             DriveRequest::Record { ws, .. } => self.drive_agent_may(agent, ws, true),
             DriveRequest::Put { path, .. }
             | DriveRequest::Symlink { path, .. }
@@ -566,15 +780,29 @@ impl<T: Transport, S: System> Node<T, S> {
                 self.drive_agent_may(agent, &ws_of(from), true)?;
                 self.drive_agent_may(agent, &ws_of(to), true)
             }
-            DriveRequest::Commit { ws, .. } | DriveRequest::Merge { ws } | DriveRequest::Sync { ws } => self.drive_agent_may(agent, ws, true),
+            DriveRequest::Commit { ws, .. }
+            | DriveRequest::Merge { ws }
+            | DriveRequest::Sync { ws } => self.drive_agent_may(agent, ws, true),
         }
     }
 
-    fn drive_agent_may(&self, agent: Option<&AgentCredential>, ws: &str, write: bool) -> Result<(), WireError> {
+    fn drive_agent_may(
+        &self,
+        agent: Option<&AgentCredential>,
+        ws: &str,
+        write: bool,
+    ) -> Result<(), WireError> {
         let body = if write {
-            Request::DrivePush { ws: ws.to_string(), head: [0; 32], count: 0 }
+            Request::DrivePush {
+                ws: ws.to_string(),
+                head: [0; 32],
+                count: 0,
+            }
         } else {
-            Request::DriveGet { ws: ws.to_string(), hashes: Vec::new() }
+            Request::DriveGet {
+                ws: ws.to_string(),
+                hashes: Vec::new(),
+            }
         };
         self.authorize_local(agent, &body)
     }
@@ -631,7 +859,10 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn fetch(&self, ws: &str, hashes: &[Hash]) -> Result<(), WireError> {
         let replicas = self.ws(ws)?.replicas;
         if replicas.is_empty() {
-            return Err(internal(format!("本机缺少 {} 个对象，工作区 {ws} 没有存储设备", hashes.len())));
+            return Err(internal(format!(
+                "本机缺少 {} 个对象，工作区 {ws} 没有存储设备",
+                hashes.len()
+            )));
         }
         let mut last = String::new();
         for r in &replicas {
@@ -640,23 +871,42 @@ impl<T: Transport, S: System> Node<T, S> {
                 Err(e) => last = format!("{r}：{}", e.message),
             }
         }
-        Err(err(ErrorCode::Unreachable, format!("内容不在本机，存储设备也取不到（{last}）")))
+        Err(err(
+            ErrorCode::Unreachable,
+            format!("内容不在本机，存储设备也取不到（{last}）"),
+        ))
     }
 
     async fn fetch_from(&self, replica: &str, ws: &str, hashes: &[Hash]) -> Result<(), WireError> {
         let device = self.resolve(replica)?;
         for batch in hashes.chunks(BATCH) {
-            let body = Request::DriveGet { ws: ws.to_string(), hashes: batch.iter().map(|h| h.0).collect() };
-            let mut stream = self.open_stream(&device, body, None).await.map_err(|e| match e {
-                crate::OpenError::Remote(e) => e,
-                crate::OpenError::StaleRoster => err(ErrorCode::Unreachable, "名册不一致"),
-                crate::OpenError::Io(e) => err(ErrorCode::Unreachable, e.to_string()),
-            })?;
+            let body = Request::DriveGet {
+                ws: ws.to_string(),
+                hashes: batch.iter().map(|h| h.0).collect(),
+            };
+            let mut stream = self
+                .open_stream(&device, body, None)
+                .await
+                .map_err(|e| match e {
+                    crate::OpenError::Remote(e) => e,
+                    crate::OpenError::StaleRoster => err(ErrorCode::Unreachable, "名册不一致"),
+                    crate::OpenError::Io(e) => err(ErrorCode::Unreachable, e.to_string()),
+                })?;
             for h in batch {
-                let obj: Option<Vec<u8>> = read_msg(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?;
-                let bytes = obj.ok_or_else(|| err(ErrorCode::NotFound, format!("{replica} 也没有对象 {}", h.short())))?;
+                let obj: Option<Vec<u8>> = read_msg(&mut stream)
+                    .await
+                    .map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?;
+                let bytes = obj.ok_or_else(|| {
+                    err(
+                        ErrorCode::NotFound,
+                        format!("{replica} 也没有对象 {}", h.short()),
+                    )
+                })?;
                 if Hash::of(&bytes) != *h {
-                    return Err(err(ErrorCode::Internal, format!("{replica} 给的对象 {} 内容不对", h.short())));
+                    return Err(err(
+                        ErrorCode::Internal,
+                        format!("{replica} 给的对象 {} 内容不对", h.short()),
+                    ));
                 }
                 self.system.cas_put(&h.0, &bytes).map_err(internal)?;
             }
@@ -677,25 +927,54 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 把本机的头推给每个存储设备。
     async fn push(&self, name: &str) -> DriveSyncReport {
-        let Ok(ws) = self.ws(name) else { return report("local", None, None, "没有这个工作区") };
+        let Ok(ws) = self.ws(name) else {
+            return report("local", None, None, "没有这个工作区");
+        };
         let head = ws.head;
         if ws.replicas.is_empty() {
             return report("local", head, None, "没有存储设备：只在本机");
         }
-        let Some(h) = head else { return report("same", None, ws.remote, "") };
+        let Some(h) = head else {
+            return report("same", None, ws.remote, "");
+        };
         let mut out = report("pushed", head, Some(h), "");
         for r in &ws.replicas {
             match self.push_to(r, name, h).await {
                 Ok(Response::DrivePushed { accepted: true, .. }) => {
                     let _ = self.update_ws(name, |w| w.remote = Some(h));
                 }
-                Ok(Response::DrivePushed { accepted: false, head: theirs }) => {
+                Ok(Response::DrivePushed {
+                    accepted: false,
+                    head: theirs,
+                }) => {
                     let theirs = theirs.map(Hash);
                     let _ = self.update_ws(name, |w| w.remote = theirs);
-                    return report("diverged", head, theirs, &format!("{r} 上有本机没有的提交：先 nexus drive sync {name}，再 merge"));
+                    return report(
+                        "diverged",
+                        head,
+                        theirs,
+                        &format!("{r} 上有本机没有的提交：先 nexus drive sync {name}，再 merge"),
+                    );
                 }
-                Ok(other) => return report("offline", head, ws.remote, &format!("{r} 的回应无法理解：{other:?}")),
-                Err(e) => out = report("offline", head, ws.remote, &format!("连不上 {r}（{}）：提交只在本机，之后 nexus drive sync {name}", e.message)),
+                Ok(other) => {
+                    return report(
+                        "offline",
+                        head,
+                        ws.remote,
+                        &format!("{r} 的回应无法理解：{other:?}"),
+                    )
+                }
+                Err(e) => {
+                    out = report(
+                        "offline",
+                        head,
+                        ws.remote,
+                        &format!(
+                            "连不上 {r}（{}）：提交只在本机，之后 nexus drive sync {name}",
+                            e.message
+                        ),
+                    )
+                }
             }
         }
         out
@@ -706,32 +985,64 @@ impl<T: Transport, S: System> Node<T, S> {
         let (all, _) = self.closure(head, true);
         let mut missing = Vec::new();
         for batch in all.chunks(BATCH) {
-            let body = Request::DriveHave { ws: ws.to_string(), hashes: batch.iter().map(|h| h.0).collect() };
-            match self.request(&device, body, None).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))? {
+            let body = Request::DriveHave {
+                ws: ws.to_string(),
+                hashes: batch.iter().map(|h| h.0).collect(),
+            };
+            match self
+                .request(&device, body, None)
+                .await
+                .map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?
+            {
                 (Response::DriveMissing(m), _) => missing.extend(m),
                 (Response::Error(e), _) => return Err(e),
                 _ => return Err(internal("存储设备的回应无法理解")),
             }
         }
-        let body = Request::DrivePush { ws: ws.to_string(), head: head.0, count: missing.len() as u32 };
-        let mut stream = self.open_stream(&device, body, None).await.map_err(|e| match e {
-            crate::OpenError::Remote(e) => e,
-            crate::OpenError::StaleRoster => err(ErrorCode::Unreachable, "名册不一致"),
-            crate::OpenError::Io(e) => err(ErrorCode::Unreachable, e.to_string()),
-        })?;
+        let body = Request::DrivePush {
+            ws: ws.to_string(),
+            head: head.0,
+            count: missing.len() as u32,
+        };
+        let mut stream = self
+            .open_stream(&device, body, None)
+            .await
+            .map_err(|e| match e {
+                crate::OpenError::Remote(e) => e,
+                crate::OpenError::StaleRoster => err(ErrorCode::Unreachable, "名册不一致"),
+                crate::OpenError::Io(e) => err(ErrorCode::Unreachable, e.to_string()),
+            })?;
         for h in &missing {
-            let bytes = self.system.cas_get(h).ok().flatten().ok_or_else(|| internal("本机缺少要推送的对象"))?;
-            write_msg(&mut stream, &bytes).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?;
+            let bytes = self
+                .system
+                .cas_get(h)
+                .ok()
+                .flatten()
+                .ok_or_else(|| internal("本机缺少要推送的对象"))?;
+            write_msg(&mut stream, &bytes)
+                .await
+                .map_err(|e| err(ErrorCode::Unreachable, e.to_string()))?;
         }
-        read_response(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, e.to_string()))
+        read_response(&mut stream)
+            .await
+            .map_err(|e| err(ErrorCode::Unreachable, e.to_string()))
     }
 
     /// 存储设备上这个工作区的头；没有存储设备或都连不上时为空。
-    async fn remote_head(&self, ws: &str, replicas: &[String]) -> Result<Option<Option<Hash>>, WireError> {
+    async fn remote_head(
+        &self,
+        ws: &str,
+        replicas: &[String],
+    ) -> Result<Option<Option<Hash>>, WireError> {
         for r in replicas {
-            let Ok(device) = self.resolve(r) else { continue };
-            if let Ok(Ok((Response::DriveInfo { workspaces, .. }, _))) =
-                tokio::time::timeout(PROBE_TIMEOUT, self.request(&device, Request::DriveInfo, None)).await
+            let Ok(device) = self.resolve(r) else {
+                continue;
+            };
+            if let Ok(Ok((Response::DriveInfo { workspaces, .. }, _))) = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                self.request(&device, Request::DriveInfo, None),
+            )
+            .await
             {
                 if let Some((_, head)) = workspaces.into_iter().find(|(n, _)| n == ws) {
                     return Ok(Some(head.map(Hash)));
@@ -743,7 +1054,10 @@ impl<T: Transport, S: System> Node<T, S> {
 
     async fn drive_sync(&self, name: &str) -> Result<DriveSyncReport, WireError> {
         if !valid_workspace(name) {
-            return Err(err(ErrorCode::InvalidInput, format!("工作区名不合法：{name}")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("工作区名不合法：{name}"),
+            ));
         }
         // 本机还没有这个工作区：问存储设备。
         if self.ws(name).is_err() {
@@ -754,7 +1068,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
             }
             if found.is_empty() {
-                return Err(err(ErrorCode::NotFound, format!("本机和存储设备上都没有工作区 {name}")));
+                return Err(err(
+                    ErrorCode::NotFound,
+                    format!("本机和存储设备上都没有工作区 {name}"),
+                ));
             }
             self.insert_ws(name, found)?;
         }
@@ -767,7 +1084,11 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         let Some(remote) = remote else {
             // 存储设备上还没有提交。
-            return Ok(if ws.head.is_some() { self.push(name).await } else { report("same", None, None, "") });
+            return Ok(if ws.head.is_some() {
+                self.push(name).await
+            } else {
+                report("same", None, None, "")
+            });
         };
         self.fetch_structure(name, remote).await?;
         self.update_ws(name, |w| w.remote = Some(remote))?;
@@ -776,7 +1097,9 @@ impl<T: Transport, S: System> Node<T, S> {
             return Ok(report("pulled", Some(remote), Some(remote), ""));
         };
         let get = |h: &Hash| self.commit(*h).ok();
-        match history::relation(&get, local, remote).map_err(|h| internal(format!("本机缺少提交 {}", h.short())))? {
+        match history::relation(&get, local, remote)
+            .map_err(|h| internal(format!("本机缺少提交 {}", h.short())))?
+        {
             Relation::Same => Ok(report("same", Some(local), Some(remote), "")),
             Relation::Ahead => Ok(self.push(name).await),
             Relation::Behind => {
@@ -797,7 +1120,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let ws = self.ws(name)?;
         let new_tree = self.commit(to)?.tree;
         let old_tree = self.head_tree(&ws)?;
-        let work = if Some(ws.work) == old_tree || (old_tree.is_none() && self.changes(&ws)?.is_empty()) {
+        let work = if Some(ws.work) == old_tree
+            || (old_tree.is_none() && self.changes(&ws)?.is_empty())
+        {
             new_tree
         } else {
             let mut cas = Cas::new(&self.system);
@@ -806,7 +1131,10 @@ impl<T: Transport, S: System> Node<T, S> {
             if !conflicts.is_empty() {
                 return Err(err(
                     ErrorCode::InvalidState,
-                    format!("本机未提交的改动和同步来的修改冲突（{}）：先提交本机的改动再同步", conflicts.join("、")),
+                    format!(
+                        "本机未提交的改动和同步来的修改冲突（{}）：先提交本机的改动再同步",
+                        conflicts.join("、")
+                    ),
                 ));
             }
             cas.finish()?;
@@ -821,29 +1149,48 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn drive_merge(&self, name: &str) -> Result<DriveResponse, WireError> {
         let ws = self.ws(name)?;
         let (Some(local), Some(remote)) = (ws.head, ws.remote) else {
-            return Err(err(ErrorCode::InvalidState, format!("没有要合并的：先 nexus drive sync {name}")));
+            return Err(err(
+                ErrorCode::InvalidState,
+                format!("没有要合并的：先 nexus drive sync {name}"),
+            ));
         };
         if !self.changes(&ws)?.is_empty() {
-            return Err(err(ErrorCode::InvalidState, "本机有未提交的改动：先提交再合并"));
+            return Err(err(
+                ErrorCode::InvalidState,
+                "本机有未提交的改动：先提交再合并",
+            ));
         }
         let get = |h: &Hash| self.commit(*h).ok();
-        let base = match history::relation(&get, local, remote).map_err(|h| internal(format!("本机缺少提交 {}", h.short())))? {
+        let base = match history::relation(&get, local, remote)
+            .map_err(|h| internal(format!("本机缺少提交 {}", h.short())))?
+        {
             Relation::Diverged { base } => base,
-            _ => return Err(err(ErrorCode::InvalidState, format!("没有分叉，不需要合并：nexus drive sync {name}"))),
+            _ => {
+                return Err(err(
+                    ErrorCode::InvalidState,
+                    format!("没有分叉，不需要合并：nexus drive sync {name}"),
+                ))
+            }
         };
         let theirs = self.commit(remote)?;
         let base_tree = base.map(|b| self.commit(b).map(|c| c.tree)).transpose()?;
         let ours_tree = self.commit(local)?.tree;
         let mut cas = Cas::new(&self.system);
-        let (merged, conflicts) = tree::merge(&mut cas, base_tree, ours_tree, theirs.tree, &theirs.device)
-            .map_err(|e| match e {
-                DriveError::Missing(_) => err(ErrorCode::Unreachable, "合并需要的目录结构不在本机：先同步"),
-                e => internal(format!("{e:?}")),
-            })?;
+        let (merged, conflicts) =
+            tree::merge(&mut cas, base_tree, ours_tree, theirs.tree, &theirs.device).map_err(
+                |e| match e {
+                    DriveError::Missing(_) => {
+                        err(ErrorCode::Unreachable, "合并需要的目录结构不在本机：先同步")
+                    }
+                    e => internal(format!("{e:?}")),
+                },
+            )?;
         let commit = Commit {
             tree: merged,
             parents: vec![local, remote],
-            device: self.my_name().unwrap_or_else(|_| self.configured_name.clone()),
+            device: self
+                .my_name()
+                .unwrap_or_else(|_| self.configured_name.clone()),
             time_ms: self.system.now().0,
             message: format!("合并 {} 的修改", theirs.device),
         };
@@ -854,7 +1201,11 @@ impl<T: Transport, S: System> Node<T, S> {
             w.work = merged;
         })?;
         let sync = self.push(name).await;
-        Ok(DriveResponse::Merged { commit: h.to_string(), conflicts, sync })
+        Ok(DriveResponse::Merged {
+            commit: h.to_string(),
+            conflicts,
+            sync,
+        })
     }
 
     /// 正在记录时记下读到的文件。
@@ -869,72 +1220,148 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    async fn drive_record(&self, name: &str, profile: Option<String>) -> Result<DriveResponse, WireError> {
+    async fn drive_record(
+        &self,
+        name: &str,
+        profile: Option<String>,
+    ) -> Result<DriveResponse, WireError> {
         let ws = self.ws(name)?;
         let Some(profile) = profile else {
             let r = self.drive_state.borrow_mut().recording.remove(name);
-            let Some(r) = r else { return Err(err(ErrorCode::InvalidState, format!("工作区 {name} 没有在记录"))) };
+            let Some(r) = r else {
+                return Err(err(
+                    ErrorCode::InvalidState,
+                    format!("工作区 {name} 没有在记录"),
+                ));
+            };
             self.save_profile(name, &r.name, r.files.clone())?;
             // 交给存储设备，别的设备才能用；交不出去的设备不算。
             let mut saved_to = Vec::new();
             for replica in &ws.replicas {
-                let Ok(device) = self.resolve(replica) else { continue };
-                let body = Request::DriveProfilePut { ws: name.to_string(), name: r.name.clone(), files: r.files.clone() };
+                let Ok(device) = self.resolve(replica) else {
+                    continue;
+                };
+                let body = Request::DriveProfilePut {
+                    ws: name.to_string(),
+                    name: r.name.clone(),
+                    files: r.files.clone(),
+                };
                 if let Ok((Response::Ok, _)) = self.request(&device, body, None).await {
                     saved_to.push(replica.clone());
                 }
             }
-            return Ok(DriveResponse::Profile { name: r.name, files: r.files, saved_to });
+            return Ok(DriveResponse::Profile {
+                name: r.name,
+                files: r.files,
+                saved_to,
+            });
         };
         if !nexus_drive_core::path::valid_part(&profile) {
-            return Err(err(ErrorCode::InvalidInput, format!("清单名不合法：{profile}")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("清单名不合法：{profile}"),
+            ));
         }
-        let rec = Recording { name: profile.clone(), ..Default::default() };
-        self.drive_state.borrow_mut().recording.insert(name.to_string(), rec);
+        let rec = Recording {
+            name: profile.clone(),
+            ..Default::default()
+        };
+        self.drive_state
+            .borrow_mut()
+            .recording
+            .insert(name.to_string(), rec);
         Ok(DriveResponse::Recording { name: profile })
     }
 
     fn save_profile(&self, ws: &str, name: &str, files: Vec<String>) -> Result<(), WireError> {
         let mut state = self.drive_state.borrow_mut();
-        state.profiles.entry(ws.to_string()).or_default().insert(name.to_string(), files);
+        state
+            .profiles
+            .entry(ws.to_string())
+            .or_default()
+            .insert(name.to_string(), files);
         save(&self.system, KEY_PROFILES, &state.profiles).map_err(internal)
     }
 
     /// 预读清单：先问存储设备（最新），取不到用本机的。
-    async fn find_profile(&self, name: &str, ws: &WsState, profile: &str) -> Result<Vec<String>, WireError> {
+    async fn find_profile(
+        &self,
+        name: &str,
+        ws: &WsState,
+        profile: &str,
+    ) -> Result<Vec<String>, WireError> {
         for replica in &ws.replicas {
-            let Ok(device) = self.resolve(replica) else { continue };
-            let body = Request::DriveProfileGet { ws: name.to_string(), name: profile.to_string() };
-            if let Ok((Response::DriveProfile(Some(files)), _)) = self.request(&device, body, None).await {
+            let Ok(device) = self.resolve(replica) else {
+                continue;
+            };
+            let body = Request::DriveProfileGet {
+                ws: name.to_string(),
+                name: profile.to_string(),
+            };
+            if let Ok((Response::DriveProfile(Some(files)), _)) =
+                self.request(&device, body, None).await
+            {
                 return Ok(files);
             }
         }
-        let local = self.drive_state.borrow().profiles.get(name).and_then(|m| m.get(profile)).cloned();
-        local.ok_or_else(|| err(ErrorCode::NotFound, format!("工作区 {name} 没有预读清单 {profile}")))
+        let local = self
+            .drive_state
+            .borrow()
+            .profiles
+            .get(name)
+            .and_then(|m| m.get(profile))
+            .cloned();
+        local.ok_or_else(|| {
+            err(
+                ErrorCode::NotFound,
+                format!("工作区 {name} 没有预读清单 {profile}"),
+            )
+        })
     }
 
-    async fn drive_prefetch(&self, name: &str, profile: Option<String>, all: bool) -> Result<nexus_wire::DrivePrefetch, WireError> {
+    async fn drive_prefetch(
+        &self,
+        name: &str,
+        profile: Option<String>,
+        all: bool,
+    ) -> Result<nexus_wire::DrivePrefetch, WireError> {
         let ws = self.ws(name)?;
         let files: Vec<String> = if all {
-            tree::files(&Cas::new(&self.system), ws.work).map_err(|e| internal(format!("{e:?}")))?.into_keys().collect()
+            tree::files(&Cas::new(&self.system), ws.work)
+                .map_err(|e| internal(format!("{e:?}")))?
+                .into_keys()
+                .collect()
         } else {
-            self.find_profile(name, &ws, profile.as_deref().unwrap_or("default")).await?
+            self.find_profile(name, &ws, profile.as_deref().unwrap_or("default"))
+                .await?
         };
         // 清单里的文件的清单对象（目录结构同步时已经取到；没有的先取）。
         let mut manifests = Vec::new();
         for f in &files {
             let parts: Vec<String> = f.split('/').map(str::to_string).collect();
-            if let Ok(Some(Entry::File { manifest, .. })) = tree::lookup(&Cas::new(&self.system), ws.work, &parts) {
+            if let Ok(Some(Entry::File { manifest, .. })) =
+                tree::lookup(&Cas::new(&self.system), ws.work, &parts)
+            {
                 manifests.push(manifest);
             }
         }
-        let absent: Vec<Hash> = manifests.iter().copied().filter(|m| !self.system.cas_has(&m.0).unwrap_or(false)).collect();
+        let absent: Vec<Hash> = manifests
+            .iter()
+            .copied()
+            .filter(|m| !self.system.cas_has(&m.0).unwrap_or(false))
+            .collect();
         if !absent.is_empty() {
             self.fetch(name, &absent).await?;
         }
-        let (mut missing, mut seen, mut total, mut fetched) = (Vec::new(), std::collections::BTreeSet::new(), 0u64, 0u64);
+        let (mut missing, mut seen, mut total, mut fetched) =
+            (Vec::new(), std::collections::BTreeSet::new(), 0u64, 0u64);
         for m in &manifests {
-            let Some(m) = Cas::new(&self.system).get(m).and_then(|b| FileManifest::decode(&b)) else { continue };
+            let Some(m) = Cas::new(&self.system)
+                .get(m)
+                .and_then(|b| FileManifest::decode(&b))
+            else {
+                continue;
+            };
             for c in m.chunks {
                 total += c.len as u64;
                 if seen.insert(c.hash) && !self.system.cas_has(&c.hash.0).unwrap_or(false) {
@@ -946,14 +1373,21 @@ impl<T: Transport, S: System> Node<T, S> {
         if !missing.is_empty() {
             self.fetch(name, &missing).await?;
         }
-        Ok(nexus_wire::DrivePrefetch { files: manifests.len() as u64, fetched_bytes: fetched, total_bytes: total, local_bytes: total })
+        Ok(nexus_wire::DrivePrefetch {
+            files: manifests.len() as u64,
+            fetched_bytes: fetched,
+            total_bytes: total,
+            local_bytes: total,
+        })
     }
 
     fn drive_where(&self, path: &str) -> Result<DriveResponse, WireError> {
         let p = parse(path)?;
         let ws = self.ws(&p.ws)?;
         let cas = Cas::new(&self.system);
-        let entry = tree::lookup(&cas, ws.work, &p.parts).map_err(|e| tree_err(e, &p))?.ok_or_else(|| err(ErrorCode::NotFound, format!("没有 {p}")))?;
+        let entry = tree::lookup(&cas, ws.work, &p.parts)
+            .map_err(|e| tree_err(e, &p))?
+            .ok_or_else(|| err(ErrorCode::NotFound, format!("没有 {p}")))?;
         let manifests: Vec<Hash> = match entry {
             Entry::File { manifest, .. } => vec![manifest],
             Entry::Symlink { .. } => vec![],
@@ -968,7 +1402,9 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         let (mut total, mut local) = (0u64, 0u64);
         for m in manifests {
-            let Some(m) = cas.get(&m).and_then(|b| FileManifest::decode(&b)) else { continue };
+            let Some(m) = cas.get(&m).and_then(|b| FileManifest::decode(&b)) else {
+                continue;
+            };
             for c in m.chunks {
                 total += c.len as u64;
                 if self.system.cas_has(&c.hash.0).unwrap_or(false) {
@@ -978,7 +1414,14 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let uncommitted = self.changes(&ws)?.len() as u32;
         let synced = !ws.replicas.is_empty() && ws.head.is_some() && ws.remote == ws.head;
-        Ok(DriveResponse::Where(DriveWhere { path: p.to_string(), replicas: ws.replicas, synced, uncommitted, total_bytes: total, local_bytes: local }))
+        Ok(DriveResponse::Where(DriveWhere {
+            path: p.to_string(),
+            replicas: ws.replicas,
+            synced,
+            uncommitted,
+            total_bytes: total,
+            local_bytes: local,
+        }))
     }
 
     // ------------------------------------------------------------ 存储设备一侧
@@ -992,12 +1435,18 @@ impl<T: Transport, S: System> Node<T, S> {
             .filter(|(n, _)| may_read(n))
             .map(|(n, w)| (n.clone(), w.head.map(|h| h.0)))
             .collect();
-        Response::DriveInfo { serving: state.serving, workspaces }
+        Response::DriveInfo {
+            serving: state.serving,
+            workspaces,
+        }
     }
 
     pub(crate) fn drive_register(&self, ws: &str) -> Response {
         if !self.drive_state.borrow().serving {
-            return Response::Error(err(ErrorCode::InvalidState, "这台设备没有开 serve（nexus drive serve on）"));
+            return Response::Error(err(
+                ErrorCode::InvalidState,
+                "这台设备没有开 serve（nexus drive serve on）",
+            ));
         }
         match self.insert_ws(ws, Vec::new()) {
             Ok(()) => Response::Ok,
@@ -1010,7 +1459,10 @@ impl<T: Transport, S: System> Node<T, S> {
             return Response::Error(err(ErrorCode::NotFound, format!("没有工作区 {ws}")));
         }
         if !nexus_drive_core::path::valid_part(name) {
-            return Response::Error(err(ErrorCode::InvalidInput, format!("清单名不合法：{name}")));
+            return Response::Error(err(
+                ErrorCode::InvalidInput,
+                format!("清单名不合法：{name}"),
+            ));
         }
         match self.save_profile(ws, name, files) {
             Ok(()) => Response::Ok,
@@ -1019,18 +1471,34 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     pub(crate) fn drive_profile_get(&self, ws: &str, name: &str) -> Response {
-        Response::DriveProfile(self.drive_state.borrow().profiles.get(ws).and_then(|m| m.get(name)).cloned())
+        Response::DriveProfile(
+            self.drive_state
+                .borrow()
+                .profiles
+                .get(ws)
+                .and_then(|m| m.get(name))
+                .cloned(),
+        )
     }
 
     pub(crate) fn drive_have(&self, ws: &str, hashes: Vec<[u8; 32]>) -> Response {
         if self.ws(ws).is_err() {
             return Response::Error(err(ErrorCode::NotFound, format!("没有工作区 {ws}")));
         }
-        Response::DriveMissing(hashes.into_iter().filter(|h| !self.system.cas_has(h).unwrap_or(false)).collect())
+        Response::DriveMissing(
+            hashes
+                .into_iter()
+                .filter(|h| !self.system.cas_has(h).unwrap_or(false))
+                .collect(),
+        )
     }
 
     /// 给对象。哈希就是内容的身份：拿得到哈希，说明对方读到过引用它的目录结构。
-    pub(crate) async fn serve_drive_get<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, hashes: Vec<[u8; 32]>) {
+    pub(crate) async fn serve_drive_get<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut stream: St,
+        hashes: Vec<[u8; 32]>,
+    ) {
         if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
@@ -1044,15 +1512,27 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 收推送：收下对象，检查新头的历史完整、是现在的头的后代，然后更新。
-    pub(crate) async fn serve_drive_push<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, ws: String, head: [u8; 32], count: u32) {
+    pub(crate) async fn serve_drive_push<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut stream: St,
+        ws: String,
+        head: [u8; 32],
+        count: u32,
+    ) {
         if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
         for _ in 0..count {
-            let Ok(bytes) = read_msg::<_, Vec<u8>>(&mut stream).await else { return };
+            let Ok(bytes) = read_msg::<_, Vec<u8>>(&mut stream).await else {
+                return;
+            };
             let h = Hash::of(&bytes);
             if let Err(e) = self.system.cas_put(&h.0, &bytes) {
-                let _ = write_response(&mut stream, &Response::Error(internal(format!("写入对象存储失败：{e}")))).await;
+                let _ = write_response(
+                    &mut stream,
+                    &Response::Error(internal(format!("写入对象存储失败：{e}"))),
+                )
+                .await;
                 let _ = stream.shutdown().await;
                 return;
             }
@@ -1061,7 +1541,10 @@ impl<T: Transport, S: System> Node<T, S> {
         let resp = (|| {
             let (_, missing) = self.closure(head, true);
             if !missing.is_empty() {
-                return Response::Error(err(ErrorCode::InvalidInput, format!("推送不完整：缺少 {} 个对象", missing.len())));
+                return Response::Error(err(
+                    ErrorCode::InvalidInput,
+                    format!("推送不完整：缺少 {} 个对象", missing.len()),
+                ));
             }
             let w = match self.ws(&ws) {
                 Ok(w) => w,
@@ -1070,10 +1553,16 @@ impl<T: Transport, S: System> Node<T, S> {
             let get = |h: &Hash| self.commit(*h).ok();
             let accept = match w.head {
                 None => true,
-                Some(cur) => matches!(history::relation(&get, head, cur), Ok(Relation::Ahead | Relation::Same)),
+                Some(cur) => matches!(
+                    history::relation(&get, head, cur),
+                    Ok(Relation::Ahead | Relation::Same)
+                ),
             };
             if !accept {
-                return Response::DrivePushed { accepted: false, head: w.head.map(|h| h.0) };
+                return Response::DrivePushed {
+                    accepted: false,
+                    head: w.head.map(|h| h.0),
+                };
             }
             // 存储设备上的工作树跟着头走，除非这台设备自己有未提交的改动。
             let follow = w.head.is_none() || self.head_tree(&w).ok().flatten() == Some(w.work);
@@ -1085,7 +1574,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
             });
             match result {
-                Ok(()) => Response::DrivePushed { accepted: true, head: Some(head.0) },
+                Ok(()) => Response::DrivePushed {
+                    accepted: true,
+                    head: Some(head.0),
+                },
                 Err(e) => Response::Error(e),
             }
         })();

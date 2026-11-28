@@ -5,22 +5,41 @@ use nexus_testkit::{scenario, World};
 use std::time::Duration;
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// 一个 HTTP GET，返回（状态码，Content-Type，正文）。
 fn http_get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连不上锚点");
-    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n").unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("回应没有头部");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("回应没有头部");
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).expect("没有状态码");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("没有状态码");
     let ctype = head
         .lines()
-        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-type:").map(|v| v.trim().to_string()))
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-type:")
+                .map(|v| v.trim().to_string())
+        })
         .unwrap_or_default();
     (status, ctype, raw[split + 4..].to_vec())
 }
@@ -31,17 +50,34 @@ async fn https_get(port: u16, path: &str, ca: &rcgen::Certificate) -> (u16, Vec<
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("连不上锚点");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连不上锚点");
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut tls = connector.connect(name, tcp).await.expect("TLS 握手失败");
-    tls.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    tls.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
     let mut raw = Vec::new();
     let _ = tls.read_to_end(&mut raw).await;
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("回应没有头部");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("回应没有头部");
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    (head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap(), raw[split + 4..].to_vec())
+    (
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap(),
+        raw[split + 4..].to_vec(),
+    )
 }
 
 /// 一个输出 `text` 的命令，但命令本身（回显在屏幕上）不包含完整的 `text`。

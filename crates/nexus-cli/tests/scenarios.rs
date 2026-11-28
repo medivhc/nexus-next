@@ -10,7 +10,11 @@ fn json(text: &str) -> Value {
 }
 
 fn keys(v: &Value) -> Vec<&str> {
-    v.as_object().expect("应当是 JSON 对象").keys().map(String::as_str).collect()
+    v.as_object()
+        .expect("应当是 JSON 对象")
+        .keys()
+        .map(String::as_str)
+        .collect()
 }
 
 /// `nexus ls --json` 里的设备，按名字排序，便于比较。
@@ -19,18 +23,36 @@ fn devices(v: &Value) -> Vec<(String, bool)> {
         .as_array()
         .expect("ls 应当输出 devices 数组")
         .iter()
-        .map(|d| (d["name"].as_str().unwrap().to_string(), d["online"].as_bool().unwrap()))
+        .map(|d| {
+            (
+                d["name"].as_str().unwrap().to_string(),
+                d["online"].as_bool().unwrap(),
+            )
+        })
         .collect();
     out.sort();
     out
 }
 
 fn error_kind(stderr: &str) -> String {
-    json(stderr)["error"].as_str().unwrap_or_default().to_string()
+    json(stderr)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 const STATUS_KEYS: [&str; 11] = [
-    "name", "node_id", "online", "path", "role", "roster_version", "rtt_ms", "schema", "started_at_ms", "uptime_ms", "version",
+    "name",
+    "node_id",
+    "online",
+    "path",
+    "role",
+    "roster_version",
+    "rtt_ms",
+    "schema",
+    "started_at_ms",
+    "uptime_ms",
+    "version",
 ];
 
 scenario! {
@@ -325,7 +347,16 @@ fn sim_is_deterministic_per_seed_and_varies_across_seeds() {
 // ---------------------------------------------------------------- M1.3 结构化执行
 
 const EXEC_KEYS: [&str; 10] = [
-    "duration_ms", "exit_code", "schema", "signal", "stderr", "stderr_base64", "stdout", "stdout_base64", "timed_out", "truncated",
+    "duration_ms",
+    "exit_code",
+    "schema",
+    "signal",
+    "stderr",
+    "stderr_base64",
+    "stdout",
+    "stdout_base64",
+    "timed_out",
+    "truncated",
 ];
 
 scenario! {

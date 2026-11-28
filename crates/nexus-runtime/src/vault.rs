@@ -2,7 +2,9 @@
 //! 吊销设备时列出要轮换的条目。
 
 use crate::{err, internal, load, load_or_create_device_key, save, valid_segment, Node};
-use nexus_core_proto::authz::{Action, Assertion, AuditEvent, Context, DenyReason, Outcome, Principal, PrincipalRef};
+use nexus_core_proto::authz::{
+    Action, Assertion, AuditEvent, Context, DenyReason, Outcome, Principal, PrincipalRef,
+};
 use nexus_core_proto::path::{Capability, ResourcePath};
 use nexus_core_proto::roster::DeviceRole;
 use nexus_core_proto::vault as crypto_vault;
@@ -10,7 +12,8 @@ use nexus_core_proto::{NodeId, PublicKey, SecretKey};
 use nexus_fabric::Transport;
 use nexus_sys::System;
 use nexus_wire::{
-    AgentCredential, ErrorCode, Request, Response, VaultCipherEntry, VaultEntryInfo, VaultRotateItem, WireError,
+    AgentCredential, ErrorCode, Request, Response, VaultCipherEntry, VaultEntryInfo,
+    VaultRotateItem, WireError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,7 +45,10 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn vault_prev_admin(&self) -> Option<NodeId> {
-        load::<_, Option<NodeId>>(&self.system, KEY_VAULT_ADMIN).ok().flatten().flatten()
+        load::<_, Option<NodeId>>(&self.system, KEY_VAULT_ADMIN)
+            .ok()
+            .flatten()
+            .flatten()
     }
 
     fn set_vault_prev_admin(&self, admin: Option<NodeId>) -> Result<(), WireError> {
@@ -62,7 +68,9 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 原来的条目只在各台设备上）。返回收不到的设备名。
     pub(crate) async fn vault_collect(&self) -> Result<Vec<String>, WireError> {
         let root = self.admin_key()?;
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let me_name = self.me_name();
         let self_secret = self.vault_shared_secret(&root, &PublicKey(self.me().0))?;
         let mut unreachable = Vec::new();
@@ -80,11 +88,18 @@ impl<T: Transport, S: System> Node<T, S> {
                 if !valid_segment(&e.name) {
                     continue;
                 }
-                let newer = self.vault.borrow().entries.get(&e.name).is_none_or(|have| have.version < e.version);
+                let newer = self
+                    .vault
+                    .borrow()
+                    .entries
+                    .get(&e.name)
+                    .is_none_or(|have| have.version < e.version);
                 if !newer {
                     continue;
                 }
-                let Some(plain) = crypto_vault::open(&peer_secret, &e.name, &e.sealed) else { continue };
+                let Some(plain) = crypto_vault::open(&peer_secret, &e.name, &e.sealed) else {
+                    continue;
+                };
                 let mut salt = [0u8; 16];
                 self.system.random(&mut salt);
                 e.sealed = crypto_vault::seal(&self_secret, &e.name, salt, &plain);
@@ -93,7 +108,11 @@ impl<T: Transport, S: System> Node<T, S> {
                     e.devices.sort();
                 }
                 let mut store = self.vault.borrow_mut();
-                store.exposed_to.entry(e.name.clone()).or_default().extend(e.devices.iter().cloned());
+                store
+                    .exposed_to
+                    .entry(e.name.clone())
+                    .or_default()
+                    .extend(e.devices.iter().cloned());
                 store.entries.insert(e.name.clone(), e);
                 changed = true;
             }
@@ -104,7 +123,11 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(unreachable)
     }
 
-    fn vault_shared_secret(&self, my_secret: &SecretKey, peer_public: &PublicKey) -> Result<[u8; 32], WireError> {
+    fn vault_shared_secret(
+        &self,
+        my_secret: &SecretKey,
+        peer_public: &PublicKey,
+    ) -> Result<[u8; 32], WireError> {
         my_secret
             .diffie_hellman(peer_public)
             .ok_or_else(|| internal("Vault 密钥协商失败：对端公钥无效"))
@@ -135,8 +158,15 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 校验本机调用方（用户或 Agent）是否有权读取条目 `name`，返回审计用的 `PrincipalRef`。
-    fn check_local_vault_read(&self, name: &str, agent: Option<&AgentCredential>, record_audit: bool) -> Result<PrincipalRef, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+    fn check_local_vault_read(
+        &self,
+        name: &str,
+        agent: Option<&AgentCredential>,
+        record_audit: bool,
+    ) -> Result<PrincipalRef, WireError> {
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         let me_name = self.me_name();
         let Some(agent) = agent else {
             let p = PrincipalRef::Device(self.me());
@@ -153,15 +183,36 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut nonce = [0u8; 16];
         self.system.random(&mut nonce);
         let now = self.system.now();
-        let assertion = Assertion { target: self.me(), action: action.clone(), issued_at: now, nonce };
+        let assertion = Assertion {
+            target: self.me(),
+            action: action.clone(),
+            issued_at: now,
+            nonce,
+        };
         let signature = assertion.sign(&SecretKey::from_seed(agent.secret));
-        let principal = Principal::Agent { cert: agent.cert.clone(), assertion, signature };
-        let verdict = nexus_core_proto::authz::decide(&Context { roster: &roster, me: self.me(), now }, self.me(), &principal, &action);
+        let principal = Principal::Agent {
+            cert: agent.cert.clone(),
+            assertion,
+            signature,
+        };
+        let verdict = nexus_core_proto::authz::decide(
+            &Context {
+                roster: &roster,
+                me: self.me(),
+                now,
+            },
+            self.me(),
+            &principal,
+            &action,
+        );
         if record_audit {
             self.audit(&roster, &verdict.audit);
         }
         match verdict.outcome {
-            Outcome::Allow => Ok(PrincipalRef::Agent { id: agent.cert.cert.agent, label: agent.cert.cert.label.clone() }),
+            Outcome::Allow => Ok(PrincipalRef::Agent {
+                id: agent.cert.cert.agent,
+                label: agent.cert.cert.label.clone(),
+            }),
             Outcome::Deny(r) => Err(crate::denied(&r)),
         }
     }
@@ -178,9 +229,14 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::Denied, "agent 不能写入或修改 Vault 条目"));
         }
         let root = self.admin_key()?;
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         if !valid_segment(&name) {
-            return Err(err(ErrorCode::InvalidInput, format!("条目名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("条目名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         let me_name = self.me_name();
         let mut authorized: BTreeSet<String> = BTreeSet::new();
@@ -231,11 +287,25 @@ impl<T: Transport, S: System> Node<T, S> {
                 let mut peer_entry = entry.clone();
                 peer_entry.sealed = crypto_vault::seal(&peer_secret, &name, peer_salt, &value);
                 let _ = self
-                    .request(dev, Request::VaultPush { name: name.clone(), entry: Some(peer_entry) }, None)
+                    .request(
+                        dev,
+                        Request::VaultPush {
+                            name: name.clone(),
+                            entry: Some(peer_entry),
+                        },
+                        None,
+                    )
                     .await;
             } else if prev_devices.contains(&dev.name) {
                 let _ = self
-                    .request(dev, Request::VaultPush { name: name.clone(), entry: None }, None)
+                    .request(
+                        dev,
+                        Request::VaultPush {
+                            name: name.clone(),
+                            entry: None,
+                        },
+                        None,
+                    )
                     .await;
             }
         }
@@ -249,11 +319,20 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 读取并解密一条秘密；每次调用都记入审计日志。
-    pub(crate) fn vault_get(&self, name: &str, agent: Option<&AgentCredential>) -> Result<Vec<u8>, WireError> {
+    pub(crate) fn vault_get(
+        &self,
+        name: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<Vec<u8>, WireError> {
         if !valid_segment(name) {
-            return Err(err(ErrorCode::InvalidInput, format!("条目名 {name:?} 不合法")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("条目名 {name:?} 不合法"),
+            ));
         }
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         let me_name = self.me_name();
         let entry = {
             let store = self.vault.borrow();
@@ -262,21 +341,38 @@ impl<T: Transport, S: System> Node<T, S> {
         // 先做授权判定并记审计（无论允许或拒绝都会记录一条 vault.read 审计）。
         let principal_ref = self.check_local_vault_read(name, agent, true)?;
         let Some(entry) = entry else {
-            return Err(err(ErrorCode::NotFound, format!("本机没有被授权的 Vault 条目 {name}")));
+            return Err(err(
+                ErrorCode::NotFound,
+                format!("本机没有被授权的 Vault 条目 {name}"),
+            ));
         };
         if !entry.devices.iter().any(|d| d == &me_name) {
-            self.audit_vault(self.me(), principal_ref, name, Outcome::Deny(DenyReason::NoMatchingGrant));
-            return Err(err(ErrorCode::Denied, format!("设备 {me_name} 没有被授权访问条目 {name}")));
+            self.audit_vault(
+                self.me(),
+                principal_ref,
+                name,
+                Outcome::Deny(DenyReason::NoMatchingGrant),
+            );
+            return Err(err(
+                ErrorCode::Denied,
+                format!("设备 {me_name} 没有被授权访问条目 {name}"),
+            ));
         }
         let device_key = load_or_create_device_key(&self.system).map_err(internal)?;
         let secret = self.vault_shared_secret(&device_key, &roster.root)?;
-        let plain = crypto_vault::open(&secret, name, &entry.sealed)
-            .ok_or_else(|| internal(format!("Vault 条目 {name} 密文校验失败（网络根密钥轮换过的话，先运行 nexus vault sync）")))?;
+        let plain = crypto_vault::open(&secret, name, &entry.sealed).ok_or_else(|| {
+            internal(format!(
+                "Vault 条目 {name} 密文校验失败（网络根密钥轮换过的话，先运行 nexus vault sync）"
+            ))
+        })?;
         Ok(plain)
     }
 
     /// 列出本机可见的 Vault 条目（Agent 只看到自己有 `vault.read` 授权的条目）。
-    pub(crate) fn vault_list(&self, agent: Option<&AgentCredential>) -> Result<Vec<VaultEntryInfo>, WireError> {
+    pub(crate) fn vault_list(
+        &self,
+        agent: Option<&AgentCredential>,
+    ) -> Result<Vec<VaultEntryInfo>, WireError> {
         let me_name = self.me_name();
         let store = self.vault.borrow();
         let mut out = Vec::new();
@@ -298,12 +394,18 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 在管理设备上删除一条秘密，并通知曾持有它的设备擦除。
-    pub(crate) async fn vault_rm(&self, name: &str, agent: Option<&AgentCredential>) -> Result<(), WireError> {
+    pub(crate) async fn vault_rm(
+        &self,
+        name: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<(), WireError> {
         if agent.is_some() {
             return Err(err(ErrorCode::Denied, "agent 不能删除 Vault 条目"));
         }
         let _root = self.admin_key()?;
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let removed = {
             let mut store = self.vault.borrow_mut();
             let old = store
@@ -318,9 +420,20 @@ impl<T: Transport, S: System> Node<T, S> {
             old
         };
         self.save_vault()?;
-        for dev in roster.devices.iter().filter(|d| d.node_id != self.me() && removed.devices.contains(&d.name)) {
+        for dev in roster
+            .devices
+            .iter()
+            .filter(|d| d.node_id != self.me() && removed.devices.contains(&d.name))
+        {
             let _ = self
-                .request(dev, Request::VaultPush { name: name.to_string(), entry: None }, None)
+                .request(
+                    dev,
+                    Request::VaultPush {
+                        name: name.to_string(),
+                        entry: None,
+                    },
+                    None,
+                )
                 .await;
         }
         Ok(())
@@ -328,9 +441,16 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 从管理设备主动同步本机被授权的所有 Vault 条目。
     pub(crate) async fn vault_sync(&self) -> Result<Vec<VaultEntryInfo>, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         let me_name = self.me_name();
-        let Some(admin) = roster.devices.iter().find(|d| d.role == DeviceRole::Admin).cloned() else {
+        let Some(admin) = roster
+            .devices
+            .iter()
+            .find(|d| d.role == DeviceRole::Admin)
+            .cloned()
+        else {
             return Err(err(ErrorCode::InvalidState, "名册里没有管理设备"));
         };
         if admin.node_id == self.me() {
@@ -340,7 +460,9 @@ impl<T: Transport, S: System> Node<T, S> {
         match self.request(&admin, Request::VaultPull, None).await {
             Ok((Response::VaultEntries(entries), _)) => {
                 // 管理设备换过（恢复码）且新的还没收回本机的条目时，只更新、不删除，免得按它更短的清单丢掉条目。
-                let merge_only = self.vault_prev_admin().is_some_and(|prev| prev != admin.node_id);
+                let merge_only = self
+                    .vault_prev_admin()
+                    .is_some_and(|prev| prev != admin.node_id);
                 let covered = {
                     let mut store = self.vault.borrow_mut();
                     let theirs: BTreeSet<String> = entries.iter().map(|e| e.name.clone()).collect();
@@ -364,7 +486,10 @@ impl<T: Transport, S: System> Node<T, S> {
             }
             Ok((Response::Error(e), _)) => Err(e),
             Ok(other) => Err(internal(format!("管理设备的回应无法理解：{other:?}"))),
-            Err(e) => Err(err(ErrorCode::Unreachable, format!("连不上管理设备 {}：{e}", admin.name))),
+            Err(e) => Err(err(
+                ErrorCode::Unreachable,
+                format!("连不上管理设备 {}：{e}", admin.name),
+            )),
         }
     }
 
@@ -375,8 +500,14 @@ impl<T: Transport, S: System> Node<T, S> {
             let mut store = self.vault.borrow_mut();
             let active_names: Vec<String> = store.entries.keys().cloned().collect();
             for name in active_names {
-                let exposed = store.exposed_to.get(&name).is_some_and(|s| s.contains(device_name))
-                    || store.entries.get(&name).is_some_and(|e| e.devices.iter().any(|d| d == device_name));
+                let exposed = store
+                    .exposed_to
+                    .get(&name)
+                    .is_some_and(|s| s.contains(device_name))
+                    || store
+                        .entries
+                        .get(&name)
+                        .is_some_and(|e| e.devices.iter().any(|d| d == device_name));
                 if exposed {
                     rotated.push(name.clone());
                 }
@@ -385,7 +516,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
             }
             if !rotated.is_empty() {
-                let set = store.rotate_needed.entry(device_name.to_string()).or_default();
+                let set = store
+                    .rotate_needed
+                    .entry(device_name.to_string())
+                    .or_default();
                 for n in &rotated {
                     set.insert(n.clone());
                 }
@@ -397,7 +531,10 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 列出因设备被吊销而需要轮换的条目清单。
-    pub(crate) fn vault_rotate_needed(&self, device: Option<&str>) -> Result<Vec<VaultRotateItem>, WireError> {
+    pub(crate) fn vault_rotate_needed(
+        &self,
+        device: Option<&str>,
+    ) -> Result<Vec<VaultRotateItem>, WireError> {
         let store = self.vault.borrow();
         let mut out = Vec::new();
         for (dev, entries) in &store.rotate_needed {
@@ -418,14 +555,22 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 根密钥轮换（M10.1）：把本机（管理设备）保存的全部条目从旧根重新加密到新根。
     /// 返回新的存储，由调用方和新根一起落盘；任何一条解不开都放弃轮换，免得秘密永久丢失。
-    pub(crate) fn vault_resealed(&self, old_root: &SecretKey, new_root: &SecretKey) -> Result<VaultStore, WireError> {
+    pub(crate) fn vault_resealed(
+        &self,
+        old_root: &SecretKey,
+        new_root: &SecretKey,
+    ) -> Result<VaultStore, WireError> {
         let me = PublicKey(self.me().0);
         let old_secret = self.vault_shared_secret(old_root, &me)?;
         let new_secret = self.vault_shared_secret(new_root, &me)?;
         let mut store = self.vault.borrow().clone();
         for e in store.entries.values_mut() {
-            let plain = crypto_vault::open(&old_secret, &e.name, &e.sealed)
-                .ok_or_else(|| internal(format!("Vault 条目 {} 密文校验失败，没有轮换根密钥", e.name)))?;
+            let plain = crypto_vault::open(&old_secret, &e.name, &e.sealed).ok_or_else(|| {
+                internal(format!(
+                    "Vault 条目 {} 密文校验失败，没有轮换根密钥",
+                    e.name
+                ))
+            })?;
             let mut salt = [0u8; 16];
             self.system.random(&mut salt);
             e.sealed = crypto_vault::seal(&new_secret, &e.name, salt, &plain);
@@ -436,28 +581,56 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 根密钥轮换（M10.1）之后：成员设备手里按旧根加密的条目已经解不开，按新根重新推送给被授权的设备。
     /// 连不上的设备之后用 `nexus vault sync` 取回。
     pub(crate) async fn vault_repush_all(&self) {
-        let (Ok(root), Some(roster)) = (self.admin_key(), self.roster()) else { return };
-        let Ok(self_secret) = self.vault_shared_secret(&root, &PublicKey(self.me().0)) else { return };
-        let entries: Vec<VaultCipherEntry> = self.vault.borrow().entries.values().cloned().collect();
+        let (Ok(root), Some(roster)) = (self.admin_key(), self.roster()) else {
+            return;
+        };
+        let Ok(self_secret) = self.vault_shared_secret(&root, &PublicKey(self.me().0)) else {
+            return;
+        };
+        let entries: Vec<VaultCipherEntry> =
+            self.vault.borrow().entries.values().cloned().collect();
         for dev in roster.devices.iter().filter(|d| d.node_id != self.me()) {
-            let Ok(peer_secret) = self.vault_shared_secret(&root, &PublicKey(dev.node_id.0)) else { continue };
-            for e in entries.iter().filter(|e| e.devices.iter().any(|d| d == &dev.name)) {
-                let Some(plain) = crypto_vault::open(&self_secret, &e.name, &e.sealed) else { continue };
+            let Ok(peer_secret) = self.vault_shared_secret(&root, &PublicKey(dev.node_id.0)) else {
+                continue;
+            };
+            for e in entries
+                .iter()
+                .filter(|e| e.devices.iter().any(|d| d == &dev.name))
+            {
+                let Some(plain) = crypto_vault::open(&self_secret, &e.name, &e.sealed) else {
+                    continue;
+                };
                 let mut salt = [0u8; 16];
                 self.system.random(&mut salt);
                 let mut peer_entry = e.clone();
                 peer_entry.sealed = crypto_vault::seal(&peer_secret, &e.name, salt, &plain);
-                let _ = self.request(dev, Request::VaultPush { name: e.name.clone(), entry: Some(peer_entry) }, None).await;
+                let _ = self
+                    .request(
+                        dev,
+                        Request::VaultPush {
+                            name: e.name.clone(),
+                            entry: Some(peer_entry),
+                        },
+                        None,
+                    )
+                    .await;
             }
         }
     }
 
     /// 处理来自管理设备的 `Request::VaultPush`。
-    pub(crate) fn handle_vault_push(&self, peer: NodeId, name: String, entry: Option<VaultCipherEntry>) -> Response {
+    pub(crate) fn handle_vault_push(
+        &self,
+        peer: NodeId,
+        name: String,
+        entry: Option<VaultCipherEntry>,
+    ) -> Response {
         let Some(roster) = self.roster() else {
             return Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络"));
         };
-        let is_admin = roster.device(peer).is_some_and(|d| d.role == DeviceRole::Admin);
+        let is_admin = roster
+            .device(peer)
+            .is_some_and(|d| d.role == DeviceRole::Admin);
         if !is_admin {
             return Response::Error(err(ErrorCode::Denied, "只有管理设备可以推送 Vault 条目"));
         }
@@ -491,7 +664,8 @@ impl<T: Transport, S: System> Node<T, S> {
             // 管理设备来收回条目（恢复码换了管理设备之后）：交出本机持有的密文，
             // 它们是按本机和根密钥协商的密钥加密的，管理设备用根私钥就能解开。
             if peer_dev.role == DeviceRole::Admin {
-                let entries: Vec<VaultCipherEntry> = self.vault.borrow().entries.values().cloned().collect();
+                let entries: Vec<VaultCipherEntry> =
+                    self.vault.borrow().entries.values().cloned().collect();
                 for e in &entries {
                     self.audit_vault(peer, PrincipalRef::Device(peer), &e.name, Outcome::Allow);
                 }

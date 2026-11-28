@@ -49,7 +49,12 @@ pub async fn run(ctl: UnixCtl, host: &str) -> i32 {
         inactivity_timeout: None,
         ..Default::default()
     };
-    let handler = Proxy { ctl: Arc::new(ctl), node, channels: HashMap::new(), ptys: HashMap::new() };
+    let handler = Proxy {
+        ctl: Arc::new(ctl),
+        node,
+        channels: HashMap::new(),
+        ptys: HashMap::new(),
+    };
     let stream = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     let session = match russh::server::run_stream(Arc::new(config), stream, handler).await {
         Ok(s) => s,
@@ -67,7 +72,9 @@ pub async fn run(ctl: UnixCtl, host: &str) -> i32 {
 
 async fn host_key(ctl: &UnixCtl, node: &str) -> Result<[u8; 32], String> {
     let mut session = ctl
-        .open(CtlRequest::SshHostKey { node: node.to_string() })
+        .open(CtlRequest::SshHostKey {
+            node: node.to_string(),
+        })
         .await
         .map_err(|e| format!("连不上本机的常驻程序（{e}），先运行 nexus daemon"))?;
     match session.rx.recv().await {
@@ -86,7 +93,12 @@ struct Proxy {
 
 impl Proxy {
     /// 取出通道交给一个独立的任务处理之后的所有数据。
-    fn start(&mut self, id: ChannelId, session: &mut Session, work: Work) -> Result<(), russh::Error> {
+    fn start(
+        &mut self,
+        id: ChannelId,
+        session: &mut Session,
+        work: Work,
+    ) -> Result<(), russh::Error> {
         let Some(channel) = self.channels.remove(&id) else {
             session.channel_failure(id)?;
             return Ok(());
@@ -111,7 +123,10 @@ fn pty_size(cols: u32, rows: u32) -> Size {
     if cols == 0 || rows == 0 {
         return Size::DEFAULT;
     }
-    Size { cols: cols.min(u16::MAX as u32) as u16, rows: rows.min(u16::MAX as u32) as u16 }
+    Size {
+        cols: cols.min(u16::MAX as u32) as u16,
+        rows: rows.min(u16::MAX as u32) as u16,
+    }
 }
 
 enum Work {
@@ -164,25 +179,49 @@ impl russh::server::Handler for Proxy {
         session.channel_success(channel)
     }
 
-    async fn env_request(&mut self, channel: ChannelId, _: &str, _: &str, session: &mut Session) -> Result<(), Self::Error> {
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        _: &str,
+        _: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         // 环境变量不传递：远端程序的环境由目标设备决定。
         session.channel_failure(channel)
     }
 
-    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.start(channel, session, Work::Shell)
     }
 
-    async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
         self.start(channel, session, Work::Exec(shell_command(command)))
     }
 
-    async fn subsystem_request(&mut self, channel: ChannelId, name: &str, session: &mut Session) -> Result<(), Self::Error> {
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         if name != "sftp" {
             return session.channel_failure(channel);
         }
-        self.start(channel, session, Work::Exec(shell_command(SFTP_SERVER.into())))
+        self.start(
+            channel,
+            session,
+            Work::Exec(shell_command(SFTP_SERVER.into())),
+        )
     }
 }
 
@@ -213,11 +252,23 @@ async fn report(write: &ChannelWriteHalf<Msg>, e: &WireError) {
     finish(write, 255).await;
 }
 
-async fn exec(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: ChannelWriteHalf<Msg>, spec: ExecSpec) {
+async fn exec(
+    ctl: &UnixCtl,
+    node: String,
+    read: ChannelReadHalf,
+    write: ChannelWriteHalf<Msg>,
+    spec: ExecSpec,
+) {
     let mut incoming = pump_reads(read);
     let mut session = match ctl.open(CtlRequest::Exec { node, spec }).await {
         Ok(s) => s,
-        Err(e) => return report(&write, &WireError::new(ErrorCode::Internal, format!("连不上本机的常驻程序：{e}"))).await,
+        Err(e) => {
+            return report(
+                &write,
+                &WireError::new(ErrorCode::Internal, format!("连不上本机的常驻程序：{e}")),
+            )
+            .await
+        }
     };
     // 发给常驻程序的消息先排队，有空位再发，与 `nexus exec` 相同的理由。
     let mut outbox: VecDeque<Input> = VecDeque::new();
@@ -263,7 +314,13 @@ async fn exec(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: Channel
     }
 }
 
-async fn shell(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: ChannelWriteHalf<Msg>, size: Size) {
+async fn shell(
+    ctl: &UnixCtl,
+    node: String,
+    read: ChannelReadHalf,
+    write: ChannelWriteHalf<Msg>,
+    size: Size,
+) {
     let mut incoming = pump_reads(read);
     // 用和 `nexus ssh` 完全相同的客户端代码：通道的数据当作键盘输入，通道当作终端。
     let (mut keys_in, mut keys_out) = tokio::io::duplex(64 * 1024);
@@ -276,7 +333,11 @@ async fn shell(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: Channe
                         break;
                     }
                 }
-                ChannelMsg::WindowChange { col_width, row_height, .. } => {
+                ChannelMsg::WindowChange {
+                    col_width,
+                    row_height,
+                    ..
+                } => {
                     let _ = resize_tx.send(pty_size(col_width, row_height)).await;
                 }
                 // 输入结束或通道关闭：断开会话（会话继续运行）。
@@ -286,7 +347,12 @@ async fn shell(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: Channe
         }
         drop(keys_in);
     };
-    let args = SshArgs { node, session: "main".into(), size, size_given: true };
+    let args = SshArgs {
+        node,
+        session: "main".into(),
+        size,
+        size_given: true,
+    };
     let mut screen = write.make_writer();
     let client = async {
         let result = ssh(ctl, &args, &mut keys_out, &mut screen, &mut resizes).await;
@@ -302,6 +368,12 @@ async fn shell(ctl: &UnixCtl, node: String, read: ChannelReadHalf, write: Channe
     match result {
         Ok(code) => finish(&write, code as u32).await,
         Err(nexus_cli::SshError::Remote(e)) => report(&write, &e).await,
-        Err(nexus_cli::SshError::Daemon(e)) => report(&write, &WireError::new(ErrorCode::Internal, other(e).to_string())).await,
+        Err(nexus_cli::SshError::Daemon(e)) => {
+            report(
+                &write,
+                &WireError::new(ErrorCode::Internal, other(e).to_string()),
+            )
+            .await
+        }
     }
 }

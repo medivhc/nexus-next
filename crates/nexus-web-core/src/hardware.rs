@@ -88,7 +88,11 @@ impl HardwareState {
     fn begin_use(&self, caller: &str, kind: HardwareKind) {
         let mut g = self.inner.lock().unwrap();
         g.active.push((caller.to_string(), kind));
-        g.history.push(HardwareUsageEvent { caller: caller.to_string(), kind, active: true });
+        g.history.push(HardwareUsageEvent {
+            caller: caller.to_string(),
+            kind,
+            active: true,
+        });
     }
 
     fn end_use(&self, caller: &str, kind: HardwareKind) {
@@ -96,14 +100,21 @@ impl HardwareState {
         if let Some(pos) = g.active.iter().position(|(c, k)| c == caller && *k == kind) {
             g.active.remove(pos);
         }
-        g.history.push(HardwareUsageEvent { caller: caller.to_string(), kind, active: false });
+        g.history.push(HardwareUsageEvent {
+            caller: caller.to_string(),
+            kind,
+            active: false,
+        });
     }
 }
 
 impl<T: Transport> WebNode<T> {
     /// 校验入站连接对端是否属于当前会话受信任的设备，并返回设备名。
     pub(crate) fn trusted_caller_name(&self, peer: NodeId) -> Option<String> {
-        self.devices().iter().find(|d| d.node_id == peer).map(|d| d.name.clone())
+        self.devices()
+            .iter()
+            .find(|d| d.node_id == peer)
+            .map(|d| d.name.clone())
     }
 
     /// 处理单条来自远端设备的硬件能力请求。
@@ -131,16 +142,27 @@ impl<T: Transport> WebNode<T> {
                     ));
                 }
                 state.begin_use(&caller, kind);
-                on_usage(HardwareUsageEvent { caller: caller.clone(), kind, active: true });
+                on_usage(HardwareUsageEvent {
+                    caller: caller.clone(),
+                    kind,
+                    active: true,
+                });
                 let result = provider.capture(kind).await;
                 state.end_use(&caller, kind);
-                on_usage(HardwareUsageEvent { caller, kind, active: false });
+                on_usage(HardwareUsageEvent {
+                    caller,
+                    kind,
+                    active: false,
+                });
                 match result {
                     Ok(cap) => Response::HardwareCapture(cap),
                     Err(e) => Response::Error(e),
                 }
             }
-            _ => Response::Error(WireError::new(ErrorCode::Denied, "网页节点只接受硬件能力请求")),
+            _ => Response::Error(WireError::new(
+                ErrorCode::Denied,
+                "网页节点只接受硬件能力请求",
+            )),
         }
     }
 
@@ -176,7 +198,11 @@ impl<T: Transport> WebNode<T> {
                         i += 1;
                     }
                 }
-                if progressed { Poll::Ready(()) } else { Poll::Pending }
+                if progressed {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
             });
             tokio::select! {
                 biased;
@@ -229,7 +255,10 @@ mod tests {
         assert!(!st.is_enabled(HardwareKind::Microphone));
 
         st.begin_use("laptop", HardwareKind::Location);
-        assert_eq!(st.active_users(), vec![("laptop".to_string(), HardwareKind::Location)]);
+        assert_eq!(
+            st.active_users(),
+            vec![("laptop".to_string(), HardwareKind::Location)]
+        );
         st.end_use("laptop", HardwareKind::Location);
         assert!(st.active_users().is_empty());
         assert_eq!(st.history().len(), 2);

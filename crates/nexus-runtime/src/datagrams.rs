@@ -78,7 +78,12 @@ where
 }
 
 /// 两个数据报端点互相转发（完整节点上的程序发给本机自己的 UDP 服务）。读到 0 字节当作结束。
-pub(crate) async fn bridge<AR, AS, BS, BR>(mut a_recv: AR, mut a_send: AS, mut b_send: BS, mut b_recv: BR) -> io::Result<()>
+pub(crate) async fn bridge<AR, AS, BS, BR>(
+    mut a_recv: AR,
+    mut a_send: AS,
+    mut b_send: BS,
+    mut b_recv: BR,
+) -> io::Result<()>
 where
     AR: AsyncFnMut(&mut [u8]) -> io::Result<usize>,
     AS: AsyncFnMut(&[u8]) -> io::Result<usize>,
@@ -151,6 +156,9 @@ mod tests {
         };
         let (r, ()) = tokio::join!(task, client);
         r.unwrap();
-        assert_eq!(*sent.borrow(), vec![b"ping".to_vec(), vec![7u8; 1400], Vec::new()]);
+        assert_eq!(
+            *sent.borrow(),
+            vec![b"ping".to_vec(), vec![7u8; 1400], Vec::new()]
+        );
     }
 }

@@ -7,27 +7,37 @@
 
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use nexus_core_proto::joincode::{self, ShortCode};
 use nexus_core_proto::authz::{
-    self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal, ReplayGuard, WebSession,
+    self, Action, AgentCert, Assertion, AuditEvent, Context, DenyReason, Grant, Outcome, Principal,
+    ReplayGuard, WebSession,
 };
+use nexus_core_proto::joincode::{self, ShortCode};
+use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
 use nexus_core_proto::path::{CapabilityPattern, ResourcePattern};
+use nexus_core_proto::roster::{
+    accept_update, verify_root_rotation, Device, DeviceRole, RootRotation, Roster,
+    SignedRootRotation, SignedRoster,
+};
 use nexus_core_proto::roster::{RevokedAgent, WebKey};
 use nexus_core_proto::webauthn::{login_challenge, verify_assertion, P256Key, WebAuthnAssertion};
-use nexus_core_proto::path::{valid_segment, Capability, ResourcePath};
-use nexus_core_proto::roster::{accept_update, verify_root_rotation, Device, DeviceRole, RootRotation, Roster, SignedRootRotation, SignedRoster};
 use nexus_core_proto::{NodeId, NodeInfo, PublicKey, SecretKey, Timestamp};
-use nexus_fabric::{read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport};
+use nexus_fabric::{
+    read_msg, read_response, write_msg, write_response, Connection, FrameReader, Proto, Transport,
+};
+use nexus_net_core::fakeip::FakePool;
 use nexus_net_core::http::{self, BadRequest, ProxyRequest};
 use nexus_net_core::route::{self, Decision, Outbound, Rule};
-use nexus_net_core::fakeip::FakePool;
 use nexus_net_core::{dns, sniff, socks5, Entry, Host, RouteTable, Target, SERVICE_SUFFIX};
 use nexus_sys::{Cmd, Proc, ProcEvent, Pty, PtyEvent, System};
-use nexus_term_proto::{Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW};
+use nexus_term_proto::{
+    Action as TermAction, ClientId, Event as TermEvent, Session as TermSession, DEFAULT_WINDOW,
+};
 use nexus_wire::{
-    hex_encode, AddrHints, AgentCredential, AnchorReport, NewCredential, WebDevice, WebEnrollReport, WebKeyInfo, AgentInfo, AgentIssueReport, AuditRecord, ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
-    Input, JoinCode, SessionFrame, ListEntry, MembershipReport, Request, RequestHeader, Response, ServiceInfo, SessionInfo, Size, StatusReport,
-    RouteExplanation, WireError, WIRE_VERSION,
+    hex_encode, AddrHints, AgentCredential, AgentInfo, AgentIssueReport, AnchorReport, AuditRecord,
+    ClientMsg, CtlRequest, CtlResponse, ErrorCode, ExecEvent, ExecResult, ExecSpec, InitReport,
+    Input, JoinCode, ListEntry, MembershipReport, NewCredential, Request, RequestHeader, Response,
+    RouteExplanation, ServiceInfo, SessionFrame, SessionInfo, Size, StatusReport, WebDevice,
+    WebEnrollReport, WebKeyInfo, WireError, WIRE_VERSION,
 };
 mod datagrams;
 mod drive;
@@ -66,22 +76,64 @@ pub type CtlCall = (CtlRequest, Option<AgentCredential>, CtlServer);
 pub fn ctl_session(req: CtlRequest, agent: Option<AgentCredential>) -> (CtlCall, CtlClient) {
     let (resp_tx, resp_rx) = mpsc::channel(16);
     let (in_tx, in_rx) = mpsc::channel(16);
-    ((req, agent, CtlServer { tx: resp_tx, rx: in_rx }), CtlClient { tx: in_tx, rx: resp_rx })
+    (
+        (
+            req,
+            agent,
+            CtlServer {
+                tx: resp_tx,
+                rx: in_rx,
+            },
+        ),
+        CtlClient {
+            tx: in_tx,
+            rx: resp_rx,
+        },
+    )
 }
 
 /// 收到请求后怎么处理：直接回应，或者进入流式的执行或终端会话。
 enum Dispatch {
     Reply(Response),
     Exec(ExecSpec),
-    Session { name: String, create: bool, size: Size, guard: Option<Box<SessionGuard>> },
-    Pipe { addr: std::net::SocketAddr, name: String },
-    Datagram { addr: std::net::SocketAddr, name: String },
-    Exit { target: Target },
-    ExitDatagram { target: Target },
-    DriveGet { hashes: Vec<[u8; 32]> },
-    DrivePush { ws: String, head: [u8; 32], count: u32 },
-    WebEnroll { token: [u8; 16], credential: NewCredential },
-    ShareSession { name: String, size: Size, token: [u8; 16], expires_at: Timestamp },
+    Session {
+        name: String,
+        create: bool,
+        size: Size,
+        guard: Option<Box<SessionGuard>>,
+    },
+    Pipe {
+        addr: std::net::SocketAddr,
+        name: String,
+    },
+    Datagram {
+        addr: std::net::SocketAddr,
+        name: String,
+    },
+    Exit {
+        target: Target,
+    },
+    ExitDatagram {
+        target: Target,
+    },
+    DriveGet {
+        hashes: Vec<[u8; 32]>,
+    },
+    DrivePush {
+        ws: String,
+        head: [u8; 32],
+        count: u32,
+    },
+    WebEnroll {
+        token: [u8; 16],
+        credential: NewCredential,
+    },
+    ShareSession {
+        name: String,
+        size: Size,
+        token: [u8; 16],
+        expires_at: Timestamp,
+    },
 }
 
 /// 终端连接的主体：名册变化时重新判定，凭据到期时断开。
@@ -99,7 +151,12 @@ impl SessionGuard {
             Principal::Agent { cert, .. } => Some(cert.cert.not_after),
             Principal::Web { session } => Some(session.session.not_after),
         };
-        Self { peer, principal, action, not_after }
+        Self {
+            peer,
+            principal,
+            action,
+            not_after,
+        }
     }
 
     fn allowed(&self, roster: &Roster, me: NodeId, now: Timestamp) -> bool {
@@ -113,7 +170,13 @@ impl SessionGuard {
                 && cert.validate(roster, now).is_ok()
                 && cert.cert.grants.iter().any(|g| g.allows(&self.action))
         } else {
-            authz::decide(&Context { roster, me, now }, self.peer, &self.principal, &self.action).allowed()
+            authz::decide(
+                &Context { roster, me, now },
+                self.peer,
+                &self.principal,
+                &self.action,
+            )
+            .allowed()
         }
     }
 }
@@ -133,7 +196,11 @@ pub const DEFAULT_WEB_PAGE: &str = "https://bewith.link";
 
 /// 发给一个终端会话任务的命令。
 enum SessCmd {
-    Attach { client: ClientId, size: Size, tx: mpsc::UnboundedSender<ClientMsg> },
+    Attach {
+        client: ClientId,
+        size: Size,
+        tx: mpsc::UnboundedSender<ClientMsg>,
+    },
     Event(TermEvent),
     Kill,
 }
@@ -172,7 +239,10 @@ impl LiveSession {
             for action in self.term.handle(event) {
                 match action {
                     TermAction::Send { client, msg } => {
-                        let gone = self.clients.get(&client).is_none_or(|tx| tx.send(msg).is_err());
+                        let gone = self
+                            .clients
+                            .get(&client)
+                            .is_none_or(|tx| tx.send(msg).is_err());
                         if gone && self.clients.remove(&client).is_some() {
                             queue.push(TermEvent::Detach { client });
                         }
@@ -241,11 +311,17 @@ enum Upstream<A, B> {
 impl<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin> Upstream<A, B> {
     /// 先把已经读到的 `first` 送过去，然后双向转发，直到两个方向都结束。
     async fn splice(self, client: ProxyStream, first: Vec<u8>) -> io::Result<()> {
-        async fn go<U: AsyncRead + AsyncWrite + Unpin>(mut client: ProxyStream, mut up: U, first: Vec<u8>) -> io::Result<()> {
+        async fn go<U: AsyncRead + AsyncWrite + Unpin>(
+            mut client: ProxyStream,
+            mut up: U,
+            first: Vec<u8>,
+        ) -> io::Result<()> {
             if !first.is_empty() {
                 up.write_all(&first).await?;
             }
-            tokio::io::copy_bidirectional(&mut client, &mut up).await.map(|_| ())
+            tokio::io::copy_bidirectional(&mut client, &mut up)
+                .await
+                .map(|_| ())
         }
         match self {
             Upstream::Tcp(a) => go(client, a, first).await,
@@ -296,6 +372,7 @@ const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
 const KEY_ROUTES: &str = "routes";
+const KEY_ROUTES_LKG: &str = "routes_lkg";
 const KEY_EXIT: &str = "exit";
 /// 用户对网络接口是否计费的设置（M5.2）：接口名 → 是否计费。
 const KEY_METERED: &str = "metered-v1";
@@ -314,11 +391,23 @@ pub enum TunRouting {
 /// 完整节点的虚拟网卡上收到的东西，由常驻程序交给节点（M3.4）。
 pub enum TunInbound {
     /// 一条 TCP 连接，`dst` 是程序连的地址。
-    Tcp { stream: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting },
+    Tcp {
+        stream: ProxyStream,
+        dst: std::net::SocketAddr,
+        routing: TunRouting,
+    },
     /// 一个程序（源地址和端口）发往 `dst` 的 UDP 数据报（M11.5）：每次读出一个数据报，每次写入一个数据报。
-    Udp { stream: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting },
+    Udp {
+        stream: ProxyStream,
+        dst: std::net::SocketAddr,
+        routing: TunRouting,
+    },
     /// 一个发给名字服务的查询；回应从 `reply` 送回（为空时不回应）。
-    Dns { query: Vec<u8>, full_capture: bool, reply: tokio::sync::oneshot::Sender<Vec<u8>> },
+    Dns {
+        query: Vec<u8>,
+        full_capture: bool,
+        reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+    },
 }
 
 /// 完整节点的虚拟网卡。
@@ -350,7 +439,11 @@ struct PublishedService {
 
 impl PublishedService {
     fn info(&self) -> ServiceInfo {
-        ServiceInfo { name: self.name.clone(), proto: self.proto.clone(), env: self.env.clone() }
+        ServiceInfo {
+            name: self.name.clone(),
+            proto: self.proto.clone(),
+            env: self.env.clone(),
+        }
     }
 }
 
@@ -372,7 +465,9 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         Request::SessionAttach { name, .. } => ("term.session.attach", Some(name)),
         Request::SessionList => ("term.session.list", None),
         Request::SessionKill { name } => ("term.session.kill", Some(name)),
-        Request::SvcList | Request::DriveInfo | Request::VaultPush { .. } | Request::VaultPull => ("node.info", None),
+        Request::SvcList | Request::DriveInfo | Request::VaultPush { .. } | Request::VaultPull => {
+            ("node.info", None)
+        }
         Request::DriveRegister { ws }
         | Request::DriveHave { ws, .. }
         | Request::DrivePush { ws, .. }
@@ -380,13 +475,20 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         | Request::DriveProfilePut { ws, .. }
         | Request::DriveProfileGet { ws, .. } => {
             if !nexus_drive_core::path::valid_workspace(ws) {
-                return Err(err(ErrorCode::InvalidInput, format!("工作区名不合法：{ws}")));
+                return Err(err(
+                    ErrorCode::InvalidInput,
+                    format!("工作区名不合法：{ws}"),
+                ));
             }
-            let read = matches!(body, Request::DriveGet { .. } | Request::DriveProfileGet { .. });
+            let read = matches!(
+                body,
+                Request::DriveGet { .. } | Request::DriveProfileGet { .. }
+            );
             let cap = if read { "drive.read" } else { "drive.write" };
             return Ok(Some(Action {
                 capability: Capability::parse(cap).expect("内置能力名合法"),
-                resource: ResourcePath::parse(&format!("{node}/drive/{ws}")).map_err(|_| internal("本机不在名册里"))?,
+                resource: ResourcePath::parse(&format!("{node}/drive/{ws}"))
+                    .map_err(|_| internal("本机不在名册里"))?,
             }));
         }
         Request::HardwareList | Request::HardwareCapture { .. } => {
@@ -394,17 +496,22 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         }
         Request::SvcConnect { name } | Request::SvcDatagram { name } => {
             if !valid_segment(name) {
-                return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+                return Err(err(
+                    ErrorCode::InvalidInput,
+                    format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+                ));
             }
             return Ok(Some(Action {
                 capability: Capability::parse("svc.connect").expect("内置能力名合法"),
-                resource: ResourcePath::parse(&format!("{node}/svc/{name}")).map_err(|_| internal("本机不在名册里"))?,
+                resource: ResourcePath::parse(&format!("{node}/svc/{name}"))
+                    .map_err(|_| internal("本机不在名册里"))?,
             }));
         }
         Request::ExitConnect { .. } | Request::ExitDatagram { .. } => {
             return Ok(Some(Action {
                 capability: Capability::parse("net.exit").expect("内置能力名合法"),
-                resource: ResourcePath::parse(&format!("{node}/exit")).map_err(|_| internal("本机不在名册里"))?,
+                resource: ResourcePath::parse(&format!("{node}/exit"))
+                    .map_err(|_| internal("本机不在名册里"))?,
             }));
         }
         Request::RosterPush { .. }
@@ -416,13 +523,14 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
         | Request::ShareDriveList { .. }
         | Request::ShareDriveRead { .. }
         | Request::ShareServiceConnect { .. }
-        | Request::ShareSessionWatch { .. } => {
-            return Ok(None)
-        }
+        | Request::ShareSessionWatch { .. } => return Ok(None),
     };
     if let Some(name) = session {
         if !valid_segment(name) {
-            return Err(err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
     }
     let resource = match session {
@@ -460,12 +568,20 @@ fn deny_text(reason: &DenyReason) -> &'static str {
 }
 
 fn denied(reason: &DenyReason) -> WireError {
-    err(ErrorCode::Denied, format!("访问被拒绝：{}", deny_text(reason)))
+    err(
+        ErrorCode::Denied,
+        format!("访问被拒绝：{}", deny_text(reason)),
+    )
 }
 
 /// 解析 `能力@资源` 形式的授权条目。
 fn parse_grant(text: &str) -> Result<Grant, WireError> {
-    let bad = |why: String| err(ErrorCode::InvalidInput, format!("授权条目 {text:?} 不合法：{why}。格式为 能力@资源，例如 term.exec@home"));
+    let bad = |why: String| {
+        err(
+            ErrorCode::InvalidInput,
+            format!("授权条目 {text:?} 不合法：{why}。格式为 能力@资源，例如 term.exec@home"),
+        )
+    };
     let (cap, res) = text.split_once('@').ok_or_else(|| bad("缺少 @".into()))?;
     Ok(Grant {
         capability: CapabilityPattern::parse(cap).map_err(|e| bad(e.to_string()))?,
@@ -482,7 +598,11 @@ fn grant_text(g: &Grant) -> String {
 /// 一次调用里双方都只发一帧，然后关闭自己的写方向。如果在对方的结束标记到达之前就丢弃流，
 /// 底层会把它当成「还有没读的数据就关闭」，向对方发送重置，可能让对方丢掉还没读完的回应。
 async fn drain<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), tokio::io::copy(stream, &mut tokio::io::sink())).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::copy(stream, &mut tokio::io::sink()),
+    )
+    .await;
 }
 
 /// 读取本设备的私钥；第一次调用时生成并保存。节点标识就是它的公钥。
@@ -509,7 +629,10 @@ fn load<S: System, T: DeserializeOwned>(sys: &S, key: &str) -> io::Result<Option
 }
 
 fn save<S: System, T: Serialize>(sys: &S, key: &str, value: &T) -> io::Result<()> {
-    sys.store_put(key, &postcard::to_allocvec(value).map_err(io::Error::other)?)
+    sys.store_put(
+        key,
+        &postcard::to_allocvec(value).map_err(io::Error::other)?,
+    )
 }
 
 fn err(code: ErrorCode, message: impl Into<String>) -> WireError {
@@ -594,7 +717,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 })?),
             },
             root_key: load(&system, KEY_ROOT_KEY)?,
-            addrs: load::<_, Vec<(NodeId, String)>>(&system, KEY_ADDRS)?.unwrap_or_default().into_iter().collect(),
+            addrs: load::<_, Vec<(NodeId, String)>>(&system, KEY_ADDRS)?
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             rotations: load(&system, KEY_ROTATIONS)?.unwrap_or_default(),
         };
         for (node, hint) in &trust.addrs {
@@ -659,7 +785,11 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     pub fn tun_info(&self) -> Option<TunInfo> {
-        self.tun.borrow().as_ref().map(|(name, pool)| TunInfo { name: name.clone(), net: pool.network(), dns: pool.dns() })
+        self.tun.borrow().as_ref().map(|(name, pool)| TunInfo {
+            name: name.clone(),
+            net: pool.network(),
+            dns: pool.dns(),
+        })
     }
 
     fn me(&self) -> NodeId {
@@ -667,11 +797,19 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn roster(&self) -> Option<Roster> {
-        self.trust.borrow().roster.as_ref().map(|s| s.roster.clone())
+        self.trust
+            .borrow()
+            .roster
+            .as_ref()
+            .map(|s| s.roster.clone())
     }
 
     fn roster_version(&self) -> u64 {
-        self.trust.borrow().roster.as_ref().map_or(0, |s| s.roster.version)
+        self.trust
+            .borrow()
+            .roster
+            .as_ref()
+            .map_or(0, |s| s.roster.version)
     }
 
     /// 本节点的名字：在名册里时用名册中的名字。
@@ -689,13 +827,24 @@ impl<T: Transport, S: System> Node<T, S> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: self.started_at,
             now: self.system.now(),
-            roster_version: self.trust.borrow().roster.as_ref().map(|s| s.roster.version),
+            roster_version: self
+                .trust
+                .borrow()
+                .roster
+                .as_ref()
+                .map(|s| s.roster.version),
         }
     }
 
     /// 已知的地址提示，加上本机自己的。随名册一起发给别的节点。
     fn addr_hints(&self) -> AddrHints {
-        let mut hints: AddrHints = self.trust.borrow().addrs.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let mut hints: AddrHints = self
+            .trust
+            .borrow()
+            .addrs
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
         hints.retain(|(id, _)| *id != self.me());
         hints.push((self.me(), self.transport.local_hint()));
         hints
@@ -714,8 +863,16 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 采用一次根密钥轮换（M10.1）：校验旧根与新根双重签名，切换本机信任根与名册并落盘。
-    fn adopt_root_rotation(&self, rotation: &SignedRootRotation, candidate: &SignedRoster) -> Result<(), WireError> {
-        let root = self.trust.borrow().root.ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+    fn adopt_root_rotation(
+        &self,
+        rotation: &SignedRootRotation,
+        candidate: &SignedRoster,
+    ) -> Result<(), WireError> {
+        let root = self
+            .trust
+            .borrow()
+            .root
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         if root == rotation.rotation.new_root {
             // 已经处于新根之下：只按普通名册更新处理。
             return self.adopt_roster(candidate);
@@ -724,7 +881,10 @@ impl<T: Transport, S: System> Node<T, S> {
         verify_root_rotation(&root, current.as_ref(), rotation, candidate)
             .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         let new_root = rotation.rotation.new_root;
-        let still_admin = candidate.roster.device(self.me()).is_some_and(|d| d.role == DeviceRole::Admin);
+        let still_admin = candidate
+            .roster
+            .device(self.me())
+            .is_some_and(|d| d.role == DeviceRole::Admin);
         let mut rotations = self.trust.borrow().rotations.clone();
         rotations.push((rotation.clone(), candidate.clone()));
         save(&self.system, KEY_ROOT_PUB, &new_root).map_err(internal)?;
@@ -747,13 +907,24 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 采用一份新名册：校验根、签名和版本，然后落盘。
     fn adopt_roster(&self, candidate: &SignedRoster) -> Result<(), WireError> {
-        let root = self.trust.borrow().root.ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let root = self
+            .trust
+            .borrow()
+            .root
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         let current = self.trust.borrow().roster.clone();
-        accept_update(current.as_ref(), candidate, &root).map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        accept_update(current.as_ref(), candidate, &root)
+            .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         save(&self.system, KEY_ROSTER, candidate).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(candidate.clone());
         self.roster_epoch.send_modify(|v| *v += 1);
-        let admin_of = |r: &SignedRoster| r.roster.devices.iter().find(|d| d.role == DeviceRole::Admin).map(|d| d.node_id);
+        let admin_of = |r: &SignedRoster| {
+            r.roster
+                .devices
+                .iter()
+                .find(|d| d.role == DeviceRole::Admin)
+                .map(|d| d.node_id)
+        };
         if let (Some(old), Some(new)) = (current.as_ref().and_then(admin_of), admin_of(candidate)) {
             if old != new {
                 self.note_admin_changed_for_vault(old);
@@ -826,7 +997,10 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 本机的网络接口；`set` 时先改设置（并保存）。
-    fn interfaces(&self, set: Option<(String, Option<bool>)>) -> Result<Vec<nexus_wire::IfaceInfo>, WireError> {
+    fn interfaces(
+        &self,
+        set: Option<(String, Option<bool>)>,
+    ) -> Result<Vec<nexus_wire::IfaceInfo>, WireError> {
         if let Some((name, value)) = set {
             let mut m = self.metered.borrow_mut();
             match value {
@@ -877,10 +1051,24 @@ impl<T: Transport, S: System> Node<T, S> {
         while streams.next().await.is_some() {}
     }
 
-    async fn serve_stream(&self, conn: &T::Conn, peer: NodeId, proto: Proto, mut stream: <T::Conn as Connection>::Stream) {
-        let Ok(header) = read_msg::<_, RequestHeader>(&mut stream).await else { return };
+    async fn serve_stream(
+        &self,
+        conn: &T::Conn,
+        peer: NodeId,
+        proto: Proto,
+        mut stream: <T::Conn as Connection>::Stream,
+    ) {
+        let Ok(header) = read_msg::<_, RequestHeader>(&mut stream).await else {
+            return;
+        };
         let body = if header.version != WIRE_VERSION {
-            Err(err(ErrorCode::UnsupportedVersion, format!("协议版本不兼容：对方 {}，本机 {WIRE_VERSION}", header.version)))
+            Err(err(
+                ErrorCode::UnsupportedVersion,
+                format!(
+                    "协议版本不兼容：对方 {}，本机 {WIRE_VERSION}",
+                    header.version
+                ),
+            ))
         } else {
             header.request(&self.describe_self())
         };
@@ -888,7 +1076,10 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(body) => body,
             Err(e) => {
                 // 旧版本不认识新请求（M7.1）：回应说明，不断开。
-                if write_response(&mut stream, &Response::Error(e)).await.is_ok() {
+                if write_response(&mut stream, &Response::Error(e))
+                    .await
+                    .is_ok()
+                {
                     let _ = stream.shutdown().await;
                     drain(&mut stream).await;
                 }
@@ -897,8 +1088,10 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 回应方向的优先级由这一端定：和请求同一类。
         conn.set_priority(&mut stream, body.class().priority());
-        if matches!(body, Request::RosterPush { .. } | Request::RootRotate { .. })
-            && self.roster().is_some_and(|r| r.device(peer).is_some())
+        if matches!(
+            body,
+            Request::RosterPush { .. } | Request::RootRotate { .. }
+        ) && self.roster().is_some_and(|r| r.device(peer).is_some())
         {
             self.transport.peer_announced(conn);
         }
@@ -906,35 +1099,69 @@ impl<T: Transport, S: System> Node<T, S> {
             Proto::Rpc => self.handle_rpc(peer, header, body),
             Proto::Join => Dispatch::Reply(self.handle_join(body)),
             Proto::Web => match body {
-                Request::WebEnroll { token, credential } => Dispatch::WebEnroll { token, credential },
-                Request::WebLogin { issued_at, assertion } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
-                Request::ShareOpen { token } => Dispatch::Reply(self.handle_share_open(peer, token)),
-                Request::ShareDriveList { token, path } => Dispatch::Reply(self.handle_share_drive_list(peer, token, &path)),
-                Request::ShareDriveRead { token, path, max } => Dispatch::Reply(self.handle_share_drive_read(peer, token, &path, max)),
+                Request::WebEnroll { token, credential } => {
+                    Dispatch::WebEnroll { token, credential }
+                }
+                Request::WebLogin {
+                    issued_at,
+                    assertion,
+                } => Dispatch::Reply(self.web_login(peer, issued_at, &assertion)),
+                Request::ShareOpen { token } => {
+                    Dispatch::Reply(self.handle_share_open(peer, token))
+                }
+                Request::ShareDriveList { token, path } => {
+                    Dispatch::Reply(self.handle_share_drive_list(peer, token, &path))
+                }
+                Request::ShareDriveRead { token, path, max } => {
+                    Dispatch::Reply(self.handle_share_drive_read(peer, token, &path, max))
+                }
                 Request::ShareServiceConnect { token } => self.handle_share_service(peer, token),
-                Request::ShareSessionWatch { token, size } => self.handle_share_terminal(peer, token, size),
-                _ => Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "网页协议上不接受这个请求"))),
+                Request::ShareSessionWatch { token, size } => {
+                    self.handle_share_terminal(peer, token, size)
+                }
+                _ => Dispatch::Reply(Response::Error(err(
+                    ErrorCode::InvalidInput,
+                    "网页协议上不接受这个请求",
+                ))),
             },
         };
         let response = match dispatch {
             Dispatch::Reply(r) => r,
             Dispatch::Exec(spec) => return self.serve_exec(stream, spec).await,
-            Dispatch::Session { name, create, size, guard } => {
-                return self.serve_session(stream, &name, create, size, guard).await
-            }
-            Dispatch::ShareSession { name, size, token, expires_at } => {
-                return self.serve_share_session(stream, &name, size, token, expires_at).await
+            Dispatch::Session {
+                name,
+                create,
+                size,
+                guard,
+            } => return self.serve_session(stream, &name, create, size, guard).await,
+            Dispatch::ShareSession {
+                name,
+                size,
+                token,
+                expires_at,
+            } => {
+                return self
+                    .serve_share_session(stream, &name, size, token, expires_at)
+                    .await
             }
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
-            Dispatch::Datagram { addr, name } => return self.serve_datagram(stream, addr, &name).await,
+            Dispatch::Datagram { addr, name } => {
+                return self.serve_datagram(stream, addr, &name).await
+            }
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
-            Dispatch::ExitDatagram { target } => return self.serve_exit_datagram(stream, target).await,
+            Dispatch::ExitDatagram { target } => {
+                return self.serve_exit_datagram(stream, target).await
+            }
             Dispatch::DriveGet { hashes } => return self.serve_drive_get(stream, hashes).await,
-            Dispatch::DrivePush { ws, head, count } => return self.serve_drive_push(stream, ws, head, count).await,
-            Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
-                Ok(label) => Response::WebEnrolled { label },
-                Err(e) => Response::Error(e),
-            },
+            Dispatch::DrivePush { ws, head, count } => {
+                return self.serve_drive_push(stream, ws, head, count).await
+            }
+            Dispatch::WebEnroll { token, credential } => {
+                match self.web_enroll_finish(token, credential).await {
+                    Ok(label) => Response::WebEnrolled { label },
+                    Err(e) => Response::Error(e),
+                }
+            }
         };
         if write_response(&mut stream, &response).await.is_err() {
             return;
@@ -945,19 +1172,30 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 写进版本说明里的本机：名字和软件版本。
     fn describe_self(&self) -> String {
-        let name = self.roster().and_then(|r| r.device(self.me()).map(|d| d.name.clone())).unwrap_or_else(|| self.configured_name.clone());
+        let name = self
+            .roster()
+            .and_then(|r| r.device(self.me()).map(|d| d.name.clone()))
+            .unwrap_or_else(|| self.configured_name.clone());
         format!("{name}（Nexus {}）", env!("CARGO_PKG_VERSION"))
     }
 
     fn handle_rpc(&self, peer: NodeId, header: RequestHeader, body: Request) -> Dispatch {
         // 根密钥轮换推送：由旧根与新根双重签名自证（M10.1）。
-        if let Request::RootRotate { rotation, roster, addrs } = &body {
+        if let Request::RootRotate {
+            rotation,
+            roster,
+            addrs,
+        } = &body
+        {
             return Dispatch::Reply(match self.adopt_root_rotation(rotation, roster) {
                 Ok(()) => {
                     let _ = self.learn_hints(addrs);
                     Response::Ok
                 }
-                Err(e) if matches!(e.code, ErrorCode::InvalidInput) && self.trust.borrow().root == Some(rotation.rotation.new_root) => {
+                Err(e)
+                    if matches!(e.code, ErrorCode::InvalidInput)
+                        && self.trust.borrow().root == Some(rotation.rotation.new_root) =>
+                {
                     if self.roster().is_some_and(|r| r.device(peer).is_some()) {
                         let _ = self.learn_hints(addrs);
                     }
@@ -987,15 +1225,29 @@ impl<T: Transport, S: System> Node<T, S> {
         // 浏览器没有名册：不交换版本。
         let web = matches!(header.principal, Principal::Web { .. });
         if !web && header.roster_version > mine {
-            return Dispatch::Reply(Response::Error(err(ErrorCode::StaleRoster, format!("本机名册版本 {mine} 较旧"))));
+            return Dispatch::Reply(Response::Error(err(
+                ErrorCode::StaleRoster,
+                format!("本机名册版本 {mine} 较旧"),
+            )));
         }
         let Some(roster) = self.roster() else {
-            return Dispatch::Reply(Response::Error(err(ErrorCode::Denied, "本机还没有加入任何网络")));
+            return Dispatch::Reply(Response::Error(err(
+                ErrorCode::Denied,
+                "本机还没有加入任何网络",
+            )));
         };
-        let me = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
+        let me = roster
+            .device(self.me())
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
         let action = match required_action(&body, &me) {
             Ok(Some(action)) => action,
-            Ok(None) => return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这个请求不能在此协议上使用"))),
+            Ok(None) => {
+                return Dispatch::Reply(Response::Error(err(
+                    ErrorCode::InvalidInput,
+                    "这个请求不能在此协议上使用",
+                )))
+            }
             Err(e) => return Dispatch::Reply(Response::Error(e)),
         };
         if let Err(e) = self.authorize(&roster, peer, &header.principal, &action) {
@@ -1088,7 +1340,12 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 处理加入协议上的邀请。邀请方不在本机名册里（本机还没有名册），
     /// 能证明它有权邀请的只有一次性随机数：只有看到加入码的人才知道它。
     fn handle_join(&self, body: Request) -> Response {
-        let Request::JoinOffer { nonce, roster, addrs } = body else {
+        let Request::JoinOffer {
+            nonce,
+            roster,
+            addrs,
+        } = body
+        else {
             return Response::Error(err(ErrorCode::InvalidInput, "加入协议上只接受邀请"));
         };
         let result = (|| {
@@ -1096,7 +1353,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 return Err(err(ErrorCode::InvalidState, "本机已经属于一个网络"));
             }
             let pending = self.pending_join.borrow();
-            let pending = pending.as_ref().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有在等待加入"))?;
+            let pending = pending
+                .as_ref()
+                .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有在等待加入"))?;
             if self.system.now() >= pending.expires_at {
                 return Err(err(ErrorCode::InvalidState, "加入码已过期"));
             }
@@ -1104,7 +1363,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 return Err(err(ErrorCode::Denied, "加入码不匹配"));
             }
             let root = roster.roster.root;
-            let verified = roster.verify(&root).map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+            let verified = roster
+                .verify(&root)
+                .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
             if verified.device(self.me()).is_none() {
                 return Err(err(ErrorCode::InvalidInput, "邀请的名册里没有本机"));
             }
@@ -1134,36 +1395,90 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 向另一个节点发起一次调用。对方的名册比本机旧时，先把名册推过去再重试一次。
-    async fn request(&self, to: &Device, body: Request, agent: Option<&AgentCredential>) -> io::Result<(Response, Option<nexus_core_proto::PathKind>)> {
+    async fn request(
+        &self,
+        to: &Device,
+        body: Request,
+        agent: Option<&AgentCredential>,
+    ) -> io::Result<(Response, Option<nexus_core_proto::PathKind>)> {
         // 每次发送都重新签署：agent 的请求不能重复使用。
-        let principal = self.principal_for(agent, to, &body).map_err(|e| io::Error::other(e.message))?;
-        let (resp, path) = self.request_once(to.node_id, Proto::Rpc, principal, body.clone()).await?;
-        if let Response::Error(WireError { code: ErrorCode::StaleRoster, .. }) = resp {
+        let principal = self
+            .principal_for(agent, to, &body)
+            .map_err(|e| io::Error::other(e.message))?;
+        let (resp, path) = self
+            .request_once(to.node_id, Proto::Rpc, principal, body.clone())
+            .await?;
+        if let Response::Error(WireError {
+            code: ErrorCode::StaleRoster,
+            ..
+        }) = resp
+        {
             self.push_roster(to.node_id).await?;
-            let principal = self.principal_for(agent, to, &body).map_err(|e| io::Error::other(e.message))?;
-            return self.request_once(to.node_id, Proto::Rpc, principal, body).await;
+            let principal = self
+                .principal_for(agent, to, &body)
+                .map_err(|e| io::Error::other(e.message))?;
+            return self
+                .request_once(to.node_id, Proto::Rpc, principal, body)
+                .await;
         }
         Ok((resp, path))
     }
 
     /// 本次请求的主体：本机设备，或代 agent 签署这一次具体的操作。
-    fn principal_for(&self, agent: Option<&AgentCredential>, to: &Device, body: &Request) -> Result<Principal, WireError> {
-        let Some(agent) = agent else { return Ok(Principal::Device) };
-        let action = required_action(body, &to.name)?.ok_or_else(|| denied(&DenyReason::NoMatchingGrant))?;
+    fn principal_for(
+        &self,
+        agent: Option<&AgentCredential>,
+        to: &Device,
+        body: &Request,
+    ) -> Result<Principal, WireError> {
+        let Some(agent) = agent else {
+            return Ok(Principal::Device);
+        };
+        let action =
+            required_action(body, &to.name)?.ok_or_else(|| denied(&DenyReason::NoMatchingGrant))?;
         let mut nonce = [0u8; 16];
         self.system.random(&mut nonce);
-        let assertion = Assertion { target: to.node_id, action, issued_at: self.system.now(), nonce };
+        let assertion = Assertion {
+            target: to.node_id,
+            action,
+            issued_at: self.system.now(),
+            nonce,
+        };
         let signature = assertion.sign(&SecretKey::from_seed(agent.secret));
-        Ok(Principal::Agent { cert: agent.cert.clone(), assertion, signature })
+        Ok(Principal::Agent {
+            cert: agent.cert.clone(),
+            assertion,
+            signature,
+        })
     }
 
     /// 判定一次访问并记入审计。agent 的请求还要通过重放检测。
-    fn authorize(&self, roster: &Roster, peer: NodeId, principal: &Principal, action: &Action) -> Result<(), WireError> {
+    fn authorize(
+        &self,
+        roster: &Roster,
+        peer: NodeId,
+        principal: &Principal,
+        action: &Action,
+    ) -> Result<(), WireError> {
         let now = self.system.now();
-        let ctx = Context { roster, me: self.me(), now };
+        let ctx = Context {
+            roster,
+            me: self.me(),
+            now,
+        };
         let mut verdict = authz::decide(&ctx, peer, principal, action);
-        if let (Outcome::Allow, Principal::Agent { cert, assertion, .. }) = (&verdict.outcome, principal) {
-            if !self.replay.borrow_mut().first_use(&cert.cert.agent, assertion, now) {
+        if let (
+            Outcome::Allow,
+            Principal::Agent {
+                cert, assertion, ..
+            },
+        ) = (&verdict.outcome, principal)
+        {
+            if !self
+                .replay
+                .borrow_mut()
+                .first_use(&cert.cert.agent, assertion, now)
+            {
                 verdict.outcome = Outcome::Deny(DenyReason::Replayed);
                 verdict.audit.outcome = verdict.outcome.clone();
             }
@@ -1176,8 +1491,14 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn audit(&self, roster: &Roster, event: &AuditEvent) {
-        let peer_name = roster.device(event.peer).map(|d| d.name.clone()).unwrap_or_else(|| event.peer.short());
-        let record = AuditRecord { event: event.clone(), peer_name };
+        let peer_name = roster
+            .device(event.peer)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| event.peer.short());
+        let record = AuditRecord {
+            event: event.clone(),
+            peer_name,
+        };
         if let Ok(frame) = nexus_wire::encode(&record) {
             let _ = self.system.append_log(LOG_AUDIT, &frame, AUDIT_LOG_MAX);
         }
@@ -1222,12 +1543,22 @@ impl<T: Transport, S: System> Node<T, S> {
         let addrs = self.addr_hints();
         // 若本机经历过根密钥轮换，先按顺序把轮换证书推过去，让错过轮换的离线设备能验证并切换到新根。
         for (rotation, step_roster) in rotations {
-            let body = Request::RootRotate { rotation, roster: step_roster, addrs: addrs.clone() };
-            let _ = self.request_once(to, Proto::Rpc, Principal::Device, body).await;
+            let body = Request::RootRotate {
+                rotation,
+                roster: step_roster,
+                addrs: addrs.clone(),
+            };
+            let _ = self
+                .request_once(to, Proto::Rpc, Principal::Device, body)
+                .await;
         }
         let Some(roster) = roster else { return Ok(()) };
         let body = Request::RosterPush { roster, addrs };
-        match self.request_once(to, Proto::Rpc, Principal::Device, body).await?.0 {
+        match self
+            .request_once(to, Proto::Rpc, Principal::Device, body)
+            .await?
+            .0
+        {
             Response::Ok => Ok(()),
             other => Err(io::Error::other(format!("推送名册失败：{other:?}"))),
         }
@@ -1235,14 +1566,19 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 把当前名册推给除自己和 `except` 之外的所有设备，返回 (送达数, 未送达的设备名)。
     async fn broadcast_roster(&self, except: Option<NodeId>) -> (u32, Vec<String>) {
-        let Some(roster) = self.roster() else { return (0, vec![]) };
+        let Some(roster) = self.roster() else {
+            return (0, vec![]);
+        };
         let targets: Vec<Device> = roster
             .devices
             .into_iter()
             .filter(|d| d.node_id != self.me() && Some(d.node_id) != except)
             .collect();
         let results = join_all(targets.iter().map(|d| async move {
-            matches!(tokio::time::timeout(REQUEST_TIMEOUT, self.push_roster(d.node_id)).await, Ok(Ok(())))
+            matches!(
+                tokio::time::timeout(REQUEST_TIMEOUT, self.push_roster(d.node_id)).await,
+                Ok(Ok(()))
+            )
         }))
         .await;
         let mut unreachable = Vec::new();
@@ -1258,7 +1594,12 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 处理一次本机控制调用。`agent` 不为空时，以该 agent 的身份执行，并且只能看到和做它被授权的事。
-    pub async fn handle_ctl(&self, req: CtlRequest, agent: Option<AgentCredential>, server: CtlServer) {
+    pub async fn handle_ctl(
+        &self,
+        req: CtlRequest,
+        agent: Option<AgentCredential>,
+        server: CtlServer,
+    ) {
         if let Some(a) = &agent {
             if let Err(e) = self.check_credential(a, &req) {
                 let _ = server.tx.send(CtlResponse::Error(e)).await;
@@ -1269,91 +1610,176 @@ impl<T: Transport, S: System> Node<T, S> {
         let result = match req {
             CtlRequest::Exec { node, spec } => return self.exec(&node, spec, agent, server).await,
             CtlRequest::Drive(req) => return self.drive(req, agent, server).await,
-            CtlRequest::Attach { node, session, size, create } => return self.attach(&node, session, size, create, agent, server).await,
+            CtlRequest::Attach {
+                node,
+                session,
+                size,
+                create,
+            } => {
+                return self
+                    .attach(&node, session, size, create, agent, server)
+                    .await
+            }
             CtlRequest::Status => Ok(CtlResponse::Status(self.local_status())),
             CtlRequest::Paths { device } => self.paths(device.as_deref()).map(CtlResponse::Paths),
-            CtlRequest::Upgrade { .. } | CtlRequest::UpgradeStatus | CtlRequest::UpgradeRollback => {
-                Err(err(ErrorCode::InvalidState, "这个常驻程序不支持升级（只有命令行的 nexus daemon 支持）"))
-            }
+            CtlRequest::Upgrade { .. }
+            | CtlRequest::UpgradeStatus
+            | CtlRequest::UpgradeRollback => Err(err(
+                ErrorCode::InvalidState,
+                "这个常驻程序不支持升级（只有命令行的 nexus daemon 支持）",
+            )),
             CtlRequest::Interfaces { set } => self.interfaces(set).map(CtlResponse::Interfaces),
-            CtlRequest::RemoteStatus { node } => self.remote_status(&node, agent_ref).await.map(CtlResponse::Status),
+            CtlRequest::RemoteStatus { node } => self
+                .remote_status(&node, agent_ref)
+                .await
+                .map(CtlResponse::Status),
             CtlRequest::Init { name } => self.init(name).map(CtlResponse::Init),
             CtlRequest::JoinStart => self.join_start().await,
-            CtlRequest::Approve { code, name } => self.approve(&code, name).await.map(CtlResponse::Membership),
+            CtlRequest::Approve { code, name } => {
+                self.approve(&code, name).await.map(CtlResponse::Membership)
+            }
             CtlRequest::Revoke { name } => self.revoke(&name).await.map(CtlResponse::Membership),
             CtlRequest::Recover { code } => self.recover(&code).await.map(CtlResponse::Membership),
             CtlRequest::RootRotate => self.rotate_root().await.map(CtlResponse::RootRotated),
             CtlRequest::List => Ok(CtlResponse::List(self.list(agent_ref).await)),
-            CtlRequest::SessionList { node } => self.remote_session_list(&node, agent_ref).await.map(CtlResponse::Sessions),
-            CtlRequest::SessionKill { node, session } => {
-                self.remote_session_kill(&node, &session, agent_ref).await.map(|()| CtlResponse::Ok)
-            }
-            CtlRequest::AgentIssue { label, grants, ttl_ms } => self.agent_issue(label, &grants, ttl_ms).map(CtlResponse::AgentIssued),
-            CtlRequest::AgentRevoke { agent } => self.agent_revoke(&agent).await.map(CtlResponse::AgentRevoked),
+            CtlRequest::SessionList { node } => self
+                .remote_session_list(&node, agent_ref)
+                .await
+                .map(CtlResponse::Sessions),
+            CtlRequest::SessionKill { node, session } => self
+                .remote_session_kill(&node, &session, agent_ref)
+                .await
+                .map(|()| CtlResponse::Ok),
+            CtlRequest::AgentIssue {
+                label,
+                grants,
+                ttl_ms,
+            } => self
+                .agent_issue(label, &grants, ttl_ms)
+                .map(CtlResponse::AgentIssued),
+            CtlRequest::AgentRevoke { agent } => self
+                .agent_revoke(&agent)
+                .await
+                .map(CtlResponse::AgentRevoked),
             CtlRequest::AgentList => self.agent_list().map(CtlResponse::Agents),
             CtlRequest::Audit { limit } => self.read_audit(limit).map(CtlResponse::Audit),
-            CtlRequest::SshHostKey { node } => self.ssh_host_key(&node, agent_ref).map(CtlResponse::SshHostKey),
-            CtlRequest::WebEnroll { label, grants, ttl_ms, page } => {
+            CtlRequest::SshHostKey { node } => self
+                .ssh_host_key(&node, agent_ref)
+                .map(CtlResponse::SshHostKey),
+            CtlRequest::WebEnroll {
+                label,
+                grants,
+                ttl_ms,
+                page,
+            } => {
                 let page = page
                     .or_else(|| self.roster().and_then(|r| r.anchor))
                     .unwrap_or_else(|| DEFAULT_WEB_PAGE.to_string());
-                self.web_enroll_start(label, &grants, ttl_ms, page.trim_end_matches('/')).map(CtlResponse::WebEnroll)
+                self.web_enroll_start(label, &grants, ttl_ms, page.trim_end_matches('/'))
+                    .map(CtlResponse::WebEnroll)
             }
             CtlRequest::WebList => self.web_list().map(CtlResponse::WebKeys),
-            CtlRequest::WebRevoke { label } => self.web_revoke(&label).await.map(CtlResponse::WebRevoked),
-            CtlRequest::HardwareList { node_id, hint } => {
-                self.hardware_rpc(node_id, &hint, Request::HardwareList).await.and_then(|r| match r {
+            CtlRequest::WebRevoke { label } => {
+                self.web_revoke(&label).await.map(CtlResponse::WebRevoked)
+            }
+            CtlRequest::HardwareList { node_id, hint } => self
+                .hardware_rpc(node_id, &hint, Request::HardwareList)
+                .await
+                .and_then(|r| match r {
                     Response::HardwareList(list) => Ok(CtlResponse::HardwareList(list)),
                     Response::Error(e) => Err(e),
                     other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
-                })
-            }
-            CtlRequest::HardwareCapture { node_id, hint, kind } => {
-                self.hardware_rpc(node_id, &hint, Request::HardwareCapture { kind }).await.and_then(|r| match r {
+                }),
+            CtlRequest::HardwareCapture {
+                node_id,
+                hint,
+                kind,
+            } => self
+                .hardware_rpc(node_id, &hint, Request::HardwareCapture { kind })
+                .await
+                .and_then(|r| match r {
                     Response::HardwareCapture(cap) => Ok(CtlResponse::HardwareCapture(cap)),
                     Response::Error(e) => Err(e),
                     other => Err(internal(format!("网页节点的回应无法理解：{other:?}"))),
-                })
-            }
-            CtlRequest::ShareCreate { target, ttl_ms, max_uses, page } => {
-                self.share_create(target, ttl_ms, max_uses, page).map(CtlResponse::ShareCreated)
-            }
+                }),
+            CtlRequest::ShareCreate {
+                target,
+                ttl_ms,
+                max_uses,
+                page,
+            } => self
+                .share_create(target, ttl_ms, max_uses, page)
+                .map(CtlResponse::ShareCreated),
             CtlRequest::ShareList => self.share_list().map(CtlResponse::Shares),
             CtlRequest::ShareRevoke { id } => self.share_revoke(&id).map(CtlResponse::ShareRevoked),
-            CtlRequest::VaultPut { name, value, devices } => {
-                self.vault_put(name, value, devices, agent_ref).await.map(CtlResponse::VaultPut)
-            }
-            CtlRequest::VaultGet { name } => {
-                self.vault_get(&name, agent_ref).map(|value| CtlResponse::VaultValue { name, value })
-            }
+            CtlRequest::VaultPut {
+                name,
+                value,
+                devices,
+            } => self
+                .vault_put(name, value, devices, agent_ref)
+                .await
+                .map(CtlResponse::VaultPut),
+            CtlRequest::VaultGet { name } => self
+                .vault_get(&name, agent_ref)
+                .map(|value| CtlResponse::VaultValue { name, value }),
             CtlRequest::VaultList => self.vault_list(agent_ref).map(CtlResponse::VaultList),
-            CtlRequest::VaultRm { name } => self.vault_rm(&name, agent_ref).await.map(|()| CtlResponse::Ok),
+            CtlRequest::VaultRm { name } => self
+                .vault_rm(&name, agent_ref)
+                .await
+                .map(|()| CtlResponse::Ok),
             CtlRequest::VaultSync => self.vault_sync().await.map(CtlResponse::VaultList),
-            CtlRequest::VaultRotateNeeded { device } => {
-                self.vault_rotate_needed(device.as_deref()).map(CtlResponse::VaultRotateNeeded)
-            }
+            CtlRequest::VaultRotateNeeded { device } => self
+                .vault_rotate_needed(device.as_deref())
+                .map(CtlResponse::VaultRotateNeeded),
             CtlRequest::AnchorSet { url } => self.anchor_set(url).await.map(CtlResponse::Anchor),
-            CtlRequest::Connect { node, name } => return self.connect(&node, &name, agent, server).await,
-            CtlRequest::Publish { name, addr, proto, env } => self.publish(name, addr, proto, env).map(|path| CtlResponse::Published { path }),
-            CtlRequest::Unpublish { name } => self.unpublish(&name).map(|()| CtlResponse::Ok),
-            CtlRequest::Services { node } => {
-                self.remote_services(&node, agent_ref).await.map(|(node, services)| CtlResponse::Services { node, services })
+            CtlRequest::Connect { node, name } => {
+                return self.connect(&node, &name, agent, server).await
             }
-            CtlRequest::RouteAdd { rule } => self.route_add(rule).map(|index| CtlResponse::RouteAdded { index }),
-            CtlRequest::RouteAddMany { rules } => self.route_add_many(rules).map(|index| CtlResponse::RouteAdded { index }),
+            CtlRequest::Publish {
+                name,
+                addr,
+                proto,
+                env,
+            } => self
+                .publish(name, addr, proto, env)
+                .map(|path| CtlResponse::Published { path }),
+            CtlRequest::Unpublish { name } => self.unpublish(&name).map(|()| CtlResponse::Ok),
+            CtlRequest::Services { node } => self
+                .remote_services(&node, agent_ref)
+                .await
+                .map(|(node, services)| CtlResponse::Services { node, services }),
+            CtlRequest::RouteAdd { rule } => self
+                .route_add(rule)
+                .map(|index| CtlResponse::RouteAdded { index }),
             CtlRequest::RouteRm { index } => self.route_rm(index).map(|()| CtlResponse::Ok),
             CtlRequest::ExitSet { enabled } => {
                 self.exit_enabled.set(enabled);
-                save(&self.system, KEY_EXIT, &enabled).map_err(internal).map(|()| CtlResponse::Exit { enabled })
+                save(&self.system, KEY_EXIT, &enabled)
+                    .map_err(internal)
+                    .map(|()| CtlResponse::Exit { enabled })
             }
-            CtlRequest::TunShow => Ok(CtlResponse::Tun(self.tun_info().map(|t| nexus_wire::TunReport {
-                name: t.name,
-                net: format!("{}/{}", t.net.0, t.net.1),
-                dns: t.dns.to_string(),
+            CtlRequest::TunShow => Ok(CtlResponse::Tun(self.tun_info().map(|t| {
+                nexus_wire::TunReport {
+                    name: t.name,
+                    net: format!("{}/{}", t.net.0, t.net.1),
+                    dns: t.dns.to_string(),
+                }
             }))),
-            CtlRequest::ExitShow => Ok(CtlResponse::Exit { enabled: self.exit_enabled.get() }),
+            CtlRequest::ExitShow => Ok(CtlResponse::Exit {
+                enabled: self.exit_enabled.get(),
+            }),
             CtlRequest::RouteList => Ok(CtlResponse::Routes(self.routes.borrow().rules.clone())),
-            CtlRequest::RouteExplain { target } => self.route_explain(&target).map(CtlResponse::Explained),
+            CtlRequest::RouteExplain { target } => {
+                self.route_explain(&target).map(CtlResponse::Explained)
+            }
+            CtlRequest::RouteImport { rules, replace } => self
+                .route_import(rules, replace)
+                .map(|(total, audit)| CtlResponse::RouteImported { total, audit }),
+            CtlRequest::RouteRollback => self.route_rollback().map(|()| CtlResponse::Ok),
+            CtlRequest::RouteAudit => Ok(CtlResponse::RouteAudit(route::audit_rules(
+                &self.routes.borrow().rules,
+            ))),
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
                 anchor: self.roster().and_then(|r| r.anchor),
                 roster_version: self.roster_version(),
@@ -1361,7 +1787,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 unreachable: vec![],
             })),
         };
-        let _ = server.tx.send(result.unwrap_or_else(CtlResponse::Error)).await;
+        let _ = server
+            .tx
+            .send(result.unwrap_or_else(CtlResponse::Error))
+            .await;
     }
 
     /// 带凭据的控制调用：凭据必须属于本网络，而且 agent 不能做管理操作。
@@ -1395,7 +1824,6 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::Publish { .. }
                 | CtlRequest::Unpublish { .. }
                 | CtlRequest::RouteAdd { .. }
-                | CtlRequest::RouteAddMany { .. }
                 | CtlRequest::RouteRm { .. }
                 | CtlRequest::ExitSet { .. }
                 | CtlRequest::Interfaces { set: Some(_) }
@@ -1405,14 +1833,31 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         if matches!(req, CtlRequest::Drive(_)) {
             // 工作区按每个请求判定（见 drive.rs 的 drive_allowed），这里只验证凭据本身。
-            let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
-            return agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason));
+            let roster = self
+                .roster()
+                .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+            return agent
+                .cert
+                .validate(&roster, self.system.now())
+                .map_err(|reason| denied(&reason));
         }
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         // 发现接口以设备身份探测，不能把未经验证的 grants 当作可见性凭证。
         // 执行和会话请求仍交给目标设备完整判定并审计，包括无效凭据的拒绝。
-        if matches!(req, CtlRequest::Status | CtlRequest::RemoteStatus { .. } | CtlRequest::Paths { .. } | CtlRequest::List | CtlRequest::SshHostKey { .. }) {
-            agent.cert.validate(&roster, self.system.now()).map_err(|reason| denied(&reason))?;
+        if matches!(
+            req,
+            CtlRequest::Status
+                | CtlRequest::RemoteStatus { .. }
+                | CtlRequest::Paths { .. }
+                | CtlRequest::List
+                | CtlRequest::SshHostKey { .. }
+        ) {
+            agent
+                .cert
+                .validate(&roster, self.system.now())
+                .map_err(|reason| denied(&reason))?;
         }
         if SecretKey::from_seed(agent.secret).public() != agent.cert.cert.agent {
             return Err(denied(&DenyReason::AssertionBadSignature));
@@ -1421,21 +1866,37 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 按名字找设备；agent 看不到的设备和不存在的设备得到同样的结果。
-    fn resolve_for(&self, node: &str, agent: Option<&AgentCredential>) -> Result<Device, WireError> {
+    fn resolve_for(
+        &self,
+        node: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<Device, WireError> {
         let device = self.resolve(node)?;
         match agent {
-            Some(a) if !visible(a, &device.name) => Err(err(ErrorCode::UnknownNode, format!("不认识节点 {node}"))),
+            Some(a) if !visible(a, &device.name) => {
+                Err(err(ErrorCode::UnknownNode, format!("不认识节点 {node}")))
+            }
             _ => Ok(device),
         }
     }
 
     /// agent 访问本机：和远端一样判定、审计、检测重放。
-    fn authorize_local(&self, agent: Option<&AgentCredential>, body: &Request) -> Result<(), WireError> {
+    fn authorize_local(
+        &self,
+        agent: Option<&AgentCredential>,
+        body: &Request,
+    ) -> Result<(), WireError> {
         let Some(agent) = agent else { return Ok(()) };
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
-        let me = roster.device(self.me()).cloned().ok_or_else(|| internal("本机不在名册里"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let me = roster
+            .device(self.me())
+            .cloned()
+            .ok_or_else(|| internal("本机不在名册里"))?;
         let principal = self.principal_for(Some(agent), &me, body)?;
-        let action = required_action(body, &me.name)?.ok_or_else(|| internal("这个请求不需要授权"))?;
+        let action =
+            required_action(body, &me.name)?.ok_or_else(|| internal("这个请求不需要授权"))?;
         self.authorize(&roster, self.me(), &principal, &action)
     }
 
@@ -1443,11 +1904,17 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// SSH 呈现层的主机密钥：由本机设备密钥对目标设备标识签名派生，因此稳定、不需要存储，
     /// 也不会和其他设备的密钥相同。SSH 只在本机两个进程之间运行，这把密钥只用来让 ssh 的主机校验稳定。
-    fn ssh_host_key(&self, node: &str, agent: Option<&AgentCredential>) -> Result<[u8; 32], WireError> {
+    fn ssh_host_key(
+        &self,
+        node: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<[u8; 32], WireError> {
         let device = self.resolve_for(node, agent)?;
         let key = load_or_create_device_key(&self.system).map_err(internal)?;
         let msg = device.node_id.0;
-        let sig = key.sign(nexus_core_proto::crypto::Purpose::SshHostKey, &msg).to_bytes();
+        let sig = key
+            .sign(nexus_core_proto::crypto::Purpose::SshHostKey, &msg)
+            .to_bytes();
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&sig[32..]);
         Ok(seed)
@@ -1456,19 +1923,39 @@ impl<T: Transport, S: System> Node<T, S> {
     // ------------------------------------------------------------ 通行密钥
 
     /// 管理设备发起登记：记下一次性登记码，给出在浏览器里打开的链接。
-    fn web_enroll_start(&self, label: String, grants: &[String], ttl_ms: u64, page: &str) -> Result<WebEnrollReport, WireError> {
+    fn web_enroll_start(
+        &self,
+        label: String,
+        grants: &[String],
+        ttl_ms: u64,
+        page: &str,
+    ) -> Result<WebEnrollReport, WireError> {
         self.admin_key()?;
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         if !valid_segment(&label) {
-            return Err(err(ErrorCode::InvalidInput, format!("名字 {label:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("名字 {label:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         if roster.device_by_name(&label).is_some() || roster.web_key(&label).is_some() {
-            return Err(err(ErrorCode::InvalidInput, format!("名字 {label} 已被使用（设备和通行密钥不能重名）")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("名字 {label} 已被使用（设备和通行密钥不能重名）"),
+            ));
         }
         let grants: Vec<Grant> = if grants.is_empty() {
-            DEFAULT_WEB_GRANTS.iter().map(|g| parse_grant(g)).collect::<Result<_, _>>()?
+            DEFAULT_WEB_GRANTS
+                .iter()
+                .map(|g| parse_grant(g))
+                .collect::<Result<_, _>>()?
         } else {
-            grants.iter().map(|g| parse_grant(g)).collect::<Result<_, _>>()?
+            grants
+                .iter()
+                .map(|g| parse_grant(g))
+                .collect::<Result<_, _>>()?
         };
         let page = page.trim_end_matches('/');
         let rp_id = page_rp_id(page).ok_or_else(|| {
@@ -1477,18 +1964,34 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut token = [0u8; 16];
         self.system.random(&mut token);
         let expires_at = Timestamp(self.system.now().0.saturating_add(ttl_ms));
-        self.web_enrolls.borrow_mut().insert(token, PendingWebEnroll { label: label.clone(), grants, rp_id, expires_at });
+        self.web_enrolls.borrow_mut().insert(
+            token,
+            PendingWebEnroll {
+                label: label.clone(),
+                grants,
+                rp_id,
+                expires_at,
+            },
+        );
         let url = format!(
             "{page}/#enroll={}&node={}&hint={}",
             hex_encode(&token),
             self.me(),
             self.transport.local_hint()
         );
-        Ok(WebEnrollReport { label, url, expires_at })
+        Ok(WebEnrollReport {
+            label,
+            url,
+            expires_at,
+        })
     }
 
     /// 浏览器交来新建的通行密钥：核对登记码和依赖方，写进名册并推送。
-    async fn web_enroll_finish(&self, token: [u8; 16], credential: NewCredential) -> Result<String, WireError> {
+    async fn web_enroll_finish(
+        &self,
+        token: [u8; 16],
+        credential: NewCredential,
+    ) -> Result<String, WireError> {
         let _write = self.roster_write.lock().await;
         let invalid = || err(ErrorCode::Denied, "登记码无效、已用过或已过期");
         let (label, grants, key) = {
@@ -1502,15 +2005,21 @@ impl<T: Transport, S: System> Node<T, S> {
             if credential.rp_id != p.rp_id {
                 return Err(err(
                     ErrorCode::InvalidInput,
-                    format!("通行密钥是为 {} 创建的，登记链接要求 {}", credential.rp_id, p.rp_id),
+                    format!(
+                        "通行密钥是为 {} 创建的，登记链接要求 {}",
+                        credential.rp_id, p.rp_id
+                    ),
                 ));
             }
-            let key = P256Key::from_spki(&credential.spki).map_err(|_| err(ErrorCode::InvalidInput, "公钥不是 P-256（ES256）"))?;
+            let key = P256Key::from_spki(&credential.spki)
+                .map_err(|_| err(ErrorCode::InvalidInput, "公钥不是 P-256（ES256）"))?;
             let p = pending.remove(&token).expect("刚刚找到");
             (p.label, p.grants, key)
         };
         let root = self.admin_key()?;
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         roster.version += 1;
         roster.web_keys.push(WebKey {
             label: label.clone(),
@@ -1520,7 +2029,9 @@ impl<T: Transport, S: System> Node<T, S> {
             grants,
             added_at: self.system.now(),
         });
-        roster.validate().map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        roster
+            .validate()
+            .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         self.install_roster(roster.sign(&root))?;
         drop(_write);
         self.broadcast_roster(None).await;
@@ -1528,18 +2039,31 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 浏览器用通行密钥登录：校验签名，签发网页会话凭证，给出它能看到的设备。
-    fn web_login(&self, peer: NodeId, issued_at: Timestamp, assertion: &WebAuthnAssertion) -> Response {
+    fn web_login(
+        &self,
+        peer: NodeId,
+        issued_at: Timestamp,
+        assertion: &WebAuthnAssertion,
+    ) -> Response {
         let result = (|| {
-            let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+            let roster = self
+                .roster()
+                .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
             let key = roster
                 .web_keys
                 .iter()
                 .find(|k| k.credential_id == assertion.credential_id)
                 .ok_or_else(|| err(ErrorCode::Denied, "不认识这个通行密钥（可能已被撤销）"))?;
             let now = self.system.now();
-            let me_name = roster.device(self.me()).map(|d| d.name.clone()).unwrap_or_default();
+            let me_name = roster
+                .device(self.me())
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
             let checked = if now.0.abs_diff(issued_at.0) > authz::MAX_CLOCK_SKEW_MS {
-                Err(err(ErrorCode::Denied, "通行密钥的签名时间与设备时钟相差太远（检查两边的时钟）"))
+                Err(err(
+                    ErrorCode::Denied,
+                    "通行密钥的签名时间与设备时钟相差太远（检查两边的时钟）",
+                ))
             } else {
                 let challenge = login_challenge(issued_at, peer);
                 verify_assertion(&key.public_key, &key.rp_id, &challenge, assertion)
@@ -1556,7 +2080,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 &AuditEvent {
                     at: now,
                     peer,
-                    principal: authz::PrincipalRef::Web { label: key.label.clone() },
+                    principal: authz::PrincipalRef::Web {
+                        label: key.label.clone(),
+                    },
                     capability: "web.login".into(),
                     resource: me_name,
                     outcome,
@@ -1597,7 +2123,9 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn web_list(&self) -> Result<Vec<WebKeyInfo>, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         Ok(roster
             .web_keys
             .iter()
@@ -1611,15 +2139,31 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 向网页节点发起一次硬件能力 RPC（M8.3）。
-    async fn hardware_rpc(&self, node_id: NodeId, hint: &str, body: Request) -> Result<Response, WireError> {
+    async fn hardware_rpc(
+        &self,
+        node_id: NodeId,
+        hint: &str,
+        body: Request,
+    ) -> Result<Response, WireError> {
         if !hint.is_empty() {
             self.transport.add_hint(node_id, hint);
         }
-        let conn = self.transport.connect(node_id, Proto::Rpc).await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
-        let mut stream = conn.open_bi().await.map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let conn = self
+            .transport
+            .connect(node_id, Proto::Rpc)
+            .await
+            .map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
+        let mut stream = conn
+            .open_bi()
+            .await
+            .map_err(|e| err(ErrorCode::Unreachable, format!("连不上网页节点：{e}")))?;
         let header = RequestHeader::new(0, Principal::Device, &body);
-        write_msg(&mut stream, &header).await.map_err(|e| err(ErrorCode::Unreachable, format!("发送请求失败：{e}")))?;
-        let resp: Response = read_response(&mut stream).await.map_err(|e| err(ErrorCode::Unreachable, format!("读取回应失败：{e}")))?;
+        write_msg(&mut stream, &header)
+            .await
+            .map_err(|e| err(ErrorCode::Unreachable, format!("发送请求失败：{e}")))?;
+        let resp: Response = read_response(&mut stream)
+            .await
+            .map_err(|e| err(ErrorCode::Unreachable, format!("读取回应失败：{e}")))?;
         let _ = stream.shutdown().await;
         Ok(resp)
     }
@@ -1627,32 +2171,52 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn web_revoke(&self, label: &str) -> Result<MembershipReport, WireError> {
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let before = roster.web_keys.len();
         roster.web_keys.retain(|k| k.label != label);
         if roster.web_keys.len() == before {
-            return Err(err(ErrorCode::NotFound, format!("没有名为 {label} 的通行密钥")));
+            return Err(err(
+                ErrorCode::NotFound,
+                format!("没有名为 {label} 的通行密钥"),
+            ));
         }
         roster.version += 1;
         self.install_roster(roster.sign(&root))?;
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
-        Ok(MembershipReport { name: label.to_string(), node_id: self.me(), roster_version: self.roster_version(), pushed, unreachable })
+        Ok(MembershipReport {
+            name: label.to_string(),
+            node_id: self.me(),
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     /// 设置或清除名册里的锚点，推送到各设备。
     async fn anchor_set(&self, url: Option<String>) -> Result<AnchorReport, WireError> {
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let url = url.map(|u| u.trim_end_matches('/').to_string());
         roster.anchor = url;
         roster.version += 1;
-        roster.validate().map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
+        roster
+            .validate()
+            .map_err(|e| err(ErrorCode::InvalidInput, e.to_string()))?;
         self.install_roster(roster.sign(&root))?;
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
-        Ok(AnchorReport { anchor: self.roster().and_then(|r| r.anchor), roster_version: self.roster_version(), pushed, unreachable })
+        Ok(AnchorReport {
+            anchor: self.roster().and_then(|r| r.anchor),
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     /// 本机签发的新名册：落盘并生效。
@@ -1664,31 +2228,57 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn load_agents(&self) -> Result<Vec<AgentInfo>, WireError> {
-        load(&self.system, KEY_AGENTS).map(Option::unwrap_or_default).map_err(internal)
+        load(&self.system, KEY_AGENTS)
+            .map(Option::unwrap_or_default)
+            .map_err(internal)
     }
 
-    fn agent_issue(&self, label: String, grants: &[String], ttl_ms: u64) -> Result<AgentIssueReport, WireError> {
+    fn agent_issue(
+        &self,
+        label: String,
+        grants: &[String],
+        ttl_ms: u64,
+    ) -> Result<AgentIssueReport, WireError> {
         let root = self.admin_key()?;
         if !valid_segment(&label) {
-            return Err(err(ErrorCode::InvalidInput, format!("agent 名 {label:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("agent 名 {label:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         if ttl_ms == 0 {
             return Err(err(ErrorCode::InvalidInput, "有效期必须大于 0"));
         }
         if grants.is_empty() {
-            return Err(err(ErrorCode::InvalidInput, "至少要有一条授权，例如 --grant term.exec@home"));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                "至少要有一条授权，例如 --grant term.exec@home",
+            ));
         }
-        let grants = grants.iter().map(|g| parse_grant(g)).collect::<Result<Vec<_>, _>>()?;
+        let grants = grants
+            .iter()
+            .map(|g| parse_grant(g))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut agents = self.load_agents()?;
         if agents.iter().any(|a| a.label == label && !a.revoked) {
-            return Err(err(ErrorCode::InvalidInput, format!("已经有一个叫 {label} 的 agent，请换个名字或先撤销它")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("已经有一个叫 {label} 的 agent，请换个名字或先撤销它"),
+            ));
         }
         let mut seed = [0u8; 32];
         self.system.random(&mut seed);
         let key = SecretKey::from_seed(seed);
         let now = self.system.now();
         let not_after = Timestamp(now.0.saturating_add(ttl_ms));
-        let cert = AgentCert { agent: key.public(), label: label.clone(), not_before: now, not_after, grants: grants.clone() }.issue(&root);
+        let cert = AgentCert {
+            agent: key.public(),
+            label: label.clone(),
+            not_before: now,
+            not_after,
+            grants: grants.clone(),
+        }
+        .issue(&root);
         agents.push(AgentInfo {
             agent_id: key.public(),
             label: label.clone(),
@@ -1699,30 +2289,48 @@ impl<T: Transport, S: System> Node<T, S> {
         });
         save(&self.system, KEY_AGENTS, &agents).map_err(internal)?;
         let credential = AgentCredential { cert, secret: seed }.encode();
-        Ok(AgentIssueReport { agent_id: key.public(), label, not_after, credential })
+        Ok(AgentIssueReport {
+            agent_id: key.public(),
+            label,
+            not_after,
+            credential,
+        })
     }
 
     async fn agent_revoke(&self, who: &str) -> Result<MembershipReport, WireError> {
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
         let mut agents = self.load_agents()?;
-        let index = agents
-            .iter()
-            .position(|a| !a.revoked && (a.label == who || NodeId(a.agent_id.0).to_string() == who));
+        let index = agents.iter().position(|a| {
+            !a.revoked && (a.label == who || NodeId(a.agent_id.0).to_string() == who)
+        });
         // 不在本机列表里的 agent（恢复管理设备之后，M6.2）：用完整标识撤销。
         let (id, label) = match index {
             Some(i) => (agents[i].agent_id, agents[i].label.clone()),
             None => match who.parse::<NodeId>().ok().map(|n| PublicKey(n.0)) {
                 Some(id) => (id, NodeId(id.0).short()),
-                None => return Err(err(ErrorCode::NotFound, format!("没有名为 {who} 的有效 agent（不在本机列表里的 agent 用它的完整标识撤销）"))),
+                None => return Err(err(
+                    ErrorCode::NotFound,
+                    format!(
+                        "没有名为 {who} 的有效 agent（不在本机列表里的 agent 用它的完整标识撤销）"
+                    ),
+                )),
             },
         };
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         if roster.is_agent_revoked(&id) {
-            return Err(err(ErrorCode::InvalidState, format!("agent {label} 已经撤销过了")));
+            return Err(err(
+                ErrorCode::InvalidState,
+                format!("agent {label} 已经撤销过了"),
+            ));
         }
         roster.version += 1;
-        roster.revoked_agents.push(RevokedAgent { agent: id, revoked_at: self.system.now() });
+        roster.revoked_agents.push(RevokedAgent {
+            agent: id,
+            revoked_at: self.system.now(),
+        });
         let signed = roster.sign(&root);
         save(&self.system, KEY_ROSTER, &signed).map_err(internal)?;
         self.trust.borrow_mut().roster = Some(signed);
@@ -1748,7 +2356,13 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 命令行请求在某个节点上执行命令：打开执行，然后在命令行和执行之间转发。
-    async fn exec(&self, node: &str, spec: ExecSpec, agent: Option<AgentCredential>, server: CtlServer) {
+    async fn exec(
+        &self,
+        node: &str,
+        spec: ExecSpec,
+        agent: Option<AgentCredential>,
+        server: CtlServer,
+    ) {
         let device = match self.resolve_for(node, agent.as_ref()) {
             Ok(d) => d,
             Err(e) => {
@@ -1771,7 +2385,10 @@ impl<T: Transport, S: System> Node<T, S> {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
                     }
                     other => {
-                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                        let _ = server
+                            .tx
+                            .send(CtlResponse::Error(internal(format!("{other:?}"))))
+                            .await;
                     }
                 }
             };
@@ -1779,7 +2396,10 @@ impl<T: Transport, S: System> Node<T, S> {
             return;
         }
         for attempt in 0..2 {
-            let failure = match self.open_stream(&device, Request::Exec(spec.clone()), agent.as_ref()).await {
+            let failure = match self
+                .open_stream(&device, Request::Exec(spec.clone()), agent.as_ref())
+                .await
+            {
                 Ok(stream) => return self.pump_exec(stream, server).await,
                 Err(OpenError::StaleRoster) if attempt == 0 => {
                     let _ = self.push_roster(device.node_id).await;
@@ -1787,7 +2407,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
                 Err(OpenError::Remote(e)) => e,
-                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+                Err(OpenError::Io(e)) => err(
+                    ErrorCode::Unreachable,
+                    format!("连不上 {}：{e}", device.name),
+                ),
             };
             let _ = server.tx.send(CtlResponse::Error(failure)).await;
             return;
@@ -1801,7 +2424,9 @@ impl<T: Transport, S: System> Node<T, S> {
         body: Request,
         agent: Option<&AgentCredential>,
     ) -> Result<<T::Conn as Connection>::Stream, OpenError> {
-        let principal = self.principal_for(agent, to, &body).map_err(OpenError::Remote)?;
+        let principal = self
+            .principal_for(agent, to, &body)
+            .map_err(OpenError::Remote)?;
         let priority = body.class().priority();
         let open = async {
             let conn = self.transport.connect(to.node_id, Proto::Rpc).await?;
@@ -1820,12 +2445,18 @@ impl<T: Transport, S: System> Node<T, S> {
             Response::Ok => Ok(stream),
             Response::Error(e) if e.code == ErrorCode::StaleRoster => Err(OpenError::StaleRoster),
             Response::Error(e) => Err(OpenError::Remote(e)),
-            other => Err(OpenError::Remote(internal(format!("对方的回应无法理解：{other:?}")))),
+            other => Err(OpenError::Remote(internal(format!(
+                "对方的回应无法理解：{other:?}"
+            )))),
         }
     }
 
     /// 调用方一侧：把命令行的输入送到执行端，把执行事件送回命令行，直到命令结束。
-    async fn pump_exec<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+    async fn pump_exec<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: St,
+        mut server: CtlServer,
+    ) {
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
         let mut input_open = true;
@@ -1868,11 +2499,19 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn serve_exec<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, spec: ExecSpec) {
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
-        let cmd = Cmd { program: spec.program.clone(), args: spec.args.clone(), cwd: spec.cwd.clone(), env: spec.env.clone() };
+        let cmd = Cmd {
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: spec.env.clone(),
+        };
         let mut proc = match self.system.spawn(cmd) {
             Ok(p) => p,
             Err(e) => {
-                let failure = err(ErrorCode::SpawnFailed, format!("无法启动 {}：{e}", spec.program));
+                let failure = err(
+                    ErrorCode::SpawnFailed,
+                    format!("无法启动 {}：{e}", spec.program),
+                );
                 let _ = write_response(&mut wr, &Response::Error(failure)).await;
                 let _ = wr.shutdown().await;
                 reader.drain().await;
@@ -1881,13 +2520,19 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 保留写入游标：select! 取消写入时，已经发出的半帧不会被重发。
         // 每次只缓存一帧，保留输出反压；计时和取消不依赖接收方继续读取。
-        let mut pending = Some((nexus_wire::encode(&nexus_wire::ResponseEnvelope::new(&Response::Ok)).expect("固定回应可编码"), 0));
+        let mut pending = Some((
+            nexus_wire::encode(&nexus_wire::ResponseEnvelope::new(&Response::Ok))
+                .expect("固定回应可编码"),
+            0,
+        ));
         let started = self.system.now();
         let limit = spec.timeout_ms.map(Duration::from_millis);
-        let deadline = tokio::time::sleep(limit.unwrap_or(Duration::from_secs(100 * 365 * 24 * 3600)));
+        let deadline =
+            tokio::time::sleep(limit.unwrap_or(Duration::from_secs(100 * 365 * 24 * 3600)));
         tokio::pin!(deadline);
         let mut sent: u64 = 0;
-        let (mut timed_out, mut truncated, mut input_open, mut caller_gone, mut exited) = (false, false, true, false, false);
+        let (mut timed_out, mut truncated, mut input_open, mut caller_gone, mut exited) =
+            (false, false, true, false, false);
         loop {
             if exited && pending.is_none() {
                 break;
@@ -1969,7 +2614,15 @@ impl<T: Transport, S: System> Node<T, S> {
     // ------------------------------------------------------------ 终端会话
 
     /// 命令行请求连上某个节点上的会话：打开会话流，然后在命令行和会话之间转发。
-    async fn attach(&self, node: &str, name: String, size: Size, create: bool, agent: Option<AgentCredential>, server: CtlServer) {
+    async fn attach(
+        &self,
+        node: &str,
+        name: String,
+        size: Size,
+        create: bool,
+        agent: Option<AgentCredential>,
+        server: CtlServer,
+    ) {
         let device = match self.resolve_for(node, agent.as_ref()) {
             Ok(d) => d,
             Err(e) => {
@@ -1978,14 +2631,24 @@ impl<T: Transport, S: System> Node<T, S> {
             }
         };
         if device.node_id == self.me() {
-            let body = Request::SessionAttach { name: name.clone(), create, size };
+            let body = Request::SessionAttach {
+                name: name.clone(),
+                create,
+                size,
+            };
             // agent 的会话要一直接受复查：授权通过后为它建立守卫。
             let check = required_action(&body, &device.name).and_then(|action| {
                 self.authorize_local(agent.as_ref(), &body)?;
-                let Some(a) = agent.as_ref() else { return Ok(None) };
+                let Some(a) = agent.as_ref() else {
+                    return Ok(None);
+                };
                 let action = action.ok_or_else(|| internal("会话请求应当需要授权"))?;
                 let principal = self.principal_for(Some(a), &device, &body)?;
-                Ok(Some(Box::new(SessionGuard::new(self.me(), principal, action))))
+                Ok(Some(Box::new(SessionGuard::new(
+                    self.me(),
+                    principal,
+                    action,
+                ))))
             });
             let guard = match check {
                 Ok(guard) => guard,
@@ -2003,16 +2666,23 @@ impl<T: Transport, S: System> Node<T, S> {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
                     }
                     other => {
-                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                        let _ = server
+                            .tx
+                            .send(CtlResponse::Error(internal(format!("{other:?}"))))
+                            .await;
                     }
                 }
             };
-            futures_util::future::join(self.serve_session(far, &name, create, size, guard), client).await;
+            futures_util::future::join(self.serve_session(far, &name, create, size, guard), client)
+                .await;
             return;
         }
         let body = Request::SessionAttach { name, create, size };
         for attempt in 0..2 {
-            let failure = match self.open_stream(&device, body.clone(), agent.as_ref()).await {
+            let failure = match self
+                .open_stream(&device, body.clone(), agent.as_ref())
+                .await
+            {
                 Ok(stream) => return self.pump_session(stream, server).await,
                 Err(OpenError::StaleRoster) if attempt == 0 => {
                     let _ = self.push_roster(device.node_id).await;
@@ -2020,7 +2690,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
                 Err(OpenError::Remote(e)) => e,
-                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+                Err(OpenError::Io(e)) => err(
+                    ErrorCode::Unreachable,
+                    format!("连不上 {}：{e}", device.name),
+                ),
             };
             let _ = server.tx.send(CtlResponse::Error(failure)).await;
             return;
@@ -2029,7 +2702,11 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 客户端一侧：把命令行的输入、尺寸变化和确认送到会话，把会话的输出送回命令行。
     /// 连接中断时告诉命令行，由它决定是否重连；命令行离开时告诉会话。
-    async fn pump_session<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+    async fn pump_session<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: St,
+        mut server: CtlServer,
+    ) {
         let (rd, mut wr) = tokio::io::split(stream);
         let mut reader = FrameReader::new(rd);
         let mut input_open = true;
@@ -2115,7 +2792,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let client = self.next_client.get();
         self.next_client.set(client + 1);
         let (tx, mut out) = mpsc::unbounded_channel();
-        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
+        if cmd.send(SessCmd::Attach { client, size, tx }).is_err()
+            || write_response(&mut wr, &Response::Ok).await.is_err()
+        {
             let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
             return;
         }
@@ -2193,7 +2872,9 @@ impl<T: Transport, S: System> Node<T, S> {
         let client = self.next_client.get();
         self.next_client.set(client + 1);
         let (tx, mut out) = mpsc::unbounded_channel();
-        if cmd.send(SessCmd::Attach { client, size, tx }).is_err() || write_response(&mut wr, &Response::Ok).await.is_err() {
+        if cmd.send(SessCmd::Attach { client, size, tx }).is_err()
+            || write_response(&mut wr, &Response::Ok).await.is_err()
+        {
             let _ = cmd.send(SessCmd::Event(TermEvent::Detach { client }));
             return;
         }
@@ -2250,7 +2931,12 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 找到名为 `name` 的会话；不存在且 `create` 时启动一个新的。
-    fn open_session(&self, name: &str, create: bool, size: Size) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
+    fn open_session(
+        &self,
+        name: &str,
+        create: bool,
+        size: Size,
+    ) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
         if let Some(h) = self.sessions.borrow().get(name) {
             return Ok(h.cmd.clone());
         }
@@ -2258,24 +2944,48 @@ impl<T: Transport, S: System> Node<T, S> {
             return Err(err(ErrorCode::NotFound, format!("没有会话 {name}")));
         }
         if !valid_segment(name) {
-            return Err(err(ErrorCode::InvalidInput, format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("会话名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         let size = size.clamped();
         let created_at = self.system.now();
-        let pty = self.system.spawn_pty(name, size, created_at).map_err(|e| err(ErrorCode::SpawnFailed, format!("无法启动终端：{e}")))?;
+        let pty = self
+            .system
+            .spawn_pty(name, size, created_at)
+            .map_err(|e| err(ErrorCode::SpawnFailed, format!("无法启动终端：{e}")))?;
         self.start_session(name, pty, size, created_at)
     }
 
     /// 把一个终端交给会话任务，登记到会话列表里。
-    fn start_session(&self, name: &str, pty: S::Pty, size: Size, created_at: Timestamp) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
+    fn start_session(
+        &self,
+        name: &str,
+        pty: S::Pty,
+        size: Size,
+        created_at: Timestamp,
+    ) -> Result<mpsc::UnboundedSender<SessCmd>, WireError> {
         let (cmd, cmds) = mpsc::unbounded_channel();
         let clients = Rc::new(Cell::new(0));
         let current_size = Rc::new(Cell::new(size));
         self.sessions.borrow_mut().insert(
             name.to_string(),
-            SessionHandle { cmd: cmd.clone(), created_at, clients: clients.clone(), size: current_size.clone() },
+            SessionHandle {
+                cmd: cmd.clone(),
+                created_at,
+                clients: clients.clone(),
+                size: current_size.clone(),
+            },
         );
-        let new = NewSession { name: name.to_string(), pty, size, cmds, clients, current_size };
+        let new = NewSession {
+            name: name.to_string(),
+            pty,
+            size,
+            cmds,
+            clients,
+            current_size,
+        };
         if self.spawn_tx.send(new).is_err() {
             self.sessions.borrow_mut().remove(name);
             return Err(internal("节点正在关闭"));
@@ -2295,7 +3005,14 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 驱动一个会话：终端程序的输出交给状态机，状态机的动作发给客户端和终端。
     async fn run_session(&self, new: NewSession<S::Pty>) {
-        let NewSession { name, mut pty, size, mut cmds, clients, current_size } = new;
+        let NewSession {
+            name,
+            mut pty,
+            size,
+            mut cmds,
+            clients,
+            current_size,
+        } = new;
         let mut live = LiveSession {
             term: TermSession::new(size, DEFAULT_WINDOW),
             clients: BTreeMap::new(),
@@ -2342,8 +3059,15 @@ impl<T: Transport, S: System> Node<T, S> {
         self.sessions
             .borrow()
             .iter()
-            .filter(|(name, _)| ResourcePath::parse(&format!("{me}/session/{name}")).is_ok_and(|p| sees(&p)))
-            .map(|(name, h)| SessionInfo { name: name.clone(), clients: h.clients.get(), created_at: h.created_at, size: h.size.get() })
+            .filter(|(name, _)| {
+                ResourcePath::parse(&format!("{me}/session/{name}")).is_ok_and(|p| sees(&p))
+            })
+            .map(|(name, h)| SessionInfo {
+                name: name.clone(),
+                clients: h.clients.get(),
+                created_at: h.created_at,
+                size: h.size.get(),
+            })
             .collect()
     }
 
@@ -2358,16 +3082,31 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 对一个节点发出一次普通请求，限时完成。
-    async fn call_node(&self, device: &Device, body: Request, agent: Option<&AgentCredential>) -> Result<Response, WireError> {
+    async fn call_node(
+        &self,
+        device: &Device,
+        body: Request,
+        agent: Option<&AgentCredential>,
+    ) -> Result<Response, WireError> {
         match tokio::time::timeout(REQUEST_TIMEOUT, self.request(device, body, agent)).await {
             Ok(Ok((Response::Error(e), _))) => Err(e),
             Ok(Ok((resp, _))) => Ok(resp),
-            Ok(Err(e)) => Err(err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name))),
-            Err(_) => Err(err(ErrorCode::Unreachable, format!("连接 {} 超时", device.name))),
+            Ok(Err(e)) => Err(err(
+                ErrorCode::Unreachable,
+                format!("连不上 {}：{e}", device.name),
+            )),
+            Err(_) => Err(err(
+                ErrorCode::Unreachable,
+                format!("连接 {} 超时", device.name),
+            )),
         }
     }
 
-    async fn remote_session_list(&self, node: &str, agent: Option<&AgentCredential>) -> Result<Vec<SessionInfo>, WireError> {
+    async fn remote_session_list(
+        &self,
+        node: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<Vec<SessionInfo>, WireError> {
         let device = self.resolve_for(node, agent)?;
         if device.node_id == self.me() {
             self.authorize_local(agent, &Request::SessionList)?;
@@ -2381,25 +3120,50 @@ impl<T: Transport, S: System> Node<T, S> {
 
     // ------------------------------------------------------------ 发布服务（M3.1）
 
-    fn publish(&self, name: String, addr: std::net::SocketAddr, proto: String, env: Vec<(String, String)>) -> Result<String, WireError> {
+    fn publish(
+        &self,
+        name: String,
+        addr: std::net::SocketAddr,
+        proto: String,
+        env: Vec<(String, String)>,
+    ) -> Result<String, WireError> {
         let me = self.my_name()?;
         if !valid_segment(&name) {
-            return Err(err(ErrorCode::InvalidInput, format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("服务名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         if !SERVICE_PROTOS.contains(&proto.as_str()) {
-            return Err(err(ErrorCode::InvalidInput, format!("不认识的协议 {proto}：可用 {}", SERVICE_PROTOS.join("、"))));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("不认识的协议 {proto}：可用 {}", SERVICE_PROTOS.join("、")),
+            ));
         }
         for (k, _) in &env {
-            let ok = !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !k.as_bytes()[0].is_ascii_digit();
+            let ok = !k.is_empty()
+                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !k.as_bytes()[0].is_ascii_digit();
             if !ok {
-                return Err(err(ErrorCode::InvalidInput, format!("环境变量名 {k:?} 不合法")));
+                return Err(err(
+                    ErrorCode::InvalidInput,
+                    format!("环境变量名 {k:?} 不合法"),
+                ));
             }
         }
         let mut services = self.services.borrow_mut();
         if services.iter().any(|s| s.name == name) {
-            return Err(err(ErrorCode::InvalidInput, format!("服务 {name} 已经发布了")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("服务 {name} 已经发布了"),
+            ));
         }
-        services.push(PublishedService { name: name.clone(), addr, proto, env });
+        services.push(PublishedService {
+            name: name.clone(),
+            addr,
+            proto,
+            env,
+        });
         save(&self.system, KEY_SERVICES, &*services).map_err(internal)?;
         Ok(format!("{me}/{name}"))
     }
@@ -2415,8 +3179,13 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     fn my_name(&self) -> Result<String, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
-        roster.device(self.me()).map(|d| d.name.clone()).ok_or_else(|| internal("本机不在名册里"))
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        roster
+            .device(self.me())
+            .map(|d| d.name.clone())
+            .ok_or_else(|| internal("本机不在名册里"))
     }
 
     /// 本机发布的服务中，`may` 允许连接的那些。
@@ -2425,21 +3194,39 @@ impl<T: Transport, S: System> Node<T, S> {
             .borrow()
             .iter()
             .filter(|s| {
-                required_action(&Request::SvcConnect { name: s.name.clone() }, me).ok().flatten().is_some_and(|a| may(&a))
+                required_action(
+                    &Request::SvcConnect {
+                        name: s.name.clone(),
+                    },
+                    me,
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|a| may(&a))
             })
             .map(PublishedService::info)
             .collect()
     }
 
     fn service_addr(&self, name: &str) -> Option<std::net::SocketAddr> {
-        self.services.borrow().iter().find(|s| s.name == name).map(|s| s.addr)
+        self.services
+            .borrow()
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.addr)
     }
 
-    async fn remote_services(&self, node: &str, agent: Option<&AgentCredential>) -> Result<(String, Vec<ServiceInfo>), WireError> {
+    async fn remote_services(
+        &self,
+        node: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<(String, Vec<ServiceInfo>), WireError> {
         let device = self.resolve_for(node, agent)?;
         if device.node_id == self.me() {
             self.authorize_local(agent, &Request::SvcList)?;
-            let list = self.service_list(&device.name, |a| agent.is_none_or(|ag| ag.cert.cert.grants.iter().any(|g| g.allows(a))));
+            let list = self.service_list(&device.name, |a| {
+                agent.is_none_or(|ag| ag.cert.cert.grants.iter().any(|g| g.allows(a)))
+            });
             return Ok((device.name, list));
         }
         match self.call_node(&device, Request::SvcList, agent).await? {
@@ -2449,11 +3236,19 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 服务一侧：接到本机服务，然后双向转发，直到两个方向都结束。
-    async fn serve_pipe<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, addr: std::net::SocketAddr, name: &str) {
+    async fn serve_pipe<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut stream: St,
+        addr: std::net::SocketAddr,
+        name: &str,
+    ) {
         let mut local = match self.system.tcp_connect(addr).await {
             Ok(c) => c,
             Err(e) => {
-                let failure = err(ErrorCode::Unreachable, format!("服务 {name} 的本机程序没有在运行（{e}）"));
+                let failure = err(
+                    ErrorCode::Unreachable,
+                    format!("服务 {name} 的本机程序没有在运行（{e}）"),
+                );
                 let _ = write_response(&mut stream, &Response::Error(failure)).await;
                 let _ = stream.shutdown().await;
                 drain(&mut stream).await;
@@ -2467,11 +3262,19 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 别的设备经完整节点发给本机 UDP 服务的数据报（M11.5）：流上的帧和本机的 UDP 套接字互相转发。
-    async fn serve_datagram<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, addr: std::net::SocketAddr, name: &str) {
+    async fn serve_datagram<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        mut stream: St,
+        addr: std::net::SocketAddr,
+        name: &str,
+    ) {
         let udp = match self.system.udp_connect(addr).await {
             Ok(u) => u,
             Err(e) => {
-                let failure = err(ErrorCode::Unreachable, format!("服务 {name} 的 UDP 套接字打不开（{e}）"));
+                let failure = err(
+                    ErrorCode::Unreachable,
+                    format!("服务 {name} 的 UDP 套接字打不开（{e}）"),
+                );
                 let _ = write_response(&mut stream, &Response::Error(failure)).await;
                 let _ = stream.shutdown().await;
                 drain(&mut stream).await;
@@ -2481,20 +3284,35 @@ impl<T: Transport, S: System> Node<T, S> {
         if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
-        let _ = datagrams::relay(stream, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await.map(Some)).await;
+        let _ = datagrams::relay(
+            stream,
+            async |b: &[u8]| udp.send(b).await,
+            async |b: &mut [u8]| udp.recv(b).await.map(Some),
+        )
+        .await;
     }
 
-    async fn exit_addresses(&self, target: &Target) -> Result<Vec<std::net::SocketAddr>, WireError> {
-        let ips = match &target.host {
-            Host::Ip(ip) => vec![*ip],
-            Host::Name(name) => {
-                self.system.resolve(name).await.map_err(|e| err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}")))?
-            }
-        };
-        let addrs: Vec<_> = ips.into_iter().filter(|ip| !is_own_address(ip))
-            .map(|ip| std::net::SocketAddr::new(ip, target.port)).collect();
+    async fn exit_addresses(
+        &self,
+        target: &Target,
+    ) -> Result<Vec<std::net::SocketAddr>, WireError> {
+        let ips =
+            match &target.host {
+                Host::Ip(ip) => vec![*ip],
+                Host::Name(name) => self.system.resolve(name).await.map_err(|e| {
+                    err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}"))
+                })?,
+            };
+        let addrs: Vec<_> = ips
+            .into_iter()
+            .filter(|ip| !is_own_address(ip))
+            .map(|ip| std::net::SocketAddr::new(ip, target.port))
+            .collect();
         if addrs.is_empty() {
-            return Err(err(ErrorCode::Denied, format!("出口不连本机地址：{target}")));
+            return Err(err(
+                ErrorCode::Denied,
+                format!("出口不连本机地址：{target}"),
+            ));
         }
         Ok(addrs)
     }
@@ -2527,8 +3345,16 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// `nexus connect`：调用方一侧把命令行的输入送到服务，把服务的输出送回命令行。
-    async fn connect(&self, node: &str, name: &str, agent: Option<AgentCredential>, server: CtlServer) {
-        let body = Request::SvcConnect { name: name.to_string() };
+    async fn connect(
+        &self,
+        node: &str,
+        name: &str,
+        agent: Option<AgentCredential>,
+        server: CtlServer,
+    ) {
+        let body = Request::SvcConnect {
+            name: name.to_string(),
+        };
         let device = match self.resolve_for(node, agent.as_ref()) {
             Ok(d) => d,
             Err(e) => {
@@ -2537,8 +3363,12 @@ impl<T: Transport, S: System> Node<T, S> {
             }
         };
         if device.node_id == self.me() {
-            let check = required_action(&body, &device.name).and_then(|_| self.authorize_local(agent.as_ref(), &body));
-            let addr = check.and_then(|()| self.service_addr(name).ok_or_else(|| err(ErrorCode::NotFound, format!("本机没有发布服务 {name}"))));
+            let check = required_action(&body, &device.name)
+                .and_then(|_| self.authorize_local(agent.as_ref(), &body));
+            let addr = check.and_then(|()| {
+                self.service_addr(name)
+                    .ok_or_else(|| err(ErrorCode::NotFound, format!("本机没有发布服务 {name}")))
+            });
             let addr = match addr {
                 Ok(a) => a,
                 Err(e) => {
@@ -2556,7 +3386,10 @@ impl<T: Transport, S: System> Node<T, S> {
                         let _ = server.tx.send(CtlResponse::Error(e)).await;
                     }
                     other => {
-                        let _ = server.tx.send(CtlResponse::Error(internal(format!("{other:?}")))).await;
+                        let _ = server
+                            .tx
+                            .send(CtlResponse::Error(internal(format!("{other:?}"))))
+                            .await;
                     }
                 }
             };
@@ -2564,7 +3397,10 @@ impl<T: Transport, S: System> Node<T, S> {
             return;
         }
         for attempt in 0..2 {
-            let failure = match self.open_stream(&device, body.clone(), agent.as_ref()).await {
+            let failure = match self
+                .open_stream(&device, body.clone(), agent.as_ref())
+                .await
+            {
                 Ok(stream) => return self.pump_pipe(stream, server).await,
                 Err(OpenError::StaleRoster) if attempt == 0 => {
                     let _ = self.push_roster(device.node_id).await;
@@ -2572,14 +3408,21 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Err(OpenError::StaleRoster) => internal("对方的名册始终比本机旧"),
                 Err(OpenError::Remote(e)) => e,
-                Err(OpenError::Io(e)) => err(ErrorCode::Unreachable, format!("连不上 {}：{e}", device.name)),
+                Err(OpenError::Io(e)) => err(
+                    ErrorCode::Unreachable,
+                    format!("连不上 {}：{e}", device.name),
+                ),
             };
             let _ = server.tx.send(CtlResponse::Error(failure)).await;
             return;
         }
     }
 
-    async fn pump_pipe<St: AsyncRead + AsyncWrite + Unpin>(&self, stream: St, mut server: CtlServer) {
+    async fn pump_pipe<St: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: St,
+        mut server: CtlServer,
+    ) {
         if server.tx.send(CtlResponse::Ok).await.is_err() {
             return;
         }
@@ -2627,10 +3470,20 @@ impl<T: Transport, S: System> Node<T, S> {
         for rule in &rules {
             match &rule.outbound {
                 Outbound::Exit(device) if self.resolve(device)?.node_id == self.me() => {
-                    return Err(err(ErrorCode::InvalidInput, format!("{device} 就是本机：本机出去用 --direct")));
+                    return Err(err(
+                        ErrorCode::InvalidInput,
+                        format!("{device} 就是本机：本机出去用 --direct"),
+                    ));
                 }
-                Outbound::Socks5(upstream) if Target::parse(upstream).filter(|target| target.port != 0).is_none() => {
-                    return Err(err(ErrorCode::InvalidInput, format!("上游代理应当写成 主机:端口：{upstream}")));
+                Outbound::Socks5(upstream)
+                    if Target::parse(upstream)
+                        .filter(|target| target.port != 0)
+                        .is_none() =>
+                {
+                    return Err(err(
+                        ErrorCode::InvalidInput,
+                        format!("上游代理应当写成 主机:端口：{upstream}"),
+                    ));
                 }
                 _ => {}
             }
@@ -2654,24 +3507,64 @@ impl<T: Transport, S: System> Node<T, S> {
         Ok(())
     }
 
+    fn route_import(
+        &self,
+        incoming: Vec<Rule>,
+        replace: bool,
+    ) -> Result<(u32, route::RuleAudit), WireError> {
+        let mut routes = self.routes.borrow_mut();
+        // 先保存上一份已验证规则作为 LKG 快照，确保随时可回滚。
+        save(&self.system, KEY_ROUTES_LKG, &*routes).map_err(internal)?;
+        if replace {
+            routes.rules = incoming;
+        } else {
+            routes.rules.extend(incoming);
+        }
+        let audit = route::audit_rules(&routes.rules);
+        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)?;
+        Ok((routes.rules.len() as u32, audit))
+    }
+
+    fn route_rollback(&self) -> Result<(), WireError> {
+        let Some(lkg) = load::<_, RouteTable>(&self.system, KEY_ROUTES_LKG).map_err(internal)?
+        else {
+            return Err(err(ErrorCode::NotFound, "没有可回滚的上一版规则快照"));
+        };
+        *self.routes.borrow_mut() = lkg.clone();
+        save(&self.system, KEY_ROUTES, &lkg).map_err(internal)
+    }
+
     fn route_explain(&self, target: &str) -> Result<RouteExplanation, WireError> {
-        let t = Target::parse(target).ok_or_else(|| err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}")))?;
+        let t = Target::parse(target).ok_or_else(|| {
+            err(
+                ErrorCode::InvalidInput,
+                format!("目标应当写成 主机:端口：{target}"),
+            )
+        })?;
         let rules = self.routes.borrow().rules.clone();
         Ok(match route::decide(&t, &rules) {
             Decision::Service { device, service } => RouteExplanation::Service { device, service },
             Decision::BadInternalName => RouteExplanation::BadInternalName,
-            Decision::Rule { index, .. } => RouteExplanation::Rule { index: index as u32 + 1, rule: rules[index].clone() },
+            Decision::Rule { index, .. } => RouteExplanation::Rule {
+                index: index as u32 + 1,
+                rule: rules[index].clone(),
+            },
             Decision::Default(outbound) => RouteExplanation::Default { outbound },
         })
     }
 
     /// 名字服务：服务的名字和规则里不直连的域名给本机临时地址，其余照常解析。
     async fn answer_dns(&self, raw: &[u8], full_capture: bool) -> Vec<u8> {
-        let Some(q) = dns::parse_query(raw) else { return Vec::new() };
+        let Some(q) = dns::parse_query(raw) else {
+            return Vec::new();
+        };
         if self.tun.borrow().is_none() {
             return dns::error(&q, dns::SERVFAIL);
         }
-        let target = Target { host: Host::Name(q.name.clone()), port: 0 };
+        let target = Target {
+            host: Host::Name(q.name.clone()),
+            port: 0,
+        };
         let capture = match route::decide(&target, &self.routes.borrow().rules) {
             Decision::Service { device, .. } => {
                 if self.resolve(&device).is_err() {
@@ -2680,7 +3573,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 true
             }
             Decision::BadInternalName => return dns::error(&q, dns::NXDOMAIN),
-            Decision::Rule { outbound, .. } | Decision::Default(outbound) => full_capture || outbound != Outbound::Direct,
+            Decision::Rule { outbound, .. } | Decision::Default(outbound) => {
+                full_capture || outbound != Outbound::Direct
+            }
         };
         if capture {
             if q.qtype != dns::A {
@@ -2707,31 +3602,62 @@ impl<T: Transport, S: System> Node<T, S> {
         let (_, pool) = tun.as_ref()?;
         let (network, prefix) = pool.network();
         let host = match dst.ip() {
-            std::net::IpAddr::V4(ip) if u32::from(ip) >> (32 - prefix) == u32::from(network) >> (32 - prefix) => {
+            std::net::IpAddr::V4(ip)
+                if u32::from(ip) >> (32 - prefix) == u32::from(network) >> (32 - prefix) =>
+            {
                 Host::Name(pool.lookup(ip)?.to_string())
             }
-            ip if matches!(routing, TunRouting::Application { .. }) && !ip.is_unspecified() && dst.port() != 0 => Host::Ip(ip),
+            ip if matches!(routing, TunRouting::Application { .. })
+                && !ip.is_unspecified()
+                && dst.port() != 0 =>
+            {
+                Host::Ip(ip)
+            }
             _ => return None,
         };
-        Some(Target { host, port: dst.port() })
+        Some(Target {
+            host,
+            port: dst.port(),
+        })
     }
 
     fn tun_decision(&self, target: &Target, routing: TunRouting) -> Decision {
         let decision = route::decide(target, &self.routes.borrow().rules);
         match (&decision, routing) {
-            (Decision::Rule { outbound: Outbound::Reject, .. } | Decision::Service { .. } | Decision::BadInternalName, _) => decision,
-            (_, TunRouting::Application { outbound: Some(outbound) }) => Decision::Default(outbound),
+            (
+                Decision::Rule {
+                    outbound: Outbound::Reject,
+                    ..
+                }
+                | Decision::Service { .. }
+                | Decision::BadInternalName,
+                _,
+            ) => decision,
+            (
+                _,
+                TunRouting::Application {
+                    outbound: Some(outbound),
+                },
+            ) => Decision::Default(outbound),
             _ => decision,
         }
     }
 
     /// Catch a literal IP or recover the original name from its temporary address.
-    async fn serve_tun(&self, mut client: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting) {
+    async fn serve_tun(
+        &self,
+        mut client: ProxyStream,
+        dst: std::net::SocketAddr,
+        routing: TunRouting,
+    ) {
         let Some(target) = self.tun_target(dst, &routing) else {
             let _ = client.shutdown().await;
             return;
         };
-        match self.open_outbound_decision(&target, self.tun_decision(&target, routing)).await {
+        match self
+            .open_outbound_decision(&target, self.tun_decision(&target, routing))
+            .await
+        {
             Ok(up) => {
                 let _ = up.splice(client, Vec::new()).await;
             }
@@ -2745,7 +3671,9 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 入口上的一条连接：按第一个字节分辨 SOCKS5 和 HTTP 代理，读出目标，按路由接到出口，然后双向转发。
     async fn serve_proxy(&self, mut client: ProxyStream) {
         let mut buf = Vec::new();
-        let entry = match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, fill(&mut client, &mut buf)).await {
+        let entry = match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, fill(&mut client, &mut buf))
+            .await
+        {
             Ok(true) => sniff(buf[0]),
             _ => None,
         };
@@ -2805,7 +3733,9 @@ impl<T: Transport, S: System> Node<T, S> {
                 client.shutdown().await
             }
             Ok(up) => {
-                client.write_all(&socks5::reply(socks5::Reply::Succeeded)).await?;
+                client
+                    .write_all(&socks5::reply(socks5::Reply::Succeeded))
+                    .await?;
                 up.splice(client, buf).await
             }
         }
@@ -2827,7 +3757,9 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         let (target, first, connect) = match http::parse(&buf) {
             Err(BadRequest(why)) => {
-                client.write_all(&http::response(400, "Bad Request", why)).await?;
+                client
+                    .write_all(&http::response(400, "Bad Request", why))
+                    .await?;
                 return client.shutdown().await;
             }
             Ok(ProxyRequest::Connect(t)) => (t, buf[end..].to_vec(), true),
@@ -2836,11 +3768,17 @@ impl<T: Transport, S: System> Node<T, S> {
         match self.open_outbound(&target).await {
             Err(fail) => {
                 let (status, reason, why) = match fail {
-                    ProxyFail::Rejected => (403, "Forbidden", format!("路由规则不允许访问 {target}")),
+                    ProxyFail::Rejected => {
+                        (403, "Forbidden", format!("路由规则不允许访问 {target}"))
+                    }
                     ProxyFail::Denied(why) => (403, "Forbidden", why),
-                    ProxyFail::Unreachable(why) | ProxyFail::Refused(why) => (502, "Bad Gateway", why),
+                    ProxyFail::Unreachable(why) | ProxyFail::Refused(why) => {
+                        (502, "Bad Gateway", why)
+                    }
                 };
-                client.write_all(&http::response(status, reason, &why)).await?;
+                client
+                    .write_all(&http::response(status, reason, &why))
+                    .await?;
                 client.shutdown().await
             }
             Ok(up) => {
@@ -2853,16 +3791,27 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 按路由接到出口。
-    async fn open_outbound(&self, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+    async fn open_outbound(
+        &self,
+        target: &Target,
+    ) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
         let decision = route::decide(target, &self.routes.borrow().rules);
         self.open_outbound_decision(target, decision).await
     }
 
-    async fn open_outbound_decision(&self, target: &Target, decision: Decision) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+    async fn open_outbound_decision(
+        &self,
+        target: &Target,
+        decision: Decision,
+    ) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
         let outbound = match decision {
-            Decision::Service { device, service } => return self.open_service(&device, &service).await,
+            Decision::Service { device, service } => {
+                return self.open_service(&device, &service).await
+            }
             Decision::BadInternalName => {
-                return Err(ProxyFail::Unreachable(format!("{target} 不是服务的名字：应当是 <服务>.<设备>.{SERVICE_SUFFIX}")))
+                return Err(ProxyFail::Unreachable(format!(
+                    "{target} 不是服务的名字：应当是 <服务>.<设备>.{SERVICE_SUFFIX}"
+                )))
             }
             Decision::Rule { outbound, .. } | Decision::Default(outbound) => outbound,
         };
@@ -2871,11 +3820,19 @@ impl<T: Transport, S: System> Node<T, S> {
             Outbound::Direct => {
                 let ips = match &target.host {
                     Host::Ip(ip) => vec![*ip],
-                    Host::Name(name) => self.system.resolve(name).await.map_err(|e| ProxyFail::Unreachable(format!("解析不了 {name}：{e}")))?,
+                    Host::Name(name) => self
+                        .system
+                        .resolve(name)
+                        .await
+                        .map_err(|e| ProxyFail::Unreachable(format!("解析不了 {name}：{e}")))?,
                 };
                 let mut last = format!("{target} 没有地址");
                 for ip in ips {
-                    match self.system.tcp_connect(std::net::SocketAddr::new(ip, target.port)).await {
+                    match self
+                        .system
+                        .tcp_connect(std::net::SocketAddr::new(ip, target.port))
+                        .await
+                    {
                         Ok(c) => return Ok(Upstream::Tcp(c)),
                         Err(e) => last = format!("连不上 {target}：{e}"),
                     }
@@ -2888,13 +3845,27 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 经网络里的一台设备出去：对方判定授权、审计，再连到目标。
-    async fn open_exit(&self, device: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
-        let body = Request::ExitConnect { target: target.to_string() };
-        self.open_exit_stream(device, body).await.map(Upstream::Remote)
+    async fn open_exit(
+        &self,
+        device: &str,
+        target: &Target,
+    ) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let body = Request::ExitConnect {
+            target: target.to_string(),
+        };
+        self.open_exit_stream(device, body)
+            .await
+            .map(Upstream::Remote)
     }
 
-    async fn open_exit_stream(&self, device: &str, body: Request) -> Result<<T::Conn as Connection>::Stream, ProxyFail> {
-        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
+    async fn open_exit_stream(
+        &self,
+        device: &str,
+        body: Request,
+    ) -> Result<<T::Conn as Connection>::Stream, ProxyFail> {
+        let device = self
+            .resolve(device)
+            .map_err(|e| ProxyFail::Unreachable(e.message))?;
         for attempt in 0..2 {
             match self.open_stream(&device, body.clone(), None).await {
                 Ok(stream) => return Ok(stream),
@@ -2902,37 +3873,64 @@ impl<T: Transport, S: System> Node<T, S> {
                     let _ = self.push_roster(device.node_id).await;
                 }
                 Err(OpenError::StaleRoster) => break,
-                Err(OpenError::Remote(e)) if e.code == ErrorCode::Denied => return Err(ProxyFail::Denied(e.message)),
+                Err(OpenError::Remote(e)) if e.code == ErrorCode::Denied => {
+                    return Err(ProxyFail::Denied(e.message))
+                }
                 Err(OpenError::Remote(e)) => return Err(ProxyFail::Unreachable(e.message)),
-                Err(OpenError::Io(e)) => return Err(ProxyFail::Unreachable(format!("连不上出口 {}：{e}", device.name))),
+                Err(OpenError::Io(e)) => {
+                    return Err(ProxyFail::Unreachable(format!(
+                        "连不上出口 {}：{e}",
+                        device.name
+                    )))
+                }
             }
         }
         Err(ProxyFail::Unreachable("对方的名册始终比本机旧".into()))
     }
 
-    async fn connect_socks_upstream(&self, upstream: &str) -> Result<(S::Tcp, std::net::IpAddr), ProxyFail> {
-        let up = Target::parse(upstream).ok_or_else(|| ProxyFail::Unreachable(format!("上游代理的地址不对：{upstream}")))?;
+    async fn connect_socks_upstream(
+        &self,
+        upstream: &str,
+    ) -> Result<(S::Tcp, std::net::IpAddr), ProxyFail> {
+        let up = Target::parse(upstream)
+            .ok_or_else(|| ProxyFail::Unreachable(format!("上游代理的地址不对：{upstream}")))?;
         let ips = match &up.host {
             Host::Ip(ip) => vec![*ip],
-            Host::Name(name) => self.system.resolve(name).await.map_err(|e| ProxyFail::Unreachable(format!("解析不了上游代理 {name}：{e}")))?,
+            Host::Name(name) => self
+                .system
+                .resolve(name)
+                .await
+                .map_err(|e| ProxyFail::Unreachable(format!("解析不了上游代理 {name}：{e}")))?,
         };
         for ip in ips {
-            if let Ok(c) = self.system.tcp_connect(std::net::SocketAddr::new(ip, up.port)).await {
+            if let Ok(c) = self
+                .system
+                .tcp_connect(std::net::SocketAddr::new(ip, up.port))
+                .await
+            {
                 return Ok((c, ip));
             }
         }
-        Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 没有在运行")))
+        Err(ProxyFail::Unreachable(format!(
+            "上游代理 {upstream} 没有在运行"
+        )))
     }
 
     /// 交给上游 SOCKS5 代理：目标原样交过去，不在本机解析。
-    async fn open_upstream(&self, upstream: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+    async fn open_upstream(
+        &self,
+        upstream: &str,
+        target: &Target,
+    ) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
         let (mut conn, _) = self.connect_socks_upstream(upstream).await?;
         let handshake = async {
             conn.write_all(&[5, 1, 0]).await?;
             let mut greet = [0u8; 2];
             conn.read_exact(&mut greet).await?;
             if greet != socks5::NO_AUTH {
-                return Ok(Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 要求认证（还不支持）"))));
+                return Ok(Err(ProxyFail::Unreachable(format!(
+                    "上游代理 {upstream} 要求认证（还不支持）"
+                ))));
             }
             conn.write_all(&socks5::request(target)).await?;
             let mut head = vec![0u8; 5];
@@ -2944,35 +3942,62 @@ impl<T: Transport, S: System> Node<T, S> {
                 _ => 0,
             };
             if total < 5 {
-                return Ok(Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 的回应无法理解"))));
+                return Ok(Err(ProxyFail::Unreachable(format!(
+                    "上游代理 {upstream} 的回应无法理解"
+                ))));
             }
             head.resize(total, 0);
             conn.read_exact(&mut head[5..]).await?;
             Ok::<_, io::Error>(match socks5::parse_reply(&head) {
                 Ok(Some((_, 0))) => Ok(()),
-                Ok(Some((_, 2))) => Err(ProxyFail::Denied(format!("上游代理 {upstream} 不允许访问 {target}"))),
-                Ok(Some((_, code))) => Err(ProxyFail::Refused(format!("上游代理 {upstream} 连不上 {target}（回应码 {code}）"))),
-                _ => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 的回应无法理解"))),
+                Ok(Some((_, 2))) => Err(ProxyFail::Denied(format!(
+                    "上游代理 {upstream} 不允许访问 {target}"
+                ))),
+                Ok(Some((_, code))) => Err(ProxyFail::Refused(format!(
+                    "上游代理 {upstream} 连不上 {target}（回应码 {code}）"
+                ))),
+                _ => Err(ProxyFail::Unreachable(format!(
+                    "上游代理 {upstream} 的回应无法理解"
+                ))),
             })
         };
         match tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, handshake).await {
             Ok(Ok(Ok(()))) => Ok(Upstream::Tcp(conn)),
             Ok(Ok(Err(fail))) => Err(fail),
-            Ok(Err(e)) => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 断开了：{e}"))),
-            Err(_) => Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 没有回应"))),
+            Ok(Err(e)) => Err(ProxyFail::Unreachable(format!(
+                "上游代理 {upstream} 断开了：{e}"
+            ))),
+            Err(_) => Err(ProxyFail::Unreachable(format!(
+                "上游代理 {upstream} 没有回应"
+            ))),
         }
     }
 
     /// 网络里的服务：本机的直接连，别的设备的经 Nexus 连（对方判定授权并审计）。
-    async fn open_service(&self, device: &str, name: &str) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
-        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
+    async fn open_service(
+        &self,
+        device: &str,
+        name: &str,
+    ) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let device = self
+            .resolve(device)
+            .map_err(|e| ProxyFail::Unreachable(e.message))?;
         if device.node_id == self.me() {
-            let addr = self.service_addr(name).ok_or_else(|| ProxyFail::Unreachable(format!("本机没有发布服务 {name}")))?;
-            return self.system.tcp_connect(addr).await.map(Upstream::Tcp).map_err(|e| {
-                ProxyFail::Unreachable(format!("服务 {name} 的本机程序没有在运行（{e}）"))
-            });
+            let addr = self
+                .service_addr(name)
+                .ok_or_else(|| ProxyFail::Unreachable(format!("本机没有发布服务 {name}")))?;
+            return self
+                .system
+                .tcp_connect(addr)
+                .await
+                .map(Upstream::Tcp)
+                .map_err(|e| {
+                    ProxyFail::Unreachable(format!("服务 {name} 的本机程序没有在运行（{e}）"))
+                });
         }
-        let body = Request::SvcConnect { name: name.to_string() };
+        let body = Request::SvcConnect {
+            name: name.to_string(),
+        };
         for attempt in 0..2 {
             match self.open_stream(&device, body.clone(), None).await {
                 Ok(stream) => return Ok(Upstream::Remote(stream)),
@@ -2981,15 +4006,27 @@ impl<T: Transport, S: System> Node<T, S> {
                 }
                 Err(OpenError::StaleRoster) => break,
                 Err(OpenError::Remote(e)) => return Err(ProxyFail::Unreachable(e.message)),
-                Err(OpenError::Io(e)) => return Err(ProxyFail::Unreachable(format!("连不上 {}：{e}", device.name))),
+                Err(OpenError::Io(e)) => {
+                    return Err(ProxyFail::Unreachable(format!(
+                        "连不上 {}：{e}",
+                        device.name
+                    )))
+                }
             }
         }
         Err(ProxyFail::Unreachable("对方的名册始终比本机旧".into()))
     }
 
-    async fn remote_session_kill(&self, node: &str, name: &str, agent: Option<&AgentCredential>) -> Result<(), WireError> {
+    async fn remote_session_kill(
+        &self,
+        node: &str,
+        name: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<(), WireError> {
         let device = self.resolve_for(node, agent)?;
-        let body = Request::SessionKill { name: name.to_string() };
+        let body = Request::SessionKill {
+            name: name.to_string(),
+        };
         if device.node_id == self.me() {
             required_action(&body, &device.name)?;
             self.authorize_local(agent, &body)?;
@@ -3006,18 +4043,29 @@ impl<T: Transport, S: System> Node<T, S> {
         let devices = match device {
             Some(d) => vec![self.resolve(d)?],
             None => {
-                let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
-                roster.devices.into_iter().filter(|d| d.node_id != self.me()).collect()
+                let roster = self
+                    .roster()
+                    .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+                roster
+                    .devices
+                    .into_iter()
+                    .filter(|d| d.node_id != self.me())
+                    .collect()
             }
         };
         Ok(devices
             .into_iter()
-            .map(|d| nexus_wire::DevicePaths { paths: self.transport.paths(d.node_id), device: d.name })
+            .map(|d| nexus_wire::DevicePaths {
+                paths: self.transport.paths(d.node_id),
+                device: d.name,
+            })
             .collect())
     }
 
     fn local_status(&self) -> StatusReport {
-        let role = self.roster().and_then(|r| r.device(self.me()).map(|d| d.role));
+        let role = self
+            .roster()
+            .and_then(|r| r.device(self.me()).map(|d| d.role));
         StatusReport {
             name: self.name(),
             node_id: self.me(),
@@ -3035,7 +4083,10 @@ impl<T: Transport, S: System> Node<T, S> {
         }
         let name = name.unwrap_or_else(|| self.configured_name.clone());
         if !valid_segment(&name) {
-            return Err(err(ErrorCode::InvalidInput, format!("设备名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("设备名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
         let mut seed = [0u8; 32];
         self.system.random(&mut seed);
@@ -3043,7 +4094,12 @@ impl<T: Transport, S: System> Node<T, S> {
         let roster = Roster {
             root: root.public(),
             version: 1,
-            devices: vec![Device { node_id: self.me(), name: name.clone(), role: DeviceRole::Admin, added_at: self.system.now() }],
+            devices: vec![Device {
+                node_id: self.me(),
+                name: name.clone(),
+                role: DeviceRole::Admin,
+                added_at: self.system.now(),
+            }],
             revoked_agents: vec![],
             web_keys: vec![],
             anchor: None,
@@ -3061,7 +4117,12 @@ impl<T: Transport, S: System> Node<T, S> {
         trust.root_key = Some(seed);
         trust.roster = Some(roster);
         self.roster_epoch.send_modify(|v| *v += 1);
-        Ok(InitReport { name, node_id: self.me(), root: root.public(), recovery_code: hex_encode(&seed) })
+        Ok(InitReport {
+            name,
+            node_id: self.me(),
+            root: root.public(),
+            recovery_code: hex_encode(&seed),
+        })
     }
 
     async fn join_start(&self) -> Result<CtlResponse, WireError> {
@@ -3071,7 +4132,11 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut nonce = [0u8; 16];
         self.system.random(&mut nonce);
         let expires_at = Timestamp(self.system.now().0 + JOIN_CODE_TTL_MS);
-        let previous = self.pending_join.borrow_mut().replace(PendingJoin { nonce, expires_at, short_seed: None });
+        let previous = self.pending_join.borrow_mut().replace(PendingJoin {
+            nonce,
+            expires_at,
+            short_seed: None,
+        });
         let code = JoinCode {
             node_id: self.me(),
             nonce,
@@ -3080,7 +4145,11 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         // 旧的短码立即失效（尽力而为：碰头服务连不上时它也会在 10 分钟后过期）。
         if let Some(seed) = previous.and_then(|p| p.short_seed) {
-            let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(seed, Vec::new())).await;
+            let _ = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                self.transport.rendezvous_put(seed, Vec::new()),
+            )
+            .await;
         }
         // 短加入码：加密后的长加入码放到碰头服务上，位置和密钥都从短码派生。
         let mut random = [0u8; 7];
@@ -3090,41 +4159,74 @@ impl<T: Transport, S: System> Node<T, S> {
         let mut salt = [0u8; 16];
         self.system.random(&mut salt);
         let sealed = joincode::seal(&keys, salt, &code.to_bytes());
-        let put = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(keys.seed, sealed)).await;
+        let put = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.transport.rendezvous_put(keys.seed, sealed),
+        )
+        .await;
         let (short_code, short_code_error) = match put {
             Ok(Ok(())) => {
-                if let Some(p) = self.pending_join.borrow_mut().as_mut().filter(|p| p.nonce == nonce) {
+                if let Some(p) = self
+                    .pending_join
+                    .borrow_mut()
+                    .as_mut()
+                    .filter(|p| p.nonce == nonce)
+                {
                     p.short_seed = Some(keys.seed);
                 }
                 (Some(short.display()), None)
             }
-            Ok(Err(e)) if e.kind() == io::ErrorKind::Unsupported => (None, Some(format!("没有碰头服务（{e}）"))),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::Unsupported => {
+                (None, Some(format!("没有碰头服务（{e}）")))
+            }
             Ok(Err(e)) => (None, Some(format!("连不上碰头服务：{e}"))),
             Err(_) => (None, Some("连接碰头服务超时".to_string())),
         };
-        Ok(CtlResponse::JoinCode { code: code.encode(), short_code, short_code_error, expires_at })
+        Ok(CtlResponse::JoinCode {
+            code: code.encode(),
+            short_code,
+            short_code_error,
+            expires_at,
+        })
     }
 
     /// 管理设备拿到的加入码：长码直接解码；短码到碰头服务上取回、解密（M6.1）。
     /// 返回长加入码和短码的位置（用过之后让它失效）。
-    async fn resolve_join_code(&self, text: &str) -> Result<(JoinCode, Option<[u8; 32]>), WireError> {
+    async fn resolve_join_code(
+        &self,
+        text: &str,
+    ) -> Result<(JoinCode, Option<[u8; 32]>), WireError> {
         if JoinCode::looks_like(text) {
-            return JoinCode::decode(text).map(|c| (c, None)).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"));
+            return JoinCode::decode(text)
+                .map(|c| (c, None))
+                .ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"));
         }
-        let short = ShortCode::parse(text).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
+        let short =
+            ShortCode::parse(text).ok_or_else(|| err(ErrorCode::InvalidInput, "加入码格式不对"))?;
         let keys = short.keys();
-        let got = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_get(keys.seed)).await;
+        let got =
+            tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_get(keys.seed)).await;
         let data = match got {
             Ok(Ok(Some(data))) if !data.is_empty() => data,
-            Ok(Ok(_)) => return Err(err(ErrorCode::NotFound, "找不到这个短加入码：已过期、已经用过，或者输错了")),
+            Ok(Ok(_)) => {
+                return Err(err(
+                    ErrorCode::NotFound,
+                    "找不到这个短加入码：已过期、已经用过，或者输错了",
+                ))
+            }
             Ok(Err(e)) if e.kind() == io::ErrorKind::Unsupported => {
-                return Err(err(ErrorCode::InvalidState, format!("本机没有碰头服务，只能用长加入码（{e}）")))
+                return Err(err(
+                    ErrorCode::InvalidState,
+                    format!("本机没有碰头服务，只能用长加入码（{e}）"),
+                ))
             }
             Ok(Err(e)) => return Err(err(ErrorCode::Unreachable, format!("连不上碰头服务：{e}"))),
             Err(_) => return Err(err(ErrorCode::Unreachable, "连接碰头服务超时")),
         };
-        let plain = joincode::open(&keys, &data).ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录无法解密"))?;
-        let code = JoinCode::from_bytes(&plain).ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录格式不对"))?;
+        let plain = joincode::open(&keys, &data)
+            .ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录无法解密"))?;
+        let code = JoinCode::from_bytes(&plain)
+            .ok_or_else(|| err(ErrorCode::InvalidInput, "碰头服务上的短加入码记录格式不对"))?;
         Ok((code, Some(keys.seed)))
     }
 
@@ -3133,10 +4235,19 @@ impl<T: Transport, S: System> Node<T, S> {
             .borrow()
             .root_key
             .map(SecretKey::from_seed)
-            .ok_or_else(|| err(ErrorCode::InvalidState, "只有管理设备（执行过 nexus init 的设备）能修改名册"))
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidState,
+                    "只有管理设备（执行过 nexus init 的设备）能修改名册",
+                )
+            })
     }
 
-    async fn approve(&self, code: &str, name: Option<String>) -> Result<MembershipReport, WireError> {
+    async fn approve(
+        &self,
+        code: &str,
+        name: Option<String>,
+    ) -> Result<MembershipReport, WireError> {
         // 名册的修改串行进行。等新设备确认期间（最长两倍请求超时）一直持有：
         // 发给它的名册必须是最新的，同时发生的撤销等它确认之后再写入下一个版本。
         let _write = self.roster_write.lock().await;
@@ -3144,25 +4255,48 @@ impl<T: Transport, S: System> Node<T, S> {
         let (code, short_seed) = self.resolve_join_code(code).await?;
         let name = name.unwrap_or_else(|| code.name.clone());
         if !valid_segment(&name) {
-            return Err(err(ErrorCode::InvalidInput, format!("设备名 {name:?} 不合法：只能用字母、数字、- 和 _")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("设备名 {name:?} 不合法：只能用字母、数字、- 和 _"),
+            ));
         }
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         if roster.device(code.node_id).is_some() {
             return Err(err(ErrorCode::InvalidState, "这台设备已经在名册里"));
         }
         if roster.device_by_name(&name).is_some() {
-            return Err(err(ErrorCode::InvalidInput, format!("设备名 {name} 已被占用，请用 --name 换一个")));
+            return Err(err(
+                ErrorCode::InvalidInput,
+                format!("设备名 {name} 已被占用，请用 --name 换一个"),
+            ));
         }
         roster.version += 1;
-        roster.devices.push(Device { node_id: code.node_id, name: name.clone(), role: DeviceRole::Member, added_at: self.system.now() });
+        roster.devices.push(Device {
+            node_id: code.node_id,
+            name: name.clone(),
+            role: DeviceRole::Member,
+            added_at: self.system.now(),
+        });
         let signed = roster.sign(&root);
 
         self.transport.add_hint(code.node_id, &code.addr);
-        let offer = Request::JoinOffer { nonce: code.nonce, roster: signed.clone(), addrs: self.addr_hints() };
-        let reply = tokio::time::timeout(REQUEST_TIMEOUT * 2, self.request_once(code.node_id, Proto::Join, Principal::Device, offer)).await;
+        let offer = Request::JoinOffer {
+            nonce: code.nonce,
+            roster: signed.clone(),
+            addrs: self.addr_hints(),
+        };
+        let reply = tokio::time::timeout(
+            REQUEST_TIMEOUT * 2,
+            self.request_once(code.node_id, Proto::Join, Principal::Device, offer),
+        )
+        .await;
         match reply {
             Ok(Ok((Response::Ok, _))) => {}
-            Ok(Ok((Response::Error(e), _))) => return Err(err(e.code, format!("对方拒绝加入：{}", e.message))),
+            Ok(Ok((Response::Error(e), _))) => {
+                return Err(err(e.code, format!("对方拒绝加入：{}", e.message)))
+            }
             Ok(Ok((other, _))) => return Err(internal(format!("对方的回应无法理解：{other:?}"))),
             Ok(Err(e)) => return Err(err(ErrorCode::Unreachable, format!("连不上这台设备：{e}"))),
             Err(_) => return Err(err(ErrorCode::Unreachable, "连接这台设备超时")),
@@ -3173,16 +4307,28 @@ impl<T: Transport, S: System> Node<T, S> {
         drop(_write);
         // 用过的短码立即失效。
         if let Some(seed) = short_seed {
-            let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.rendezvous_put(seed, Vec::new())).await;
+            let _ = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                self.transport.rendezvous_put(seed, Vec::new()),
+            )
+            .await;
         }
         let (pushed, unreachable) = self.broadcast_roster(Some(code.node_id)).await;
-        Ok(MembershipReport { name, node_id: code.node_id, roster_version: self.roster_version(), pushed, unreachable })
+        Ok(MembershipReport {
+            name,
+            node_id: code.node_id,
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     async fn revoke(&self, name: &str) -> Result<MembershipReport, WireError> {
         let _write = self.roster_write.lock().await;
         let root = self.admin_key()?;
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let device = roster
             .device_by_name(name)
             .cloned()
@@ -3199,14 +4345,22 @@ impl<T: Transport, S: System> Node<T, S> {
         self.roster_epoch.send_modify(|v| *v += 1);
         drop(_write);
         let (pushed, unreachable) = self.broadcast_roster(None).await;
-        Ok(MembershipReport { name: name.to_string(), node_id: device.node_id, roster_version: self.roster_version(), pushed, unreachable })
+        Ok(MembershipReport {
+            name: name.to_string(),
+            node_id: device.node_id,
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     /// 在管理设备上轮换网络的根密钥（M10.1，R75）：无需重建网络，旧恢复码与旧根签发的 agent 立即失效。
     async fn rotate_root(&self) -> Result<nexus_wire::RootRotateReport, WireError> {
         let _write = self.roster_write.lock().await;
         let old_root = self.admin_key()?;
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let mut new_seed = [0u8; 32];
         self.system.random(&mut new_seed);
         let new_root = SecretKey::from_seed(new_seed);
@@ -3264,22 +4418,42 @@ impl<T: Transport, S: System> Node<T, S> {
             let t = self.trust.borrow();
             (t.root, t.root_key.is_some())
         };
-        let root_pub = root_pub.ok_or_else(|| err(ErrorCode::InvalidState, "本机还不属于任何网络：恢复码只能在网络里的设备上用"))?;
+        let root_pub = root_pub.ok_or_else(|| {
+            err(
+                ErrorCode::InvalidState,
+                "本机还不属于任何网络：恢复码只能在网络里的设备上用",
+            )
+        })?;
         if has_key {
             return Err(err(ErrorCode::InvalidState, "本机已经是管理设备"));
         }
-        let cleaned: String = code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_lowercase();
+        let cleaned: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
         let seed: [u8; 32] = nexus_wire::hex_decode(&cleaned)
             .and_then(|b| b.try_into().ok())
-            .ok_or_else(|| err(ErrorCode::InvalidInput, "恢复码格式不对：应当是 64 个十六进制字符（nexus init 输出的）"))?;
+            .ok_or_else(|| {
+                err(
+                    ErrorCode::InvalidInput,
+                    "恢复码格式不对：应当是 64 个十六进制字符（nexus init 输出的）",
+                )
+            })?;
         let root = SecretKey::from_seed(seed);
         if root.public() != root_pub {
             return Err(err(ErrorCode::InvalidInput, "恢复码不属于这个网络"));
         }
-        let mut roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
+        let mut roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机没有名册"))?;
         let me = self.me();
         for d in &mut roster.devices {
-            d.role = if d.node_id == me { DeviceRole::Admin } else { DeviceRole::Member };
+            d.role = if d.node_id == me {
+                DeviceRole::Admin
+            } else {
+                DeviceRole::Member
+            };
         }
         roster.version += 1;
         let signed = roster.sign(&root);
@@ -3289,7 +4463,11 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(())
         };
         persist().map_err(internal)?;
-        let name = signed.roster.device(me).map(|d| d.name.clone()).unwrap_or_default();
+        let name = signed
+            .roster
+            .device(me)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
         {
             let mut t = self.trust.borrow_mut();
             t.root_key = Some(seed);
@@ -3300,13 +4478,24 @@ impl<T: Transport, S: System> Node<T, S> {
         let (pushed, unreachable) = self.broadcast_roster(None).await;
         // 原来的 Vault 条目只在各台设备上：收回在线设备上的（离线的之后在这里 vault sync 再收）。
         let _ = self.vault_collect().await;
-        Ok(MembershipReport { name, node_id: me, roster_version: self.roster_version(), pushed, unreachable })
+        Ok(MembershipReport {
+            name,
+            node_id: me,
+            roster_version: self.roster_version(),
+            pushed,
+            unreachable,
+        })
     }
 
     /// 在名册里按名字或标识找设备。
     fn resolve(&self, name_or_id: &str) -> Result<Device, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
-        let by_id = name_or_id.parse::<NodeId>().ok().and_then(|id| roster.device(id).cloned());
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let by_id = name_or_id
+            .parse::<NodeId>()
+            .ok()
+            .and_then(|id| roster.device(id).cloned());
         roster
             .device_by_name(name_or_id)
             .cloned()
@@ -3317,7 +4506,11 @@ impl<T: Transport, S: System> Node<T, S> {
     async fn probe(&self, device: &Device) -> Result<StatusReport, WireError> {
         let started = self.system.now();
         // 探测总是以本机设备的身份进行；agent 能看到什么，由调用方按授权过滤。
-        let reply = tokio::time::timeout(REQUEST_TIMEOUT, self.request(device, Request::NodeInfo, None)).await;
+        let reply = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.request(device, Request::NodeInfo, None),
+        )
+        .await;
         let rtt_ms = self.system.now().millis_since(started);
         let offline = StatusReport {
             name: device.name.clone(),
@@ -3329,23 +4522,32 @@ impl<T: Transport, S: System> Node<T, S> {
             role: Some(device.role),
         };
         match reply {
-            Ok(Ok((Response::NodeInfo(info), path))) if info.node_id == device.node_id => Ok(StatusReport {
-                info: Some(info),
-                online: true,
-                rtt_ms: Some(rtt_ms),
-                path,
-                ..offline
-            }),
+            Ok(Ok((Response::NodeInfo(info), path))) if info.node_id == device.node_id => {
+                Ok(StatusReport {
+                    info: Some(info),
+                    online: true,
+                    rtt_ms: Some(rtt_ms),
+                    path,
+                    ..offline
+                })
+            }
             Ok(Ok((Response::Error(e), _))) if e.code == ErrorCode::Denied => Err(err(
                 ErrorCode::Denied,
-                format!("{} 拒绝了访问（本机可能已被移出名册）：{}", device.name, e.message),
+                format!(
+                    "{} 拒绝了访问（本机可能已被移出名册）：{}",
+                    device.name, e.message
+                ),
             )),
             // 超时、连接失败、或对端自称是别的节点：一律视为不可达。
             _ => Ok(offline),
         }
     }
 
-    async fn remote_status(&self, name_or_id: &str, agent: Option<&AgentCredential>) -> Result<StatusReport, WireError> {
+    async fn remote_status(
+        &self,
+        name_or_id: &str,
+        agent: Option<&AgentCredential>,
+    ) -> Result<StatusReport, WireError> {
         let device = self.resolve_for(name_or_id, agent)?;
         if device.node_id == self.me() {
             return Ok(self.local_status());
@@ -3355,12 +4557,21 @@ impl<T: Transport, S: System> Node<T, S> {
 
     async fn list(&self, agent: Option<&AgentCredential>) -> Vec<ListEntry> {
         let Some(roster) = self.roster() else {
-            return vec![ListEntry { report: self.local_status(), is_self: true }];
+            return vec![ListEntry {
+                report: self.local_status(),
+                is_self: true,
+            }];
         };
-        let devices = roster.devices.iter().filter(|d| agent.is_none_or(|a| visible(a, &d.name)));
+        let devices = roster
+            .devices
+            .iter()
+            .filter(|d| agent.is_none_or(|a| visible(a, &d.name)));
         let reports = join_all(devices.map(|d| async move {
             if d.node_id == self.me() {
-                return ListEntry { report: self.local_status(), is_self: true };
+                return ListEntry {
+                    report: self.local_status(),
+                    is_self: true,
+                };
             }
             let report = self.probe(d).await.unwrap_or(StatusReport {
                 name: d.name.clone(),
@@ -3371,7 +4582,10 @@ impl<T: Transport, S: System> Node<T, S> {
                 path: None,
                 role: Some(d.role),
             });
-            ListEntry { report, is_self: false }
+            ListEntry {
+                report,
+                is_self: false,
+            }
         }))
         .await;
         reports
@@ -3384,7 +4598,10 @@ fn visible(agent: &AgentCredential, device: &str) -> bool {
 }
 
 /// 可取消的帧写入；部分写入的进度保存在调用方，不受 select! 取消影响。
-async fn write_pending<W: AsyncWrite + Unpin>(wr: &mut W, frame: &mut (Vec<u8>, usize)) -> io::Result<()> {
+async fn write_pending<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    frame: &mut (Vec<u8>, usize),
+) -> io::Result<()> {
     while frame.1 < frame.0.len() {
         let n = wr.write(&frame.0[frame.1..]).await?;
         if n == 0 {
@@ -3397,14 +4614,18 @@ async fn write_pending<W: AsyncWrite + Unpin>(wr: &mut W, frame: &mut (Vec<u8>, 
 
 /// 限时写一帧：写入卡住 [`PEER_SILENT`] 也算失败（连接可能已经失效而传输层还没发现）。
 async fn send_within<W: AsyncWrite + Unpin, M: serde::Serialize>(wr: &mut W, msg: &M) -> bool {
-    matches!(tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await, Ok(Ok(())))
+    matches!(
+        tokio::time::timeout(PEER_SILENT, write_msg(wr, msg)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// 页面地址对应的依赖方（通行密钥绑定的域名）：`https://域名[:端口]`，或开发用的 `http://localhost[:端口]`。
 fn page_rp_id(page: &str) -> Option<String> {
     let (_, rest) = page.split_once("://")?;
     let host = rest.split(':').next()?;
-    (!host.is_empty() && nexus_core_proto::webauthn::origin_allowed(page, host)).then(|| host.to_string())
+    (!host.is_empty() && nexus_core_proto::webauthn::origin_allowed(page, host))
+        .then(|| host.to_string())
 }
 
 /// 一组授权能否看到 `path`（或它之下的东西）。
@@ -3481,7 +4702,9 @@ mod tests {
         }
         fn add_hint(&self, _: NodeId, _: &str) {}
         async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<TestConnection> {
-            let Some((peer, tx)) = &self.network else { unreachable!() };
+            let Some((peer, tx)) = &self.network else {
+                unreachable!()
+            };
             assert_eq!(to, *peer);
             assert!(matches!(proto, Proto::Rpc));
             Ok(TestConnection(Some(tx.clone())))
@@ -3512,13 +4735,26 @@ mod tests {
         type Pty = TestPty;
         type Tcp = DuplexStream;
         async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<DuplexStream> {
-            self.0.tcp_targets.borrow_mut().remove(&addr).ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
+            self.0
+                .tcp_targets
+                .borrow_mut()
+                .remove(&addr)
+                .ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
         }
         async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<nexus_sys::UdpConn> {
-            self.0.udp_targets.borrow_mut().remove(&addr).ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
+            self.0
+                .udp_targets
+                .borrow_mut()
+                .remove(&addr)
+                .ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
         }
         async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
-            self.0.dns.borrow().get(host).cloned().ok_or_else(|| io::ErrorKind::NotFound.into())
+            self.0
+                .dns
+                .borrow()
+                .get(host)
+                .cloned()
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
         }
         fn now(&self) -> Timestamp {
             Timestamp(0)
@@ -3527,7 +4763,11 @@ mod tests {
             unreachable!()
         }
         fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-            Ok(if key == KEY_ROUTES { self.0.saved_routes.borrow().clone() } else { None })
+            Ok(if key == KEY_ROUTES {
+                self.0.saved_routes.borrow().clone()
+            } else {
+                None
+            })
         }
         fn cas_get(&self, _: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
             Ok(None)
@@ -3566,8 +4806,15 @@ mod tests {
     #[test]
     fn invalid_or_unsaved_batch_does_not_modify_routes() {
         let node = Node::new(TestTransport::default(), TestSystem(Rc::default()), "test").unwrap();
-        let rule = |name: &str, outbound: Outbound| Rule { matcher: route::Matcher::parse_domain(name).unwrap(), outbound };
-        assert_eq!(node.route_add(rule("original.test", Outbound::Direct)).unwrap(), 1);
+        let rule = |name: &str, outbound: Outbound| Rule {
+            matcher: route::Matcher::parse_domain(name).unwrap(),
+            outbound,
+        };
+        assert_eq!(
+            node.route_add(rule("original.test", Outbound::Direct))
+                .unwrap(),
+            1
+        );
         let original = node.routes.borrow().clone();
         let valid = rule("valid.test", Outbound::Socks5("127.0.0.1:7890".into()));
         let invalid = rule("invalid.test", Outbound::Socks5("invalid".into()));
@@ -3577,7 +4824,10 @@ mod tests {
         node.system.0.fail_route_write.set(true);
         assert!(node.route_add_many(vec![valid.clone()]).is_err());
         assert_eq!(*node.routes.borrow(), original);
-        assert_eq!(load::<_, RouteTable>(&node.system, KEY_ROUTES).unwrap(), Some(original));
+        assert_eq!(
+            load::<_, RouteTable>(&node.system, KEY_ROUTES).unwrap(),
+            Some(original)
+        );
 
         node.system.0.fail_route_write.set(false);
         assert_eq!(node.route_add_many(vec![valid.clone()]).unwrap(), 2);
@@ -3637,11 +4887,22 @@ mod tests {
             write_msg(&mut client, &future).await.unwrap();
             read_response(&mut client).await.unwrap()
         };
-        let ((), answer) = tokio::time::timeout(Duration::from_secs(3), futures_util::future::join(serve, ask)).await.unwrap();
+        let ((), answer) = tokio::time::timeout(
+            Duration::from_secs(3),
+            futures_util::future::join(serve, ask),
+        )
+        .await
+        .unwrap();
         match answer {
             Response::Error(e) => {
                 assert_eq!(e.code, ErrorCode::UnsupportedVersion);
-                assert!(e.message.contains("home") && e.message.contains(env!("CARGO_PKG_VERSION")) && e.message.contains("升级"), "{}", e.message);
+                assert!(
+                    e.message.contains("home")
+                        && e.message.contains(env!("CARGO_PKG_VERSION"))
+                        && e.message.contains("升级"),
+                    "{}",
+                    e.message
+                );
             }
             other => panic!("应当回应版本错误：{other:?}"),
         }

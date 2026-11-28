@@ -12,10 +12,18 @@ use nexus_core_proto::{NodeId, SecretKey, Timestamp};
 
 const NOW: Timestamp = Timestamp(1_800_000_000_000);
 
-fn root() -> SecretKey { SecretKey::from_seed([1; 32]) }
-fn other_root() -> SecretKey { SecretKey::from_seed([2; 32]) }
-fn agent_key() -> SecretKey { SecretKey::from_seed([3; 32]) }
-fn other_agent() -> SecretKey { SecretKey::from_seed([4; 32]) }
+fn root() -> SecretKey {
+    SecretKey::from_seed([1; 32])
+}
+fn other_root() -> SecretKey {
+    SecretKey::from_seed([2; 32])
+}
+fn agent_key() -> SecretKey {
+    SecretKey::from_seed([3; 32])
+}
+fn other_agent() -> SecretKey {
+    SecretKey::from_seed([4; 32])
+}
 const LAPTOP: NodeId = NodeId([10; 32]);
 const HOME: NodeId = NodeId([11; 32]); // 本节点
 const STRANGER: NodeId = NodeId([12; 32]);
@@ -44,12 +52,25 @@ enum Kind {
 }
 
 const KINDS: [Kind; 19] = [
-    Kind::DeviceInRoster, Kind::DeviceStranger, Kind::AgentOk, Kind::AgentSkewEdgePast,
-    Kind::AgentSkewEdgeFuture, Kind::AgentStartsNow, Kind::AgentViaStranger, Kind::AgentCertForged,
-    Kind::AgentCertTampered, Kind::AgentCertRosterPurpose, Kind::AgentNotYetValid,
-    Kind::AgentExpiredExactly, Kind::AgentRevoked, Kind::AgentAssertionByOtherKey,
-    Kind::AgentAssertionCertPurpose, Kind::AgentWrongTarget, Kind::AgentActionMismatch,
-    Kind::AgentStalePast, Kind::AgentStaleFuture,
+    Kind::DeviceInRoster,
+    Kind::DeviceStranger,
+    Kind::AgentOk,
+    Kind::AgentSkewEdgePast,
+    Kind::AgentSkewEdgeFuture,
+    Kind::AgentStartsNow,
+    Kind::AgentViaStranger,
+    Kind::AgentCertForged,
+    Kind::AgentCertTampered,
+    Kind::AgentCertRosterPurpose,
+    Kind::AgentNotYetValid,
+    Kind::AgentExpiredExactly,
+    Kind::AgentRevoked,
+    Kind::AgentAssertionByOtherKey,
+    Kind::AgentAssertionCertPurpose,
+    Kind::AgentWrongTarget,
+    Kind::AgentActionMismatch,
+    Kind::AgentStalePast,
+    Kind::AgentStaleFuture,
 ];
 
 const GRANT_SHAPES: [&[(&str, &str)]; 7] = [
@@ -58,14 +79,26 @@ const GRANT_SHAPES: [&[(&str, &str)]; 7] = [
     &[("term.*", "home/**")],
     &[("*", "*/session/*")],
     &[("node.info", "office")],
-    &[("node.info", "office"), ("term.session.*", "home/session/*")],
+    &[
+        ("node.info", "office"),
+        ("term.session.*", "home/session/*"),
+    ],
     &[("*", "**")],
 ];
 const CAPS: [&str; 3] = ["term.exec", "term.session.attach", "node.info"];
-const RESOURCES: [&str; 5] = ["home", "home/session/main", "home/files", "office", "office/session/x"];
+const RESOURCES: [&str; 5] = [
+    "home",
+    "home/session/main",
+    "home/files",
+    "office",
+    "office/session/x",
+];
 
 fn action(cap: &str, res: &str) -> Action {
-    Action { capability: Capability::parse(cap).unwrap(), resource: ResourcePath::parse(res).unwrap() }
+    Action {
+        capability: Capability::parse(cap).unwrap(),
+        resource: ResourcePath::parse(res).unwrap(),
+    }
 }
 
 fn grants(shape: &[(&str, &str)]) -> Vec<Grant> {
@@ -79,10 +112,25 @@ fn grants(shape: &[(&str, &str)]) -> Vec<Grant> {
 }
 
 fn roster(kind: Kind) -> Roster {
-    let dev = |id, name: &str| Device { node_id: id, name: name.into(), role: DeviceRole::Member, added_at: Timestamp(0) };
-    let mut r = Roster { root: root().public(), version: 3, devices: vec![dev(LAPTOP, "laptop"), dev(HOME, "home")], revoked_agents: vec![], web_keys: vec![], anchor: None };
+    let dev = |id, name: &str| Device {
+        node_id: id,
+        name: name.into(),
+        role: DeviceRole::Member,
+        added_at: Timestamp(0),
+    };
+    let mut r = Roster {
+        root: root().public(),
+        version: 3,
+        devices: vec![dev(LAPTOP, "laptop"), dev(HOME, "home")],
+        revoked_agents: vec![],
+        web_keys: vec![],
+        anchor: None,
+    };
     if kind == Kind::AgentRevoked {
-        r.revoked_agents.push(RevokedAgent { agent: agent_key().public(), revoked_at: Timestamp(NOW.0 - 1) });
+        r.revoked_agents.push(RevokedAgent {
+            agent: agent_key().public(),
+            revoked_at: Timestamp(NOW.0 - 1),
+        });
     }
     r
 }
@@ -124,7 +172,11 @@ fn build(kind: Kind, shape: &[(&str, &str)], act: &Action) -> (NodeId, Principal
 
     let signed_action = if kind == AgentActionMismatch {
         // 与实际请求只差一处
-        let other_res = if act.resource.as_str() == "office" { "home" } else { "office" };
+        let other_res = if act.resource.as_str() == "office" {
+            "home"
+        } else {
+            "office"
+        };
         action(act.capability.as_str(), other_res)
     } else {
         act.clone()
@@ -137,7 +189,11 @@ fn build(kind: Kind, shape: &[(&str, &str)], act: &Action) -> (NodeId, Principal
         _ => NOW,
     };
     let assertion = Assertion {
-        target: if kind == AgentWrongTarget { LAPTOP } else { HOME },
+        target: if kind == AgentWrongTarget {
+            LAPTOP
+        } else {
+            HOME
+        },
         action: signed_action,
         issued_at,
         nonce: [9; 16],
@@ -147,8 +203,19 @@ fn build(kind: Kind, shape: &[(&str, &str)], act: &Action) -> (NodeId, Principal
         AgentAssertionCertPurpose => agent_key().sign(Purpose::AgentCert, &canonical(&assertion)),
         _ => assertion.sign(&agent_key()),
     };
-    let peer = if kind == AgentViaStranger { STRANGER } else { LAPTOP };
-    (peer, Principal::Agent { cert: signed, assertion, signature })
+    let peer = if kind == AgentViaStranger {
+        STRANGER
+    } else {
+        LAPTOP
+    };
+    (
+        peer,
+        Principal::Agent {
+            cert: signed,
+            assertion,
+            signature,
+        },
+    )
 }
 
 // ---- 参考判定：与正式实现分开写，只依赖字符串 ----
@@ -157,7 +224,9 @@ fn ref_resource_match(pat: &[&str], path: &[&str]) -> bool {
     match (pat.split_first(), path.split_first()) {
         (None, None) => true,
         (Some((&"**", _)), _) => true,
-        (Some((p, prest)), Some((q, qrest))) if *p == "*" || p == q => ref_resource_match(prest, qrest),
+        (Some((p, prest)), Some((q, qrest))) if *p == "*" || p == q => {
+            ref_resource_match(prest, qrest)
+        }
         _ => false,
     }
 }
@@ -193,7 +262,11 @@ fn reference(kind: Kind, shape: &[(&str, &str)], cap: &str, res: &str) -> Outcom
                 ref_cap_match(&gc.split('.').collect::<Vec<_>>(), &csegs)
                     && ref_resource_match(&gr.split('/').collect::<Vec<_>>(), &rsegs)
             });
-            if hit { Outcome::Allow } else { deny(NoMatchingGrant) }
+            if hit {
+                Outcome::Allow
+            } else {
+                deny(NoMatchingGrant)
+            }
         }
     }
 }
@@ -205,7 +278,11 @@ fn matrix_matches_reference() {
     let mut mismatches = Vec::new();
     for kind in KINDS {
         let roster = roster(kind);
-        let ctx = Context { roster: &roster, me: HOME, now: NOW };
+        let ctx = Context {
+            roster: &roster,
+            me: HOME,
+            now: NOW,
+        };
         for shape in GRANT_SHAPES {
             for cap in CAPS {
                 for res in RESOURCES {
@@ -214,7 +291,10 @@ fn matrix_matches_reference() {
                     let verdict = decide(&ctx, peer, &principal, &act);
                     let want = reference(kind, shape, cap, res);
                     if verdict.outcome != want {
-                        mismatches.push(format!("{kind:?} {shape:?} {cap} {res}: 得到 {:?}，应为 {want:?}", verdict.outcome));
+                        mismatches.push(format!(
+                            "{kind:?} {shape:?} {cap} {res}: 得到 {:?}，应为 {want:?}",
+                            verdict.outcome
+                        ));
                     }
                     // 每次判定都附带完整的审计事件
                     let a = &verdict.audit;
@@ -238,10 +318,21 @@ fn matrix_matches_reference() {
             }
         }
     }
-    assert!(mismatches.is_empty(), "{} 处不一致：\n{}", mismatches.len(), mismatches.join("\n"));
-    assert_eq!(checked, KINDS.len() * GRANT_SHAPES.len() * CAPS.len() * RESOURCES.len());
+    assert!(
+        mismatches.is_empty(),
+        "{} 处不一致：\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
+    assert_eq!(
+        checked,
+        KINDS.len() * GRANT_SHAPES.len() * CAPS.len() * RESOURCES.len()
+    );
     // 矩阵里既要有大量允许，也要有大量拒绝，否则说明构造本身出了问题
-    assert!(allowed > 100 && checked - allowed > 1000, "允许 {allowed} / 共 {checked}");
+    assert!(
+        allowed > 100 && checked - allowed > 1000,
+        "允许 {allowed} / 共 {checked}"
+    );
 }
 
 #[test]
@@ -249,7 +340,9 @@ fn visibility_follows_grants() {
     // covers: R15
     let act = action("node.info", "home");
     let (_, p) = build(Kind::AgentOk, &[("term.exec", "home/session/build")], &act);
-    let Principal::Agent { cert, .. } = p else { unreachable!() };
+    let Principal::Agent { cert, .. } = p else {
+        unreachable!()
+    };
     let see = |s: &str| cert.can_see(&ResourcePath::parse(s).unwrap());
     assert!(see("home"));
     assert!(see("home/session/build"));
@@ -257,6 +350,8 @@ fn visibility_follows_grants() {
     assert!(!see("office"));
 
     let (_, p) = build(Kind::AgentOk, &[], &act);
-    let Principal::Agent { cert, .. } = p else { unreachable!() };
+    let Principal::Agent { cert, .. } = p else {
+        unreachable!()
+    };
     assert!(!cert.can_see(&ResourcePath::parse("home").unwrap()));
 }

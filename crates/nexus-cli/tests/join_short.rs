@@ -11,15 +11,26 @@ fn json(text: &str) -> Value {
 }
 
 fn names(v: &Value) -> Vec<String> {
-    let mut out: Vec<String> = v["devices"].as_array().unwrap().iter().map(|d| d["name"].as_str().unwrap().to_string()).collect();
+    let mut out: Vec<String> = v["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap().to_string())
+        .collect();
     out.sort();
     out
 }
 
 async fn short_code(w: &World, node: &str) -> String {
     let v = w.cli_ok(node, &["join"]).await;
-    let code = v["short_code"].as_str().unwrap_or_else(|| panic!("join 应当给出短码：{v}")).to_string();
-    assert!(v["code"].as_str().unwrap().starts_with("nxj2-"), "长码：{v}");
+    let code = v["short_code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("join 应当给出短码：{v}"))
+        .to_string();
+    assert!(
+        v["code"].as_str().unwrap().starts_with("nxj2-"),
+        "长码：{v}"
+    );
     code
 }
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Nexus 的 Android 外壳：一个 VpnService 和一个用来授权、启动它的界面。核心在 libnexus_android.so 里。 -->
+<!-- Nexus 的 Android 外壳：一个 VpnService 和完整的 N1/N2 控制界面。核心在 libnexus_android.so 里。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="link.bewith.nexus"
     android:versionCode="2"
@@ -7,7 +7,7 @@
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- 多路径（M11.4）：请求蜂窝网络在有 Wi-Fi 时也保持在线。 -->
+    <!-- 多路径（M11.4 / N2）：仅在实时多路径模式下请求蜂窝网络在线。 -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -18,8 +18,14 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
     </queries>
+    <!-- 应用分流（N1）：列出已安装应用供用户选择绕过 VPN。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <application android:label="Nexus" android:extractNativeLibs="true" android:allowBackup="false">
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

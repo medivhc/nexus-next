@@ -34,7 +34,10 @@ impl EntryHandle {
             out.extend_from_slice(host.as_bytes());
         }
         if out.len() > MAX_USER_HANDLE {
-            return Err(format!("中继地址太长，放不进通行密钥（主机名最多 {} 字节）", MAX_USER_HANDLE - 33));
+            return Err(format!(
+                "中继地址太长，放不进通行密钥（主机名最多 {} 字节）",
+                MAX_USER_HANDLE - 33
+            ));
         }
         Ok(out)
     }
@@ -74,19 +77,45 @@ mod tests {
             (None, None),
             (Some("https://bewith.link"), Some("https://bewith.link/")),
             (Some("https://bewith.link/"), Some("https://bewith.link/")),
-            (Some("http://127.0.0.1:3340"), Some("http://127.0.0.1:3340/")),
+            (
+                Some("http://127.0.0.1:3340"),
+                Some("http://127.0.0.1:3340/"),
+            ),
         ] {
-            let h = EntryHandle { node, relay: relay.map(String::from) };
+            let h = EntryHandle {
+                node,
+                relay: relay.map(String::from),
+            };
             let bytes = h.encode().unwrap();
             assert!(bytes.len() <= MAX_USER_HANDLE);
-            assert_eq!(EntryHandle::decode(&bytes), Some(EntryHandle { node, relay: back.map(String::from) }));
+            assert_eq!(
+                EntryHandle::decode(&bytes),
+                Some(EntryHandle {
+                    node,
+                    relay: back.map(String::from)
+                })
+            );
         }
-        let long = EntryHandle { node, relay: Some(format!("https://{}", "a".repeat(32))) };
+        let long = EntryHandle {
+            node,
+            relay: Some(format!("https://{}", "a".repeat(32))),
+        };
         assert!(long.encode().is_err());
-        let ok = EntryHandle { node, relay: Some(format!("https://{}", "a".repeat(31))) };
+        let ok = EntryHandle {
+            node,
+            relay: Some(format!("https://{}", "a".repeat(31))),
+        };
         assert_eq!(ok.encode().unwrap().len(), 64);
         for bad in ["ftp://x", "https://", "https://a/b"] {
-            assert!(EntryHandle { node, relay: Some(bad.into()) }.encode().is_err(), "{bad}");
+            assert!(
+                EntryHandle {
+                    node,
+                    relay: Some(bad.into())
+                }
+                .encode()
+                .is_err(),
+                "{bad}"
+            );
         }
         assert_eq!(EntryHandle::decode(&[0; 31]), None);
         let mut bad = vec![0u8; 32];

@@ -29,8 +29,15 @@ static STOP: Mutex<Option<DaemonStop>> = Mutex::new(None);
 /// 启动常驻程序。返回 0 表示已经启动；之后的错误写到数据目录里的 daemon.log。
 /// `rendezvous` 和 `nexus daemon --rendezvous` 一样：空串或 `default` 跟随 `discovery`，`disabled` 不用，其余是地址
 /// （自建网络里用锚点的 `https://<锚点>/pkarr`）。
-fn start(data_dir: PathBuf, name: String, tun_fd: OwnedFd, relay: String, discovery: bool, rendezvous: String,
-    (app_router, on_traffic): (Option<AppRouter>, Option<TrafficObserver>)) -> Result<(), String> {
+fn start(
+    data_dir: PathBuf,
+    name: String,
+    tun_fd: OwnedFd,
+    relay: String,
+    discovery: bool,
+    rendezvous: String,
+    (app_router, on_traffic): (Option<AppRouter>, Option<TrafficObserver>),
+) -> Result<(), String> {
     let mut stop = STOP.lock().map_err(|_| "状态损坏".to_string())?;
     if stop.is_some() {
         return Err("已经在运行".into());
@@ -45,36 +52,52 @@ fn start(data_dir: PathBuf, name: String, tun_fd: OwnedFd, relay: String, discov
         .spawn(move || {
             let log = data_dir.join("daemon.log");
             // ipstack closes active TCP flows with block_in_place.
-            let result = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| e.to_string()).and_then(|rt| {
-                rt.block_on(async {
-                    // 网卡要在运行时里注册到事件循环。
-                    // SAFETY: VpnService.establish() 给出的描述符，所有权交给我们（Java 一侧 detachFd）。
-                    let device = unsafe { tun_rs::AsyncDevice::from_fd(tun_fd.into_raw_fd()) }.map_err(|e| format!("网卡：{e}"))?;
-                    let mut config = daemon::transport_config(false, &relay, !discovery);
-                    if let Some(r) = rendezvous_override(&rendezvous) {
-                        config.rendezvous = r;
-                    }
-                    config.scheduling = true;
-                    let opts = daemon::Options {
-                        data_dir: data_dir.clone(),
-                        agent_socket: data_dir.join("agent.sock"),
-                        name: Some(name),
-                        config,
-                        proxy: None,
-                        tun: Some(daemon::Tun::Device { device, label: "android-vpn".into(), pool, app_router, on_traffic }),
-                    };
-                    daemon::run(opts, async {
-                        let _ = rx.await;
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        // 网卡要在运行时里注册到事件循环。
+                        // SAFETY: VpnService.establish() 给出的描述符，所有权交给我们（Java 一侧 detachFd）。
+                        let device = unsafe { tun_rs::AsyncDevice::from_fd(tun_fd.into_raw_fd()) }
+                            .map_err(|e| format!("网卡：{e}"))?;
+                        let mut config = daemon::transport_config(false, &relay, !discovery);
+                        if let Some(r) = rendezvous_override(&rendezvous) {
+                            config.rendezvous = r;
+                        }
+                        config.scheduling = true;
+                        let opts = daemon::Options {
+                            data_dir: data_dir.clone(),
+                            agent_socket: data_dir.join("agent.sock"),
+                            name: Some(name),
+                            config,
+                            proxy: None,
+                            tun: Some(daemon::Tun::Device {
+                                device,
+                                label: "android-vpn".into(),
+                                pool,
+                                app_router,
+                                on_traffic,
+                            }),
+                        };
+                        daemon::run(opts, async {
+                            let _ = rx.await;
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
                     })
-                    .await
-                    .map_err(|e| e.to_string())
-                })
-            });
+                });
             let line = match result {
                 Ok(()) => "nexus: 已停止\n".to_string(),
                 Err(e) => format!("nexus: {e}\n"),
             };
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
             if let Ok(mut s) = STOP.lock() {
                 *s = None;
             }
@@ -99,7 +122,11 @@ pub fn rendezvous_override(text: &str) -> Option<Option<String>> {
 /// 数据目录里有 trace 文件时，各个库的调试日志也写进去（排查用）。
 fn redirect_stderr(path: &std::path::Path) {
     use std::os::fd::AsRawFd;
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         // SAFETY: 把一个打开的文件复制到描述符 2；f 随后关闭不影响复制出的描述符。
         unsafe {
             libc::dup2(f.as_raw_fd(), 2);
@@ -140,73 +167,26 @@ pub fn screen_json(data_dir: &std::path::Path, held: &str, renew: bool, now_ms: 
         _ => None,
     };
     let ctl = nexus_cli::UnixCtl::new(data_dir, None);
-    let screen = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let screen = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt.block_on(async {
             // 核心卡住时界面不能跟着卡住。
-            tokio::time::timeout(std::time::Duration::from_secs(15), refresh(&ctl, held, renew, now_ms))
-                .await
-                .unwrap_or(Screen::Failed { message: "核心没有回应".into() })
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                refresh(&ctl, held, renew, now_ms),
+            )
+            .await
+            .unwrap_or(Screen::Failed {
+                message: "核心没有回应".into(),
+            })
         }),
-        Err(e) => Screen::Failed { message: e.to_string() },
+        Err(e) => Screen::Failed {
+            message: e.to_string(),
+        },
     };
     serde_json::to_string(&screen).unwrap_or_default()
-}
-
-fn route_command(data_dir: &std::path::Path, operation: &str, domain: &str, endpoint: &str) -> Result<String, String> {
-    use nexus_cli::{Captured, Cmd, Output, RouteCmd, UnixCtl};
-    use nexus_net_core::route::Outbound;
-    let ctl = UnixCtl::new(data_dir, None);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    let timeout = std::time::Duration::from_secs(10);
-    if let Some(mode) = operation.strip_prefix("import_") {
-        if endpoint.is_empty() {
-            return Err("请填写导入规则使用的出口".into());
-        }
-        let selected = match mode {
-            "exit" => Outbound::Exit(endpoint.to_string()),
-            "socks5" => Outbound::Socks5(endpoint.to_string()),
-            _ => return Err("未知的导入出口类型".into()),
-        };
-        return runtime.block_on(async {
-            let count = tokio::time::timeout(timeout, nexus_cli::app::import_rules(&ctl, domain, selected))
-                .await.map_err(|_| "核心没有回应".to_string())??;
-            Ok(format!("已追加 {count} 条规则。已有规则仍优先匹配。"))
-        });
-    }
-    let cmd = match operation {
-        "list" => RouteCmd::Ls { json: false },
-        "remove" => {
-            let index = domain.parse::<u32>().ok().filter(|&n| n != 0).ok_or("请输入要删除的规则编号")?;
-            RouteCmd::Rm { index, json: false }
-        }
-        "exit" | "socks5" | "reject" => {
-            if operation != "reject" && endpoint.is_empty() {
-                return Err("请填写出口设备名或 SOCKS5 地址".into());
-            }
-            RouteCmd::Add {
-                domain: Some(domain.to_string()), cidr: None, reject: operation == "reject", direct: false,
-                via: (operation == "exit").then(|| endpoint.to_string()),
-                socks5: (operation == "socks5").then(|| endpoint.to_string()), json: false,
-            }
-        }
-        _ => return Err("未知的规则操作".into()),
-    };
-    runtime.block_on(async {
-        let mut captured = Captured::default();
-        let request = Cmd::Route { cmd };
-        let mut input = tokio::io::empty();
-        let code = tokio::time::timeout(
-            timeout,
-            nexus_cli::run_client(&request, &ctl, &mut input, &mut captured),
-        ).await.map_err(|_| "核心没有回应".to_string())?;
-        let output = Output::from_captured(code, captured);
-        if code == 0 {
-            return Ok(output.stdout);
-        }
-        let message = serde_json::from_str::<serde_json::Value>(&output.stderr).ok()
-            .and_then(|value| value.get("message")?.as_str().map(str::to_string)).unwrap_or(output.stderr);
-        Err(message)
-    })
 }
 
 fn string(env: &mut JNIEnv, s: &JString) -> String {
@@ -221,13 +201,20 @@ fn app_router(env: &mut JNIEnv, service: &JObject) -> jni::errors::Result<AppRou
         let result = env.with_local_frame(8, |env| -> jni::errors::Result<Option<TunRouting>> {
             let src_ip = env.new_string(src.ip().to_string())?;
             let dst_ip = env.new_string(dst.ip().to_string())?;
-            let result = env.call_method(
-                service.as_obj(), "routeForConnection", "(ILjava/lang/String;ILjava/lang/String;I)Ljava/lang/String;",
-                &[
-                    JValue::Int(protocol.into()), JValue::Object(src_ip.as_ref()), JValue::Int(src.port().into()),
-                    JValue::Object(dst_ip.as_ref()), JValue::Int(dst.port().into()),
-                ],
-            )?.l()?;
+            let result = env
+                .call_method(
+                    service.as_obj(),
+                    "routeForConnection",
+                    "(ILjava/lang/String;ILjava/lang/String;I)Ljava/lang/String;",
+                    &[
+                        JValue::Int(protocol.into()),
+                        JValue::Object(src_ip.as_ref()),
+                        JValue::Int(src.port().into()),
+                        JValue::Object(dst_ip.as_ref()),
+                        JValue::Int(dst.port().into()),
+                    ],
+                )?
+                .l()?;
             if result.is_null() {
                 return Ok(None);
             }
@@ -237,7 +224,10 @@ fn app_router(env: &mut JNIEnv, service: &JObject) -> jni::errors::Result<AppRou
                 None
             } else if let Some(device) = route.strip_prefix("exit:").filter(|s| !s.is_empty()) {
                 Some(Outbound::Exit(device.into()))
-            } else if let Some(address) = route.strip_prefix("socks5:").filter(|s| Target::parse(s).is_some_and(|target| target.port != 0)) {
+            } else if let Some(address) = route
+                .strip_prefix("socks5:")
+                .filter(|s| Target::parse(s).is_some_and(|target| target.port != 0))
+            {
                 Some(Outbound::Socks5(address.into()))
             } else {
                 return Ok(None);
@@ -256,7 +246,9 @@ fn traffic_observer(env: &mut JNIEnv, service: &JObject) -> jni::errors::Result<
     let service = env.new_global_ref(service)?;
     Ok(Box::new(move || {
         if let Ok(mut env) = vm.attach_current_thread() {
-            if env.call_method(service.as_obj(), "onTunTraffic", "()V", &[]).is_err()
+            if env
+                .call_method(service.as_obj(), "onTunTraffic", "()V", &[])
+                .is_err()
                 && env.exception_check().unwrap_or(false)
             {
                 let _ = env.exception_clear();
@@ -283,7 +275,12 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
         static INIT_CTX: std::sync::Once = std::sync::Once::new();
         INIT_CTX.call_once(|| {
             let ctx = env
-                .call_method(&_this, "getApplicationContext", "()Landroid/content/Context;", &[])
+                .call_method(
+                    &_this,
+                    "getApplicationContext",
+                    "()Landroid/content/Context;",
+                    &[],
+                )
                 .ok()
                 .and_then(|v| v.l().ok())
                 .unwrap_or_else(|| env.new_local_ref(&_this).unwrap());
@@ -296,13 +293,21 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
             }
         });
     }
-    let (data_dir, name, relay) = (string(&mut env, &data_dir), string(&mut env, &name), string(&mut env, &relay));
+    let (data_dir, name, relay) = (
+        string(&mut env, &data_dir),
+        string(&mut env, &name),
+        string(&mut env, &relay),
+    );
     let rendezvous = string(&mut env, &rendezvous);
     // SAFETY: Java passes ownership of its open VPN descriptor via detachFd().
     let tun_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
     let observers = (|| -> jni::errors::Result<_> {
-        let router = (full_capture != 0).then(|| app_router(&mut env, &_this)).transpose()?;
-        let traffic = (adaptive_cellular != 0).then(|| traffic_observer(&mut env, &_this)).transpose()?;
+        let router = (full_capture != 0)
+            .then(|| app_router(&mut env, &_this))
+            .transpose()?;
+        let traffic = (adaptive_cellular != 0)
+            .then(|| traffic_observer(&mut env, &_this))
+            .transpose()?;
         Ok((router, traffic))
     })();
     let observers = match observers {
@@ -312,7 +317,15 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
             return -1;
         }
     };
-    match start(data_dir.into(), name, tun_fd, relay, discovery != 0, rendezvous, observers) {
+    match start(
+        data_dir.into(),
+        name,
+        tun_fd,
+        relay,
+        discovery != 0,
+        rendezvous,
+        observers,
+    ) {
         Ok(()) => 0,
         Err(e) => {
             let _ = env.throw_new("java/lang/IllegalStateException", e);
@@ -322,13 +335,20 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(_env: JNIEnv, _class: JClass) {
+pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
     stop();
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStopping(_env: JNIEnv, _class: JClass) -> jboolean {
-    STOP.lock().is_ok_and(|s| s.as_ref().is_some_and(|daemon| daemon.signal.is_none())) as jboolean
+pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStopping(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    STOP.lock()
+        .is_ok_and(|s| s.as_ref().is_some_and(|daemon| daemon.signal.is_none())) as jboolean
 }
 
 /// 系统的网络变化时（M11.4）：应用把当前每个网络的接口名和是否计费交过来，下一次查看接口（5 秒内）时生效。
@@ -341,12 +361,17 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeSetNetworks(
 ) {
     let n = env.get_array_length(&names).unwrap_or(0).max(0) as usize;
     let mut flags = vec![0 as jboolean; n];
-    if env.get_boolean_array_region(&metered, 0, &mut flags).is_err() {
+    if env
+        .get_boolean_array_region(&metered, 0, &mut flags)
+        .is_err()
+    {
         return;
     }
     let mut list = Vec::with_capacity(n);
     for (i, m) in flags.iter().enumerate() {
-        let Ok(obj) = env.get_object_array_element(&names, i as i32) else { return };
+        let Ok(obj) = env.get_object_array_element(&names, i as i32) else {
+            return;
+        };
         let name = string(&mut env, &JString::from(obj));
         if !name.is_empty() {
             list.push((name, *m != 0));
@@ -365,21 +390,334 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
     now_ms: jlong,
 ) -> jstring {
     let (data_dir, held) = (string(&mut env, &data_dir), string(&mut env, &held));
-    let json = screen_json(std::path::Path::new(&data_dir), &held, renew != 0, now_ms.max(0) as u64);
-    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    let json = screen_json(
+        std::path::Path::new(&data_dir),
+        &held,
+        renew != 0,
+        now_ms.max(0) as u64,
+    );
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// N2 电源模式查询：判断当前模式在有 Wi-Fi 时是否需要主动请求蜂窝网络。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeShouldKeepCellular(
+    mut env: JNIEnv,
+    _class: JClass,
+    power_mode: JString,
+) -> jboolean {
+    let mode_str = string(&mut env, &power_mode);
+    let mode = nexus_net_core::power::PowerMode::parse(&mode_str);
+    jboolean::from(nexus_net_core::power::PowerPolicy::for_mode(mode).keep_cellular_with_wifi)
+}
+
+/// N1 应用绕过列表归一化：返回按换行分隔的最终 `disallowed_packages`（强制包含自身包名防 VPN 环路）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeEffectiveBypass(
+    mut env: JNIEnv,
+    _class: JClass,
+    self_pkg: JString,
+    raw_lines: JString,
+) -> jstring {
+    let self_pkg = string(&mut env, &self_pkg);
+    let raw = string(&mut env, &raw_lines);
+    let policy = nexus_net_core::app_policy::AppPolicy::parse_lines(&raw);
+    let joined = policy.effective_disallowed_packages(&self_pkg).join(
+        "
+",
+    );
+    env.new_string(joined)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+fn ctl_request_sync(
+    data_dir: &std::path::Path,
+    req: nexus_wire::CtlRequest,
+) -> Result<nexus_wire::CtlResponse, String> {
+    let ctl = nexus_cli::UnixCtl::new(data_dir, None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            nexus_cli::call(&ctl, req),
+        )
+        .await
+        .map_err(|_| "核心没有回应（请确认 VPN 已启动）".to_string())?
+        .map_err(|e| format!("无法连接核心：{e}"))
+    })
+}
+
+fn route_list_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteList) {
+        Ok(nexus_wire::CtlResponse::Routes(rules)) => {
+            let items: Vec<serde_json::Value> = rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    serde_json::json!({
+                        "index": i + 1,
+                        "match": r.matcher.to_string(),
+                        "outbound": r.outbound.to_string(),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "ok": true, "rules": items }).to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_import_json(
+    data_dir: &std::path::Path,
+    yaml: &str,
+    via_exit: &str,
+    socks5: &str,
+    replace: bool,
+    dry_run: bool,
+) -> String {
+    let opts = nexus_net_core::import::ImportOptions {
+        default_exit: (!via_exit.trim().is_empty()).then(|| via_exit.trim().to_string()),
+        default_socks5: (!socks5.trim().is_empty()).then(|| socks5.trim().to_string()),
+    };
+    let report = nexus_net_core::import::parse_clash_rules(yaml, &opts);
+    let pre_audit = nexus_net_core::route::audit_rules(&report.imported);
+    if dry_run {
+        return serde_json::json!({
+            "ok": true,
+            "dry_run": true,
+            "imported_count": report.imported.len(),
+            "skipped": report.skipped,
+            "notes": report.notes,
+            "audit": pre_audit,
+        })
+        .to_string();
+    }
+    match ctl_request_sync(
+        data_dir,
+        nexus_wire::CtlRequest::RouteImport {
+            rules: report.imported,
+            replace,
+        },
+    ) {
+        Ok(nexus_wire::CtlResponse::RouteImported { total, audit }) => serde_json::json!({
+            "ok": true,
+            "dry_run": false,
+            "total": total,
+            "skipped": report.skipped,
+            "notes": report.notes,
+            "audit": audit,
+        })
+        .to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_rollback_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRollback) {
+        Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_rm_json(data_dir: &std::path::Path, index: u32) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRm { index }) {
+        Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
+    let trimmed = target.trim();
+    let normalized = if trimmed.contains(':') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}:443")
+    };
+    if nexus_net_core::Target::parse(&normalized).is_none() {
+        return serde_json::json!({ "ok": false, "error": format!("目标格式不合法：{trimmed}（示例：claude.ai:443）") }).to_string();
+    }
+    match ctl_request_sync(
+        data_dir,
+        nexus_wire::CtlRequest::RouteExplain {
+            target: normalized.clone(),
+        },
+    ) {
+        Ok(nexus_wire::CtlResponse::Explained(exp)) => {
+            let summary = match exp {
+                nexus_wire::RouteExplanation::Service { device, service } => {
+                    format!("目标 {normalized} → Nexus 私有服务 {device}/{service}")
+                }
+                nexus_wire::RouteExplanation::BadInternalName => {
+                    format!("目标 {normalized} → 非法的 .internal 服务名（应为 <服务>.<设备>.internal）")
+                }
+                nexus_wire::RouteExplanation::Rule { index, rule } => {
+                    format!(
+                        "目标 {normalized} → 命中第 {index} 条规则（{}）→ {}",
+                        rule.matcher, rule.outbound
+                    )
+                }
+                nexus_wire::RouteExplanation::Default { outbound } => {
+                    format!("目标 {normalized} → 未命中规则，走默认动作：{outbound}")
+                }
+            };
+            serde_json::json!({ "ok": true, "summary": summary }).to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_audit_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteAudit) {
+        Ok(nexus_wire::CtlResponse::RouteAudit(audit)) => {
+            serde_json::json!({ "ok": true, "clean": audit.is_clean(), "issues": audit.issues })
+                .to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => {
+            serde_json::json!({ "ok": false, "error": e.message }).to_string()
+        }
+        Ok(other) => {
+            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
+                .to_string()
+        }
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRoutes(
-    mut env: JNIEnv, _class: JClass, data_dir: JString, operation: JString, domain: JString, endpoint: JString,
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteList(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
 ) -> jstring {
-    let data_dir = string(&mut env, &data_dir);
-    let operation = string(&mut env, &operation);
-    let domain = string(&mut env, &domain);
-    let endpoint = string(&mut env, &endpoint);
-    let message = route_command(std::path::Path::new(&data_dir), &operation, domain.trim(), endpoint.trim())
-        .unwrap_or_else(|e| format!("规则操作失败：{e}"));
-    env.new_string(message).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    let dir = string(&mut env, &data_dir);
+    let json = route_list_json(std::path::Path::new(&dir));
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteImport(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    yaml: JString,
+    via_exit: JString,
+    socks5: JString,
+    replace: jboolean,
+    dry_run: jboolean,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let yaml = string(&mut env, &yaml);
+    let via_exit = string(&mut env, &via_exit);
+    let socks5 = string(&mut env, &socks5);
+    let json = route_import_json(
+        std::path::Path::new(&dir),
+        &yaml,
+        &via_exit,
+        &socks5,
+        replace != 0,
+        dry_run != 0,
+    );
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRollback(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_rollback_json(std::path::Path::new(&dir));
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRm(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    index: jint,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_rm_json(std::path::Path::new(&dir), index.max(0) as u32);
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteExplain(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    target: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let target = string(&mut env, &target);
+    let json = route_explain_json(std::path::Path::new(&dir), &target);
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteAudit(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_audit_json(std::path::Path::new(&dir));
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]
@@ -392,7 +730,10 @@ mod tests {
         assert_eq!(rendezvous_override(""), None);
         assert_eq!(rendezvous_override("default"), None);
         assert_eq!(rendezvous_override("disabled"), Some(None));
-        assert_eq!(rendezvous_override("http://10.0.0.1:8080/pkarr"), Some(Some("http://10.0.0.1:8080/pkarr".into())));
+        assert_eq!(
+            rendezvous_override("http://10.0.0.1:8080/pkarr"),
+            Some(Some("http://10.0.0.1:8080/pkarr".into()))
+        );
     }
 
     // FP-11.2-06：核心还没起来（没有控制套接字）时界面显示正在启动；交回的内容不对也不影响
@@ -400,7 +741,8 @@ mod tests {
     fn screen_before_the_core_is_up() {
         let dir = std::env::temp_dir().join(format!("nexus-android-test-{}", std::process::id()));
         for held in ["", "{", r#"{"state":"starting","message":"x"}"#] {
-            let v: serde_json::Value = serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
             assert_eq!(v["state"], "starting", "{v}");
         }
     }

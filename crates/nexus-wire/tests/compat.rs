@@ -33,8 +33,18 @@ fn roster() -> SignedRoster {
         root: key(1).public(),
         version: 7,
         devices: vec![
-            Device { node_id: node(2), name: "laptop".into(), role: DeviceRole::Admin, added_at: Timestamp(1_000) },
-            Device { node_id: node(3), name: "home".into(), role: DeviceRole::Member, added_at: Timestamp(2_000) },
+            Device {
+                node_id: node(2),
+                name: "laptop".into(),
+                role: DeviceRole::Admin,
+                added_at: Timestamp(1_000),
+            },
+            Device {
+                node_id: node(3),
+                name: "home".into(),
+                role: DeviceRole::Member,
+                added_at: Timestamp(2_000),
+            },
         ],
         revoked_agents: vec![],
         web_keys: vec![],
@@ -69,12 +79,19 @@ fn agent_principal() -> Principal {
     .issue(&key(1));
     let assertion = Assertion {
         target: node(3),
-        action: Action { capability: Capability::parse("term.exec").unwrap(), resource: ResourcePath::parse("home").unwrap() },
+        action: Action {
+            capability: Capability::parse("term.exec").unwrap(),
+            resource: ResourcePath::parse("home").unwrap(),
+        },
         issued_at: Timestamp(4_000),
         nonce: [4; 16],
     };
     let signature = assertion.sign(&key(8));
-    Principal::Agent { cert, assertion, signature }
+    Principal::Agent {
+        cert,
+        assertion,
+        signature,
+    }
 }
 
 fn size() -> Size {
@@ -86,8 +103,15 @@ fn request_samples() -> Vec<(&'static str, Request)> {
     let all = vec![
         Request::NodeInfo,
         Request::RosterSync,
-        Request::RosterPush { roster: roster(), addrs: vec![(node(2), "hint".into())] },
-        Request::JoinOffer { nonce: [5; 16], roster: roster(), addrs: vec![] },
+        Request::RosterPush {
+            roster: roster(),
+            addrs: vec![(node(2), "hint".into())],
+        },
+        Request::JoinOffer {
+            nonce: [5; 16],
+            roster: roster(),
+            addrs: vec![],
+        },
         Request::Exec(ExecSpec {
             program: "uname".into(),
             args: vec!["-a".into()],
@@ -98,7 +122,11 @@ fn request_samples() -> Vec<(&'static str, Request)> {
         }),
         Request::WebEnroll {
             token: [6; 16],
-            credential: NewCredential { credential_id: vec![1], spki: vec![2, 3], rp_id: "bewith.link".into() },
+            credential: NewCredential {
+                credential_id: vec![1],
+                spki: vec![2, 3],
+                rp_id: "bewith.link".into(),
+            },
         },
         Request::WebLogin {
             issued_at: Timestamp(3_000),
@@ -109,26 +137,63 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 signature: vec![7; 8],
             },
         },
-        Request::SessionAttach { name: "main".into(), create: true, size: size() },
+        Request::SessionAttach {
+            name: "main".into(),
+            create: true,
+            size: size(),
+        },
         Request::SessionList,
-        Request::SessionKill { name: "build".into() },
+        Request::SessionKill {
+            name: "build".into(),
+        },
         Request::SvcConnect { name: "web".into() },
         Request::SvcList,
-        Request::ExitConnect { target: "example.com:443".into() },
+        Request::ExitConnect {
+            target: "example.com:443".into(),
+        },
         Request::DriveInfo,
         Request::DriveRegister { ws: "work".into() },
-        Request::DriveGet { ws: "work".into(), hashes: vec![[1; 32]] },
-        Request::DriveHave { ws: "work".into(), hashes: vec![[2; 32], [3; 32]] },
-        Request::DrivePush { ws: "work".into(), head: [4; 32], count: 3 },
-        Request::DriveProfilePut { ws: "work".into(), name: "build".into(), files: vec!["/a".into()] },
-        Request::DriveProfileGet { ws: "work".into(), name: "build".into() },
+        Request::DriveGet {
+            ws: "work".into(),
+            hashes: vec![[1; 32]],
+        },
+        Request::DriveHave {
+            ws: "work".into(),
+            hashes: vec![[2; 32], [3; 32]],
+        },
+        Request::DrivePush {
+            ws: "work".into(),
+            head: [4; 32],
+            count: 3,
+        },
+        Request::DriveProfilePut {
+            ws: "work".into(),
+            name: "build".into(),
+            files: vec!["/a".into()],
+        },
+        Request::DriveProfileGet {
+            ws: "work".into(),
+            name: "build".into(),
+        },
         Request::HardwareList,
-        Request::HardwareCapture { kind: HardwareKind::Location },
+        Request::HardwareCapture {
+            kind: HardwareKind::Location,
+        },
         Request::ShareOpen { token: [8; 16] },
-        Request::ShareDriveList { token: [8; 16], path: "/sub".into() },
-        Request::ShareDriveRead { token: [8; 16], path: "/a.txt".into(), max: 1024 },
+        Request::ShareDriveList {
+            token: [8; 16],
+            path: "/sub".into(),
+        },
+        Request::ShareDriveRead {
+            token: [8; 16],
+            path: "/a.txt".into(),
+            max: 1024,
+        },
         Request::ShareServiceConnect { token: [8; 16] },
-        Request::ShareSessionWatch { token: [8; 16], size: Size { cols: 80, rows: 24 } },
+        Request::ShareSessionWatch {
+            token: [8; 16],
+            size: Size { cols: 80, rows: 24 },
+        },
         Request::VaultPush {
             name: "api_key".into(),
             entry: Some(VaultCipherEntry {
@@ -151,7 +216,9 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             addrs: vec![(node(3), "hint".into())],
         },
         Request::SvcDatagram { name: "dns".into() },
-        Request::ExitDatagram { target: "example.com:443".into() },
+        Request::ExitDatagram {
+            target: "203.0.113.7:3478".into(),
+        },
     ];
     all.into_iter()
         .map(|r| {
@@ -204,26 +271,51 @@ fn response_samples() -> Vec<(&'static str, Response)> {
             now: Timestamp(200),
             roster_version: Some(7),
         }),
-        Response::Roster { roster: Some(roster()), addrs: vec![(node(3), "hint".into())] },
+        Response::Roster {
+            roster: Some(roster()),
+            addrs: vec![(node(3), "hint".into())],
+        },
         Response::Ok,
-        Response::Sessions(vec![SessionInfo { name: "main".into(), clients: 2, created_at: Timestamp(10), size: size() }]),
+        Response::Sessions(vec![SessionInfo {
+            name: "main".into(),
+            clients: 2,
+            created_at: Timestamp(10),
+            size: size(),
+        }]),
         Response::Services(vec![ServiceInfo {
             name: "llm".into(),
             proto: "http".into(),
             env: vec![("OPENAI_BASE_URL".into(), "http://{addr}/v1".into())],
         }]),
-        Response::WebEnrolled { label: "phone".into() },
+        Response::WebEnrolled {
+            label: "phone".into(),
+        },
         Response::WebLoggedIn {
             session: web_session(),
-            devices: vec![WebDevice { name: "home".into(), node_id: node(3), hint: "hint".into() }],
+            devices: vec![WebDevice {
+                name: "home".into(),
+                node_id: node(3),
+                hint: "hint".into(),
+            }],
         },
-        Response::DriveInfo { serving: true, workspaces: vec![("work".into(), Some([5; 32])), ("new".into(), None)] },
+        Response::DriveInfo {
+            serving: true,
+            workspaces: vec![("work".into(), Some([5; 32])), ("new".into(), None)],
+        },
         Response::DriveMissing(vec![[6; 32]]),
-        Response::DrivePushed { accepted: false, head: Some([7; 32]) },
+        Response::DrivePushed {
+            accepted: false,
+            head: Some([7; 32]),
+        },
         Response::DriveProfile(Some(vec!["/a".into()])),
         Response::Error(WireError::new(ErrorCode::Denied, "不行")),
         Response::HardwareList(vec![HardwareKind::Camera, HardwareKind::Location]),
-        Response::HardwareCapture(HardwareCapture::Location { lat_e7: 312_304_000, lon_e7: 1_214_737_000, accuracy_cm: 1250, timestamp_ms: 100 }),
+        Response::HardwareCapture(HardwareCapture::Location {
+            lat_e7: 312_304_000,
+            lon_e7: 1_214_737_000,
+            accuracy_cm: 1250,
+            timestamp_ms: 100,
+        }),
         Response::ShareOpened(ShareInfo {
             id: "01020304".into(),
             device: "home".into(),
@@ -231,8 +323,17 @@ fn response_samples() -> Vec<(&'static str, Response)> {
             expires_at: Timestamp(500),
             remaining_uses: Some(3),
         }),
-        Response::ShareDriveEntries(vec![ShareDriveEntry { name: "a.txt".into(), kind: "file".into(), size: 5, target: None }]),
-        Response::ShareDriveFile { size: 5, bytes: b"hello".to_vec(), truncated: false },
+        Response::ShareDriveEntries(vec![ShareDriveEntry {
+            name: "a.txt".into(),
+            kind: "file".into(),
+            size: 5,
+            target: None,
+        }]),
+        Response::ShareDriveFile {
+            size: 5,
+            bytes: b"hello".to_vec(),
+            truncated: false,
+        },
         Response::VaultEntries(vec![VaultCipherEntry {
             name: "api_key".into(),
             version: 1,
@@ -317,7 +418,12 @@ fn encoded_samples() -> BTreeMap<&'static str, Vec<u8>> {
     let principals = [
         ("principal.device", Principal::Device),
         ("principal.agent", agent_principal()),
-        ("principal.web", Principal::Web { session: web_session() }),
+        (
+            "principal.web",
+            Principal::Web {
+                session: web_session(),
+            },
+        ),
     ];
     for (n, p) in principals {
         // 请求头的形状不变；次版本取固定值，样例才不随 WIRE_MINOR 变。
@@ -328,17 +434,33 @@ fn encoded_samples() -> BTreeMap<&'static str, Vec<u8>> {
     // 信封的形状不变；次版本取固定值，样例才不随 WIRE_MINOR 变。
     let mut envelope = ResponseEnvelope::new(&Response::Ok);
     envelope.minor = 0;
-    out.insert("envelope.response", postcard::to_allocvec(&envelope).unwrap());
-    out.insert("frame.input_resize", postcard::to_allocvec(&Input::Resize(size())).unwrap());
-    let audit = PrincipalRef::Agent { id: key(8).public(), label: "ci".into() };
-    out.insert("audit.principal_agent", postcard::to_allocvec(&audit).unwrap());
+    out.insert(
+        "envelope.response",
+        postcard::to_allocvec(&envelope).unwrap(),
+    );
+    out.insert(
+        "frame.input_resize",
+        postcard::to_allocvec(&Input::Resize(size())).unwrap(),
+    );
+    let audit = PrincipalRef::Agent {
+        id: key(8).public(),
+        label: "ci".into(),
+    };
+    out.insert(
+        "audit.principal_agent",
+        postcard::to_allocvec(&audit).unwrap(),
+    );
     out
 }
 
 /// 按名字解码再编码：能解码并且得到同样的字节。
 fn round_trips(name: &str, bytes: &[u8]) -> bool {
     fn rt<T: serde::Serialize + serde::de::DeserializeOwned>(bytes: &[u8]) -> bool {
-        postcard::from_bytes::<T>(bytes).ok().and_then(|v| postcard::to_allocvec(&v).ok()).as_deref() == Some(bytes)
+        postcard::from_bytes::<T>(bytes)
+            .ok()
+            .and_then(|v| postcard::to_allocvec(&v).ok())
+            .as_deref()
+            == Some(bytes)
     }
     match name.split('.').next().unwrap() {
         "request" => rt::<Request>(bytes),
@@ -359,17 +481,33 @@ fn fixtures_dir() -> PathBuf {
 /// (次版本, 名字, 字节)，按次版本从小到大。
 fn load_fixtures() -> Vec<(u16, String, Vec<u8>)> {
     let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir(fixtures_dir()) else { return out };
+    let Ok(dir) = std::fs::read_dir(fixtures_dir()) else {
+        return out;
+    };
     for entry in dir {
         let path = entry.unwrap().path();
         let file = path.file_name().unwrap().to_str().unwrap().to_string();
-        let Some(ver) = file.strip_suffix(".txt") else { continue };
+        let Some(ver) = file.strip_suffix(".txt") else {
+            continue;
+        };
         let (major, minor) = ver.split_once('.').expect("文件名是 主版本.次版本.txt");
-        assert_eq!(major.parse::<u16>().unwrap(), WIRE_VERSION, "fixtures 里有别的主版本的文件 {file}：升主版本时删掉旧的");
+        assert_eq!(
+            major.parse::<u16>().unwrap(),
+            WIRE_VERSION,
+            "fixtures 里有别的主版本的文件 {file}：升主版本时删掉旧的"
+        );
         let minor: u16 = minor.parse().unwrap();
-        for line in std::fs::read_to_string(&path).unwrap().lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+        for line in std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        {
             let (name, hex) = line.split_once(' ').expect("每行是 名字 十六进制");
-            out.push((minor, name.to_string(), hex_decode(hex.trim()).expect("十六进制")));
+            out.push((
+                minor,
+                name.to_string(),
+                hex_decode(hex.trim()).expect("十六进制"),
+            ));
         }
     }
     out.sort_by_key(|(m, _, _)| *m);
@@ -385,7 +523,10 @@ fn existing_messages_keep_their_encoding() {
     for (minor, name, bytes) in &fixtures {
         let ok = *minor <= WIRE_MINOR;
         assert!(ok, "fixtures 里有比当前次版本 {WIRE_MINOR} 新的文件");
-        assert!(round_trips(name, bytes), "{WIRE_VERSION}.{minor} 的 {name} 解码不了或者再编码不一样");
+        assert!(
+            round_trips(name, bytes),
+            "{WIRE_VERSION}.{minor} 的 {name} 解码不了或者再编码不一样"
+        );
         if let Some(now) = samples.get(name.as_str()) {
             assert_eq!(
                 hex_encode(now),
@@ -394,8 +535,13 @@ fn existing_messages_keep_their_encoding() {
             );
         }
     }
-    let known: std::collections::BTreeSet<&str> = fixtures.iter().map(|(_, n, _)| n.as_str()).collect();
-    let new: Vec<(&str, &Vec<u8>)> = samples.iter().filter(|(n, _)| !known.contains(*n)).map(|(n, b)| (*n, b)).collect();
+    let known: std::collections::BTreeSet<&str> =
+        fixtures.iter().map(|(_, n, _)| n.as_str()).collect();
+    let new: Vec<(&str, &Vec<u8>)> = samples
+        .iter()
+        .filter(|(n, _)| !known.contains(*n))
+        .map(|(n, b)| (*n, b))
+        .collect();
     if new.is_empty() {
         return;
     }
@@ -431,7 +577,11 @@ fn unknown_messages_are_reported_not_fatal() {
     header = postcard::from_bytes(&future).expect("请求头本身照样能读");
     let e = header.request("home（Nexus 0.1.0）").unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedVersion);
-    assert!(e.message.contains("home（Nexus 0.1.0）") && e.message.contains("升级"), "{}", e.message);
+    assert!(
+        e.message.contains("home（Nexus 0.1.0）") && e.message.contains("升级"),
+        "{}",
+        e.message
+    );
 
     let env = ResponseEnvelope::new(&Response::Ok);
     let mut b = postcard::to_allocvec(&env).unwrap();

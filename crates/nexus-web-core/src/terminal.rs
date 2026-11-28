@@ -58,7 +58,13 @@ impl<T: Transport> WebNode<T> {
     ///
     /// 连接中断时自动重连，不需要再用通行密钥；设备拒绝（例如通行密钥被撤销、登录过期）时结束并返回原因。
     /// 第一次就连不上时直接返回错误。
-    pub async fn run_terminal(&self, device: &str, session: &str, size: Size, ui: &mut impl TerminalUi) -> Result<TerminalEnd, WireError> {
+    pub async fn run_terminal(
+        &self,
+        device: &str,
+        session: &str,
+        size: Size,
+        ui: &mut impl TerminalUi,
+    ) -> Result<TerminalEnd, WireError> {
         let mut size = size;
         let mut connected_once = false;
         let mut outage = false;
@@ -109,7 +115,11 @@ where
     matches!(timeout(PEER_SILENT, term.send(input)).await, Ok(Ok(())))
 }
 
-async fn pump<S>(term: &mut crate::WebTerminal<S>, size: &mut Size, ui: &mut impl TerminalUi) -> Pumped
+async fn pump<S>(
+    term: &mut crate::WebTerminal<S>,
+    size: &mut Size,
+    ui: &mut impl TerminalUi,
+) -> Pumped
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {

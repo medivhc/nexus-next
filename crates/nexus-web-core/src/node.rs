@@ -6,7 +6,8 @@ use nexus_core_proto::webauthn::WebAuthnAssertion;
 use nexus_core_proto::{NodeId, NodeInfo, Timestamp};
 use nexus_fabric::{read_response, write_msg, Connection, FrameReader, Proto, Transport};
 use nexus_wire::{
-    ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, SessionInfo, Size, WebDevice, WireError,
+    ErrorCode, Input, Request, RequestHeader, Response, SessionFrame, SessionInfo, Size, WebDevice,
+    WireError,
 };
 use tokio::io::{ReadHalf, WriteHalf};
 
@@ -27,33 +28,56 @@ pub struct WebNode<T> {
 
 impl<T: Transport> WebNode<T> {
     /// 向入口设备登录。调用前应当已经给 `transport` 加上入口设备的地址提示。
-    pub async fn login(transport: T, entry: NodeId, issued_at: Timestamp, assertion: WebAuthnAssertion) -> Result<Self, WireError> {
-        let body = Request::WebLogin { issued_at, assertion };
+    pub async fn login(
+        transport: T,
+        entry: NodeId,
+        issued_at: Timestamp,
+        assertion: WebAuthnAssertion,
+    ) -> Result<Self, WireError> {
+        let body = Request::WebLogin {
+            issued_at,
+            assertion,
+        };
         match call(&transport, entry, Proto::Web, Principal::Device, body).await? {
             Response::WebLoggedIn { session, devices } => {
                 for d in &devices {
                     transport.add_hint(d.node_id, &d.hint);
                 }
-                Ok(Self { transport, session, devices, drive_cache: Default::default(), svc_protos: Default::default() })
+                Ok(Self {
+                    transport,
+                    session,
+                    devices,
+                    drive_cache: Default::default(),
+                    svc_protos: Default::default(),
+                })
             }
             Response::Error(e) => Err(e),
-            other => Err(WireError::new(ErrorCode::Internal, format!("入口设备的回应无法理解：{other:?}"))),
+            other => Err(WireError::new(
+                ErrorCode::Internal,
+                format!("入口设备的回应无法理解：{other:?}"),
+            )),
         }
     }
 
     pub(crate) fn principal(&self) -> Principal {
-        Principal::Web { session: self.session.clone() }
+        Principal::Web {
+            session: self.session.clone(),
+        }
     }
 
     pub(crate) fn transport(&self) -> &T {
         &self.transport
     }
 
-    pub(crate) fn svc_protos(&self) -> &std::cell::RefCell<std::collections::HashMap<(String, String), String>> {
+    pub(crate) fn svc_protos(
+        &self,
+    ) -> &std::cell::RefCell<std::collections::HashMap<(String, String), String>> {
         &self.svc_protos
     }
 
-    pub(crate) fn drive_cache(&self) -> &std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>> {
+    pub(crate) fn drive_cache(
+        &self,
+    ) -> &std::cell::RefCell<std::collections::HashMap<nexus_drive_core::Hash, Vec<u8>>> {
         &self.drive_cache
     }
 
@@ -111,31 +135,60 @@ impl<T: Transport> WebNode<T> {
     pub async fn status(&self, device: &str) -> Result<NodeInfo, WireError> {
         match self.rpc(device, Request::NodeInfo).await? {
             Response::NodeInfo(info) => Ok(info),
-            other => Err(WireError::new(ErrorCode::Internal, format!("回应无法理解：{other:?}"))),
+            other => Err(WireError::new(
+                ErrorCode::Internal,
+                format!("回应无法理解：{other:?}"),
+            )),
         }
     }
 
     pub async fn session_list(&self, device: &str) -> Result<Vec<SessionInfo>, WireError> {
         match self.rpc(device, Request::SessionList).await? {
             Response::Sessions(list) => Ok(list),
-            other => Err(WireError::new(ErrorCode::Internal, format!("回应无法理解：{other:?}"))),
+            other => Err(WireError::new(
+                ErrorCode::Internal,
+                format!("回应无法理解：{other:?}"),
+            )),
         }
     }
 
     /// 连上（必要时创建）一台设备上的终端会话。
-    pub async fn attach(&self, device: &str, session: &str, size: Size) -> Result<WebTerminal<<T::Conn as Connection>::Stream>, WireError> {
+    pub async fn attach(
+        &self,
+        device: &str,
+        session: &str,
+        size: Size,
+    ) -> Result<WebTerminal<<T::Conn as Connection>::Stream>, WireError> {
         let to = self.device(device)?;
-        let conn = self.transport.connect(to, Proto::Rpc).await.map_err(unreachable)?;
+        let conn = self
+            .transport
+            .connect(to, Proto::Rpc)
+            .await
+            .map_err(unreachable)?;
         let mut stream = conn.open_bi().await.map_err(unreachable)?;
-        let header = RequestHeader::new(0, self.principal(), &Request::SessionAttach { name: session.to_string(), create: true, size });
+        let header = RequestHeader::new(
+            0,
+            self.principal(),
+            &Request::SessionAttach {
+                name: session.to_string(),
+                create: true,
+                size,
+            },
+        );
         write_msg(&mut stream, &header).await.map_err(unreachable)?;
         match read_response(&mut stream).await.map_err(unreachable)? {
             Response::Ok => {
                 let (rd, writer) = tokio::io::split(stream);
-                Ok(WebTerminal { reader: FrameReader::new(rd), writer })
+                Ok(WebTerminal {
+                    reader: FrameReader::new(rd),
+                    writer,
+                })
             }
             Response::Error(e) => Err(e),
-            other => Err(WireError::new(ErrorCode::Internal, format!("回应无法理解：{other:?}"))),
+            other => Err(WireError::new(
+                ErrorCode::Internal,
+                format!("回应无法理解：{other:?}"),
+            )),
         }
     }
 }
@@ -153,7 +206,9 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebTerminal<S> {
     }
 
     pub async fn send(&mut self, input: Input) -> Result<(), WireError> {
-        write_msg(&mut self.writer, &input).await.map_err(unreachable)
+        write_msg(&mut self.writer, &input)
+            .await
+            .map_err(unreachable)
     }
 
     /// 有序关闭发送方向：已经发出的消息都会送到。

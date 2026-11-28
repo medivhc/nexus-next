@@ -3,7 +3,10 @@
 //! 全在命令行这一侧：经 Nexus 的执行命令，在目标设备上运行它自己的 `nexus upgrade`（常驻程序执行的命令
 //! 带着 `NEXUS_EXE` 和 `NEXUS_DATA_DIR`），新版本从标准输入送过去。
 
-use super::{call, doc, exit_for, fail, Ctl, Sink, EXIT_INVALID_INPUT, EXIT_INVALID_STATE, EXIT_TIMED_OUT, EXIT_UNREACHABLE, JSON_SCHEMA};
+use super::{
+    call, doc, exit_for, fail, Ctl, Sink, EXIT_INVALID_INPUT, EXIT_INVALID_STATE, EXIT_TIMED_OUT,
+    EXIT_UNREACHABLE, JSON_SCHEMA,
+};
 use nexus_wire::{CtlRequest, CtlResponse, ExecEvent, ExecSpec, Input, WireError};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -56,11 +59,31 @@ enum RunErr {
     Broken,
 }
 
-async fn run_remote<C: Ctl>(ctl: &C, node: &str, script: String, args: Vec<String>, input: Option<Vec<u8>>, timeout_ms: Option<u64>) -> Result<Ran, RunErr> {
+async fn run_remote<C: Ctl>(
+    ctl: &C,
+    node: &str,
+    script: String,
+    args: Vec<String>,
+    input: Option<Vec<u8>>,
+    timeout_ms: Option<u64>,
+) -> Result<Ran, RunErr> {
     let mut all = vec!["-c".to_string(), script, "nexus-upgrade".to_string()];
     all.extend(args);
-    let spec = ExecSpec { program: "sh".into(), args: all, cwd: None, env: Vec::new(), timeout_ms, max_output: 1 << 20 };
-    let mut session = ctl.open(CtlRequest::Exec { node: node.to_string(), spec }).await.map_err(|_| RunErr::Broken)?;
+    let spec = ExecSpec {
+        program: "sh".into(),
+        args: all,
+        cwd: None,
+        env: Vec::new(),
+        timeout_ms,
+        max_output: 1 << 20,
+    };
+    let mut session = ctl
+        .open(CtlRequest::Exec {
+            node: node.to_string(),
+            spec,
+        })
+        .await
+        .map_err(|_| RunErr::Broken)?;
     let tx = session.tx.clone();
     let sender = tokio::spawn(async move {
         if let Some(data) = input {
@@ -77,7 +100,13 @@ async fn run_remote<C: Ctl>(ctl: &C, node: &str, script: String, args: Vec<Strin
         match session.rx.recv().await {
             Some(CtlResponse::Exec(ExecEvent::Stdout(b))) => stdout.extend(b),
             Some(CtlResponse::Exec(ExecEvent::Stderr(b))) => stderr.extend(b),
-            Some(CtlResponse::Exec(ExecEvent::Exit(r))) => break Ok(Ran { code: r.exit_code, stdout, stderr }),
+            Some(CtlResponse::Exec(ExecEvent::Exit(r))) => {
+                break Ok(Ran {
+                    code: r.exit_code,
+                    stdout,
+                    stderr,
+                })
+            }
             Some(CtlResponse::Error(e)) => break Err(RunErr::Wire(e)),
             Some(_) => {}
             None => break Err(RunErr::Broken),
@@ -100,7 +129,13 @@ struct Report {
 fn report(stdout: &[u8]) -> Option<Report> {
     let v: Value = serde_json::from_slice(stdout).ok()?;
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-    Some(Report { state: s("state"), from: s("from"), to: s("to"), message: s("message"), id: v["id"].as_u64().unwrap_or(0) })
+    Some(Report {
+        state: s("state"),
+        from: s("from"),
+        to: s("to"),
+        message: s("message"),
+        id: v["id"].as_u64().unwrap_or(0),
+    })
 }
 
 /// 没有成功的命令：退出码和原因。
@@ -109,7 +144,11 @@ fn failure(ran: &Ran) -> (i32, String) {
     let message = text
         .lines()
         .rev()
-        .find_map(|l| serde_json::from_str::<Value>(l).ok().and_then(|v| v["message"].as_str().map(String::from)))
+        .find_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(String::from))
+        })
         .unwrap_or_else(|| text.trim().to_string());
     (ran.code.unwrap_or(super::EXIT_INTERNAL), message)
 }
@@ -123,22 +162,45 @@ fn run_failure(e: RunErr) -> (i32, String) {
 
 /// 目标设备上最近一次升级的状态。
 async fn status<C: Ctl>(ctl: &C, node: &str) -> Result<Report, (i32, String)> {
-    let ran = run_remote(ctl, node, status_script(), Vec::new(), None, Some(30_000)).await.map_err(run_failure)?;
+    let ran = run_remote(ctl, node, status_script(), Vec::new(), None, Some(30_000))
+        .await
+        .map_err(run_failure)?;
     if ran.code != Some(0) {
         return Err(failure(&ran));
     }
-    report(&ran.stdout).ok_or_else(|| (super::EXIT_INTERNAL, "这台设备的 nexus upgrade --status 回答无法理解".into()))
+    report(&ran.stdout).ok_or_else(|| {
+        (
+            super::EXIT_INTERNAL,
+            "这台设备的 nexus upgrade --status 回答无法理解".into(),
+        )
+    })
 }
 
 async fn upgrade_one<C: Ctl>(ctl: &C, node: &str, data: &[u8], opts: &Options) -> Outcome {
-    let out = |state, code, from: String, to: String, message: String| Outcome { device: node.to_string(), state, from, to, message, code };
+    let out = |state, code, from: String, to: String, message: String| Outcome {
+        device: node.to_string(),
+        state,
+        from,
+        to,
+        message,
+        code,
+    };
     let before = match status(ctl, node).await {
         Ok(r) => r,
         Err((code, message)) => return out("failed", code, String::new(), String::new(), message),
     };
     let confirm = format!("{}s", opts.confirm_ms.div_ceil(1000).max(1));
     let force = if opts.force { "--force" } else { "" }.to_string();
-    match run_remote(ctl, node, push_script(), vec![confirm, force], Some(data.to_vec()), None).await {
+    match run_remote(
+        ctl,
+        node,
+        push_script(),
+        vec![confirm, force],
+        Some(data.to_vec()),
+        None,
+    )
+    .await
+    {
         Ok(ran) if ran.code == Some(0) => {}
         Ok(ran) => {
             let (code, message) = failure(&ran);
@@ -158,13 +220,23 @@ async fn upgrade_one<C: Ctl>(ctl: &C, node: &str, data: &[u8], opts: &Options) -
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Ok(r) = status(ctl, node).await {
             if r.id != before.id && (r.state == "confirmed" || r.state == "rolled_back") {
-                let (state, code) = if r.state == "confirmed" { ("confirmed", 0) } else { ("rolled_back", EXIT_INVALID_STATE) };
+                let (state, code) = if r.state == "confirmed" {
+                    ("confirmed", 0)
+                } else {
+                    ("rolled_back", EXIT_INVALID_STATE)
+                };
                 return out(state, code, r.from, r.to, r.message);
             }
         }
         if tokio::time::Instant::now() >= deadline {
             let message = format!("等了 {} 秒，还不知道升级的结果：稍后用 nexus exec {node} -- nexus upgrade --status 查看", wait.as_secs());
-            return out("timed_out", EXIT_TIMED_OUT, String::new(), String::new(), message);
+            return out(
+                "timed_out",
+                EXIT_TIMED_OUT,
+                String::new(),
+                String::new(),
+                message,
+            );
         }
     }
 }
@@ -182,7 +254,11 @@ async fn targets<C: Ctl>(ctl: &C, opts: &Options) -> Result<Vec<String>, (i32, S
     }
     match call(ctl, CtlRequest::List).await {
         Ok(CtlResponse::List(entries)) => {
-            let mut names: Vec<String> = entries.into_iter().filter(|e| !e.is_self && e.report.online).map(|e| e.report.name).collect();
+            let mut names: Vec<String> = entries
+                .into_iter()
+                .filter(|e| !e.is_self && e.report.online)
+                .map(|e| e.report.name)
+                .collect();
             names.sort();
             if names.is_empty() {
                 return Err((EXIT_INVALID_STATE, "没有在线的其他设备".into()));
@@ -191,14 +267,24 @@ async fn targets<C: Ctl>(ctl: &C, opts: &Options) -> Result<Vec<String>, (i32, S
         }
         Ok(CtlResponse::Error(e)) => Err((exit_for(e.code).0, e.message)),
         Ok(_) => Err((super::EXIT_INTERNAL, "常驻程序的回应无法理解".into())),
-        Err(e) => Err((super::EXIT_DAEMON_UNREACHABLE, format!("连不上本机的常驻程序（{e}）{}", super::DAEMON_HINT))),
+        Err(e) => Err((
+            super::EXIT_DAEMON_UNREACHABLE,
+            format!("连不上本机的常驻程序（{e}）{}", super::DAEMON_HINT),
+        )),
     }
 }
 
 pub async fn run<C: Ctl, K: Sink>(ctl: &C, opts: &Options, sink: &mut K) -> i32 {
     let data = match std::fs::read(&opts.file) {
         Ok(d) => d,
-        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("读不了 {}：{e}", opts.file.display())),
+        Err(e) => {
+            return fail(
+                sink,
+                EXIT_INVALID_INPUT,
+                "invalid_input",
+                &format!("读不了 {}：{e}", opts.file.display()),
+            )
+        }
     };
     if let Err(e) = crate::upgrade::verify_checksum(&opts.file, &data) {
         return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &e.message);
@@ -212,7 +298,14 @@ pub async fn run<C: Ctl, K: Sink>(ctl: &C, opts: &Options, sink: &mut K) -> i32 
     for d in &devices {
         if stopped {
             let message = "前面的设备升级后换回了，没有继续".to_string();
-            results.push(Outcome { device: d.clone(), state: "skipped", from: String::new(), to: String::new(), message, code: 0 });
+            results.push(Outcome {
+                device: d.clone(),
+                state: "skipped",
+                from: String::new(),
+                to: String::new(),
+                message,
+                code: 0,
+            });
             continue;
         }
         if !opts.json {
@@ -232,7 +325,11 @@ pub async fn run<C: Ctl, K: Sink>(ctl: &C, opts: &Options, sink: &mut K) -> i32 
             .collect();
         sink.out(doc(json!({ "schema": JSON_SCHEMA, "devices": list })).as_bytes());
     }
-    results.iter().map(|r| r.code).find(|c| *c != 0).unwrap_or(0)
+    results
+        .iter()
+        .map(|r| r.code)
+        .find(|c| *c != 0)
+        .unwrap_or(0)
 }
 
 fn line(r: &Outcome) -> String {

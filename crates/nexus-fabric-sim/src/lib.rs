@@ -28,24 +28,47 @@ impl SimTransport {
     /// 必须在 turmoil 的主机上下文里调用，`host` 是本主机的名字。
     pub async fn bind(me: NodeId, host: &str) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
-        Ok(Self { me, host: host.to_string(), hints: RefCell::default(), listener: Some(listener) })
+        Ok(Self {
+            me,
+            host: host.to_string(),
+            hints: RefCell::default(),
+            listener: Some(listener),
+        })
     }
 
     /// 绑定到指定端口（用于同一仿真主机上的多个可接收连接的节点，例如浏览器发布硬件能力）。
     pub async fn bind_port(me: NodeId, host: &str, port: u16) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-        Ok(Self { me, host: format!("{host}:{port}"), hints: RefCell::default(), listener: Some(listener) })
+        Ok(Self {
+            me,
+            host: format!("{host}:{port}"),
+            hints: RefCell::default(),
+            listener: Some(listener),
+        })
     }
 
     /// 只发起连接、不接受连接的一方，例如浏览器。同一台仿真主机上可以有任意多个。
     pub fn client(me: NodeId) -> Self {
-        Self { me, host: String::new(), hints: RefCell::default(), listener: None }
+        Self {
+            me,
+            host: String::new(),
+            hints: RefCell::default(),
+            listener: None,
+        }
     }
 }
 
 pub enum SimConn {
-    Outgoing { me: NodeId, remote: NodeId, host: String, proto: Proto },
-    Incoming { remote: NodeId, stream: RefCell<Option<TcpStream>> },
+    Outgoing {
+        me: NodeId,
+        remote: NodeId,
+        host: String,
+        proto: Proto,
+    },
+    Incoming {
+        remote: NodeId,
+        stream: RefCell<Option<TcpStream>>,
+    },
 }
 
 fn proto_byte(p: Proto) -> u8 {
@@ -75,13 +98,23 @@ impl Transport for SimTransport {
 
     async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<SimConn> {
         let host = self.hints.borrow().get(&to).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("不知道节点 {} 的地址", to.short()))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("不知道节点 {} 的地址", to.short()),
+            )
         })?;
-        Ok(SimConn::Outgoing { me: self.me, remote: to, host, proto })
+        Ok(SimConn::Outgoing {
+            me: self.me,
+            remote: to,
+            host,
+            proto,
+        })
     }
 
     async fn accept(&self) -> io::Result<(SimConn, Proto)> {
-        let Some(listener) = &self.listener else { return std::future::pending().await };
+        let Some(listener) = &self.listener else {
+            return std::future::pending().await;
+        };
         loop {
             let (mut stream, _) = listener.accept().await?;
             let mut head = [0u8; 33];
@@ -96,7 +129,10 @@ impl Transport for SimTransport {
             };
             let mut id = [0u8; 32];
             id.copy_from_slice(&head[..32]);
-            let conn = SimConn::Incoming { remote: NodeId(id), stream: RefCell::new(Some(stream)) };
+            let conn = SimConn::Incoming {
+                remote: NodeId(id),
+                stream: RefCell::new(Some(stream)),
+            };
             return Ok((conn, proto));
         }
     }
@@ -181,7 +217,9 @@ impl Connection for SimConn {
 
     async fn open_bi(&self) -> io::Result<TcpStream> {
         match self {
-            SimConn::Outgoing { me, host, proto, .. } => {
+            SimConn::Outgoing {
+                me, host, proto, ..
+            } => {
                 let mut s = {
                     let (h, p) = match host.rsplit_once(':') {
                         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(PORT)),
@@ -195,9 +233,10 @@ impl Connection for SimConn {
                 s.write_all(&head).await?;
                 Ok(s)
             }
-            SimConn::Incoming { .. } => {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "仿真传输只支持由发起方开流"))
-            }
+            SimConn::Incoming { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "仿真传输只支持由发起方开流",
+            )),
         }
     }
 

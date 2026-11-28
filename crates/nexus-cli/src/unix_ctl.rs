@@ -21,7 +21,9 @@ impl UnixCtl {
     pub fn new(data_dir: &Path, agent: Option<AgentCredential>) -> Self {
         let socket = match &agent {
             None => data_dir.join("ctl.sock"),
-            Some(_) => std::env::var_os("NEXUS_AGENT_SOCKET").map(PathBuf::from).unwrap_or_else(|| data_dir.join("agent.sock")),
+            Some(_) => std::env::var_os("NEXUS_AGENT_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("agent.sock")),
         };
         Self { socket, agent }
     }
@@ -30,7 +32,14 @@ impl UnixCtl {
 impl Ctl for UnixCtl {
     async fn open(&self, req: CtlRequest) -> io::Result<CtlClient> {
         let mut stream = ctl_endpoint::connect(&self.socket).await?;
-        write_msg(&mut stream, &CtlHello { agent: self.agent.clone(), request: req }).await?;
+        write_msg(
+            &mut stream,
+            &CtlHello {
+                agent: self.agent.clone(),
+                request: req,
+            },
+        )
+        .await?;
         let (rd, mut wr) = tokio::io::split(stream);
         let (in_tx, mut in_rx) = mpsc::channel::<Input>(16);
         let (resp_tx, resp_rx) = mpsc::channel::<CtlResponse>(16);
@@ -50,7 +59,9 @@ impl Ctl for UnixCtl {
                 }
             }
         });
-        Ok(CtlClient { tx: in_tx, rx: resp_rx })
+        Ok(CtlClient {
+            tx: in_tx,
+            rx: resp_rx,
+        })
     }
 }
-

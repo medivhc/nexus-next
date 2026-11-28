@@ -157,7 +157,7 @@ scenario! {
         w.network("laptop", &["home"]).await;
         let t = w.term("laptop", &["ssh", "home"]).await;
         t.expect_prompt().await;
-        
+
         let ls = w.cli_ok("laptop", &["session", "ls", "home"]).await;
         let sessions = ls["sessions"].as_array().expect("应当有 sessions 数组");
         assert_eq!(sessions.len(), 1, "{ls}");

@@ -8,7 +8,17 @@ use std::time::{Duration, Instant};
 
 /// 按 `nexus ssh-config` 的输出配置 laptop 上的 ssh。除此之外不做任何 SSH 配置，也没有密钥。
 async fn configure_ssh(w: &World, node: &str) {
-    let out = w.host(node, &["sh", "-c", "mkdir -p ~/.ssh && nexus ssh-config >> ~/.ssh/config"], b"").await;
+    let out = w
+        .host(
+            node,
+            &[
+                "sh",
+                "-c",
+                "mkdir -p ~/.ssh && nexus ssh-config >> ~/.ssh/config",
+            ],
+            b"",
+        )
+        .await;
     assert_eq!(out.code, 0, "{}", out.stderr);
 }
 

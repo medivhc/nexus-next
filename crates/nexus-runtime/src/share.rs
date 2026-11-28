@@ -10,7 +10,8 @@ use nexus_drive_core::FileManifest;
 use nexus_fabric::Transport;
 use nexus_sys::System;
 use nexus_wire::{
-    hex_encode, Response, ShareCreatedReport, ShareDriveEntry, ShareInfo, ShareRecord, ShareTarget, Size, WireError,
+    hex_encode, Response, ShareCreatedReport, ShareDriveEntry, ShareInfo, ShareRecord, ShareTarget,
+    Size, WireError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -41,8 +42,15 @@ impl ShareStore {
 }
 
 fn norm_parts(path: &str) -> Result<Vec<String>, WireError> {
-    let parts: Vec<String> = path.split('/').filter(|p| !p.is_empty()).map(str::to_string).collect();
-    if let Some(bad) = parts.iter().find(|p| !nexus_drive_core::path::valid_part(p)) {
+    let parts: Vec<String> = path
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(bad) = parts
+        .iter()
+        .find(|p| !nexus_drive_core::path::valid_part(p))
+    {
         return Err(err(ErrorCode::InvalidInput, format!("路径里不能有 {bad}")));
     }
     Ok(parts)
@@ -55,14 +63,23 @@ impl<T: Transport, S: System> Node<T, S> {
         save(&self.system, KEY_SHARES, &*self.shares.borrow()).map_err(internal)
     }
 
-    fn audit_share(&self, peer: NodeId, id: &str, capability: &str, resource: &str, outcome: Outcome) {
+    fn audit_share(
+        &self,
+        peer: NodeId,
+        id: &str,
+        capability: &str,
+        resource: &str,
+        outcome: Outcome,
+    ) {
         if let Some(roster) = self.roster() {
             self.audit(
                 &roster,
                 &AuditEvent {
                     at: self.system.now(),
                     peer,
-                    principal: PrincipalRef::Web { label: format!("share:{id}") },
+                    principal: PrincipalRef::Web {
+                        label: format!("share:{id}"),
+                    },
                     capability: capability.to_string(),
                     resource: resource.to_string(),
                     outcome,
@@ -78,7 +95,9 @@ impl<T: Transport, S: System> Node<T, S> {
         max_uses: Option<u32>,
         page: Option<String>,
     ) -> Result<ShareCreatedReport, WireError> {
-        let roster = self.roster().ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
+        let roster = self
+            .roster()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "本机还没有加入任何网络"))?;
         if ttl_ms == 0 {
             return Err(err(ErrorCode::InvalidInput, "--ttl 必须大于 0"));
         }
@@ -89,7 +108,10 @@ impl<T: Transport, S: System> Node<T, S> {
         let normalized_target = match target {
             ShareTarget::Drive { ws, path } => {
                 if !nexus_drive_core::path::valid_workspace(&ws) {
-                    return Err(err(ErrorCode::InvalidInput, format!("工作区名不合法：{ws}")));
+                    return Err(err(
+                        ErrorCode::InvalidInput,
+                        format!("工作区名不合法：{ws}"),
+                    ));
                 }
                 let parts = norm_parts(&path)?;
                 let ws_state = self
@@ -100,11 +122,21 @@ impl<T: Transport, S: System> Node<T, S> {
                     .cloned()
                     .ok_or_else(|| err(ErrorCode::NotFound, format!("本机上没有工作区 {ws}")))?;
                 let cas = Cas::new(&self.system);
-                match tree::lookup(&cas, ws_state.work, &parts).map_err(|e| internal(format!("{e:?}")))? {
+                match tree::lookup(&cas, ws_state.work, &parts)
+                    .map_err(|e| internal(format!("{e:?}")))?
+                {
                     Some(_) => {}
-                    None => return Err(err(ErrorCode::NotFound, format!("{ws}:/{} 不存在", parts.join("/")))),
+                    None => {
+                        return Err(err(
+                            ErrorCode::NotFound,
+                            format!("{ws}:/{} 不存在", parts.join("/")),
+                        ))
+                    }
                 }
-                ShareTarget::Drive { ws, path: format!("/{}", parts.join("/")) }
+                ShareTarget::Drive {
+                    ws,
+                    path: format!("/{}", parts.join("/")),
+                }
             }
             ShareTarget::Service { name } => {
                 let svcs = self.services.borrow();
@@ -113,13 +145,22 @@ impl<T: Transport, S: System> Node<T, S> {
                     .find(|s| s.name == name)
                     .ok_or_else(|| err(ErrorCode::NotFound, format!("本机没有发布服务 {name}")))?;
                 if svc.proto != "http" {
-                    return Err(err(ErrorCode::InvalidInput, format!("服务 {name} 的协议是 {}，只能临时分享 --proto http 的网页服务", svc.proto)));
+                    return Err(err(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "服务 {name} 的协议是 {}，只能临时分享 --proto http 的网页服务",
+                            svc.proto
+                        ),
+                    ));
                 }
                 ShareTarget::Service { name }
             }
             ShareTarget::Terminal { session } => {
                 if !self.sessions.borrow().contains_key(&session) {
-                    return Err(err(ErrorCode::NotFound, format!("本机没有正在运行的终端会话 {session}")));
+                    return Err(err(
+                        ErrorCode::NotFound,
+                        format!("本机没有正在运行的终端会话 {session}"),
+                    ));
                 }
                 ShareTarget::Terminal { session }
             }
@@ -205,36 +246,75 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 校验分享令牌是否仍然有效（`consume = true` 时在 `ShareOpen` 扣减一次次数）。
-    fn validate_share(&self, peer: NodeId, token: &[u8; 16], capability: &str, consume: bool) -> Result<StoredShare, WireError> {
+    fn validate_share(
+        &self,
+        peer: NodeId,
+        token: &[u8; 16],
+        capability: &str,
+        consume: bool,
+    ) -> Result<StoredShare, WireError> {
         let now = self.system.now();
-        let me_name = self.roster().and_then(|r| r.device(self.me()).map(|d| d.name.clone())).unwrap_or_else(|| self.configured_name.clone());
+        let me_name = self
+            .roster()
+            .and_then(|r| r.device(self.me()).map(|d| d.name.clone()))
+            .unwrap_or_else(|| self.configured_name.clone());
         let mut store = self.shares.borrow_mut();
         let Some(entry) = store.entries.values_mut().find(|s| &s.token == token) else {
             drop(store);
-            self.audit_share(peer, "unknown", capability, &me_name, Outcome::Deny(DenyReason::NoMatchingGrant));
+            self.audit_share(
+                peer,
+                "unknown",
+                capability,
+                &me_name,
+                Outcome::Deny(DenyReason::NoMatchingGrant),
+            );
             return Err(err(ErrorCode::Denied, "分享链接无效"));
         };
         let id = entry.id.clone();
         let res = entry.target.describe(&me_name);
         if entry.revoked {
             drop(store);
-            self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::WebKeyRevoked));
+            self.audit_share(
+                peer,
+                &id,
+                capability,
+                &res,
+                Outcome::Deny(DenyReason::WebKeyRevoked),
+            );
             return Err(err(ErrorCode::Denied, "这项分享已被撤销"));
         }
         if now >= entry.expires_at {
             drop(store);
-            self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::SessionExpired));
+            self.audit_share(
+                peer,
+                &id,
+                capability,
+                &res,
+                Outcome::Deny(DenyReason::SessionExpired),
+            );
             return Err(err(ErrorCode::Denied, "这项分享已过期"));
         }
         if let Some(max) = entry.max_uses {
             if consume && entry.uses >= max {
                 drop(store);
-                self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
+                self.audit_share(
+                    peer,
+                    &id,
+                    capability,
+                    &res,
+                    Outcome::Deny(DenyReason::NoMatchingGrant),
+                );
                 return Err(err(ErrorCode::Denied, "这项分享的使用次数已用完"));
             }
             if !consume && entry.uses > max {
                 drop(store);
-                self.audit_share(peer, &id, capability, &res, Outcome::Deny(DenyReason::NoMatchingGrant));
+                self.audit_share(
+                    peer,
+                    &id,
+                    capability,
+                    &res,
+                    Outcome::Deny(DenyReason::NoMatchingGrant),
+                );
                 return Err(err(ErrorCode::Denied, "这项分享的使用次数已用完"));
             }
         }
@@ -253,11 +333,17 @@ impl<T: Transport, S: System> Node<T, S> {
     pub(crate) fn share_is_active(&self, token: &[u8; 16]) -> bool {
         let now = self.system.now();
         let store = self.shares.borrow();
-        store.entries.values().any(|s| &s.token == token && !s.revoked && now < s.expires_at)
+        store
+            .entries
+            .values()
+            .any(|s| &s.token == token && !s.revoked && now < s.expires_at)
     }
 
     pub(crate) fn handle_share_open(&self, peer: NodeId, token: [u8; 16]) -> Response {
-        let me_name = self.roster().and_then(|r| r.device(self.me()).map(|d| d.name.clone())).unwrap_or_else(|| self.configured_name.clone());
+        let me_name = self
+            .roster()
+            .and_then(|r| r.device(self.me()).map(|d| d.name.clone()))
+            .unwrap_or_else(|| self.configured_name.clone());
         match self.validate_share(peer, &token, "share.open", true) {
             Ok(s) => Response::ShareOpened(ShareInfo {
                 id: s.id,
@@ -270,10 +356,19 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    pub(crate) fn handle_share_drive_list(&self, peer: NodeId, token: [u8; 16], sub_path: &str) -> Response {
+    pub(crate) fn handle_share_drive_list(
+        &self,
+        peer: NodeId,
+        token: [u8; 16],
+        sub_path: &str,
+    ) -> Response {
         let result = (|| {
             let s = self.validate_share(peer, &token, "share.drive", false)?;
-            let ShareTarget::Drive { ws, path: base_path } = &s.target else {
+            let ShareTarget::Drive {
+                ws,
+                path: base_path,
+            } = &s.target
+            else {
                 return Err(err(ErrorCode::InvalidInput, "这项分享不是文件或目录"));
             };
             let mut full_parts = norm_parts(base_path)?;
@@ -295,14 +390,24 @@ impl<T: Transport, S: System> Node<T, S> {
                         return Err(err(ErrorCode::Denied, "不能越界访问单文件分享之外的路径"));
                     }
                     let name = full_parts.last().cloned().unwrap_or_else(|| ws.clone());
-                    Ok(vec![ShareDriveEntry { name, kind: "file".into(), size, target: None }])
+                    Ok(vec![ShareDriveEntry {
+                        name,
+                        kind: "file".into(),
+                        size,
+                        target: None,
+                    }])
                 }
                 Entry::Symlink { target } => {
                     if !sub_parts.is_empty() {
                         return Err(err(ErrorCode::Denied, "不能越界访问链接分享之外的路径"));
                     }
                     let name = full_parts.last().cloned().unwrap_or_else(|| ws.clone());
-                    Ok(vec![ShareDriveEntry { name, kind: "symlink".into(), size: 0, target: Some(target) }])
+                    Ok(vec![ShareDriveEntry {
+                        name,
+                        kind: "symlink".into(),
+                        size: 0,
+                        target: Some(target),
+                    }])
                 }
                 Entry::Dir { .. } => {
                     full_parts.extend(sub_parts);
@@ -317,9 +422,24 @@ impl<T: Transport, S: System> Node<T, S> {
                         .entries
                         .into_iter()
                         .map(|(name, e)| match e {
-                            Entry::File { size, .. } => ShareDriveEntry { name, kind: "file".into(), size, target: None },
-                            Entry::Dir { .. } => ShareDriveEntry { name, kind: "dir".into(), size: 0, target: None },
-                            Entry::Symlink { target } => ShareDriveEntry { name, kind: "symlink".into(), size: 0, target: Some(target) },
+                            Entry::File { size, .. } => ShareDriveEntry {
+                                name,
+                                kind: "file".into(),
+                                size,
+                                target: None,
+                            },
+                            Entry::Dir { .. } => ShareDriveEntry {
+                                name,
+                                kind: "dir".into(),
+                                size: 0,
+                                target: None,
+                            },
+                            Entry::Symlink { target } => ShareDriveEntry {
+                                name,
+                                kind: "symlink".into(),
+                                size: 0,
+                                target: Some(target),
+                            },
                         })
                         .collect();
                     out.sort_by(|a, b| (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name)));
@@ -333,10 +453,20 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    pub(crate) fn handle_share_drive_read(&self, peer: NodeId, token: [u8; 16], sub_path: &str, max: u64) -> Response {
+    pub(crate) fn handle_share_drive_read(
+        &self,
+        peer: NodeId,
+        token: [u8; 16],
+        sub_path: &str,
+        max: u64,
+    ) -> Response {
         let result = (|| {
             let s = self.validate_share(peer, &token, "share.drive", false)?;
-            let ShareTarget::Drive { ws, path: base_path } = &s.target else {
+            let ShareTarget::Drive {
+                ws,
+                path: base_path,
+            } = &s.target
+            else {
                 return Err(err(ErrorCode::InvalidInput, "这项分享不是文件或目录"));
             };
             let mut full_parts = norm_parts(base_path)?;
@@ -354,16 +484,30 @@ impl<T: Transport, S: System> Node<T, S> {
                 .ok_or_else(|| err(ErrorCode::NotFound, "分享的路径已不存在"))?;
             let target_entry = match base_entry {
                 Entry::File { .. } => {
-                    if !sub_parts.is_empty() && !(sub_parts.len() == 1 && full_parts.last() == sub_parts.first()) {
-                        let me_name = self.roster().and_then(|r| r.device(self.me()).map(|d| d.name.clone())).unwrap_or_default();
-                        self.audit_share(peer, &s.id, "share.drive", &s.target.describe(&me_name), Outcome::Deny(DenyReason::NoMatchingGrant));
+                    if !sub_parts.is_empty()
+                        && !(sub_parts.len() == 1 && full_parts.last() == sub_parts.first())
+                    {
+                        let me_name = self
+                            .roster()
+                            .and_then(|r| r.device(self.me()).map(|d| d.name.clone()))
+                            .unwrap_or_default();
+                        self.audit_share(
+                            peer,
+                            &s.id,
+                            "share.drive",
+                            &s.target.describe(&me_name),
+                            Outcome::Deny(DenyReason::NoMatchingGrant),
+                        );
                         return Err(err(ErrorCode::Denied, "不能越界读取被分享文件之外的路径"));
                     }
                     base_entry
                 }
                 Entry::Dir { .. } => {
                     if sub_parts.is_empty() {
-                        return Err(err(ErrorCode::InvalidInput, "目标是目录，请指定要读取的文件子路径"));
+                        return Err(err(
+                            ErrorCode::InvalidInput,
+                            "目标是目录，请指定要读取的文件子路径",
+                        ));
                     }
                     full_parts.extend(sub_parts);
                     tree::lookup(&cas, ws_state.work, &full_parts)
@@ -371,7 +515,10 @@ impl<T: Transport, S: System> Node<T, S> {
                         .ok_or_else(|| err(ErrorCode::NotFound, "文件不存在"))?
                 }
                 Entry::Symlink { target } => {
-                    return Err(err(ErrorCode::InvalidInput, format!("目标是链接（指向 {target}）")));
+                    return Err(err(
+                        ErrorCode::InvalidInput,
+                        format!("目标是链接（指向 {target}）"),
+                    ));
                 }
             };
             let Entry::File { manifest, .. } = target_entry else {
@@ -384,15 +531,23 @@ impl<T: Transport, S: System> Node<T, S> {
             let spans = m.spans(0, max);
             let mut bytes = Vec::new();
             for span in spans {
-                let chunk = cas.get(&span.hash).ok_or_else(|| internal("本机缺少文件数据块"))?;
-                let part = chunk.get(span.from as usize..span.to as usize).ok_or_else(|| internal("文件块范围越界"))?;
+                let chunk = cas
+                    .get(&span.hash)
+                    .ok_or_else(|| internal("本机缺少文件数据块"))?;
+                let part = chunk
+                    .get(span.from as usize..span.to as usize)
+                    .ok_or_else(|| internal("文件块范围越界"))?;
                 bytes.extend_from_slice(part);
             }
             let truncated = (bytes.len() as u64) < m.size;
             Ok((m.size, bytes, truncated))
         })();
         match result {
-            Ok((size, bytes, truncated)) => Response::ShareDriveFile { size, bytes, truncated },
+            Ok((size, bytes, truncated)) => Response::ShareDriveFile {
+                size,
+                bytes,
+                truncated,
+            },
             Err(e) => Response::Error(e),
         }
     }
@@ -403,22 +558,41 @@ impl<T: Transport, S: System> Node<T, S> {
             Err(e) => return Dispatch::Reply(Response::Error(e)),
         };
         let ShareTarget::Service { name } = s.target else {
-            return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这项分享不是网页服务")));
+            return Dispatch::Reply(Response::Error(err(
+                ErrorCode::InvalidInput,
+                "这项分享不是网页服务",
+            )));
         };
         match self.service_addr(&name) {
             Some(addr) => Dispatch::Pipe { addr, name },
-            None => Dispatch::Reply(Response::Error(err(ErrorCode::NotFound, format!("服务 {name} 已取消发布")))),
+            None => Dispatch::Reply(Response::Error(err(
+                ErrorCode::NotFound,
+                format!("服务 {name} 已取消发布"),
+            ))),
         }
     }
 
-    pub(crate) fn handle_share_terminal(&self, peer: NodeId, token: [u8; 16], size: Size) -> Dispatch {
+    pub(crate) fn handle_share_terminal(
+        &self,
+        peer: NodeId,
+        token: [u8; 16],
+        size: Size,
+    ) -> Dispatch {
         let s = match self.validate_share(peer, &token, "share.terminal", false) {
             Ok(s) => s,
             Err(e) => return Dispatch::Reply(Response::Error(e)),
         };
         let ShareTarget::Terminal { session } = s.target else {
-            return Dispatch::Reply(Response::Error(err(ErrorCode::InvalidInput, "这项分享不是终端会话")));
+            return Dispatch::Reply(Response::Error(err(
+                ErrorCode::InvalidInput,
+                "这项分享不是终端会话",
+            )));
         };
-        Dispatch::ShareSession { name: session, size, token, expires_at: s.expires_at }
+        Dispatch::ShareSession {
+            name: session,
+            size,
+            token,
+            expires_at: s.expires_at,
+        }
     }
 }

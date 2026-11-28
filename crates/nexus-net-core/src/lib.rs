@@ -3,6 +3,10 @@
 //! 这里只处理字节和规则，不碰网络：读写由运行时负责，所以同一份代码在仿真和真实环境里一样。
 #![forbid(unsafe_code)]
 
+pub mod app_policy;
+pub mod import;
+pub mod power;
+
 use core::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +47,10 @@ impl Target {
             let (host, port) = s.rsplit_once(':')?;
             (host_of(host)?, port)
         };
-        Some(Target { host, port: port.parse().ok()? })
+        Some(Target {
+            host,
+            port: port.parse().ok()?,
+        })
     }
 }
 
@@ -101,11 +108,15 @@ pub mod socks5 {
 
     /// 问候：版本、方法数、方法。返回（消耗的字节，是否提供了不认证）；不完整时 `None`。
     pub fn parse_greeting(buf: &[u8]) -> Result<Option<(usize, bool)>, Reply> {
-        let Some(&ver) = buf.first() else { return Ok(None) };
+        let Some(&ver) = buf.first() else {
+            return Ok(None);
+        };
         if ver != 5 {
             return Err(Reply::GeneralFailure);
         }
-        let Some(&n) = buf.get(1) else { return Ok(None) };
+        let Some(&n) = buf.get(1) else {
+            return Ok(None);
+        };
         let end = 2 + n as usize;
         if buf.len() < end {
             return Ok(None);
@@ -128,16 +139,27 @@ pub mod socks5 {
     }
 
     fn parse_address(buf: &[u8]) -> Result<Option<(usize, Target)>, Reply> {
-        let Some(&kind) = buf.first() else { return Ok(None) };
+        let Some(&kind) = buf.first() else {
+            return Ok(None);
+        };
         let (host, at) = match kind {
             1 => {
-                let Some(b) = buf.get(1..5) else { return Ok(None) };
-                (Host::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))), 5)
+                let Some(b) = buf.get(1..5) else {
+                    return Ok(None);
+                };
+                (
+                    Host::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
+                    5,
+                )
             }
             3 => {
-                let Some(&len) = buf.get(1) else { return Ok(None) };
+                let Some(&len) = buf.get(1) else {
+                    return Ok(None);
+                };
                 let end = 2 + len as usize;
-                let Some(name) = buf.get(2..end) else { return Ok(None) };
+                let Some(name) = buf.get(2..end) else {
+                    return Ok(None);
+                };
                 let name = core::str::from_utf8(name).map_err(|_| Reply::GeneralFailure)?;
                 if name.is_empty() {
                     return Err(Reply::GeneralFailure);
@@ -145,14 +167,24 @@ pub mod socks5 {
                 (Host::Name(name.to_string()), end)
             }
             4 => {
-                let Some(b) = buf.get(1..17) else { return Ok(None) };
+                let Some(b) = buf.get(1..17) else {
+                    return Ok(None);
+                };
                 let octets: [u8; 16] = b.try_into().expect("长度已检查");
                 (Host::Ip(IpAddr::V6(Ipv6Addr::from(octets))), 17)
             }
             _ => return Err(Reply::AddressTypeNotSupported),
         };
-        let Some(p) = buf.get(at..at + 2) else { return Ok(None) };
-        Ok(Some((at + 2, Target { host, port: u16::from_be_bytes([p[0], p[1]]) })))
+        let Some(p) = buf.get(at..at + 2) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            at + 2,
+            Target {
+                host,
+                port: u16::from_be_bytes([p[0], p[1]]),
+            },
+        )))
     }
 
     /// 回应：绑定地址固定为 0.0.0.0:0（客户端用不上它）。
@@ -212,12 +244,16 @@ pub mod socks5 {
         if !reply.starts_with(&[5, 0, 0]) {
             return Err(BadReply);
         }
-        parse_address(&reply[3..]).map_err(|_| BadReply)?.map(|(_, target)| target).ok_or(BadReply)
+        parse_address(&reply[3..])
+            .map_err(|_| BadReply)?
+            .map(|(_, target)| target)
+            .ok_or(BadReply)
     }
 
     /// SOCKS5 UDP 头。只发送不分片的数据报。
     pub fn udp_header(target: &Target) -> Option<Vec<u8>> {
-        if matches!(&target.host, Host::Name(name) if name.is_empty() || name.len() > u8::MAX as usize) {
+        if matches!(&target.host, Host::Name(name) if name.is_empty() || name.len() > u8::MAX as usize)
+        {
             return None;
         }
         let mut header = vec![0, 0, 0];
@@ -253,20 +289,28 @@ pub mod http {
 
     /// 解析完整的请求头（到空行为止）。
     pub fn parse(head: &[u8]) -> Result<ProxyRequest, BadRequest> {
-        let end = head.windows(4).position(|w| w == b"\r\n\r\n").ok_or(BadRequest("请求头不完整"))?;
+        let end = head
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or(BadRequest("请求头不完整"))?;
         let text = core::str::from_utf8(&head[..end]).map_err(|_| BadRequest("请求头不是文本"))?;
         let mut lines = text.split("\r\n");
         let line = lines.next().unwrap_or_default();
         let mut parts = line.split(' ');
-        let (method, uri, version) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(m), Some(u), Some(v), None) if !m.is_empty() && v.starts_with("HTTP/") => (m, u, v),
+        let (method, uri, version) = match (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            (Some(m), Some(u), Some(v), None) if !m.is_empty() && v.starts_with("HTTP/") => {
+                (m, u, v)
+            }
             _ => return Err(BadRequest("请求行不合法")),
         };
         if method == "CONNECT" {
             let target = Target::parse(uri).ok_or(BadRequest("CONNECT 的目标应当是 主机:端口"))?;
             return Ok(ProxyRequest::Connect(target));
         }
-        let rest = uri.strip_prefix("http://").ok_or(BadRequest("代理请求要用绝对形式的 http:// 地址"))?;
+        let rest = uri
+            .strip_prefix("http://")
+            .ok_or(BadRequest("代理请求要用绝对形式的 http:// 地址"))?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => match rest.find('?') {
@@ -274,15 +318,31 @@ pub mod http {
                 None => (rest, "/"),
             },
         };
-        let path = if path.starts_with('?') { format!("/{path}") } else { path.to_string() };
-        let target = if authority.starts_with('[') || authority.rsplit_once(':').is_some_and(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())) {
+        let path = if path.starts_with('?') {
+            format!("/{path}")
+        } else {
+            path.to_string()
+        };
+        let target = if authority.starts_with('[')
+            || authority
+                .rsplit_once(':')
+                .is_some_and(|(_, p)| p.bytes().all(|b| b.is_ascii_digit()))
+        {
             Target::parse(authority).ok_or(BadRequest("地址不合法"))?
         } else {
-            Target { host: host_of(authority).ok_or(BadRequest("地址不合法"))?, port: 80 }
+            Target {
+                host: host_of(authority).ok_or(BadRequest("地址不合法"))?,
+                port: 80,
+            }
         };
         let mut out = format!("{method} {path} {version}\r\n");
         for l in lines {
-            let name = l.split(':').next().unwrap_or_default().trim().to_ascii_lowercase();
+            let name = l
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
             if name.starts_with("proxy-") {
                 continue;
             }
@@ -292,7 +352,10 @@ pub mod http {
         out.push_str("\r\n");
         let mut bytes = out.into_bytes();
         bytes.extend_from_slice(&head[end + 4..]);
-        Ok(ProxyRequest::Forward { target, head: bytes })
+        Ok(ProxyRequest::Forward {
+            target,
+            head: bytes,
+        })
     }
 
     /// 一个简短的错误回应（之后关闭连接）。
@@ -318,13 +381,18 @@ pub mod route {
         Domain(String),
         /// 一个地址段。
         Cidr { net: IpAddr, prefix: u8 },
+        /// 仅精确匹配该域名本身，不匹配子域名（小写，不带结尾的点）。
+        /// 必须放在最后：路由表用 postcard 存盘，按变体序号编码，插在中间会让已存的地址段规则读错。
+        DomainExact(String),
     }
 
     impl Matcher {
         pub fn parse_domain(s: &str) -> Result<Self, String> {
             let d = s.trim_end_matches('.').to_ascii_lowercase();
             let ok = !d.is_empty()
-                && d.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+                && d.split('.').all(|l| {
+                    !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                });
             if ok {
                 Ok(Matcher::Domain(d))
             } else {
@@ -332,12 +400,28 @@ pub mod route {
             }
         }
 
+        pub fn parse_domain_exact(s: &str) -> Result<Self, String> {
+            match Self::parse_domain(s)? {
+                Matcher::Domain(d) => Ok(Matcher::DomainExact(d)),
+                other => Ok(other),
+            }
+        }
+
         pub fn parse_cidr(s: &str) -> Result<Self, String> {
-            let (ip, len) = s.split_once('/').ok_or_else(|| format!("地址段应当写成 地址/前缀长度：{s}"))?;
+            let (ip, len) = s
+                .split_once('/')
+                .ok_or_else(|| format!("地址段应当写成 地址/前缀长度：{s}"))?;
             let ip: IpAddr = ip.parse().map_err(|_| format!("地址不合法：{s}"))?;
             let max = if ip.is_ipv4() { 32 } else { 128 };
-            let prefix: u8 = len.parse().ok().filter(|&p| p <= max).ok_or_else(|| format!("前缀长度不合法：{s}"))?;
-            Ok(Matcher::Cidr { net: mask(ip, prefix), prefix })
+            let prefix: u8 = len
+                .parse()
+                .ok()
+                .filter(|&p| p <= max)
+                .ok_or_else(|| format!("前缀长度不合法：{s}"))?;
+            Ok(Matcher::Cidr {
+                net: mask(ip, prefix),
+                prefix,
+            })
         }
 
         pub fn matches(&self, t: &Target) -> bool {
@@ -346,6 +430,7 @@ pub mod route {
                     let n = normalize(n);
                     n == *d || n.ends_with(&format!(".{d}"))
                 }
+                (Matcher::DomainExact(d), Host::Name(n)) => normalize(n) == *d,
                 (Matcher::Cidr { net, prefix }, Host::Ip(ip)) => {
                     net.is_ipv4() == ip.is_ipv4() && mask(*ip, *prefix) == *net
                 }
@@ -358,6 +443,7 @@ pub mod route {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 Matcher::Domain(d) => write!(f, "{d}"),
+                Matcher::DomainExact(d) => write!(f, "exact:{d}"),
                 Matcher::Cidr { net, prefix } => write!(f, "{net}/{prefix}"),
             }
         }
@@ -366,11 +452,19 @@ pub mod route {
     fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
         match ip {
             IpAddr::V4(v) => {
-                let m = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                let m = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
                 IpAddr::V4((u32::from(v) & m).into())
             }
             IpAddr::V6(v) => {
-                let m = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+                let m = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
                 IpAddr::V6((u128::from(v) & m).into())
             }
         }
@@ -408,68 +502,6 @@ pub mod route {
         pub outbound: Outbound,
     }
 
-    /// 读取 Clash/Mihomo `rules` 或 `payload` 中的 DOMAIN-SUFFIX 条目。
-    /// DIRECT、REJECT 保持原义，一个命名策略或无策略的条目映射到选定出口。
-    pub fn import_domain_rules(text: &str, selected: Outbound) -> Result<Vec<Rule>, String> {
-        if text.len() > 64 * 1024 {
-            return Err("导入内容超过 64 KiB".into());
-        }
-        let mut rules = Vec::new();
-        let mut named_policy = None;
-        for (index, raw) in text.lines().enumerate() {
-            let invalid = |why: &str| format!("第 {} 行：{why}", index + 1);
-            let mut line = raw.trim();
-            if line.is_empty() || line.starts_with('#') || matches!(line, "rules:" | "payload:") {
-                continue;
-            }
-            if let Some(item) = line.strip_prefix("- ") {
-                line = item.trim();
-            }
-            if line.contains('#') {
-                return Err(invalid("请移除规则行尾的注释"));
-            }
-            if let Some(first) = line.chars().next().filter(|c| matches!(c, '\'' | '"')) {
-                line = line.strip_prefix(first).and_then(|s| s.strip_suffix(first)).ok_or_else(|| invalid("规则引号不成对"))?;
-            }
-            let mut parts = line.split(',').map(str::trim);
-            if parts.next() != Some("DOMAIN-SUFFIX") {
-                return Err(invalid("只支持 DOMAIN-SUFFIX；请粘贴规则列表或规则集的子集"));
-            }
-            let domain = parts.next().ok_or_else(|| invalid("缺少域名"))?;
-            let matcher = Matcher::parse_domain(domain).map_err(|e| invalid(&e))?;
-            if matches!(&matcher, Matcher::Domain(d) if d == super::SERVICE_SUFFIX || d.ends_with(".internal")) {
-                return Err(invalid(".internal 域名只能由 Nexus 私有服务处理"));
-            }
-            let policy = parts.next();
-            if parts.next().is_some() || policy.is_some_and(str::is_empty) {
-                return Err(invalid("缺少策略或包含不支持的规则选项"));
-            }
-            let outbound = match policy {
-                Some("DIRECT") => Outbound::Direct,
-                Some("REJECT") => Outbound::Reject,
-                Some("REJECT-DROP" | "REJECT-TINYGIF" | "PASS" | "COMPATIBLE" | "GLOBAL") => {
-                    return Err(invalid("该内置策略没有等价的 Nexus 行为"));
-                }
-                Some(name) => {
-                    if named_policy.is_some_and(|existing| existing != name) {
-                        return Err(invalid("一次只能把一个命名策略映射到所选出口"));
-                    }
-                    named_policy = Some(name);
-                    selected.clone()
-                }
-                None => selected.clone(),
-            };
-            if rules.len() == 256 {
-                return Err("一次最多导入 256 条规则".into());
-            }
-            rules.push(Rule { matcher, outbound });
-        }
-        if rules.is_empty() {
-            return Err("没有可导入的 DOMAIN-SUFFIX 规则".into());
-        }
-        Ok(rules)
-    }
-
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Decision {
         /// 网络里发布的服务。
@@ -487,18 +519,138 @@ pub mod route {
             let n = normalize(n);
             if n == SERVICE_SUFFIX || n.ends_with(&format!(".{SERVICE_SUFFIX}")) {
                 let labels: Vec<&str> = n.split('.').collect();
-                let ok = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                let ok = |l: &str| {
+                    !l.is_empty()
+                        && l.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                };
                 return match labels.as_slice() {
-                    [service, device, _] if ok(service) && ok(device) => {
-                        Decision::Service { device: device.to_string(), service: service.to_string() }
-                    }
+                    [service, device, _] if ok(service) && ok(device) => Decision::Service {
+                        device: device.to_string(),
+                        service: service.to_string(),
+                    },
                     _ => Decision::BadInternalName,
                 };
             }
         }
         match rules.iter().position(|r| r.matcher.matches(target)) {
-            Some(index) => Decision::Rule { index, outbound: rules[index].outbound.clone() },
+            Some(index) => Decision::Rule {
+                index,
+                outbound: rules[index].outbound.clone(),
+            },
             None => Decision::Default(Outbound::Direct),
+        }
+    }
+
+    /// 静态规则审计发现的问题类型。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AuditKind {
+        /// 与前序规则匹配器完全重复，永不可达。
+        Duplicate,
+        /// 被更宽的前序规则遮蔽，永不可达。
+        Shadowed,
+        /// 出口或上游代理配置无效。
+        InvalidUpstream,
+    }
+
+    /// 单条审计问题（规则编号为 1-based，与 `nexus route ls` 一致）。
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AuditIssue {
+        pub rule_index: usize,
+        pub kind: AuditKind,
+        pub shadowed_by: Option<usize>,
+        pub message: String,
+    }
+
+    /// 规则表的静态编译审计报告。
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RuleAudit {
+        pub issues: Vec<AuditIssue>,
+    }
+
+    impl RuleAudit {
+        pub fn is_clean(&self) -> bool {
+            self.issues.is_empty()
+        }
+    }
+
+    /// 检查规则表中的重复规则、被前序宽规则遮蔽的不可达规则以及无效上游地址。
+    pub fn audit_rules(rules: &[Rule]) -> RuleAudit {
+        let mut issues = Vec::new();
+        for (i, rule) in rules.iter().enumerate() {
+            let idx = i + 1;
+            match &rule.outbound {
+                Outbound::Exit(dev) if dev.trim().is_empty() => {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::InvalidUpstream,
+                        shadowed_by: None,
+                        message: format!("第 {idx} 条规则的出口设备名为空"),
+                    });
+                }
+                Outbound::Socks5(addr) if Target::parse(addr).is_none() => {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::InvalidUpstream,
+                        shadowed_by: None,
+                        message: format!("第 {idx} 条规则的上游 SOCKS5 地址不合法：{addr}"),
+                    });
+                }
+                _ => {}
+            }
+            for (j, prev) in rules[..i].iter().enumerate() {
+                let prev_idx = j + 1;
+                if prev.matcher == rule.matcher {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::Duplicate,
+                        shadowed_by: Some(prev_idx),
+                        message: format!(
+                            "第 {idx} 条规则（{}）与第 {prev_idx} 条完全重复，永不生效",
+                            rule.matcher
+                        ),
+                    });
+                    break;
+                }
+                if matcher_covers(&prev.matcher, &rule.matcher) {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::Shadowed,
+                        shadowed_by: Some(prev_idx),
+                        message: format!(
+                            "第 {idx} 条规则（{}）被第 {prev_idx} 条（{}）完全遮蔽，永不可达",
+                            rule.matcher, prev.matcher
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+        RuleAudit { issues }
+    }
+
+    fn matcher_covers(broad: &Matcher, narrow: &Matcher) -> bool {
+        match (broad, narrow) {
+            (Matcher::Domain(b), Matcher::Domain(n))
+            | (Matcher::Domain(b), Matcher::DomainExact(n)) => {
+                n == b || n.ends_with(&format!(".{b}"))
+            }
+            (
+                Matcher::Cidr {
+                    net: b_net,
+                    prefix: b_pref,
+                },
+                Matcher::Cidr {
+                    net: n_net,
+                    prefix: n_pref,
+                },
+            ) => {
+                b_net.is_ipv4() == n_net.is_ipv4()
+                    && b_pref <= n_pref
+                    && mask(*n_net, *b_pref) == *b_net
+            }
+            _ => false,
         }
     }
 }
@@ -618,8 +770,8 @@ pub mod dns {
 /// 完整节点给名字分配的本机临时地址：同一个名字总是同一个地址，地址可以反查名字；
 /// 用完时重新用最早分配的地址。网段的第一个地址留给网段本身，第二个给本机一侧，第三个给名字服务，最后一个是广播。
 pub mod fakeip {
-    use std::collections::BTreeMap;
     use core::net::Ipv4Addr;
+    use std::collections::BTreeMap;
 
     #[derive(Clone, Debug)]
     pub struct FakePool {
@@ -644,7 +796,14 @@ pub mod fakeip {
                 return None;
             }
             let size = (1u32 << (32 - prefix)) - 4;
-            Some(Self { base, prefix, size, next: 0, by_name: BTreeMap::new(), by_ip: BTreeMap::new() })
+            Some(Self {
+                base,
+                prefix,
+                size,
+                next: 0,
+                by_name: BTreeMap::new(),
+                by_ip: BTreeMap::new(),
+            })
         }
 
         pub fn network(&self) -> (Ipv4Addr, u8) {

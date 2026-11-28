@@ -37,7 +37,12 @@ pub fn seal(secret: &[u8; 32], name: &str, salt: [u8; SALT_LEN], plain: &[u8]) -
     let key = entry_key(secret, name);
     let mut out = Vec::with_capacity(SALT_LEN + plain.len() + TAG_LEN);
     out.extend_from_slice(&salt);
-    out.extend(plain.iter().zip(keystream(&key, &salt, plain.len())).map(|(a, b)| a ^ b));
+    out.extend(
+        plain
+            .iter()
+            .zip(keystream(&key, &salt, plain.len()))
+            .map(|(a, b)| a ^ b),
+    );
     let t = tag(&key, &salt, &out[SALT_LEN..]);
     out.extend_from_slice(&t);
     out
@@ -55,7 +60,12 @@ pub fn open(secret: &[u8; 32], name: &str, sealed: &[u8]) -> Option<Vec<u8>> {
     if expect.iter().zip(t).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0 {
         return None;
     }
-    Some(ct.iter().zip(keystream(&key, salt, ct.len())).map(|(a, b)| a ^ b).collect())
+    Some(
+        ct.iter()
+            .zip(keystream(&key, salt, ct.len()))
+            .map(|(a, b)| a ^ b)
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -72,10 +82,15 @@ mod tests {
         let salt = [3; 16];
         let sealed = seal(&secret, "openai_key", salt, b"sk-live-12345");
         assert_ne!(&sealed[16..sealed.len() - 16], b"sk-live-12345");
-        assert_eq!(open(&peer_secret, "openai_key", &sealed).unwrap(), b"sk-live-12345");
+        assert_eq!(
+            open(&peer_secret, "openai_key", &sealed).unwrap(),
+            b"sk-live-12345"
+        );
         // 公开根公钥、其他设备密钥、换条目名或篡改密文都解不开。
         assert!(open(&root.public().0, "openai_key", &sealed).is_none());
-        let other = SecretKey::from_seed([11; 32]).diffie_hellman(&root.public()).unwrap();
+        let other = SecretKey::from_seed([11; 32])
+            .diffie_hellman(&root.public())
+            .unwrap();
         assert!(open(&other, "openai_key", &sealed).is_none());
         assert!(open(&peer_secret, "other_key", &sealed).is_none());
         let mut bad = sealed.clone();

@@ -1,10 +1,13 @@
 use nexus_cli::daemon::{self, parse_tun_net, transport_config};
-use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Sink, EXIT_INTERNAL, EXIT_USAGE};
+use nexus_cli::UnixCtl;
+use nexus_cli::{
+    load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Cli, Cmd, Sink, EXIT_INTERNAL,
+    EXIT_USAGE,
+};
 use nexus_fabric_iroh::Relay;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use nexus_cli::UnixCtl;
 
 mod anchor;
 #[cfg(target_os = "linux")]
@@ -42,20 +45,45 @@ fn main() {
     }
     let data_dir = data_dir(&cli);
     // 终端会话的持有进程（M7.2）：自己建运行时，shell 退出才返回。
-    if let Cmd::SessionHold { name, cols, rows, created_at_ms, restore } = &cli.cmd {
-        let size = nexus_sys_real::Size { cols: *cols, rows: *rows };
-        let r = nexus_sys_real::holder::run(&data_dir, name, size, nexus_core_proto::Timestamp(*created_at_ms), *restore);
+    if let Cmd::SessionHold {
+        name,
+        cols,
+        rows,
+        created_at_ms,
+        restore,
+    } = &cli.cmd
+    {
+        let size = nexus_sys_real::Size {
+            cols: *cols,
+            rows: *rows,
+        };
+        let r = nexus_sys_real::holder::run(
+            &data_dir,
+            name,
+            size,
+            nexus_core_proto::Timestamp(*created_at_ms),
+            *restore,
+        );
         if let Err(e) = r {
             Terminal.err(format!("nexus session-hold: {e}\n").as_bytes());
             std::process::exit(EXIT_INTERNAL);
         }
         std::process::exit(0);
     }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("无法启动运行时");
     let agent = match cli.agent.as_deref().map(load_agent).transpose() {
         Ok(a) => a,
         Err(msg) => {
-            Terminal.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+            Terminal.err(
+                format!(
+                    "{}\n",
+                    serde_json::json!({ "error": "usage", "message": msg })
+                )
+                .as_bytes(),
+            );
             std::process::exit(EXIT_USAGE);
         }
     };
@@ -210,11 +238,21 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
     let mut args = match ssh_args(cmd) {
         Ok(a) => a,
         Err(msg) => {
-            Terminal.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+            Terminal.err(
+                format!(
+                    "{}\n",
+                    serde_json::json!({ "error": "usage", "message": msg })
+                )
+                .as_bytes(),
+            );
             return EXIT_USAGE;
         }
     };
-    let current = || crossterm::terminal::size().ok().map(|(cols, rows)| nexus_wire::Size { cols, rows });
+    let current = || {
+        crossterm::terminal::size()
+            .ok()
+            .map(|(cols, rows)| nexus_wire::Size { cols, rows })
+    };
     if !args.size_given {
         if let Some(size) = current() {
             args.size = size;
@@ -225,7 +263,9 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
         #[cfg(unix)]
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut winch) = signal(SignalKind::window_change()) else { return };
+            let Ok(mut winch) = signal(SignalKind::window_change()) else {
+                return;
+            };
             while winch.recv().await.is_some() {
                 if let Some(size) = current() {
                     if tx.send(size).await.is_err() {
@@ -256,7 +296,14 @@ async fn interactive_ssh(cmd: &Cmd, ctl: &UnixCtl) -> i32 {
         Terminal.err("nexus ssh: 无法把终端切换到原始模式\n".as_bytes());
         return EXIT_INTERNAL;
     }
-    let result = ssh(ctl, &args, &mut tokio::io::stdin(), &mut tokio::io::stdout(), &mut resizes).await;
+    let result = ssh(
+        ctl,
+        &args,
+        &mut tokio::io::stdin(),
+        &mut tokio::io::stdout(),
+        &mut resizes,
+    )
+    .await;
     let _ = crossterm::terminal::disable_raw_mode();
     match result {
         Ok(code) => code,
@@ -276,6 +323,8 @@ fn data_dir(cli: &Cli) -> PathBuf {
     if let Some(d) = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("USERPROFILE")) {
         return PathBuf::from(d).join("nexus");
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| ".".into());
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ".".into());
     home.join(".local/share/nexus")
 }

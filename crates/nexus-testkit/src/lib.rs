@@ -10,11 +10,16 @@ pub use nexus_web_core;
 
 pub use nexus_cli::Output;
 
-use nexus_cli::{load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs, EXIT_USAGE};
+use nexus_cli::{
+    load_agent, parse, run_client, ssh, ssh_args, ssh_fail, Captured, Ctl, Sink, SshArgs,
+    EXIT_USAGE,
+};
 use nexus_fabric_sim::SimTransport;
-use nexus_runtime::{ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node, ProxyStream};
-use nexus_sys_sim::{SimClock, SimDisk, SimServices, SimSystem};
+use nexus_runtime::{
+    ctl_session, load_or_create_device_key, CtlCall, CtlClient, Node, ProxyStream,
+};
 pub use nexus_sys_sim::SimService as Service;
+use nexus_sys_sim::{SimClock, SimDisk, SimServices, SimSystem};
 use nexus_wire::{AgentCredential, CtlRequest};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -51,10 +56,17 @@ impl World {
     /// 在节点上运行一个只监听本机的服务，返回它的端口。
     pub async fn serve(&self, node: &str, service: Service) -> u16 {
         match &self.inner {
-            Inner::Sim { services, next_port, .. } => {
+            Inner::Sim {
+                services,
+                next_port,
+                ..
+            } => {
                 let port = next_port.get();
                 next_port.set(port + 1);
-                services.get(node).unwrap_or_else(|| panic!("没有节点 {node}")).add(port, service);
+                services
+                    .get(node)
+                    .unwrap_or_else(|| panic!("没有节点 {node}"))
+                    .add(port, service);
                 port
             }
             Inner::Real(real) => real.serve(service).await,
@@ -65,16 +77,26 @@ impl World {
     /// 仿真里只有用这个地址才连得上，而且只在这个节点上；真实后端里是这台机器的一个非本机地址。
     pub async fn serve_public(&self, node: &str, service: Service) -> (String, u16) {
         match &self.inner {
-            Inner::Sim { services, next_port, .. } => {
+            Inner::Sim {
+                services,
+                next_port,
+                ..
+            } => {
                 let port = next_port.get();
                 next_port.set(port + 1);
                 let ip = std::net::IpAddr::from([198, 51, 100, 7]);
-                services.get(node).unwrap_or_else(|| panic!("没有节点 {node}")).add_public((ip, port).into(), service);
+                services
+                    .get(node)
+                    .unwrap_or_else(|| panic!("没有节点 {node}"))
+                    .add_public((ip, port).into(), service);
                 (ip.to_string(), port)
             }
             Inner::Real(_) => {
                 let ip = public_ip();
-                (ip.to_string(), serve_on(std::net::SocketAddr::new(ip, 0), service))
+                (
+                    ip.to_string(),
+                    serve_on(std::net::SocketAddr::new(ip, 0), service),
+                )
             }
         }
     }
@@ -82,9 +104,12 @@ impl World {
     /// 节点的本机统一入口（SOCKS5 / HTTP 代理）。
     pub fn proxy(&self, node: &str) -> ProxyClient {
         match &self.inner {
-            Inner::Sim { proxies, .. } => {
-                ProxyClient::Sim(proxies.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone())
-            }
+            Inner::Sim { proxies, .. } => ProxyClient::Sim(
+                proxies
+                    .get(node)
+                    .unwrap_or_else(|| panic!("场景里没有节点 {node}"))
+                    .clone(),
+            ),
             Inner::Real(real) => ProxyClient::Real(real.proxy_port(node)),
         }
     }
@@ -97,7 +122,11 @@ impl World {
                 next_port.set(port + 1);
                 port
             }
-            Inner::Real(_) => std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(),
+            Inner::Real(_) => std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port(),
         }
     }
 
@@ -110,18 +139,27 @@ impl World {
     pub async fn cli_with_stdin(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         let out = match &self.inner {
             Inner::Sim { nodes, .. } => {
-                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                let tx = nodes
+                    .get(node)
+                    .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
                 let mut sink = Captured::default();
                 let code = match parse(args.iter().copied(), &mut sink) {
                     Err(code) => code,
                     Ok(cli) => match cli.agent.as_deref().map(load_agent).transpose() {
                         Err(msg) => {
-                            sink.err(format!("{}\n", serde_json::json!({ "error": "usage", "message": msg })).as_bytes());
+                            sink.err(
+                                format!(
+                                    "{}\n",
+                                    serde_json::json!({ "error": "usage", "message": msg })
+                                )
+                                .as_bytes(),
+                            );
                             EXIT_USAGE
                         }
                         Ok(agent) => {
                             let mut input = std::io::Cursor::new(stdin.to_vec());
-                            run_client(&cli.cmd, &ChanCtl(tx.clone(), agent), &mut input, &mut sink).await
+                            run_client(&cli.cmd, &ChanCtl(tx.clone(), agent), &mut input, &mut sink)
+                                .await
                         }
                     },
                 };
@@ -130,9 +168,10 @@ impl World {
             Inner::Real(real) => real.cli_async(node, args, stdin).await,
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
-        self.trace
-            .borrow_mut()
-            .push(format!("{at}ms {node} {args:?} -> {} {}{}", out.code, out.stdout, out.stderr));
+        self.trace.borrow_mut().push(format!(
+            "{at}ms {node} {args:?} -> {} {}{}",
+            out.code, out.stdout, out.stderr
+        ));
         out
     }
 
@@ -148,16 +187,23 @@ impl World {
         let now = now_ms.unwrap_or_else(|| self.now().0);
         let screen = match &self.inner {
             Inner::Sim { nodes, .. } => {
-                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                let tx = nodes
+                    .get(node)
+                    .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
                 nexus_cli::app::refresh(&ChanCtl(tx.clone(), None), held, renew, now).await
             }
             Inner::Real(real) => {
-                let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+                let dir = real
+                    .dirs
+                    .get(node)
+                    .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
                 nexus_cli::app::refresh(&nexus_cli::UnixCtl::new(dir, None), held, renew, now).await
             }
         };
         let at = turmoil::sim_elapsed().map(|d| d.as_millis()).unwrap_or(0);
-        self.trace.borrow_mut().push(format!("{at}ms {node} app {screen:?}"));
+        self.trace
+            .borrow_mut()
+            .push(format!("{at}ms {node} app {screen:?}"));
         screen
     }
 
@@ -190,9 +236,20 @@ impl World {
         let mut full: Vec<&str> = args.to_vec();
         full.push("--json");
         let out = self.cli(node, &full).await;
-        assert_eq!(out.code, 0, "{node}: nexus {} 失败：{}", full.join(" "), out.stderr);
-        serde_json::from_str(&out.stdout)
-            .unwrap_or_else(|e| panic!("{node}: nexus {} 的输出不是 JSON（{e}）：{:?}", full.join(" "), out.stdout))
+        assert_eq!(
+            out.code,
+            0,
+            "{node}: nexus {} 失败：{}",
+            full.join(" "),
+            out.stderr
+        );
+        serde_json::from_str(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{node}: nexus {} 的输出不是 JSON（{e}）：{:?}",
+                full.join(" "),
+                out.stdout
+            )
+        })
     }
 
     /// 用户的操作流程：在 `admin` 上建立网络，再把 `members` 逐个加入。
@@ -200,8 +257,12 @@ impl World {
         self.cli_ok(admin, &["init", "--name", admin]).await;
         for m in members {
             let code = self.cli_ok(m, &["join"]).await;
-            let code = code["code"].as_str().expect("join 应当输出加入码").to_string();
-            self.cli_ok(admin, &["device", "approve", &code, "--name", m]).await;
+            let code = code["code"]
+                .as_str()
+                .expect("join 应当输出加入码")
+                .to_string();
+            self.cli_ok(admin, &["device", "approve", &code, "--name", m])
+                .await;
         }
     }
 
@@ -244,15 +305,24 @@ impl World {
             full.extend(["--size", "80x24"]);
         }
         let mut ignored = Captured::default();
-        let cli = parse(full.iter().copied(), &mut ignored).unwrap_or_else(|_| panic!("参数不对：{full:?}"));
+        let cli = parse(full.iter().copied(), &mut ignored)
+            .unwrap_or_else(|_| panic!("参数不对：{full:?}"));
         let ssh = ssh_args(&cli.cmd).unwrap_or_else(|e| panic!("{e}"));
         let state = Arc::new(TermState::new(ssh.size));
         let label = format!("{node}$ nexus {}", args.join(" "));
         self.trace.borrow_mut().push(format!("term {label}"));
         let io = match &self.inner {
             Inner::Sim { nodes, .. } => {
-                let tx = nodes.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
-                let agent = cli.agent.as_deref().map(load_agent).transpose().expect("合法凭据");
+                let tx = nodes
+                    .get(node)
+                    .unwrap_or_else(|| panic!("场景里没有节点 {node}"))
+                    .clone();
+                let agent = cli
+                    .agent
+                    .as_deref()
+                    .map(load_agent)
+                    .transpose()
+                    .expect("合法凭据");
                 TermIo::Sim(sim_term(tx, ssh, agent, state.clone()))
             }
             Inner::Real(real) => TermIo::Real(real.term(node, &full, state.clone())),
@@ -286,15 +356,23 @@ impl World {
     /// 环境：`PATH` 最前面是 nexus 所在的目录，`NEXUS_DATA_DIR` 指向这个节点，
     /// `HOME` 是这个节点专用的空目录（没有任何 SSH 密钥和配置）。
     pub async fn host(&self, node: &str, argv: &[&str], stdin: &[u8]) -> Output {
-        let Inner::Real(real) = &self.inner else { panic!("host 只能用于真实后端") };
-        self.trace.borrow_mut().push(format!("host {node}$ {}", argv.join(" ")));
+        let Inner::Real(real) = &self.inner else {
+            panic!("host 只能用于真实后端")
+        };
+        self.trace
+            .borrow_mut()
+            .push(format!("host {node}$ {}", argv.join(" ")));
         real.host(node, None, argv, stdin)
     }
 
     /// 和 [`World::host`] 一样，但以另一个系统账号（`uid`）运行。`NEXUS_AGENT_SOCKET` 指向该节点的 agent 入口。
     pub async fn host_as(&self, node: &str, uid: u32, argv: &[&str], stdin: &[u8]) -> Output {
-        let Inner::Real(real) = &self.inner else { panic!("host_as 只能用于真实后端") };
-        self.trace.borrow_mut().push(format!("host {node} uid={uid}$ {}", argv.join(" ")));
+        let Inner::Real(real) = &self.inner else {
+            panic!("host_as 只能用于真实后端")
+        };
+        self.trace
+            .borrow_mut()
+            .push(format!("host {node} uid={uid}$ {}", argv.join(" ")));
         real.host(node, Some(uid), argv, stdin)
     }
 
@@ -305,9 +383,16 @@ impl World {
 
     /// 同 [`World::spawn_cli`]，另外设置环境变量；标准输出可以用 [`Background::stdout`] 读。
     pub fn spawn_cli_env(&self, node: &str, args: &[&str], env: &[(&str, &str)]) -> Background {
-        let Inner::Real(real) = &self.inner else { panic!("spawn_cli 只能用于真实后端") };
-        self.trace.borrow_mut().push(format!("spawn {node}$ nexus {}", args.join(" ")));
-        let dir = real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let Inner::Real(real) = &self.inner else {
+            panic!("spawn_cli 只能用于真实后端")
+        };
+        self.trace
+            .borrow_mut()
+            .push(format!("spawn {node}$ nexus {}", args.join(" ")));
+        let dir = real
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         let n = SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let err_path = dir.join(format!("spawn-{n}.stderr"));
         let err = std::fs::File::create(&err_path).expect("无法创建后台命令的错误输出文件");
@@ -323,25 +408,39 @@ impl World {
             .stderr(err)
             .spawn()
             .expect("无法执行 nexus");
-        Background { child, err_path, out_path, done: None }
+        Background {
+            child,
+            err_path,
+            out_path,
+            done: None,
+        }
     }
 
     /// 某个节点的 agent 入口（套接字路径），只用于真实后端。
     pub fn agent_socket(&self, node: &str) -> PathBuf {
-        let Inner::Real(real) = &self.inner else { panic!("agent_socket 只能用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("agent_socket 只能用于真实后端")
+        };
         real.agent_socket(node)
     }
 
     /// 某个节点的 `HOME`（见 [`World::host`]），只用于真实后端。
     pub fn home_dir(&self, node: &str) -> PathBuf {
-        let Inner::Real(real) = &self.inner else { panic!("home_dir 只能用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("home_dir 只能用于真实后端")
+        };
         real.home(node)
     }
 
     /// 节点常驻程序的数据目录（只用于真实后端）。
     pub fn data_dir(&self, node: &str) -> PathBuf {
-        let Inner::Real(real) = &self.inner else { panic!("data_dir 只能用于真实后端") };
-        real.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone()
+        let Inner::Real(real) = &self.inner else {
+            panic!("data_dir 只能用于真实后端")
+        };
+        real.dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"))
+            .clone()
     }
 }
 
@@ -382,7 +481,10 @@ impl World {
         match &self.inner {
             Inner::Sim { clock, .. } => clock.now(),
             Inner::Real(_) => nexus_core_proto::Timestamp(
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
             ),
         }
     }
@@ -399,23 +501,39 @@ impl World {
             Inner::Sim { .. } => {
                 // 仿真里身份由种子决定，保持可复现。
                 let key = nexus_core_proto::SecretKey::from_seed([(n % 200) as u8 + 50; 32]);
-                BrowserTransport::Sim(SimTransport::bind_port(nexus_core_proto::NodeId(key.public().0), SCENARIO_HOST, 19100 + (n as u16)).await.expect("仿真浏览器监听端口失败"))
+                BrowserTransport::Sim(
+                    SimTransport::bind_port(
+                        nexus_core_proto::NodeId(key.public().0),
+                        SCENARIO_HOST,
+                        19100 + (n as u16),
+                    )
+                    .await
+                    .expect("仿真浏览器监听端口失败"),
+                )
             }
             Inner::Real(_) => {
                 let mut seed = [0u8; 32];
                 getrandom::fill(&mut seed).expect("无法取得随机数");
-                let t = nexus_fabric_iroh::IrohTransport::bind(seed, nexus_fabric_iroh::Config::local_only())
-                    .await
-                    .expect("浏览器的传输无法启动");
+                let t = nexus_fabric_iroh::IrohTransport::bind(
+                    seed,
+                    nexus_fabric_iroh::Config::local_only(),
+                )
+                .await
+                .expect("浏览器的传输无法启动");
                 BrowserTransport::Real(t)
             }
         };
-        Browser { state: RefCell::new(BrowserState::Fresh(transport)), label: format!("browser{n}") }
+        Browser {
+            state: RefCell::new(BrowserState::Fresh(transport)),
+            label: format!("browser{n}"),
+        }
     }
 
     /// 和真正的浏览器一样只经中继 `relay` 通信的浏览器（只在真实后端）。
     pub async fn browser_via(&self, relay: &str) -> Browser {
-        let Inner::Real(_) = &self.inner else { panic!("browser_via 只用于真实后端") };
+        let Inner::Real(_) = &self.inner else {
+            panic!("browser_via 只用于真实后端")
+        };
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).expect("无法取得随机数");
         let config = nexus_fabric_iroh::Config {
@@ -426,15 +544,22 @@ impl World {
             scheduling: true,
             rendezvous: None,
         };
-        let t = nexus_fabric_iroh::IrohTransport::bind(seed, config).await.expect("浏览器的传输无法启动");
+        let t = nexus_fabric_iroh::IrohTransport::bind(seed, config)
+            .await
+            .expect("浏览器的传输无法启动");
         self.trace.borrow_mut().push("browser".into());
-        Browser { state: RefCell::new(BrowserState::Fresh(BrowserTransport::Real(t))), label: "browser-relayed".into() }
+        Browser {
+            state: RefCell::new(BrowserState::Fresh(BrowserTransport::Real(t))),
+            label: "browser-relayed".into(),
+        }
     }
 
     /// 以新的参数（`daemon` 之后的部分，替换默认的 `--local-only`）重启节点的常驻程序，保留数据目录。
     /// 只在真实后端：用于锚点这样需要真实网络服务的设备。
     pub async fn restart(&self, node: &str, args: &[&str]) {
-        let Inner::Real(real) = &self.inner else { panic!("restart 只用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("restart 只用于真实后端")
+        };
         real.kill(node);
         // 被杀掉的常驻程序留下的控制套接字文件不代表新的已经就绪。
         let _ = std::fs::remove_file(real.dirs[node].join("ctl.sock"));
@@ -445,7 +570,9 @@ impl World {
     /// 模拟设备重启：结束常驻程序和所有终端会话的持有进程（连同会话里的程序），再以 `args` 启动常驻程序。
     /// 只在真实后端。
     pub async fn reboot(&self, node: &str, args: &[&str]) {
-        let Inner::Real(real) = &self.inner else { panic!("reboot 只用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("reboot 只用于真实后端")
+        };
         real.kill(node);
         let sessions = real.dirs[node].join("sessions");
         for entry in std::fs::read_dir(&sessions).into_iter().flatten().flatten() {
@@ -453,7 +580,9 @@ impl World {
             if path.extension().is_some_and(|e| e == "pid") {
                 if let Ok(pid) = std::fs::read_to_string(&path) {
                     // 持有进程自成一个进程组；它不在了，会话里的 shell 随伪终端关闭而结束。
-                    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", pid.trim())]).status();
+                    let _ = Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{}", pid.trim())])
+                        .status();
                 }
             }
         }
@@ -466,19 +595,25 @@ impl World {
     /// 让节点的常驻程序用它自己的一份二进制（复制一份），并重新启动。返回那份二进制的路径。
     /// 升级的测试（M7.3）会替换它，不会改到构建出来的那个。只在真实后端。
     pub async fn use_own_binary(&self, node: &str, args: &[&str]) -> PathBuf {
-        let Inner::Real(real) = &self.inner else { panic!("use_own_binary 只用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("use_own_binary 只用于真实后端")
+        };
         let dir = real.home(node).join("bin");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nexus");
         std::fs::copy(&real.bin, &path).unwrap();
-        real.own_bins.borrow_mut().insert(node.to_string(), path.clone());
+        real.own_bins
+            .borrow_mut()
+            .insert(node.to_string(), path.clone());
         self.restart(node, args).await;
         path
     }
 
     /// 构建出来的 nexus 二进制。
     pub fn nexus_bin(&self) -> PathBuf {
-        let Inner::Real(real) = &self.inner else { panic!("nexus_bin 只用于真实后端") };
+        let Inner::Real(real) = &self.inner else {
+            panic!("nexus_bin 只用于真实后端")
+        };
         real.bin.clone()
     }
 
@@ -491,14 +626,23 @@ impl World {
         let name = format!("nxt{tag}");
         let net = std::net::Ipv4Addr::new(198, 18, (tag % 250) as u8 + 1, 0);
         let net_arg = format!("{net}/24");
-        self.restart(node, &["--local-only", "--tun", &name, "--tun-net", &net_arg]).await;
+        self.restart(
+            node,
+            &["--local-only", "--tun", &name, "--tun-net", &net_arg],
+        )
+        .await;
         let o = net.octets();
-        FullNode { net, dns: std::net::Ipv4Addr::new(o[0], o[1], o[2], 2) }
+        FullNode {
+            net,
+            dns: std::net::Ipv4Addr::new(o[0], o[1], o[2], 2),
+        }
     }
 
     /// 节点的常驻程序到目前为止的日志（只在真实后端）。
     pub fn daemon_log(&self, node: &str) -> String {
-        let Inner::Real(real) = &self.inner else { return String::new() };
+        let Inner::Real(real) = &self.inner else {
+            return String::new();
+        };
         std::fs::read_to_string(real.dirs[node].join("daemon.log")).unwrap_or_default()
     }
 }
@@ -563,7 +707,8 @@ impl Browser {
         link: &str,
         auth: &nexus_core_proto::webauthn::soft::SoftAuthenticator,
     ) -> Result<String, nexus_wire::WireError> {
-        let link = nexus_web_core::EnrollLink::parse(link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let link = nexus_web_core::EnrollLink::parse(link)
+            .map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
         let credential = nexus_wire::NewCredential {
             credential_id: auth.credential_id.clone(),
             spki: auth.spki(),
@@ -571,7 +716,9 @@ impl Browser {
         };
         // 等待期间不持有借用：先取出传输，用完放回。
         let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
-        let BrowserState::Fresh(t) = state else { panic!("{}：登记只能在登录之前", self.label) };
+        let BrowserState::Fresh(t) = state else {
+            panic!("{}：登记只能在登录之前", self.label)
+        };
         let result = match &t {
             BrowserTransport::Sim(t) => nexus_web_core::enroll(t, &link, credential).await,
             BrowserTransport::Real(t) => nexus_web_core::enroll(t, &link, credential).await,
@@ -587,7 +734,9 @@ impl Browser {
         at: nexus_core_proto::Timestamp,
     ) -> nexus_core_proto::webauthn::WebAuthnAssertion {
         let state = self.state.borrow();
-        let BrowserState::Fresh(t) = &*state else { panic!("{}：已经登录过", self.label) };
+        let BrowserState::Fresh(t) = &*state else {
+            panic!("{}：已经登录过", self.label)
+        };
         let challenge = match t {
             BrowserTransport::Sim(t) => nexus_web_core::challenge(t, at),
             BrowserTransport::Real(t) => nexus_web_core::challenge(t, at),
@@ -614,9 +763,12 @@ impl Browser {
         at: nexus_core_proto::Timestamp,
         assertion: nexus_core_proto::webauthn::WebAuthnAssertion,
     ) -> Result<(), nexus_wire::WireError> {
-        let link = nexus_web_core::EnrollLink::parse(entry_link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+        let link = nexus_web_core::EnrollLink::parse(entry_link)
+            .map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
         let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
-        let BrowserState::Fresh(t) = state else { panic!("{}：每个浏览器只能登录一次", self.label) };
+        let BrowserState::Fresh(t) = state else {
+            panic!("{}：每个浏览器只能登录一次", self.label)
+        };
         let node = match t {
             BrowserTransport::Sim(t) => {
                 nexus_fabric::Transport::add_hint(&t, link.node, &link.hint);
@@ -624,7 +776,9 @@ impl Browser {
             }
             BrowserTransport::Real(t) => {
                 nexus_fabric::Transport::add_hint(&t, link.node, &link.hint);
-                BrowserNode::Real(nexus_web_core::WebNode::login(t, link.node, at, assertion).await?)
+                BrowserNode::Real(
+                    nexus_web_core::WebNode::login(t, link.node, at, assertion).await?,
+                )
             }
         };
         *self.state.borrow_mut() = BrowserState::LoggedIn(Rc::new(node));
@@ -646,13 +800,23 @@ impl Browser {
     }
 
     /// 访客打开临时分享链接（M9.1）。
-    pub async fn share_open(&self, link: &str) -> Result<nexus_wire::ShareInfo, nexus_wire::WireError> {
-        let parsed = nexus_web_core::ShareLink::parse(link).map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
+    pub async fn share_open(
+        &self,
+        link: &str,
+    ) -> Result<nexus_wire::ShareInfo, nexus_wire::WireError> {
+        let parsed = nexus_web_core::ShareLink::parse(link)
+            .map_err(|m| wire_err(nexus_wire::ErrorCode::InvalidInput, m))?;
         let state = std::mem::replace(&mut *self.state.borrow_mut(), BrowserState::Spent);
-        let BrowserState::Fresh(t) = state else { panic!("{}：每个浏览器只能打开一次分享", self.label) };
+        let BrowserState::Fresh(t) = state else {
+            panic!("{}：每个浏览器只能打开一次分享", self.label)
+        };
         let guest = match t {
-            BrowserTransport::Sim(t) => BrowserGuest::Sim(nexus_web_core::GuestShare::open(t, &parsed).await?),
-            BrowserTransport::Real(t) => BrowserGuest::Real(nexus_web_core::GuestShare::open(t, &parsed).await?),
+            BrowserTransport::Sim(t) => {
+                BrowserGuest::Sim(nexus_web_core::GuestShare::open(t, &parsed).await?)
+            }
+            BrowserTransport::Real(t) => {
+                BrowserGuest::Real(nexus_web_core::GuestShare::open(t, &parsed).await?)
+            }
         };
         let info = on_guest!(&guest, g => g.info().clone());
         *self.state.borrow_mut() = BrowserState::Guest(Rc::new(guest));
@@ -660,13 +824,20 @@ impl Browser {
     }
 
     /// 访客列出分享目录（M9.1）。
-    pub async fn share_drive_ls(&self, sub_path: &str) -> Result<Vec<nexus_wire::ShareDriveEntry>, nexus_wire::WireError> {
+    pub async fn share_drive_ls(
+        &self,
+        sub_path: &str,
+    ) -> Result<Vec<nexus_wire::ShareDriveEntry>, nexus_wire::WireError> {
         let g = self.guest();
         on_guest!(g, n => n.drive_list(sub_path).await)
     }
 
     /// 访客读取分享文件（M9.1）。
-    pub async fn share_drive_read(&self, sub_path: &str, max: u64) -> Result<(u64, Vec<u8>, bool), nexus_wire::WireError> {
+    pub async fn share_drive_read(
+        &self,
+        sub_path: &str,
+        max: u64,
+    ) -> Result<(u64, Vec<u8>, bool), nexus_wire::WireError> {
         let g = self.guest();
         on_guest!(g, n => n.drive_read(sub_path, max).await)
     }
@@ -688,7 +859,12 @@ impl Browser {
         let label = format!("{}（访客只读终端）", self.label);
         let (input, keys) = tokio::io::duplex(4096);
         let (resize_tx, resizes) = mpsc::channel(8);
-        let mut ui = PageUi { state: state.clone(), keys, resizes, buf: vec![0u8; 4096] };
+        let mut ui = PageUi {
+            state: state.clone(),
+            keys,
+            resizes,
+            buf: vec![0u8; 4096],
+        };
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
         let st = state.clone();
         tokio::task::spawn_local(async move {
@@ -712,18 +888,29 @@ impl Browser {
             *st.exit.lock().unwrap() = Some(code);
         });
         first_rx.await.expect("访客终端任务提前结束")?;
-        Ok(Term { io: TermIo::Sim(SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: Some(resize_tx) }), state, label })
+        Ok(Term {
+            io: TermIo::Sim(SimTerm {
+                input: tokio::sync::Mutex::new(Some(input)),
+                resize: Some(resize_tx),
+            }),
+            state,
+            label,
+        })
     }
 
     /// 能看到的设备的名字，按字母排序。
     pub fn devices(&self) -> Vec<String> {
         let node = self.node();
-        let mut names: Vec<String> = on_node!(node, n => n.devices().iter().map(|d| d.name.clone()).collect());
+        let mut names: Vec<String> =
+            on_node!(node, n => n.devices().iter().map(|d| d.name.clone()).collect());
         names.sort();
         names
     }
 
-    pub async fn status(&self, device: &str) -> Result<nexus_core_proto::NodeInfo, nexus_wire::WireError> {
+    pub async fn status(
+        &self,
+        device: &str,
+    ) -> Result<nexus_core_proto::NodeInfo, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.status(device).await)
     }
@@ -743,13 +930,22 @@ impl Browser {
     }
 
     /// 列出工作区里的目录（M8.1）。
-    pub async fn drive_ls(&self, ws: &str, path: &str) -> Result<Vec<nexus_web_core::DriveEntry>, nexus_wire::WireError> {
+    pub async fn drive_ls(
+        &self,
+        ws: &str,
+        path: &str,
+    ) -> Result<Vec<nexus_web_core::DriveEntry>, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_list(ws, path).await)
     }
 
     /// 读工作区里文件开头的最多 `max` 字节（M8.1）。
-    pub async fn drive_read(&self, ws: &str, path: &str, max: u64) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
+    pub async fn drive_read(
+        &self,
+        ws: &str,
+        path: &str,
+        max: u64,
+    ) -> Result<nexus_web_core::DriveFile, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.drive_read(ws, path, max).await)
     }
@@ -784,7 +980,10 @@ impl Browser {
     }
 
     /// 设备上能用的服务（M8.2）。
-    pub async fn services(&self, device: &str) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
+    pub async fn services(
+        &self,
+        device: &str,
+    ) -> Result<Vec<nexus_wire::ServiceInfo>, nexus_wire::WireError> {
         let node = self.node();
         on_node!(node, n => n.services(device).await)
     }
@@ -811,7 +1010,12 @@ impl Browser {
         let label = format!("{}（网页）→ {device}/{session}", self.label);
         let (input, keys) = tokio::io::duplex(4096);
         let (resize_tx, resizes) = mpsc::channel(8);
-        let mut ui = PageUi { state: state.clone(), keys, resizes, buf: vec![0u8; 4096] };
+        let mut ui = PageUi {
+            state: state.clone(),
+            keys,
+            resizes,
+            buf: vec![0u8; 4096],
+        };
         // 第一次连接的结果同步返回，之后的事在后台进行。
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
         let (device, session) = (device.to_string(), session.to_string());
@@ -837,7 +1041,14 @@ impl Browser {
             *st.exit.lock().unwrap() = Some(code);
         });
         first_rx.await.expect("页面终端的任务提前结束")?;
-        Ok(Term { io: TermIo::Sim(SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: Some(resize_tx) }), state, label })
+        Ok(Term {
+            io: TermIo::Sim(SimTerm {
+                input: tokio::sync::Mutex::new(Some(input)),
+                resize: Some(resize_tx),
+            }),
+            state,
+            label,
+        })
     }
 }
 
@@ -880,7 +1091,10 @@ impl nexus_web_core::TerminalUi for PageUi {
 }
 
 /// 第一段输出到来（第一次连接成功）时通知等待的一方。
-struct FirstOutput<'a>(&'a mut PageUi, &'a mut Option<tokio::sync::oneshot::Sender<Result<(), nexus_wire::WireError>>>);
+struct FirstOutput<'a>(
+    &'a mut PageUi,
+    &'a mut Option<tokio::sync::oneshot::Sender<Result<(), nexus_wire::WireError>>>,
+);
 
 impl nexus_web_core::TerminalUi for FirstOutput<'_> {
     fn output(&mut self, bytes: &[u8]) {
@@ -1004,7 +1218,10 @@ impl TermState {
         let rows = std::num::NonZeroU16::new(size.rows).unwrap();
         let cols = std::num::NonZeroU16::new(size.cols).unwrap();
         Self {
-            screen: Mutex::new(Screen { parser: vt100::Parser::new(rows, cols, 0), pending: Vec::new() }),
+            screen: Mutex::new(Screen {
+                parser: vt100::Parser::new(rows, cols, 0),
+                pending: Vec::new(),
+            }),
             paused: AtomicBool::new(false),
             exit: Mutex::new(None),
         }
@@ -1047,14 +1264,23 @@ impl Term {
         self.wait_until_within(what, EXPECT_TIMEOUT, pred).await
     }
 
-    async fn wait_until_within(&self, what: &str, limit: Duration, pred: impl Fn(&vt100::Screen) -> bool) {
+    async fn wait_until_within(
+        &self,
+        what: &str,
+        limit: Duration,
+        pred: impl Fn(&vt100::Screen) -> bool,
+    ) {
         let start = tokio::time::Instant::now();
         loop {
             if pred(self.state.screen.lock().unwrap().parser.screen()) {
                 return;
             }
             if start.elapsed() >= limit {
-                panic!("{}：{limit:?} 内没有等到{what}。屏幕：\n{}\n", self.label, self.screen());
+                panic!(
+                    "{}：{limit:?} 内没有等到{what}。屏幕：\n{}\n",
+                    self.label,
+                    self.screen()
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1066,7 +1292,10 @@ impl Term {
     }
 
     pub async fn expect_line_within(&self, text: &str, limit: Duration) {
-        self.wait_until_within(&format!("一行 {text:?}"), limit, |s| s.contents().lines().any(|l| l.trim_end() == text)).await
+        self.wait_until_within(&format!("一行 {text:?}"), limit, |s| {
+            s.contents().lines().any(|l| l.trim_end() == text)
+        })
+        .await
     }
 
     /// 等到屏幕上出现 `text`。
@@ -1075,13 +1304,16 @@ impl Term {
     }
 
     pub async fn expect_contains_within(&self, text: &str, limit: Duration) {
-        self.wait_until_within(&format!("{text:?}"), limit, |s| s.contents().contains(text)).await
+        self.wait_until_within(&format!("{text:?}"), limit, |s| s.contents().contains(text))
+            .await
     }
 
     /// 改变终端的尺寸（只用于页面里的终端）。
     pub async fn resize(&self, size: nexus_wire::Size) {
         match &self.io {
-            TermIo::Sim(SimTerm { resize: Some(tx), .. }) => tx.send(size).await.expect("终端已经结束"),
+            TermIo::Sim(SimTerm {
+                resize: Some(tx), ..
+            }) => tx.send(size).await.expect("终端已经结束"),
             _ => panic!("{}：只有页面里的终端可以改变尺寸", self.label),
         }
     }
@@ -1121,7 +1353,11 @@ impl Term {
                 return code;
             }
             if start.elapsed() >= limit {
-                panic!("{}：{limit:?} 内没有结束。屏幕：\n{}\n", self.label, self.screen());
+                panic!(
+                    "{}：{limit:?} 内没有结束。屏幕：\n{}\n",
+                    self.label,
+                    self.screen()
+                );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1135,7 +1371,12 @@ struct SimTerm {
     resize: Option<mpsc::Sender<nexus_wire::Size>>,
 }
 
-fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, agent: Option<AgentCredential>, state: Arc<TermState>) -> SimTerm {
+fn sim_term(
+    tx: mpsc::Sender<CtlCall>,
+    args: SshArgs,
+    agent: Option<AgentCredential>,
+    state: Arc<TermState>,
+) -> SimTerm {
     let (input, mut stdin) = tokio::io::duplex(4096);
     // 输出管道很小：暂停读取时，客户端很快就写不进去，不再确认输出。
     let (mut stdout, mut out_rd) = tokio::io::duplex(16 * 1024);
@@ -1163,7 +1404,10 @@ fn sim_term(tx: mpsc::Sender<CtlCall>, args: SshArgs, agent: Option<AgentCredent
             }
         }
     });
-    SimTerm { input: tokio::sync::Mutex::new(Some(input)), resize: None }
+    SimTerm {
+        input: tokio::sync::Mutex::new(Some(input)),
+        resize: None,
+    }
 }
 
 // 真实后端：真正的 `nexus ssh` 进程，标准输入和输出都是管道。
@@ -1188,7 +1432,10 @@ impl RealTerm {
             if exit.is_none() {
                 let code = status.code().unwrap_or(-1);
                 if (100..120).contains(&code) {
-                    eprintln!("nexus ssh 的错误输出：{}", String::from_utf8_lossy(&self.stderr.lock().unwrap()));
+                    eprintln!(
+                        "nexus ssh 的错误输出：{}",
+                        String::from_utf8_lossy(&self.stderr.lock().unwrap())
+                    );
                 }
                 *exit = Some(code);
             }
@@ -1222,10 +1469,16 @@ impl Ctl for ChanCtl {
 /// 本次运行使用的种子。`NEXUS_SIM_SEED=n` 只跑一个指定的种子（用于复现），
 /// `NEXUS_SIM_SEEDS=k` 指定种子个数（默认 20）。
 pub fn default_seeds() -> Vec<u64> {
-    if let Some(seed) = std::env::var("NEXUS_SIM_SEED").ok().and_then(|s| s.parse().ok()) {
+    if let Some(seed) = std::env::var("NEXUS_SIM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         return vec![seed];
     }
-    let count = std::env::var("NEXUS_SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let count = std::env::var("NEXUS_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     (1..=count).collect()
 }
 
@@ -1274,11 +1527,19 @@ where
         let rx = Rc::new(tokio::sync::Mutex::new(rx));
         let (name, clock) = (name.to_string(), clock.clone());
         sim.host(name.clone(), move || {
-            let (disk, name, rx, clock, services, prx) = (disk.clone(), name.clone(), rx.clone(), clock.clone(), services.clone(), prx.clone());
+            let (disk, name, rx, clock, services, prx) = (
+                disk.clone(),
+                name.clone(),
+                rx.clone(),
+                clock.clone(),
+                services.clone(),
+                prx.clone(),
+            );
             async move {
                 let system = SimSystem::with_services(disk, node_seed(seed, i), clock, services);
                 let key = load_or_create_device_key(&system)?;
-                let transport = SimTransport::bind(nexus_core_proto::NodeId(key.public().0), &name).await?;
+                let transport =
+                    SimTransport::bind(nexus_core_proto::NodeId(key.public().0), &name).await?;
                 let node = Node::new(transport, system, &name)?;
                 let mut rx = rx.lock().await;
                 // 入口上的连接转给这一次启动的节点（节点重启后换成新的节点）。
@@ -1307,7 +1568,13 @@ where
 
     let trace = Rc::new(RefCell::new(Vec::new()));
     let world = World {
-        inner: Inner::Sim { nodes: ctl, clock, services: all_services, next_port: std::cell::Cell::new(8000), proxies },
+        inner: Inner::Sim {
+            nodes: ctl,
+            clock,
+            services: all_services,
+            next_port: std::cell::Cell::new(8000),
+            proxies,
+        },
         trace: trace.clone(),
     };
     let fut = scenario(world);
@@ -1331,7 +1598,10 @@ struct SeedHint(u64);
 impl Drop for SeedHint {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("\n仿真场景失败，种子 = {0}。复现：NEXUS_SIM_SEED={0} cargo test <测试名>\n", self.0);
+            eprintln!(
+                "\n仿真场景失败，种子 = {0}。复现：NEXUS_SIM_SEED={0} cargo test <测试名>\n",
+                self.0
+            );
         }
     }
 }
@@ -1359,7 +1629,8 @@ impl RealWorld {
         let sockets = tempfile::tempdir().expect("无法创建临时目录");
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         let rendezvous = format!("http://127.0.0.1:{}/pkarr", start_rendezvous());
         let mut world = RealWorld {
@@ -1392,7 +1663,11 @@ impl RealWorld {
     }
 
     fn proxy_port(&self, node: &str) -> u16 {
-        *self.proxy_ports.borrow().get(node).unwrap_or_else(|| panic!("节点 {node} 没有开统一入口"))
+        *self
+            .proxy_ports
+            .borrow()
+            .get(node)
+            .unwrap_or_else(|| panic!("节点 {node} 没有开统一入口"))
     }
 
     /// 启动节点的常驻程序，`extra` 是 `daemon` 之后的其他参数。没有给 `--proxy` 时开一个本机统一入口。
@@ -1400,29 +1675,56 @@ impl RealWorld {
         let dir = &self.dirs[name];
         let mut proxy = Vec::new();
         if !extra.contains(&"--proxy") {
-            let port = *self.proxy_ports.borrow_mut().entry(name.to_string()).or_insert_with(|| {
-                std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-            });
+            let port = *self
+                .proxy_ports
+                .borrow_mut()
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    std::net::TcpListener::bind("127.0.0.1:0")
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                        .port()
+                });
             proxy = vec!["--proxy".to_string(), format!("127.0.0.1:{port}")];
         }
         let _ = std::fs::remove_file(dir.join("ctl.sock"));
-        let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
-        let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") { vec![] } else { vec!["--rendezvous", &self.rendezvous] };
-        let bin = self.own_bins.borrow().get(name).cloned().unwrap_or_else(|| self.bin.clone());
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("daemon.log"))
+            .unwrap();
+        let rendezvous: Vec<&str> = if extra.contains(&"--rendezvous") {
+            vec![]
+        } else {
+            vec!["--rendezvous", &self.rendezvous]
+        };
+        let bin = self
+            .own_bins
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| self.bin.clone());
         let mut cmd = Command::new(&bin);
-        cmd.args(["--data-dir", dir.to_str().unwrap(), "daemon", "--name", name])
-            .args(extra)
-            .args(&rendezvous)
-            .args(&proxy)
-            .arg("--agent-socket")
-            .arg(self.sockets.path().join(format!("{name}.sock")))
-            // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
-            .env("SHELL", "/bin/sh")
-            .env("PS1", "$ ")
-            .env_remove("ENV")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log);
+        cmd.args([
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "daemon",
+            "--name",
+            name,
+        ])
+        .args(extra)
+        .args(&rendezvous)
+        .args(&proxy)
+        .arg("--agent-socket")
+        .arg(self.sockets.path().join(format!("{name}.sock")))
+        // 终端会话里用一个行为确定的 shell，提示符和仿真里一样是 `$ `。
+        .env("SHELL", "/bin/sh")
+        .env("PS1", "$ ")
+        .env_remove("ENV")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
         // 刚复制出来的二进制（use_own_binary）：并行的测试里别的线程 fork 出的子进程在 exec 之前还持有它的写句柄，
         // 这时执行会得到 ETXTBSY。等一下再试。
         let mut tries = 0;
@@ -1444,14 +1746,26 @@ impl RealWorld {
         let dir = &self.dirs[name];
         let mut deadline = Instant::now() + Duration::from_secs(10);
         let mut retries = 0;
-        let log_len = || std::fs::metadata(dir.join("daemon.log")).map(|m| m.len()).unwrap_or(0);
+        let log_len = || {
+            std::fs::metadata(dir.join("daemon.log"))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
         let mut log_from = 0;
         while !dir.join("ctl.sock").exists() {
-            let exited = self.children.borrow_mut().get_mut(name).and_then(|c| c.try_wait().ok().flatten());
+            let exited = self
+                .children
+                .borrow_mut()
+                .get_mut(name)
+                .and_then(|c| c.try_wait().ok().flatten());
             if Instant::now() >= deadline || exited.is_some() {
                 let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap_or_default();
                 let this_run = log.get(log_from as usize..).unwrap_or("");
-                if exited.is_some() && retries < 5 && !extra.contains(&"--proxy") && this_run.contains("无法监听统一入口") {
+                if exited.is_some()
+                    && retries < 5
+                    && !extra.contains(&"--proxy")
+                    && this_run.contains("无法监听统一入口")
+                {
                     retries += 1;
                     log_from = log_len();
                     self.proxy_ports.borrow_mut().remove(name);
@@ -1473,7 +1787,11 @@ impl RealWorld {
     }
 
     fn home(&self, node: &str) -> PathBuf {
-        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).join("home");
+        let dir = self
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"))
+            .join("home");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1486,9 +1804,16 @@ impl RealWorld {
     fn host(&self, node: &str, uid: Option<u32>, argv: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
         use std::os::unix::process::CommandExt;
-        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let dir = self
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         let bin_dir = self.bin.parent().unwrap();
-        let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let mut cmd = Command::new(argv[0]);
         cmd.args(&argv[1..])
             .env("PATH", path)
@@ -1505,7 +1830,9 @@ impl RealWorld {
                     .current_dir("/");
             }
             None => {
-                cmd.env("HOME", self.home(node)).env("NEXUS_DATA_DIR", dir).current_dir(self.home(node));
+                cmd.env("HOME", self.home(node))
+                    .env("NEXUS_DATA_DIR", dir)
+                    .current_dir(self.home(node));
             }
         }
         let mut child = cmd
@@ -1531,14 +1858,19 @@ impl RealWorld {
 
     fn signal(&self, node: &str, sig: nix::sys::signal::Signal) {
         let children = self.children.borrow();
-        let child = children.get(node).unwrap_or_else(|| panic!("节点 {node} 没有在运行"));
+        let child = children
+            .get(node)
+            .unwrap_or_else(|| panic!("节点 {node} 没有在运行"));
         let pid = nix::unistd::Pid::from_raw(child.id() as i32);
         nix::sys::signal::kill(pid, sig).expect("无法向常驻程序发送信号");
     }
 
     fn term(&self, node: &str, args: &[&str], state: Arc<TermState>) -> RealTerm {
         use std::io::Read;
-        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let dir = self
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         let mut child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
             .args(args)
@@ -1571,12 +1903,20 @@ impl RealWorld {
             sink.lock().unwrap().extend(buf);
         });
         let stdin = child.stdin.take();
-        RealTerm { child: RefCell::new(child), stdin: RefCell::new(stdin), stderr }
+        RealTerm {
+            child: RefCell::new(child),
+            stdin: RefCell::new(stdin),
+            stderr,
+        }
     }
 
     async fn cli_async(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         let bin = self.bin.clone();
-        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}")).clone();
+        let dir = self
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"))
+            .clone();
         let agent_socket = self.agent_socket(node);
         let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         let data = stdin.to_vec();
@@ -1612,7 +1952,10 @@ impl RealWorld {
     #[allow(dead_code)]
     fn cli(&self, node: &str, args: &[&str], stdin: &[u8]) -> Output {
         use std::io::Write;
-        let dir = self.dirs.get(node).unwrap_or_else(|| panic!("场景里没有节点 {node}"));
+        let dir = self
+            .dirs
+            .get(node)
+            .unwrap_or_else(|| panic!("场景里没有节点 {node}"));
         // 标准输入是管道而不是终端：任何交互提示都会让命令失败。
         let mut child = Command::new(&self.bin)
             .args(["--data-dir", dir.to_str().unwrap()])
@@ -1631,7 +1974,13 @@ impl RealWorld {
         let out = child.wait_with_output().expect("无法等待 nexus");
         let _ = writer.join();
         let code = out.status.code().unwrap_or(-1);
-        Output::from_captured(code, Captured { stdout: out.stdout, stderr: out.stderr })
+        Output::from_captured(
+            code,
+            Captured {
+                stdout: out.stdout,
+                stderr: out.stderr,
+            },
+        )
     }
 }
 
@@ -1643,14 +1992,23 @@ impl Drop for RealWorld {
         }
         // 终端会话的持有进程（M7.2）不随常驻程序结束：按它们留下的 pid 文件结束它们（连同 shell）。
         for dir in self.dirs.values() {
-            let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else { continue };
+            let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let path = e.path();
                 if path.extension().is_some_and(|x| x == "pid") {
-                    if let Some(pid) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                    if let Some(pid) = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                    {
                         // 持有进程自成一个进程组，shell 在它下面：结束整个进程组和 shell 的进程组。
-                        let _ = Command::new("pkill").args(["-KILL", "-P", &pid.to_string()]).status();
-                        let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+                        let _ = Command::new("pkill")
+                            .args(["-KILL", "-P", &pid.to_string()])
+                            .status();
+                        let _ = Command::new("kill")
+                            .args(["-KILL", &pid.to_string()])
+                            .status();
                     }
                 }
             }
@@ -1668,7 +2026,10 @@ where
         inner: Inner::Real(RealWorld::start(nodes, bin)),
         trace: Rc::new(RefCell::new(Vec::new())),
     };
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     // 和仿真一样在单线程的本地任务集里运行，场景可以启动本地任务（例如页面里的终端）。
     tokio::task::LocalSet::new().block_on(&rt, scenario(world));
 }
@@ -1752,18 +2113,26 @@ impl ProxyClient {
         match self {
             ProxyClient::Sim(tx) => {
                 let (near, far) = tokio::io::duplex(256 * 1024);
-                tx.send(Box::new(far)).map_err(|_| ProxyError::Io("节点没有在运行".into()))?;
+                tx.send(Box::new(far))
+                    .map_err(|_| ProxyError::Io("节点没有在运行".into()))?;
                 Ok(Box::new(near))
             }
             ProxyClient::Real(port) => {
-                let s = tokio::net::TcpStream::connect(("127.0.0.1", *port)).await.map_err(io_err)?;
+                let s = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                    .await
+                    .map_err(io_err)?;
                 Ok(Box::new(s))
             }
         }
     }
 
     /// 经 SOCKS5 连到 `host:port`，发一个 HTTP GET，返回正文。
-    pub async fn socks5_http_get(&self, host: &str, port: u16, path: &str) -> Result<String, ProxyError> {
+    pub async fn socks5_http_get(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<String, ProxyError> {
         let go = async {
             let mut s = self.open().await?;
             s.write_all(&[5, 1, 0]).await.map_err(io_err)?;
@@ -1795,31 +2164,51 @@ impl ProxyClient {
             if reply[1] != 0 {
                 return Err(ProxyError::Socks5(reply[1]));
             }
-            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            s.write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .map_err(io_err)?;
             let raw = read_all(&mut s).await?;
             let (_, body) = split_response(&raw)?;
             Ok(body)
         };
-        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go)
+            .await
+            .unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
     }
 
     /// 经 HTTP 代理发一个 GET（绝对形式的地址），返回状态码和正文。
     pub async fn http_get(&self, url: &str) -> Result<(u16, String), ProxyError> {
         let go = async {
             let mut s = self.open().await?;
-            let host = url.trim_start_matches("http://").split('/').next().unwrap_or_default();
-            s.write_all(format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            let host = url
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            s.write_all(
+                format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .map_err(io_err)?;
             let raw = read_all(&mut s).await?;
             split_response(&raw)
         };
-        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go)
+            .await
+            .unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
     }
 
     /// 经 HTTP 代理的 CONNECT 建立隧道，送出 `data` 后关闭写方向，返回读到的全部字节。
     pub async fn connect_tunnel(&self, target: &str, data: &[u8]) -> Result<Vec<u8>, ProxyError> {
         let go = async {
             let mut s = self.open().await?;
-            s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await.map_err(io_err)?;
+            s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+                .await
+                .map_err(io_err)?;
             let mut head = Vec::new();
             let mut byte = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") {
@@ -1836,7 +2225,9 @@ impl ProxyClient {
             s.shutdown().await.map_err(io_err)?;
             read_all(&mut s).await
         };
-        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go)
+            .await
+            .unwrap_or_else(|_| Err(ProxyError::Io("超时".into())))
     }
 
     /// 送出任意字节，返回入口回的全部字节（它关闭连接为止）。
@@ -1846,7 +2237,10 @@ impl ProxyClient {
             s.write_all(data).await.map_err(io_err)?;
             read_all(&mut s).await
         };
-        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go).await.expect("入口没有关闭连接").unwrap_or_default()
+        tokio::time::timeout(PROXY_CLIENT_TIMEOUT, go)
+            .await
+            .expect("入口没有关闭连接")
+            .unwrap_or_default()
     }
 }
 
@@ -1862,15 +2256,23 @@ async fn read_all(s: &mut Box<dyn Duplex>) -> Result<Vec<u8>, ProxyError> {
 
 fn status_of(head: &[u8]) -> Result<u16, ProxyError> {
     let text = String::from_utf8_lossy(head);
-    text.split(' ').nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| ProxyError::Io(format!("回应无法理解：{text:?}")))
+    text.split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| ProxyError::Io(format!("回应无法理解：{text:?}")))
 }
 
 fn split_response(raw: &[u8]) -> Result<(u16, String), ProxyError> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| ProxyError::Io(format!("回应没有头部：{:?}", String::from_utf8_lossy(raw))))?;
-    Ok((status_of(&raw[..split])?, String::from_utf8_lossy(&raw[split + 4..]).into_owned()))
+        .ok_or_else(|| {
+            ProxyError::Io(format!("回应没有头部：{:?}", String::from_utf8_lossy(raw)))
+        })?;
+    Ok((
+        status_of(&raw[..split])?,
+        String::from_utf8_lossy(&raw[split + 4..]).into_owned(),
+    ))
 }
 
 /// 一个 HTTP GET（Connection: close），返回正文。用于验证端口转发这类真实的本机网络。
@@ -1878,10 +2280,16 @@ pub fn http_get(port: u16, path: &str) -> io::Result<String> {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)?;
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io::Error::other("回应没有头部"))?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("回应没有头部"))?;
     Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
 }
 
@@ -1959,9 +2367,15 @@ impl FullNode {
     }
 
     /// 像 `echo ... | nc ip port`：送出 `data` 后关闭写方向，返回读到的全部字节（10 秒没有结束算出错）。
-    pub fn send_then_half_close(&self, ip: std::net::IpAddr, port: u16, data: &[u8]) -> io::Result<Vec<u8>> {
+    pub fn send_then_half_close(
+        &self,
+        ip: std::net::IpAddr,
+        port: u16,
+        data: &[u8],
+    ) -> io::Result<Vec<u8>> {
         use std::io::{Read, Write};
-        let mut s = std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))?;
+        let mut s =
+            std::net::TcpStream::connect_timeout(&(ip, port).into(), Duration::from_secs(5))?;
         s.set_read_timeout(Some(Duration::from_secs(10)))?;
         // 边写边读：回声服务边读边回，不读的话两边的缓冲区都满了会互相等。
         let mut r = s.try_clone()?;
@@ -1971,7 +2385,9 @@ impl FullNode {
         });
         s.write_all(data)?;
         s.shutdown(std::net::Shutdown::Write)?;
-        reader.join().map_err(|_| io::Error::other("读的线程出错"))?
+        reader
+            .join()
+            .map_err(|_| io::Error::other("读的线程出错"))?
     }
 }
 
@@ -1983,8 +2399,15 @@ pub fn local_tree(files: &[(&str, &[u8])]) -> LocalTree {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     files.hash(&mut h);
-    let thread = std::thread::current().name().unwrap_or("main").replace(|c: char| !c.is_ascii_alphanumeric(), "_");
-    let dir = std::env::temp_dir().join(format!("nexus-tree-{}-{thread}-{:016x}", std::process::id(), h.finish()));
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let dir = std::env::temp_dir().join(format!(
+        "nexus-tree-{}-{thread}-{:016x}",
+        std::process::id(),
+        h.finish()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     for (path, content) in files {
         let p = dir.join(path);
@@ -1997,7 +2420,10 @@ pub fn local_tree(files: &[(&str, &[u8])]) -> LocalTree {
 
 /// 本机临时目录里一个空目录，名字取决于进程、测试线程和 `tag`（同一个测试里要几个时用不同的 `tag`）。
 pub fn local_dir(tag: &str) -> LocalTree {
-    let thread = std::thread::current().name().unwrap_or("main").replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let dir = std::env::temp_dir().join(format!("nexus-dir-{}-{thread}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -2036,13 +2462,19 @@ pub fn http_get_at(addr: std::net::SocketAddr, path: &str) -> io::Result<String>
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)?;
     if raw.is_empty() {
         return Ok(String::new());
     }
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io::Error::other("回应没有头部"))?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("回应没有头部"))?;
     Ok(String::from_utf8_lossy(&raw[split + 4..]).into_owned())
 }
 
@@ -2053,7 +2485,11 @@ fn start_rendezvous() -> u16 {
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().expect("碰头服务的运行时");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("碰头服务的运行时");
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
             let _ = nexus_fabric_iroh::rendezvous::serve(listener, Default::default()).await;
@@ -2067,11 +2503,16 @@ fn serve_on(addr: std::net::SocketAddr, service: Service) -> u16 {
     let port = std_listener.local_addr().unwrap().port();
     std_listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("测试服务的运行时");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试服务的运行时");
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("无法监听");
             loop {
-                let Ok((s, _)) = listener.accept().await else { return };
+                let Ok((s, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(run_test_service(service.clone(), s));
             }
         });
@@ -2082,9 +2523,13 @@ fn serve_on(addr: std::net::SocketAddr, service: Service) -> u16 {
 /// 这台机器对外的地址（不发任何数据包：UDP 的 connect 只选路由）。
 fn public_ip() -> std::net::IpAddr {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").expect("无法打开 UDP");
-    s.connect("203.0.113.1:9").expect("这台机器没有对外的路由，无法测试出口");
+    s.connect("203.0.113.1:9")
+        .expect("这台机器没有对外的路由，无法测试出口");
     let ip = s.local_addr().unwrap().ip();
-    assert!(!ip.is_loopback() && !ip.is_unspecified(), "这台机器没有非本机地址：{ip}");
+    assert!(
+        !ip.is_loopback() && !ip.is_unspecified(),
+        "这台机器没有非本机地址：{ip}"
+    );
     ip
 }
 
@@ -2094,7 +2539,10 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
             use nexus_net_core::socks5;
             let mut buf = Vec::new();
             let mut chunk = [0u8; 1024];
-            let mut read_more = async |s: &mut tokio::net::TcpStream, buf: &mut Vec<u8>| match s.read(&mut chunk).await {
+            let mut read_more = async |s: &mut tokio::net::TcpStream, buf: &mut Vec<u8>| match s
+                .read(&mut chunk)
+                .await
+            {
                 Ok(0) | Err(_) => false,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
@@ -2121,7 +2569,9 @@ async fn run_test_service(service: Service, mut s: tokio::net::TcpStream) {
                 }
             };
             if matches!(&target.host, nexus_net_core::Host::Name(h) if h.starts_with("refuse.")) {
-                let _ = s.write_all(&socks5::reply(socks5::Reply::ConnectionRefused)).await;
+                let _ = s
+                    .write_all(&socks5::reply(socks5::Reply::ConnectionRefused))
+                    .await;
                 let _ = s.shutdown().await;
                 return;
             }

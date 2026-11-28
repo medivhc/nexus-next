@@ -10,7 +10,10 @@ fn json(text: &str) -> Value {
 }
 
 fn error_kind(stderr: &str) -> String {
-    json(stderr.lines().last().unwrap_or_default())["error"].as_str().unwrap_or_default().to_string()
+    json(stderr.lines().last().unwrap_or_default())["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// 在管理设备上签发一份凭据，返回凭据文本。

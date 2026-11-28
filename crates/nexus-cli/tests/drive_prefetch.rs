@@ -12,18 +12,30 @@ async fn setup(w: &World, others: &[&str]) -> Vec<u8> {
     let big = pseudo_random(1024 * 1024, 3);
     let b = pseudo_random(300 * 1024, 4);
     let dir = local_tree(&[("a.txt", b"alpha"), ("src/b.rs", &b), ("big.bin", &big)]);
-    w.cli_ok("laptop", &["drive", "import", dir.path().to_str().unwrap(), "work:/"]).await;
-    let c = w.cli_ok("laptop", &["drive", "commit", "work", "-m", "base"]).await;
+    w.cli_ok(
+        "laptop",
+        &["drive", "import", dir.path().to_str().unwrap(), "work:/"],
+    )
+    .await;
+    let c = w
+        .cli_ok("laptop", &["drive", "commit", "work", "-m", "base"])
+        .await;
     assert_eq!(c["sync"]["state"], "pushed", "{c}");
     for o in others {
-        assert_eq!(w.cli_ok(o, &["drive", "sync", "work"]).await["state"], "pulled");
+        assert_eq!(
+            w.cli_ok(o, &["drive", "sync", "work"]).await["state"],
+            "pulled"
+        );
     }
     b
 }
 
 async fn local(w: &World, node: &str, path: &str) -> (u64, u64) {
     let v = w.cli_ok(node, &["drive", "where", path]).await;
-    (v["local_bytes"].as_u64().unwrap(), v["total_bytes"].as_u64().unwrap())
+    (
+        v["local_bytes"].as_u64().unwrap(),
+        v["total_bytes"].as_u64().unwrap(),
+    )
 }
 
 scenario! {

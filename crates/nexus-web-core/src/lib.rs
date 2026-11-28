@@ -12,18 +12,20 @@ mod node;
 mod share;
 mod terminal;
 pub use drive::{DriveEntry, DriveFile, DriveWorkspace};
-pub use http::{encode_request, parse_response, HttpResponse, WebHttpRequest, MAX_RESPONSE};
 pub use handle::{EntryHandle, MAX_USER_HANDLE};
 pub use hardware::{HardwareProvider, HardwareState, HardwareUsageEvent};
-pub use node::{challenge, WebNode, WebTerminal};
+pub use http::{encode_request, parse_response, HttpResponse, WebHttpRequest, MAX_RESPONSE};
 pub use nexus_wire::{HardwareCapture, HardwareKind};
+pub use node::{challenge, WebNode, WebTerminal};
 pub use share::{GuestShare, ShareLink};
 pub use terminal::{Notice, TerminalEnd, TerminalUi, UiEvent};
 
 use nexus_core_proto::authz::Principal;
 use nexus_core_proto::NodeId;
 use nexus_fabric::{read_response, write_msg, Connection, Proto, Transport};
-use nexus_wire::{hex_decode, ErrorCode, NewCredential, Request, RequestHeader, Response, WireError};
+use nexus_wire::{
+    hex_decode, ErrorCode, NewCredential, Request, RequestHeader, Response, WireError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 登记链接里的信息：`…#enroll=<登记码>&node=<管理设备>&hint=<地址提示>`。
@@ -48,7 +50,11 @@ impl EnrollLink {
             .and_then(|b| b.try_into().ok())
             .ok_or("登记码格式不对")?;
         let node: NodeId = field("node")?.parse().map_err(|_| "设备标识格式不对")?;
-        Ok(Self { token, node, hint: field("hint")?.to_string() })
+        Ok(Self {
+            token,
+            node,
+            hint: field("hint")?.to_string(),
+        })
     }
 }
 
@@ -77,13 +83,23 @@ pub(crate) async fn call<T: Transport>(
 }
 
 /// 把新建的通行密钥交给管理设备登记，返回它在网络里的名字。
-pub async fn enroll<T: Transport>(transport: &T, link: &EnrollLink, credential: NewCredential) -> Result<String, WireError> {
+pub async fn enroll<T: Transport>(
+    transport: &T,
+    link: &EnrollLink,
+    credential: NewCredential,
+) -> Result<String, WireError> {
     transport.add_hint(link.node, &link.hint);
-    let body = Request::WebEnroll { token: link.token, credential };
+    let body = Request::WebEnroll {
+        token: link.token,
+        credential,
+    };
     match call(transport, link.node, Proto::Web, Principal::Device, body).await? {
         Response::WebEnrolled { label } => Ok(label),
         Response::Error(e) => Err(e),
-        other => Err(WireError::new(ErrorCode::Internal, format!("管理设备的回应无法理解：{other:?}"))),
+        other => Err(WireError::new(
+            ErrorCode::Internal,
+            format!("管理设备的回应无法理解：{other:?}"),
+        )),
     }
 }
 
@@ -94,10 +110,23 @@ mod tests {
     #[test]
     fn enroll_links_parse() {
         let node = NodeId([7; 32]);
-        let link = format!("https://bewith.link/#enroll={}&node={node}&hint=abcd", "0f".repeat(16));
+        let link = format!(
+            "https://bewith.link/#enroll={}&node={node}&hint=abcd",
+            "0f".repeat(16)
+        );
         let parsed = EnrollLink::parse(&link).unwrap();
-        assert_eq!(parsed, EnrollLink { token: [0x0f; 16], node, hint: "abcd".into() });
-        assert_eq!(EnrollLink::parse(&link[link.find('#').unwrap() + 1..]).unwrap(), parsed);
+        assert_eq!(
+            parsed,
+            EnrollLink {
+                token: [0x0f; 16],
+                node,
+                hint: "abcd".into()
+            }
+        );
+        assert_eq!(
+            EnrollLink::parse(&link[link.find('#').unwrap() + 1..]).unwrap(),
+            parsed
+        );
         assert!(EnrollLink::parse("https://bewith.link/").is_err());
         assert!(EnrollLink::parse(&link.replace("enroll=0f", "enroll=0")).is_err());
         assert!(EnrollLink::parse(&link.replace("node=07", "node=zz")).is_err());

@@ -32,7 +32,12 @@ async fn wait_state(w: &World, node: &str, state: &str, within: Duration) -> Val
                 return v;
             }
         }
-        assert!(std::time::Instant::now() < deadline, "{node} 的升级状态没有变成 {state}：{} {}", out.stdout, out.stderr);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{node} 的升级状态没有变成 {state}：{} {}",
+            out.stdout,
+            out.stderr
+        );
         w.run_for(Duration::from_millis(250)).await;
     }
 }
@@ -133,7 +138,10 @@ scenario! {
 
 /// `nexus upgrade ... --json` 的 `devices` 里那台设备的一项。
 fn device<'a>(v: &'a Value, name: &str) -> &'a Value {
-    v["devices"].as_array().and_then(|d| d.iter().find(|e| e["device"] == name)).unwrap_or_else(|| panic!("结果里没有 {name}：{v}"))
+    v["devices"]
+        .as_array()
+        .and_then(|d| d.iter().find(|e| e["device"] == name))
+        .unwrap_or_else(|| panic!("结果里没有 {name}：{v}"))
 }
 
 scenario! {

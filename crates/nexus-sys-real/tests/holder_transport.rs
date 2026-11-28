@@ -14,7 +14,10 @@ fn holder_accepts_reconnects_and_exits() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().to_path_buf();
     let sock = holder::sessions_dir(&data).join("main.sock");
-    let size = Size { cols: 100, rows: 30 };
+    let size = Size {
+        cols: 100,
+        rows: 30,
+    };
     let d = data.clone();
     let held = std::thread::spawn(move || holder::run(&d, "main", size, Timestamp(7), false));
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -23,7 +26,10 @@ fn holder_accepts_reconnects_and_exits() {
         assert!(!held.is_finished(), "持有进程提前结束：{:?}", held.join());
         std::thread::sleep(Duration::from_millis(20));
     }
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         eprintln!("持有进程就绪，第一次连上");
         // 第一次连上：会话名、尺寸、创建时间都对。
@@ -54,11 +60,17 @@ fn holder_accepts_reconnects_and_exits() {
     // 持有进程在 shell 结束后要自己结束（限时：卡住时测试失败，而不是一直挂着）。
     let deadline = Instant::now() + Duration::from_secs(20);
     while !held.is_finished() {
-        assert!(Instant::now() < deadline, "shell 结束 20 秒后持有进程还没有结束");
+        assert!(
+            Instant::now() < deadline,
+            "shell 结束 20 秒后持有进程还没有结束"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     held.join().unwrap().unwrap();
     assert!(!sock.exists(), "持有进程退出时应当删掉端点");
     // 会话是被结束的（M11.5，R90）：为恢复记下的状态也要删掉，下次不会被当成要恢复的会话。
-    assert!(!holder::sessions_dir(&data).join("main.state").exists(), "会话结束后应当删掉记下的状态");
+    assert!(
+        !holder::sessions_dir(&data).join("main.state").exists(),
+        "会话结束后应当删掉记下的状态"
+    );
 }

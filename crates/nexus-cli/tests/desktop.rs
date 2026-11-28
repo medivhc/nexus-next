@@ -52,7 +52,14 @@ fn fake_viewer(dir: &Path) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(dir).unwrap();
     let log = dir.join("opened");
     let script = dir.join("viewer");
-    std::fs::write(&script, format!("#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" > {}\n", log.display())).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" > {}\n",
+            log.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     (script, log)
 }
@@ -70,8 +77,11 @@ async fn eventually<T>(w: &World, what: &str, mut f: impl FnMut() -> Option<T>) 
 
 /// `vnc://127.0.0.1:<端口>` 里的端口。
 fn port_of(url: &str) -> u16 {
-    let rest = url.strip_prefix("vnc://127.0.0.1:").unwrap_or_else(|| panic!("地址应当是本机的 vnc://：{url}"));
-    rest.parse().unwrap_or_else(|_| panic!("地址里的端口不对：{url}"))
+    let rest = url
+        .strip_prefix("vnc://127.0.0.1:")
+        .unwrap_or_else(|| panic!("地址应当是本机的 vnc://：{url}"));
+    rest.parse()
+        .unwrap_or_else(|_| panic!("地址里的端口不对：{url}"))
 }
 
 /// 连本机端口：读到问候，写一句话再读回来。
@@ -87,10 +97,24 @@ fn talk(port: u16) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// 用 `NEXUS_DESKTOP_VIEWER` 运行，返回查看器收到的地址。
-async fn open_with_viewer(w: &World, tag: &str, args: &[&str]) -> (String, nexus_testkit::Background) {
+async fn open_with_viewer(
+    w: &World,
+    tag: &str,
+    args: &[&str],
+) -> (String, nexus_testkit::Background) {
     let (viewer, log) = fake_viewer(&w.home_dir("laptop").join(format!("viewer-{tag}")));
-    let bg = w.spawn_cli_env("laptop", args, &[("NEXUS_DESKTOP_VIEWER", viewer.to_str().unwrap())]);
-    let url = eventually(w, "查看器收到地址", || std::fs::read_to_string(&log).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())).await;
+    let bg = w.spawn_cli_env(
+        "laptop",
+        args,
+        &[("NEXUS_DESKTOP_VIEWER", viewer.to_str().unwrap())],
+    );
+    let url = eventually(w, "查看器收到地址", || {
+        std::fs::read_to_string(&log)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+    .await;
     (url, bg)
 }
 

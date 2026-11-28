@@ -5,7 +5,9 @@
 //! 没有提示也能按标识拨号。
 #![forbid(unsafe_code)]
 
-use iroh::endpoint::{presets, Connection as IrohConnection, QuicTransportConfig, RecvStream, SendStream};
+use iroh::endpoint::{
+    presets, Connection as IrohConnection, QuicTransportConfig, RecvStream, SendStream,
+};
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey};
 use nexus_core_proto::{NodeId, PathKind};
 use nexus_fabric::{Connection, Proto, Transport};
@@ -58,7 +60,14 @@ pub struct Config {
 impl Config {
     /// 只在本机回环地址上通信，不连任何外部服务。用于测试。
     pub fn local_only() -> Self {
-        Self { relay: Relay::Disabled, discovery: false, bind: Some(([127, 0, 0, 1], 0).into()), direct: true, scheduling: true, rendezvous: None }
+        Self {
+            relay: Relay::Disabled,
+            discovery: false,
+            bind: Some(([127, 0, 0, 1], 0).into()),
+            direct: true,
+            scheduling: true,
+            rendezvous: None,
+        }
     }
 }
 
@@ -125,7 +134,9 @@ impl IrohTransport {
             // 默认的拥塞控制（CUBIC）一直加大发送量直到丢包，排队就推到了瓶颈处的缓冲里：
             // 大下载时终端的每个字都要排在几百毫秒的队尾。BBR 按测得的带宽和最小时延发送，队列留在本端，
             // 在本端再按流的优先级发。
-            quic = quic.congestion_controller_factory(std::sync::Arc::new(noq_proto::congestion::Bbr3Config::default()));
+            quic = quic.congestion_controller_factory(std::sync::Arc::new(
+                noq_proto::congestion::Bbr3Config::default(),
+            ));
         }
         builder = builder.transport_config(quic.build());
         let mut relay = None;
@@ -133,11 +144,15 @@ impl IrohTransport {
             Relay::Default => builder.relay_mode(RelayMode::Default),
             Relay::Disabled => builder.relay_mode(RelayMode::Disabled),
             Relay::Custom(url) => {
-                let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
+                let url: RelayUrl = url
+                    .parse()
+                    .map_err(|e| io_err(format!("中继地址无效：{e}")))?;
                 relay = Some(url.clone());
                 // 自建中继（锚点）不提供 QUIC 地址探测：不登记它，否则启动时要等探测超时（3 秒）
                 // 才选定它为本端的中继，这期间别人经它连不上本端。
-                builder.relay_mode(RelayMode::Custom(iroh::RelayMap::from(iroh::RelayConfig::new(url, None))))
+                builder.relay_mode(RelayMode::Custom(iroh::RelayMap::from(
+                    iroh::RelayConfig::new(url, None),
+                )))
             }
         };
         // 浏览器里本来就只有中继。
@@ -145,20 +160,29 @@ impl IrohTransport {
         if !config.direct {
             builder = builder.clear_ip_transports();
         } else if let Some(addr) = config.bind {
-            builder = builder.clear_ip_transports().bind_addr(addr).map_err(io_err)?;
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(addr)
+                .map_err(io_err)?;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let extra_roots = load_extra_ca_roots();
             if !extra_roots.is_empty() {
-                builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::embedded().with_extra_roots(extra_roots));
+                builder = builder.ca_tls_config(
+                    iroh::tls::CaTlsConfig::embedded().with_extra_roots(extra_roots),
+                );
             }
         }
         let ep = builder.bind().await.map_err(io_err)?;
         let me = NodeId(*ep.id().as_bytes());
         let (own_tx, own_rx) = tokio::sync::mpsc::unbounded_channel();
         #[cfg(not(target_arch = "wasm32"))]
-        let rendezvous = config.rendezvous.as_deref().map(|url| rendezvous::Client::new(url, &ep)).transpose()?;
+        let rendezvous = config
+            .rendezvous
+            .as_deref()
+            .map(|url| rendezvous::Client::new(url, &ep))
+            .transpose()?;
         Ok(Self {
             ep,
             me,
@@ -204,7 +228,9 @@ impl Transport for IrohTransport {
     }
 
     fn add_hint(&self, node: NodeId, hint: &str) {
-        let Some(mut addr) = decode_hint(node, hint) else { return };
+        let Some(mut addr) = decode_hint(node, hint) else {
+            return;
+        };
         if self.relay_only {
             addr.addrs.retain(|a| a.is_relay());
         }
@@ -215,25 +241,41 @@ impl Transport for IrohTransport {
 
     async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<IrohConn> {
         if self.offline {
-            return Err(io::Error::new(io::ErrorKind::NetworkUnreachable, "NEXUS_TEST_NO_NETWORK：不用网络"));
+            return Err(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                "NEXUS_TEST_NO_NETWORK：不用网络",
+            ));
         }
         if proto == Proto::Rpc {
             let cached = self.conns.borrow().get(&to).cloned();
             if let Some(conn) = cached {
                 if conn.close_reason().is_none() {
-                    return Ok(IrohConn { conn, remote: to, scheduling: self.scheduling });
+                    return Ok(IrohConn {
+                        conn,
+                        remote: to,
+                        scheduling: self.scheduling,
+                    });
                 }
                 self.conns.borrow_mut().remove(&to);
             }
         }
         let id = iroh::EndpointId::from_bytes(&to.0).map_err(io_err)?;
-        let addr = self.hints.borrow().get(&to).cloned().unwrap_or_else(|| EndpointAddr::new(id));
+        let addr = self
+            .hints
+            .borrow()
+            .get(&to)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(id));
         let conn = self.ep.connect(addr, proto.alpn()).await.map_err(io_err)?;
         if proto == Proto::Rpc {
             self.conns.borrow_mut().insert(to, conn.clone());
             let _ = self.own_tx.send(conn.clone());
         }
-        Ok(IrohConn { conn, remote: to, scheduling: self.scheduling })
+        Ok(IrohConn {
+            conn,
+            remote: to,
+            scheduling: self.scheduling,
+        })
     }
 
     async fn accept(&self) -> io::Result<(IrohConn, Proto)> {
@@ -280,7 +322,10 @@ impl Transport for IrohTransport {
     }
 
     fn peer_announced(&self, conn: &IrohConn) {
-        let old = self.conns.borrow_mut().insert(conn.remote, conn.conn.clone());
+        let old = self
+            .conns
+            .borrow_mut()
+            .insert(conn.remote, conn.conn.clone());
         if let Some(old) = old {
             if old.stable_id() != conn.conn.stable_id() {
                 old.close(0u32.into(), b"peer restarted");
@@ -289,7 +334,9 @@ impl Transport for IrohTransport {
     }
 
     fn paths(&self, node: NodeId) -> Vec<nexus_wire::PathInfo> {
-        let Some(conn) = self.conns.borrow().get(&node).cloned() else { return Vec::new() };
+        let Some(conn) = self.conns.borrow().get(&node).cloned() else {
+            return Vec::new();
+        };
         if conn.close_reason().is_some() {
             return Vec::new();
         }
@@ -308,11 +355,17 @@ impl Transport for IrohTransport {
                     iroh::TransportAddr::Relay(u) => u.to_string(),
                     other => other.to_string(),
                 };
-                let metered = local.parse::<std::net::IpAddr>().is_ok_and(|ip| self.metered_ips.borrow().contains(&ip));
+                let metered = local
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| self.metered_ips.borrow().contains(&ip));
                 nexus_wire::PathInfo {
                     local,
                     remote,
-                    kind: if p.is_relay() { PathKind::Relay } else { PathKind::Direct },
+                    kind: if p.is_relay() {
+                        PathKind::Relay
+                    } else {
+                        PathKind::Direct
+                    },
                     rtt_us: p.rtt().as_micros() as u64,
                     tx_bytes: stats.udp_tx.bytes,
                     rx_bytes: stats.udp_rx.bytes,
@@ -328,7 +381,10 @@ impl Transport for IrohTransport {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn interfaces(&self, overrides: &std::collections::BTreeMap<String, bool>) -> Vec<nexus_wire::IfaceInfo> {
+    fn interfaces(
+        &self,
+        overrides: &std::collections::BTreeMap<String, bool>,
+    ) -> Vec<nexus_wire::IfaceInfo> {
         let list = metered::scan();
         let mut ips = std::collections::BTreeSet::new();
         let out = list
@@ -357,7 +413,10 @@ impl Transport for IrohTransport {
     async fn rendezvous_put(&self, seed: [u8; 32], data: Vec<u8>) -> io::Result<()> {
         match &self.rendezvous {
             Some(c) => c.put(seed, data).await,
-            None => Err(io::Error::new(io::ErrorKind::Unsupported, "启动时关闭了地址发现，也没有用 --rendezvous 指定")),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "启动时关闭了地址发现，也没有用 --rendezvous 指定",
+            )),
         }
     }
 
@@ -365,17 +424,27 @@ impl Transport for IrohTransport {
     async fn rendezvous_get(&self, seed: [u8; 32]) -> io::Result<Option<Vec<u8>>> {
         match &self.rendezvous {
             Some(c) => c.get(seed).await,
-            None => Err(io::Error::new(io::ErrorKind::Unsupported, "启动时关闭了地址发现，也没有用 --rendezvous 指定")),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "启动时关闭了地址发现，也没有用 --rendezvous 指定",
+            )),
         }
     }
 
     async fn use_relay(&self, url: &str) -> io::Result<()> {
-        let url: RelayUrl = url.parse().map_err(|e| io_err(format!("中继地址无效：{e}")))?;
+        let url: RelayUrl = url
+            .parse()
+            .map_err(|e| io_err(format!("中继地址无效：{e}")))?;
         if self.relay.borrow().as_ref() == Some(&url) {
             return Ok(());
         }
         // 锚点只提供中继，不提供 QUIC 地址发现。
-        self.ep.insert_relay(url.clone(), std::sync::Arc::new(iroh::RelayConfig::new(url.clone(), None))).await;
+        self.ep
+            .insert_relay(
+                url.clone(),
+                std::sync::Arc::new(iroh::RelayConfig::new(url.clone(), None)),
+            )
+            .await;
         *self.relay.borrow_mut() = Some(url);
         Ok(())
     }
@@ -396,7 +465,11 @@ pub fn relay_hint(node: NodeId, relay: &str) -> Result<String, String> {
 /// 地址提示里的中继地址（有多个时取第一个）。
 pub fn hint_relay(hint: &str) -> Option<String> {
     let bytes = nexus_wire::hex_decode(hint)?;
-    let addrs = decode_addrs(&bytes).or_else(|| postcard::from_bytes::<EndpointAddr>(&bytes).ok().map(|a| a.addrs))?;
+    let addrs = decode_addrs(&bytes).or_else(|| {
+        postcard::from_bytes::<EndpointAddr>(&bytes)
+            .ok()
+            .map(|a| a.addrs)
+    })?;
     let first = addrs.iter().find_map(|a| match a {
         iroh::TransportAddr::Relay(u) => Some(u.to_string()),
         _ => None,
@@ -430,7 +503,9 @@ fn decode_hint(node: NodeId, hint: &str) -> Option<EndpointAddr> {
         return Some(addr);
     }
     // 旧的提示（数据目录里存着的）：完整的端点地址，标识必须对得上。
-    postcard::from_bytes::<EndpointAddr>(&bytes).ok().filter(|a| a.id == id)
+    postcard::from_bytes::<EndpointAddr>(&bytes)
+        .ok()
+        .filter(|a| a.id == id)
 }
 
 pub struct IrohConn {
@@ -449,7 +524,11 @@ impl Connection for IrohConn {
     fn path_kind(&self) -> Option<PathKind> {
         let paths = self.conn.paths();
         let selected = paths.iter().find(|p| p.is_selected())?;
-        Some(if selected.is_relay() { PathKind::Relay } else { PathKind::Direct })
+        Some(if selected.is_relay() {
+            PathKind::Relay
+        } else {
+            PathKind::Direct
+        })
     }
 
     async fn open_bi(&self) -> io::Result<Self::Stream> {
@@ -482,7 +561,11 @@ fn load_extra_ca_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
     if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|p| !p.is_empty()) {
         paths.push(std::path::PathBuf::from(path));
     }
-    for fallback in ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"] {
+    for fallback in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ] {
         let path = std::path::PathBuf::from(fallback);
         if !paths.contains(&path) {
             paths.push(path);
@@ -500,7 +583,9 @@ fn load_extra_ca_roots() -> Vec<rustls_pki_types::CertificateDer<'static>> {
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_pem_certs(pem: &[u8]) -> Vec<rustls_pki_types::CertificateDer<'static>> {
     use rustls_pki_types::pem::PemObject;
-    rustls_pki_types::CertificateDer::pem_slice_iter(pem).filter_map(Result::ok).collect()
+    rustls_pki_types::CertificateDer::pem_slice_iter(pem)
+        .filter_map(Result::ok)
+        .collect()
 }
 
 #[cfg(test)]
@@ -515,7 +600,13 @@ mod tests {
 -----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n\
 -----BEGIN CERTIFICATE-----\nAwQF\nBgc=\n-----END CERTIFICATE-----\n";
         let certs = parse_pem_certs(pem);
-        assert_eq!(certs.iter().map(|c| c.as_ref().to_vec()).collect::<Vec<_>>(), vec![vec![0, 1, 2], vec![3, 4, 5, 6, 7]]);
+        assert_eq!(
+            certs
+                .iter()
+                .map(|c| c.as_ref().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1, 2], vec![3, 4, 5, 6, 7]]
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -544,7 +635,12 @@ mod tests {
             .with_ip_addr("192.0.2.7:4433".parse().unwrap());
         let hint = encode_hint(&addr);
         let legacy = nexus_wire::hex_encode(&postcard::to_allocvec(&addr).unwrap());
-        assert!(hint.len() + 2 * 31 <= legacy.len(), "{} 对 {}", hint.len(), legacy.len());
+        assert!(
+            hint.len() + 2 * 31 <= legacy.len(),
+            "{} 对 {}",
+            hint.len(),
+            legacy.len()
+        );
         assert_eq!(decode_hint(node, &hint), Some(addr.clone()));
         assert_eq!(decode_hint(node, &legacy), Some(addr));
         let other = NodeId(*SecretKey::from_bytes(&[4; 32]).public().as_bytes());
