@@ -1,7 +1,7 @@
 //! 出口（M3.3，FP-3.3-04 的纯逻辑部分）：作为 SOCKS5 客户端连上游代理。
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use nexus_net_core::route::{decide, Decision, Matcher, Outbound, Rule};
+use nexus_net_core::route::{decide, import_domain_rules, Decision, Matcher, Outbound, Rule};
 use nexus_net_core::{socks5, Host, Target};
 use proptest::prelude::*;
 
@@ -51,6 +51,32 @@ fn rules_can_send_traffic_out_through_a_device_or_an_upstream() {
     assert!(matches!(decide(&t, &rules), Decision::Service { .. }));
     assert_eq!(Outbound::Exit("home".into()).to_string(), "经 home 出去");
     assert_eq!(Outbound::Socks5("127.0.0.1:7890".into()).to_string(), "经上游代理 127.0.0.1:7890");
+}
+
+#[test]
+fn import_mihomo_domain_rules_keeps_order_and_policy() {
+    let selected = Outbound::Socks5("127.0.0.1:7890".into());
+    let rules = import_domain_rules("rules:\n  - 'DOMAIN-SUFFIX,blocked.example,REJECT'\n  - DOMAIN-SUFFIX,example,Proxy\n  - DOMAIN-SUFFIX,direct.test,DIRECT", selected.clone()).unwrap();
+    assert_eq!(rules.iter().map(|r| r.outbound.clone()).collect::<Vec<_>>(), [Outbound::Reject, selected.clone(), Outbound::Direct]);
+    assert_eq!(decide(&Target::parse("sub.blocked.example:443").unwrap(), &rules), Decision::Rule { index: 0, outbound: Outbound::Reject });
+    assert_eq!(import_domain_rules("payload:\n  - DOMAIN-SUFFIX,example.com", selected.clone()).unwrap()[0].outbound, selected);
+}
+
+#[test]
+fn import_mihomo_rules_reports_unsupported_lines() {
+    for line in [
+        "DOMAIN,example.com,Proxy",
+        "IP-CIDR,198.51.100.0/24,Proxy",
+        "DOMAIN-SUFFIX,example.com,Other-Proxy",
+        "DOMAIN-SUFFIX,example.com,REJECT-DROP",
+        "DOMAIN-SUFFIX,home.internal,Proxy",
+        "DOMAIN-SUFFIX,example.com,DIRECT # local",
+        "MATCH,DIRECT",
+    ] {
+        let text = format!("rules:\n  - DOMAIN-SUFFIX,accepted.test,Proxy\n  - {line}");
+        let error = import_domain_rules(&text, Outbound::Exit("host".into())).unwrap_err();
+        assert!(error.starts_with("第 3 行"), "{line}: {error}");
+    }
 }
 
 proptest! {

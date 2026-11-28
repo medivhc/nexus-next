@@ -13,4 +13,6 @@ final class NexusCore {
      * 返回 {"state": "starting"|"joined"|"joining"|"failed", ...}，字段见 nexus_cli::app::Screen。
      */
     static native String nativeScreen(String dataDir, String held, boolean renew, long nowMs);
+
+    static native String nativeRoutes(String dataDir, String operation, String match, String endpoint);
 }

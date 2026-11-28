@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 5;
+pub const WIRE_MINOR: u16 = 6;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -157,6 +157,8 @@ pub enum Request {
     /// 连到对方发布的一个 UDP 服务（`--proto udp`，M11.5）。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后两个方向都是一串数据报帧：2 字节大端长度 + 数据报。任一方向结束发送即结束这条转发。
     SvcDatagram { name: String },
+    /// 经已开放的出口收发 UDP，目标为 `主机:端口`。握手与数据报帧同 `SvcDatagram`。
+    ExitDatagram { target: String },
 }
 
 /// 临时分享的目标（M9.1）：全部为只读访问。
@@ -366,6 +368,7 @@ impl Request {
             Request::Exec(_) => TrafficClass::Normal,
             Request::SvcConnect { .. }
             | Request::ExitConnect { .. }
+            | Request::ExitDatagram { .. }
             | Request::DriveGet { .. }
             | Request::DrivePush { .. }
             | Request::ShareServiceConnect { .. } => {
@@ -839,6 +842,8 @@ pub enum CtlRequest {
     Attach { node: String, session: String, size: Size, create: bool },
     SessionList { node: String },
     SessionKill { node: String, session: String },
+    /// 本机批量导入路由规则，按顺序追加，任何一条非法时都不写入。
+    RouteAddMany { rules: Vec<nexus_net_core::route::Rule> },
 }
 
 /// 最近一次升级（M7.3）。

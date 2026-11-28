@@ -127,6 +127,17 @@ fn joined(entries: &[nexus_wire::ListEntry]) -> Option<Screen> {
     Some(Screen::Joined { name: me.report.name.clone(), devices })
 }
 
+/// 导入规则集的受支持子集。已存在的规则优先，导入成功后返回新增的条数。
+pub async fn import_rules<C: Ctl>(ctl: &C, text: &str, exit: nexus_net_core::route::Outbound) -> Result<usize, String> {
+    let rules = nexus_net_core::route::import_domain_rules(text, exit)?;
+    let count = rules.len();
+    match call(ctl, CtlRequest::RouteAddMany { rules }).await.map_err(|e| e.to_string())? {
+        CtlResponse::RouteAdded { .. } => Ok(count),
+        CtlResponse::Error(e) => Err(e.message),
+        other => Err(format!("核心的回应无法理解：{other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // covers: R79, R80

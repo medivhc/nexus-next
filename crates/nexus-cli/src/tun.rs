@@ -3,7 +3,9 @@
 
 use nexus_net_core::fakeip::FakePool;
 use nexus_runtime::TunInbound;
+pub use nexus_runtime::TunRouting;
 use std::io;
+use std::net::SocketAddr;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,7 +36,7 @@ pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInboun
     }
     let dev = builder.build_async()?;
     let actual = dev.name().unwrap_or_else(|_| name.to_string());
-    run_stack(dev, pool, entry)?;
+    run_stack(dev, pool, entry, None, None)?;
     let guard = configure_resolver(&actual, pool);
     Ok((actual, guard))
 }
@@ -63,28 +65,42 @@ fn wintun_path() -> io::Result<String> {
 }
 
 /// 在别人建好的网卡上启动协议栈（Android：VpnService 建网卡、配地址和路由）。
-pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<()> {
+pub type AppRouter = Arc<dyn Fn(u8, SocketAddr, SocketAddr) -> Option<TunRouting> + Send + Sync>;
+/// TUN activity is sampled at most once every two seconds.
+pub type TrafficObserver = Box<dyn Fn() + Send>;
+
+pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>, router: Option<AppRouter>, on_traffic: Option<TrafficObserver>) -> io::Result<()> {
     let mut config = ipstack::IpStackConfig::default();
     config.mtu(1500).map_err(io::Error::other)?;
     config.udp_timeout(Duration::from_secs(30));
-    let mut stack = ipstack::IpStack::new(config, PacketPipe::new(dev));
+    let mut stack = ipstack::IpStack::new(config, PacketPipe::new(dev, on_traffic));
     let dns = std::net::IpAddr::V4(pool.dns());
+    let full_capture = router.is_some();
+    let is_dns = move |dst: SocketAddr| dst.port() == 53 && (full_capture || dst.ip() == dns);
     tokio::spawn(async move {
         loop {
             match stack.accept().await {
+                Ok(ipstack::IpStackStream::Tcp(tcp)) if is_dns(tcp.peer_addr()) => {
+                    tokio::spawn(serve_tcp_dns(TunTcp::new(tcp), entry.clone(), full_capture));
+                }
                 Ok(ipstack::IpStackStream::Tcp(tcp)) => {
                     let dst = tcp.peer_addr();
-                    if entry.send(TunInbound::Tcp { stream: Box::new(TunTcp::new(tcp)), dst }).is_err() {
+                    let Some(routing) = classify_flow(&router, 6, tcp.local_addr(), dst).await else {
+                        // ipstack resets active connections when the stream is dropped.
+                        continue;
+                    };
+                    if entry.send(TunInbound::Tcp { stream: Box::new(TunTcp::new(tcp)), dst, routing }).is_err() {
                         return;
                     }
                 }
-                Ok(ipstack::IpStackStream::Udp(udp)) if udp.peer_addr().ip() == dns && udp.peer_addr().port() == 53 => {
-                    tokio::spawn(serve_dns(udp, entry.clone()));
+                Ok(ipstack::IpStackStream::Udp(udp)) if is_dns(udp.peer_addr()) => {
+                    tokio::spawn(serve_udp_dns(udp, entry.clone(), full_capture));
                 }
-                // 其余的 UDP（M11.5）：交给节点按目标转发（只转发到 UDP 服务）。
+                // 其余的 UDP：交给节点按目标转发到已发布服务或出口。
                 Ok(ipstack::IpStackStream::Udp(udp)) => {
                     let dst = udp.peer_addr();
-                    if entry.send(TunInbound::Udp { stream: Box::new(udp), dst }).is_err() {
+                    let Some(routing) = classify_flow(&router, 17, udp.local_addr(), dst).await else { continue };
+                    if entry.send(TunInbound::Udp { stream: Box::new(udp), dst, routing }).is_err() {
                         return;
                     }
                 }
@@ -99,22 +115,47 @@ pub fn run_stack(dev: tun_rs::AsyncDevice, pool: &FakePool, entry: mpsc::Unbound
     Ok(())
 }
 
+async fn classify_flow(router: &Option<AppRouter>, protocol: u8, src: SocketAddr, dst: SocketAddr) -> Option<TunRouting> {
+    let Some(router) = router.clone() else { return Some(TunRouting::FakeIp) };
+    let transport = if protocol == 6 { "TCP" } else { "UDP" };
+    if dst.port() == 853 {
+        eprintln!("nexus daemon: {transport} {dst}：按应用接管时使用 VPN 的受控 DNS");
+        return None;
+    }
+    let routing = tokio::task::spawn_blocking(move || router(protocol, src, dst)).await.ok().flatten();
+    if routing.is_none() {
+        eprintln!("nexus daemon: {transport} {dst}：无法确认应用归属或共享 UID 的策略冲突");
+    }
+    routing
+}
+
+async fn dns_reply(entry: &mpsc::UnboundedSender<TunInbound>, query: Vec<u8>, full_capture: bool) -> Option<Vec<u8>> {
+    let (reply, answer) = oneshot::channel();
+    entry.send(TunInbound::Dns { query, full_capture, reply }).ok()?;
+    answer.await.ok()
+}
+
 /// 一个查询方（源端口）发来的查询：每个数据报是一个查询，逐个交给节点回答。
-async fn serve_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSender<TunInbound>) {
+async fn serve_udp_dns(mut udp: ipstack::IpStackUdpStream, entry: mpsc::UnboundedSender<TunInbound>, full_capture: bool) {
     let mut buf = vec![0u8; 1500];
     loop {
         let n = match udp.read(&mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        let (reply, answer) = oneshot::channel();
-        if entry.send(TunInbound::Dns { query: buf[..n].to_vec(), reply }).is_err() {
-            return;
-        }
-        let Ok(a) = answer.await else { return };
+        let Some(a) = dns_reply(&entry, buf[..n].to_vec(), full_capture).await else { return };
         if !a.is_empty() && udp.write_all(&a).await.is_err() {
             return;
         }
+    }
+}
+
+async fn serve_tcp_dns(mut tcp: TunTcp, entry: mpsc::UnboundedSender<TunInbound>, full_capture: bool) {
+    while let Ok(size) = tcp.read_u16().await {
+        let mut query = vec![0; usize::from(size)];
+        if tcp.read_exact(&mut query).await.is_err() { return }
+        let Some(answer) = dns_reply(&entry, query, full_capture).await else { return };
+        if answer.is_empty() || tcp.write_u16(answer.len() as u16).await.is_err() || tcp.write_all(&answer).await.is_err() { return }
     }
 }
 
@@ -281,14 +322,22 @@ struct PacketPipe {
 }
 
 impl PacketPipe {
-    fn new(dev: tun_rs::AsyncDevice) -> Self {
+    fn new(dev: tun_rs::AsyncDevice, on_traffic: Option<TrafficObserver>) -> Self {
         let dev = Arc::new(dev);
         let (in_tx, rx) = mpsc::channel(1024);
         let (tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let d = dev.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
+            let mut last_report = None;
             while let Ok(n) = d.recv(&mut buf).await {
+                if let Some(report) = &on_traffic {
+                    let now = tokio::time::Instant::now();
+                    if n != 0 && last_report.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(2)) {
+                        last_report = Some(now);
+                        report();
+                    }
+                }
                 if in_tx.send(buf[..n].to_vec()).await.is_err() {
                     break;
                 }

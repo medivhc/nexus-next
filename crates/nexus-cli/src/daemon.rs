@@ -40,7 +40,10 @@ pub enum Tun {
     /// 常驻程序自己建网卡（Linux、macOS、Windows）。
     Named { name: String, pool: FakePool },
     /// 别人建好的网卡（Android 的 VpnService），`label` 只用于显示。
-    Device { device: tun_rs::AsyncDevice, label: String, pool: FakePool },
+    Device {
+        device: tun_rs::AsyncDevice, label: String, pool: FakePool,
+        app_router: Option<tun::AppRouter>, on_traffic: Option<tun::TrafficObserver>,
+    },
 }
 
 pub struct Options {
@@ -94,9 +97,9 @@ pub async fn run(opts: Options, stop: impl std::future::Future<Output = ()>) -> 
             let (net, prefix) = pool.network();
             eprintln!("nexus daemon: 完整节点：虚拟网卡 {actual}，网段 {net}/{prefix}，名字服务 {}", pool.dns());
         }
-        Some(Tun::Device { device, label, pool }) => {
+        Some(Tun::Device { device, label, pool, app_router, on_traffic }) => {
             let entry = node.enable_tun(&label, pool.clone());
-            tun::run_stack(device, &pool, entry)?;
+            tun::run_stack(device, &pool, entry, app_router, on_traffic)?;
             eprintln!("nexus daemon: 完整节点：虚拟网卡 {label}，名字服务 {}", pool.dns());
         }
     }

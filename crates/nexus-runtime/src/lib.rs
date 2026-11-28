@@ -31,6 +31,7 @@ use nexus_wire::{
 };
 mod datagrams;
 mod drive;
+mod proxy_udp;
 mod share;
 mod vault;
 
@@ -76,6 +77,7 @@ enum Dispatch {
     Pipe { addr: std::net::SocketAddr, name: String },
     Datagram { addr: std::net::SocketAddr, name: String },
     Exit { target: Target },
+    ExitDatagram { target: Target },
     DriveGet { hashes: Vec<[u8; 32]> },
     DrivePush { ws: String, head: [u8; 32], count: u32 },
     WebEnroll { token: [u8; 16], credential: NewCredential },
@@ -221,6 +223,15 @@ enum ProxyFail {
     Refused(String),
 }
 
+impl std::fmt::Display for ProxyFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected => f.write_str("路由规则拒绝访问"),
+            Self::Denied(why) | Self::Unreachable(why) | Self::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
 /// 入口接到的出口。
 enum Upstream<A, B> {
     Tcp(A),
@@ -294,14 +305,20 @@ const INTERFACES_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 /// 统一入口上的一条连接（SOCKS5 或 HTTP 代理），由常驻程序从本机监听的端口交给节点。
 pub type ProxyStream = Box<dyn ProxyIo + Send>;
 
+/// 原有临时地址引流，或 Android 按应用接管的连接。
+pub enum TunRouting {
+    FakeIp,
+    Application { outbound: Option<Outbound> },
+}
+
 /// 完整节点的虚拟网卡上收到的东西，由常驻程序交给节点（M3.4）。
 pub enum TunInbound {
     /// 一条 TCP 连接，`dst` 是程序连的地址。
-    Tcp { stream: ProxyStream, dst: std::net::SocketAddr },
+    Tcp { stream: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting },
     /// 一个程序（源地址和端口）发往 `dst` 的 UDP 数据报（M11.5）：每次读出一个数据报，每次写入一个数据报。
-    Udp { stream: ProxyStream, dst: std::net::SocketAddr },
+    Udp { stream: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting },
     /// 一个发给名字服务的查询；回应从 `reply` 送回（为空时不回应）。
-    Dns { query: Vec<u8>, reply: tokio::sync::oneshot::Sender<Vec<u8>> },
+    Dns { query: Vec<u8>, full_capture: bool, reply: tokio::sync::oneshot::Sender<Vec<u8>> },
 }
 
 /// 完整节点的虚拟网卡。
@@ -384,7 +401,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
                 resource: ResourcePath::parse(&format!("{node}/svc/{name}")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
-        Request::ExitConnect { .. } => {
+        Request::ExitConnect { .. } | Request::ExitDatagram { .. } => {
             return Ok(Some(Action {
                 capability: Capability::parse("net.exit").expect("内置能力名合法"),
                 resource: ResourcePath::parse(&format!("{node}/exit")).map_err(|_| internal("本机不在名册里"))?,
@@ -789,10 +806,10 @@ impl<T: Transport, S: System> Node<T, S> {
                     tasks.push(Box::pin(self.serve_proxy(conn)));
                 }
                 Some(inbound) = tunneled.recv() => match inbound {
-                    TunInbound::Tcp { stream, dst } => tasks.push(Box::pin(self.serve_tun(stream, dst))),
-                    TunInbound::Udp { stream, dst } => tasks.push(Box::pin(self.serve_tun_udp(stream, dst))),
-                    TunInbound::Dns { query, reply } => tasks.push(Box::pin(async move {
-                        let _ = reply.send(self.answer_dns(&query).await);
+                    TunInbound::Tcp { stream, dst, routing } => tasks.push(Box::pin(self.serve_tun(stream, dst, routing))),
+                    TunInbound::Udp { stream, dst, routing } => tasks.push(Box::pin(self.serve_tun_udp(stream, dst, routing))),
+                    TunInbound::Dns { query, full_capture, reply } => tasks.push(Box::pin(async move {
+                        let _ = reply.send(self.answer_dns(&query, full_capture).await);
                     })),
                 },
             }
@@ -911,6 +928,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
             Dispatch::Datagram { addr, name } => return self.serve_datagram(stream, addr, &name).await,
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
+            Dispatch::ExitDatagram { target } => return self.serve_exit_datagram(stream, target).await,
             Dispatch::DriveGet { hashes } => return self.serve_drive_get(stream, hashes).await,
             Dispatch::DrivePush { ws, head, count } => return self.serve_drive_push(stream, ws, head, count).await,
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
@@ -1043,11 +1061,14 @@ impl<T: Transport, S: System> Node<T, S> {
                 Some(s) => Response::Error(err(ErrorCode::InvalidInput, format!("{me} 上的服务 {name} 是 {}，不是 UDP 服务", s.proto))),
                 None => Response::Error(err(ErrorCode::NotFound, format!("{me} 上没有发布服务 {name}"))),
             },
-            Request::ExitConnect { target } => {
+            Request::ExitConnect { ref target } | Request::ExitDatagram { ref target } => {
                 if !self.exit_enabled.get() {
                     Response::Error(err(ErrorCode::Denied, format!("{me} 没有开放出口（在 {me} 上执行 nexus exit on）")))
                 } else {
-                    match Target::parse(&target) {
+                    match Target::parse(target) {
+                        Some(target) if matches!(body, Request::ExitDatagram { .. }) => {
+                            return Dispatch::ExitDatagram { target };
+                        }
                         Some(target) => return Dispatch::Exit { target },
                         None => Response::Error(err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}"))),
                     }
@@ -1319,6 +1340,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 self.remote_services(&node, agent_ref).await.map(|(node, services)| CtlResponse::Services { node, services })
             }
             CtlRequest::RouteAdd { rule } => self.route_add(rule).map(|index| CtlResponse::RouteAdded { index }),
+            CtlRequest::RouteAddMany { rules } => self.route_add_many(rules).map(|index| CtlResponse::RouteAdded { index }),
             CtlRequest::RouteRm { index } => self.route_rm(index).map(|()| CtlResponse::Ok),
             CtlRequest::ExitSet { enabled } => {
                 self.exit_enabled.set(enabled);
@@ -1373,6 +1395,7 @@ impl<T: Transport, S: System> Node<T, S> {
                 | CtlRequest::Publish { .. }
                 | CtlRequest::Unpublish { .. }
                 | CtlRequest::RouteAdd { .. }
+                | CtlRequest::RouteAddMany { .. }
                 | CtlRequest::RouteRm { .. }
                 | CtlRequest::ExitSet { .. }
                 | CtlRequest::Interfaces { set: Some(_) }
@@ -2458,25 +2481,30 @@ impl<T: Transport, S: System> Node<T, S> {
         if write_response(&mut stream, &Response::Ok).await.is_err() {
             return;
         }
-        let _ = datagrams::relay(stream, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+        let _ = datagrams::relay(stream, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await.map(Some)).await;
+    }
+
+    async fn exit_addresses(&self, target: &Target) -> Result<Vec<std::net::SocketAddr>, WireError> {
+        let ips = match &target.host {
+            Host::Ip(ip) => vec![*ip],
+            Host::Name(name) => {
+                self.system.resolve(name).await.map_err(|e| err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}")))?
+            }
+        };
+        let addrs: Vec<_> = ips.into_iter().filter(|ip| !is_own_address(ip))
+            .map(|ip| std::net::SocketAddr::new(ip, target.port)).collect();
+        if addrs.is_empty() {
+            return Err(err(ErrorCode::Denied, format!("出口不连本机地址：{target}")));
+        }
+        Ok(addrs)
     }
 
     /// 出口：替别的设备连到目标。不连本机地址：本机上的程序要给别人用，应当发布成服务。
     async fn serve_exit<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, target: Target) {
         let result = async {
-            let ips = match &target.host {
-                Host::Ip(ip) => vec![*ip],
-                Host::Name(name) => {
-                    self.system.resolve(name).await.map_err(|e| err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}")))?
-                }
-            };
-            let ips: Vec<_> = ips.into_iter().filter(|ip| !is_own_address(ip)).collect();
-            if ips.is_empty() {
-                return Err(err(ErrorCode::Denied, format!("出口不连本机地址：{target}")));
-            }
             let mut last = String::new();
-            for ip in ips {
-                match self.system.tcp_connect(std::net::SocketAddr::new(ip, target.port)).await {
+            for addr in self.exit_addresses(&target).await? {
+                match self.system.tcp_connect(addr).await {
                     Ok(c) => return Ok(c),
                     Err(e) => last = format!("出口连不上 {target}：{e}"),
                 }
@@ -2589,32 +2617,41 @@ impl<T: Transport, S: System> Node<T, S> {
     // ------------------------------------------------------------ 统一入口与路由（M3.2）
 
     fn route_add(&self, rule: Rule) -> Result<u32, WireError> {
-        match &rule.outbound {
-            Outbound::Exit(device) => {
-                if self.resolve(device)?.node_id == self.me() {
+        self.route_add_many(vec![rule])
+    }
+
+    fn route_add_many(&self, rules: Vec<Rule>) -> Result<u32, WireError> {
+        if rules.is_empty() || rules.len() > 256 {
+            return Err(err(ErrorCode::InvalidInput, "一次可添加 1 到 256 条规则"));
+        }
+        for rule in &rules {
+            match &rule.outbound {
+                Outbound::Exit(device) if self.resolve(device)?.node_id == self.me() => {
                     return Err(err(ErrorCode::InvalidInput, format!("{device} 就是本机：本机出去用 --direct")));
                 }
-            }
-            Outbound::Socks5(upstream) => {
-                if Target::parse(upstream).is_none() {
+                Outbound::Socks5(upstream) if Target::parse(upstream).filter(|target| target.port != 0).is_none() => {
                     return Err(err(ErrorCode::InvalidInput, format!("上游代理应当写成 主机:端口：{upstream}")));
                 }
+                _ => {}
             }
-            Outbound::Direct | Outbound::Reject => {}
         }
-        let mut routes = self.routes.borrow_mut();
-        routes.rules.push(rule);
-        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)?;
-        Ok(routes.rules.len() as u32)
+        let mut routes = self.routes.borrow().clone();
+        routes.rules.extend(rules);
+        let last = routes.rules.len() as u32;
+        save(&self.system, KEY_ROUTES, &routes).map_err(internal)?;
+        *self.routes.borrow_mut() = routes;
+        Ok(last)
     }
 
     fn route_rm(&self, index: u32) -> Result<(), WireError> {
-        let mut routes = self.routes.borrow_mut();
+        let mut routes = self.routes.borrow().clone();
         if index == 0 || index as usize > routes.rules.len() {
             return Err(err(ErrorCode::NotFound, format!("没有第 {index} 条规则")));
         }
         routes.rules.remove(index as usize - 1);
-        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)
+        save(&self.system, KEY_ROUTES, &routes).map_err(internal)?;
+        *self.routes.borrow_mut() = routes;
+        Ok(())
     }
 
     fn route_explain(&self, target: &str) -> Result<RouteExplanation, WireError> {
@@ -2629,7 +2666,7 @@ impl<T: Transport, S: System> Node<T, S> {
     }
 
     /// 名字服务：服务的名字和规则里不直连的域名给本机临时地址，其余照常解析。
-    async fn answer_dns(&self, raw: &[u8]) -> Vec<u8> {
+    async fn answer_dns(&self, raw: &[u8], full_capture: bool) -> Vec<u8> {
         let Some(q) = dns::parse_query(raw) else { return Vec::new() };
         if self.tun.borrow().is_none() {
             return dns::error(&q, dns::SERVFAIL);
@@ -2643,9 +2680,12 @@ impl<T: Transport, S: System> Node<T, S> {
                 true
             }
             Decision::BadInternalName => return dns::error(&q, dns::NXDOMAIN),
-            Decision::Rule { outbound, .. } | Decision::Default(outbound) => outbound != Outbound::Direct,
+            Decision::Rule { outbound, .. } | Decision::Default(outbound) => full_capture || outbound != Outbound::Direct,
         };
         if capture {
+            if q.qtype != dns::A {
+                return dns::answer(&q, &[], DNS_TTL);
+            }
             let ip = match self.tun.borrow_mut().as_mut() {
                 Some((_, pool)) => pool.assign(&q.name),
                 None => return dns::error(&q, dns::SERVFAIL),
@@ -2662,62 +2702,42 @@ impl<T: Transport, S: System> Node<T, S> {
         }
     }
 
-    /// 虚拟网卡上的一条 TCP 连接：按地址找回名字，然后和统一入口一样按路由接到出口。
-    async fn serve_tun(&self, mut client: ProxyStream, dst: std::net::SocketAddr) {
-        let name = match (dst.ip(), self.tun.borrow().as_ref()) {
-            (std::net::IpAddr::V4(ip), Some((_, pool))) => pool.lookup(ip).map(str::to_string),
-            _ => None,
-        };
-        let Some(name) = name else {
-            let _ = client.shutdown().await;
-            return;
-        };
-        let target = Target { host: Host::Name(name), port: dst.port() };
-        match self.open_outbound(&target).await {
-            Ok(up) => {
-                let _ = up.splice(client, Vec::new()).await;
+    fn tun_target(&self, dst: std::net::SocketAddr, routing: &TunRouting) -> Option<Target> {
+        let tun = self.tun.borrow();
+        let (_, pool) = tun.as_ref()?;
+        let (network, prefix) = pool.network();
+        let host = match dst.ip() {
+            std::net::IpAddr::V4(ip) if u32::from(ip) >> (32 - prefix) == u32::from(network) >> (32 - prefix) => {
+                Host::Name(pool.lookup(ip)?.to_string())
             }
-            Err(_) => {
-                let _ = client.shutdown().await;
-            }
+            ip if matches!(routing, TunRouting::Application { .. }) && !ip.is_unspecified() && dst.port() != 0 => Host::Ip(ip),
+            _ => return None,
+        };
+        Some(Target { host, port: dst.port() })
+    }
+
+    fn tun_decision(&self, target: &Target, routing: TunRouting) -> Decision {
+        let decision = route::decide(target, &self.routes.borrow().rules);
+        match (&decision, routing) {
+            (Decision::Rule { outbound: Outbound::Reject, .. } | Decision::Service { .. } | Decision::BadInternalName, _) => decision,
+            (_, TunRouting::Application { outbound: Some(outbound) }) => Decision::Default(outbound),
+            _ => decision,
         }
     }
 
-    /// 完整节点上程序发往服务临时地址的 UDP 数据报（M11.5）：只转发到发布成 `--proto udp` 的服务，
-    /// 端口和 TCP 一样不看。规则里的域名（出口、上游代理）不转发 UDP。
-    async fn serve_tun_udp(&self, client: ProxyStream, dst: std::net::SocketAddr) {
-        let name = match (dst.ip(), self.tun.borrow().as_ref()) {
-            (std::net::IpAddr::V4(ip), Some((_, pool))) => pool.lookup(ip).map(str::to_string),
-            _ => None,
-        };
-        let Some(name) = name else { return };
-        let target = Target { host: Host::Name(name), port: dst.port() };
-        let Decision::Service { device, service } = route::decide(&target, &self.routes.borrow().rules) else { return };
-        let Ok(device) = self.resolve(&device) else { return };
-        // 协议栈的 UDP 流：每次读出一个数据报，每次写入一个数据报。
-        let (mut client_rd, mut client_wr) = tokio::io::split(client);
-        let to_client = async |b: &[u8]| -> io::Result<usize> {
-            client_wr.write_all(b).await?;
-            Ok(b.len())
-        };
-        let from_client = async |b: &mut [u8]| -> io::Result<usize> { client_rd.read(b).await };
-        if device.node_id == self.me() {
-            let Some(addr) = self.services.borrow().iter().find(|s| s.name == service && s.proto == "udp").map(|s| s.addr) else { return };
-            let Ok(udp) = self.system.udp_connect(addr).await else { return };
-            let _ = datagrams::bridge(from_client, to_client, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+    /// Catch a literal IP or recover the original name from its temporary address.
+    async fn serve_tun(&self, mut client: ProxyStream, dst: std::net::SocketAddr, routing: TunRouting) {
+        let Some(target) = self.tun_target(dst, &routing) else {
+            let _ = client.shutdown().await;
             return;
-        }
-        let body = Request::SvcDatagram { name: service };
-        for attempt in 0..2 {
-            match self.open_stream(&device, body.clone(), None).await {
-                Ok(stream) => {
-                    let _ = datagrams::relay(stream, to_client, from_client).await;
-                    return;
-                }
-                Err(OpenError::StaleRoster) if attempt == 0 => {
-                    let _ = self.push_roster(device.node_id).await;
-                }
-                Err(_) => return,
+        };
+        match self.open_outbound_decision(&target, self.tun_decision(&target, routing)).await {
+            Ok(up) => {
+                let _ = up.splice(client, Vec::new()).await;
+            }
+            Err(e) => {
+                eprintln!("nexus daemon: TCP {target}：{e}");
+                let _ = client.shutdown().await;
             }
         }
     }
@@ -2835,6 +2855,10 @@ impl<T: Transport, S: System> Node<T, S> {
     /// 按路由接到出口。
     async fn open_outbound(&self, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
         let decision = route::decide(target, &self.routes.borrow().rules);
+        self.open_outbound_decision(target, decision).await
+    }
+
+    async fn open_outbound_decision(&self, target: &Target, decision: Decision) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
         let outbound = match decision {
             Decision::Service { device, service } => return self.open_service(&device, &service).await,
             Decision::BadInternalName => {
@@ -2865,11 +2889,15 @@ impl<T: Transport, S: System> Node<T, S> {
 
     /// 经网络里的一台设备出去：对方判定授权、审计，再连到目标。
     async fn open_exit(&self, device: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
-        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
         let body = Request::ExitConnect { target: target.to_string() };
+        self.open_exit_stream(device, body).await.map(Upstream::Remote)
+    }
+
+    async fn open_exit_stream(&self, device: &str, body: Request) -> Result<<T::Conn as Connection>::Stream, ProxyFail> {
+        let device = self.resolve(device).map_err(|e| ProxyFail::Unreachable(e.message))?;
         for attempt in 0..2 {
             match self.open_stream(&device, body.clone(), None).await {
-                Ok(stream) => return Ok(Upstream::Remote(stream)),
+                Ok(stream) => return Ok(stream),
                 Err(OpenError::StaleRoster) if attempt == 0 => {
                     let _ = self.push_roster(device.node_id).await;
                 }
@@ -2882,21 +2910,23 @@ impl<T: Transport, S: System> Node<T, S> {
         Err(ProxyFail::Unreachable("对方的名册始终比本机旧".into()))
     }
 
-    /// 交给上游 SOCKS5 代理：目标原样交过去，不在本机解析。
-    async fn open_upstream(&self, upstream: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+    async fn connect_socks_upstream(&self, upstream: &str) -> Result<(S::Tcp, std::net::IpAddr), ProxyFail> {
         let up = Target::parse(upstream).ok_or_else(|| ProxyFail::Unreachable(format!("上游代理的地址不对：{upstream}")))?;
         let ips = match &up.host {
             Host::Ip(ip) => vec![*ip],
             Host::Name(name) => self.system.resolve(name).await.map_err(|e| ProxyFail::Unreachable(format!("解析不了上游代理 {name}：{e}")))?,
         };
-        let mut conn = None;
         for ip in ips {
             if let Ok(c) = self.system.tcp_connect(std::net::SocketAddr::new(ip, up.port)).await {
-                conn = Some(c);
-                break;
+                return Ok((c, ip));
             }
         }
-        let mut conn = conn.ok_or_else(|| ProxyFail::Unreachable(format!("上游代理 {upstream} 没有在运行")))?;
+        Err(ProxyFail::Unreachable(format!("上游代理 {upstream} 没有在运行")))
+    }
+
+    /// 交给上游 SOCKS5 代理：目标原样交过去，不在本机解析。
+    async fn open_upstream(&self, upstream: &str, target: &Target) -> Result<Upstream<S::Tcp, <T::Conn as Connection>::Stream>, ProxyFail> {
+        let (mut conn, _) = self.connect_socks_upstream(upstream).await?;
         let handshake = async {
             conn.write_all(&[5, 1, 0]).await?;
             let mut greet = [0u8; 2];
@@ -3412,34 +3442,49 @@ mod tests {
     use nexus_sys::{ExitStatus, Size};
     use tokio::io::DuplexStream;
     use tokio::sync::Notify;
+    mod proxy_udp;
 
     #[derive(Default)]
-    struct ExecState {
+    struct TestState {
         output_ready: Notify,
         killed: Notify,
         is_killed: Cell<bool>,
+        udp_targets: RefCell<BTreeMap<std::net::SocketAddr, nexus_sys::UdpConn>>,
+        tcp_targets: RefCell<BTreeMap<std::net::SocketAddr, DuplexStream>>,
+        dns: RefCell<BTreeMap<String, Vec<std::net::IpAddr>>>,
+        saved_routes: RefCell<Option<Vec<u8>>>,
+        fail_route_write: Cell<bool>,
     }
 
-    struct TestSystem(Rc<ExecState>);
+    struct TestSystem(Rc<TestState>);
     struct TestProc {
-        state: Rc<ExecState>,
+        state: Rc<TestState>,
         output_sent: bool,
     }
     struct TestPty;
-    struct TestTransport;
-    struct TestConnection;
+    #[derive(Default)]
+    struct TestTransport {
+        id: u8,
+        network: Option<(NodeId, mpsc::UnboundedSender<DuplexStream>)>,
+    }
+
+    #[derive(Default)]
+    struct TestConnection(Option<mpsc::UnboundedSender<DuplexStream>>);
 
     impl Transport for TestTransport {
         type Conn = TestConnection;
         fn node_id(&self) -> NodeId {
-            NodeId([1; 32])
+            NodeId([self.id; 32])
         }
         fn local_hint(&self) -> String {
             String::new()
         }
         fn add_hint(&self, _: NodeId, _: &str) {}
-        async fn connect(&self, _: NodeId, _: Proto) -> io::Result<TestConnection> {
-            unreachable!()
+        async fn connect(&self, to: NodeId, proto: Proto) -> io::Result<TestConnection> {
+            let Some((peer, tx)) = &self.network else { unreachable!() };
+            assert_eq!(to, *peer);
+            assert!(matches!(proto, Proto::Rpc));
+            Ok(TestConnection(Some(tx.clone())))
         }
         async fn accept(&self) -> io::Result<(TestConnection, Proto)> {
             unreachable!()
@@ -3454,7 +3499,9 @@ mod tests {
             None
         }
         async fn open_bi(&self) -> io::Result<DuplexStream> {
-            unreachable!()
+            let (local, remote) = tokio::io::duplex(8192);
+            self.0.as_ref().unwrap().send(remote).unwrap();
+            Ok(local)
         }
         async fn accept_bi(&self) -> io::Result<Option<DuplexStream>> {
             unreachable!()
@@ -3464,11 +3511,14 @@ mod tests {
         type Proc = TestProc;
         type Pty = TestPty;
         type Tcp = DuplexStream;
-        async fn tcp_connect(&self, _: std::net::SocketAddr) -> io::Result<DuplexStream> {
-            Err(io::ErrorKind::ConnectionRefused.into())
+        async fn tcp_connect(&self, addr: std::net::SocketAddr) -> io::Result<DuplexStream> {
+            self.0.tcp_targets.borrow_mut().remove(&addr).ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
         }
-        async fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
-            Err(io::ErrorKind::NotFound.into())
+        async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<nexus_sys::UdpConn> {
+            self.0.udp_targets.borrow_mut().remove(&addr).ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
+        }
+        async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            self.0.dns.borrow().get(host).cloned().ok_or_else(|| io::ErrorKind::NotFound.into())
         }
         fn now(&self) -> Timestamp {
             Timestamp(0)
@@ -3476,8 +3526,8 @@ mod tests {
         fn random(&self, _: &mut [u8]) {
             unreachable!()
         }
-        fn store_get(&self, _: &str) -> io::Result<Option<Vec<u8>>> {
-            Ok(None)
+        fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+            Ok(if key == KEY_ROUTES { self.0.saved_routes.borrow().clone() } else { None })
         }
         fn cas_get(&self, _: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
             Ok(None)
@@ -3488,11 +3538,16 @@ mod tests {
         fn cas_has(&self, _: &[u8; 32]) -> io::Result<bool> {
             Ok(false)
         }
-        fn store_put(&self, _: &str, _: &[u8]) -> io::Result<()> {
-            unreachable!()
+        fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
+            assert_eq!(key, KEY_ROUTES);
+            if self.0.fail_route_write.get() {
+                return Err(io::Error::other("写入失败"));
+            }
+            *self.0.saved_routes.borrow_mut() = Some(value.to_vec());
+            Ok(())
         }
         fn append_log(&self, _: &str, _: &[u8], _: u64) -> io::Result<()> {
-            unreachable!()
+            Ok(())
         }
         fn read_log(&self, _: &str) -> io::Result<Vec<u8>> {
             unreachable!()
@@ -3506,6 +3561,27 @@ mod tests {
         fn spawn_pty(&self, _: &str, _: Size, _: Timestamp) -> io::Result<TestPty> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn invalid_or_unsaved_batch_does_not_modify_routes() {
+        let node = Node::new(TestTransport::default(), TestSystem(Rc::default()), "test").unwrap();
+        let rule = |name: &str, outbound: Outbound| Rule { matcher: route::Matcher::parse_domain(name).unwrap(), outbound };
+        assert_eq!(node.route_add(rule("original.test", Outbound::Direct)).unwrap(), 1);
+        let original = node.routes.borrow().clone();
+        let valid = rule("valid.test", Outbound::Socks5("127.0.0.1:7890".into()));
+        let invalid = rule("invalid.test", Outbound::Socks5("invalid".into()));
+        assert!(node.route_add_many(vec![valid.clone(), invalid]).is_err());
+        assert_eq!(*node.routes.borrow(), original);
+
+        node.system.0.fail_route_write.set(true);
+        assert!(node.route_add_many(vec![valid.clone()]).is_err());
+        assert_eq!(*node.routes.borrow(), original);
+        assert_eq!(load::<_, RouteTable>(&node.system, KEY_ROUTES).unwrap(), Some(original));
+
+        node.system.0.fail_route_write.set(false);
+        assert_eq!(node.route_add_many(vec![valid.clone()]).unwrap(), 2);
+        assert_eq!(node.routes.borrow().rules[1], valid);
     }
     impl Pty for TestPty {
         async fn next_event(&mut self) -> PtyEvent {
@@ -3547,7 +3623,7 @@ mod tests {
     /// FP-7.1-02：不认识的请求得到说明版本的回应，而不是连接被断开。
     #[tokio::test]
     async fn unknown_request_gets_a_version_answer() {
-        let node = Node::new(TestTransport, TestSystem(Rc::default()), "home").unwrap();
+        let node = Node::new(TestTransport::default(), TestSystem(Rc::default()), "home").unwrap();
         let (mut client, server) = tokio::io::duplex(4096);
         let header = RequestHeader::new(0, Principal::Device, &Request::NodeInfo);
         let mut bytes = postcard::to_allocvec(&header).unwrap();
@@ -3555,7 +3631,8 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] = 120;
         let future: RequestHeader = postcard::from_bytes(&bytes).unwrap();
-        let serve = node.serve_stream(&TestConnection, NodeId([2; 32]), Proto::Rpc, server);
+        let connection = TestConnection::default();
+        let serve = node.serve_stream(&connection, NodeId([2; 32]), Proto::Rpc, server);
         let ask = async {
             write_msg(&mut client, &future).await.unwrap();
             read_response(&mut client).await.unwrap()
@@ -3571,8 +3648,8 @@ mod tests {
     }
 
     async fn stalled_exec(cancel: bool) {
-        let state = Rc::new(ExecState::default());
-        let node = Node::new(TestTransport, TestSystem(state.clone()), "test").unwrap();
+        let state = Rc::new(TestState::default());
+        let node = Node::new(TestTransport::default(), TestSystem(state.clone()), "test").unwrap();
         // 比输出帧小得多，强制发生部分写入和反压。
         let (mut client, server) = tokio::io::duplex(16);
         let spec = ExecSpec {

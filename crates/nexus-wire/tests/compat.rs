@@ -151,6 +151,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
             addrs: vec![(node(3), "hint".into())],
         },
         Request::SvcDatagram { name: "dns".into() },
+        Request::ExitDatagram { target: "example.com:443".into() },
     ];
     all.into_iter()
         .map(|r| {
@@ -186,6 +187,7 @@ fn request_samples() -> Vec<(&'static str, Request)> {
                 Request::VaultPull => "request.vault_pull",
                 Request::RootRotate { .. } => "request.root_rotate",
                 Request::SvcDatagram { .. } => "request.svc_datagram",
+                Request::ExitDatagram { .. } => "request.exit_datagram",
             };
             (name, r)
         })
