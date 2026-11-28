@@ -1,11 +1,11 @@
-// covers: R43
+// covers: R43, R105, R106
 //! N3 CLI 端到端测试（TC-N3-09 / TC-N3-10，覆盖仿真与真实后端）。
 
 use nexus_testkit::{scenario, World};
 
 scenario! {
     name: dns_rules_add_explain_list_rm_and_flow_ls,
-    covers: "R43",
+    covers: "R43, R105, R106",
     nodes: ["laptop"],
     real: yes,
     run: |w: World| async move {

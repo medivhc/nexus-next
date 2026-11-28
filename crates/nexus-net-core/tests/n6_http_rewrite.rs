@@ -1,4 +1,4 @@
-// covers: R40, R41
+// covers: R40, R41, R109
 //! N6 显式 HTTP 变换纯逻辑单测（对应 docs/test-cases/network-runtime-n6-test-cases.md）。
 
 use nexus_net_core::http_rewrite::{

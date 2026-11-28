@@ -1,4 +1,4 @@
-// covers: R43
+// covers: R43, R105
 //! N3 运行时仿真测试（TC-N3-07 / TC-N3-08）：
 //! 验证 answer_dns 执行自定义 DNS Override、BlockNxdomain、BlockNodata、Allowlist，
 //! 并将脱敏事件写入本地 FlowRing 供 CtlRequest::FlowRecent 查询。

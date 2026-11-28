@@ -1,4 +1,4 @@
-// covers: R41, R42, R43
+// covers: R41, R42, R43, R105, R106, R107
 //! N3 纯逻辑测试用例（对应 docs/test-cases/network-runtime-n3-test-cases.md）。
 
 use core::net::{IpAddr, Ipv4Addr};

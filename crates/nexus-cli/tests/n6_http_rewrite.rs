@@ -1,4 +1,4 @@
-// covers: R40, R41, R76
+// covers: R40, R41, R109
 //! N6 显式 HTTP 代理变换与 MCP 隔离策略模拟端到端测试（仿真 + 真实后端）。
 
 use nexus_testkit::{scenario, Service, World};
@@ -6,7 +6,7 @@ use nexus_testkit::{scenario, Service, World};
 // TC-N6-04：显式 HTTP 代理 Map Local、测试服务重定向与 503 故障注入
 scenario! {
     name: http_proxy_map_local_redirect_and_fault_inject,
-    covers: "R40",
+    covers: "R40, R109",
     nodes: ["laptop"],
     real: yes,
     run: |w: World| async move {

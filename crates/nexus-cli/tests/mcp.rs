@@ -256,3 +256,57 @@ scenario! {
         assert_eq!(agent_replies[4]["result"]["structuredContent"]["error"], "denied");
     },
 }
+
+// N3、N6：agent 只读的网络诊断与策略模拟（R110）。
+scenario! {
+    name: mcp_network_diagnostics_are_read_only,
+    covers: "R110",
+    nodes: ["laptop"],
+    real: yes,
+    run: |w: World| async move {
+        w.cli_ok("laptop", &["init", "--name", "laptop"]).await;
+        w.cli_ok("laptop", &["route", "add", "--domain", "old.test", "--reject"]).await;
+        w.cli_ok("laptop", &["dns", "add", "--id", "ads", "--domain", "ads.example.com", "--block"]).await;
+        let replies = mcp(
+            &w,
+            "laptop",
+            &[],
+            &[
+                req_init(1),
+                serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+                req_call(3, "nexus_policy_simulate", serde_json::json!({
+                    "rules_yaml": "rules:\n  - DOMAIN-SUFFIX,new.test,DIRECT\n  - DOMAIN-SUFFIX,new.test,REJECT\n  - SCRIPT,bad,DIRECT\n",
+                    "targets": ["a.new.test:443", "old.test:80"]
+                })),
+                req_call(4, "nexus_dns_explain", serde_json::json!({ "domain": "track.ads.example.com" })),
+                req_call(5, "nexus_route_audit", serde_json::json!({})),
+                req_call(6, "nexus_flow_summary", serde_json::json!({ "limit": 5 })),
+            ],
+        )
+        .await;
+        assert_eq!(replies.len(), 6);
+        let names: Vec<&str> =
+            replies[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for expected in ["nexus_route_audit", "nexus_dns_explain", "nexus_flow_summary", "nexus_policy_simulate"] {
+            assert!(names.contains(&expected), "缺少工具 {expected}：{names:?}");
+        }
+        // 策略模拟：报告导入、跳过和冲突，给出每个目标的去向
+        let sim = &replies[2]["result"];
+        assert_eq!(sim["isError"], false, "{sim}");
+        let sim = &sim["structuredContent"];
+        assert_eq!(sim["simulated"], true, "{sim}");
+        assert_eq!(sim["imported"], 2, "{sim}");
+        assert_eq!(sim["skipped"].as_array().unwrap().len(), 1, "{sim}");
+        assert!(!sim["audit"]["issues"].as_array().unwrap().is_empty(), "重复规则应当被审计出来：{sim}");
+        assert_eq!(sim["simulations"].as_array().unwrap().len(), 2, "{sim}");
+        // 其余三个工具都能用
+        for reply in &replies[3..6] {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+        }
+        // 只读：生效的路由规则没变
+        let routes = w.cli_ok("laptop", &["route", "ls"]).await;
+        let rules = routes["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "{routes}");
+        assert_eq!(rules[0]["match"], "old.test", "{routes}");
+    },
+}

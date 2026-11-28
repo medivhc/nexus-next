@@ -1,4 +1,4 @@
-// covers: R44, R56, R60
+// covers: R44, R56, R60, R108
 //! N5 自适应路径选择纯逻辑测试用例（对应 docs/test-cases/network-runtime-n5-test-cases.md）。
 
 use nexus_net_core::path_selector::{choose_path, HysteresisConfig, PathDecision, PathSample, TrafficProfile};
