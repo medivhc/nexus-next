@@ -67,6 +67,36 @@ Android 10 及以后可通过「按应用选择出口」为指定应用设置设
 `tools/android_e2e.py` 在 adb 连着的设备（默认 redroid 的 `127.0.0.1:5555`）上装应用，
 让本机当 home，检查内网访问、出口和其余流量。需要免密 sudo（临时改 `/etc/hosts`）。
 
+### 模拟器代理和切网回归
+
+先构建 x86_64 APK，再启动专用的 Android Emulator AVD。回归使用 Android 14（API 34）的 AOSP x86_64
+`userdebug` 镜像、默认开放的 `AndroidWifi` 和模拟蜂窝，要求 `adb root`。优先使用有 KVM 的宿主机。
+
+```sh
+tools/build-android.sh x86_64
+python3 tools/android_proxy_e2e.py --serial emulator-5554
+```
+
+脚本启动宿主机本地回声端点和两个 SOCKS5 上游，生成并安装两个独立 UID 的探针应用。它先在 Wi-Fi 下检查
+启动 VPN 前的 TCP/UDP 连通性，再验证按应用选路、绕过、域名和 IPv6。切换 Wi-Fi → 蜂窝 → Wi-Fi 时，脚本核对
+系统默认网络和 VPN 会话 ID，并用新建的 TCP/UDP 连接验证恢复。拒绝 `UDP ASSOCIATE` 的上游用于检查核心失败
+记录和目标端是否收到回退流量。脚本使用 `app_bypass.txt` 配置绕过应用，切网时使用 `balanced` 电源模式。
+最后停用 VPN 并确认两个协议恢复直连，随后恢复原来的 VPN 偏好、绕过文件、电源模式和无线开关，卸载探针应用。
+请使用可供覆盖安装 Nexus APK 的测试 AVD。
+
+若宿主机的 HTTP 代理拒绝虚拟 Wi-Fi 到 `10.0.2.2` 的 TCP 请求，启动 AVD 时给 `netsimd` 指定本地转发器，
+运行测试时带上对应端口。转发器只把本次的测试端口（默认 `19180`–`19182`）接到本机，其余请求沿用
+`http_proxy` 或 `HTTP_PROXY`（无认证的 HTTP 代理地址）。
+
+```sh
+# 在另一个终端启动 AVD，等待系统就绪
+"$ANDROID_HOME/emulator/emulator" -avd Nexus_API34 -netsim-args '--http-proxy=http://127.0.0.1:19185'
+python3 tools/android_proxy_e2e.py --serial emulator-5554 --local-http-port 19185
+```
+
+独立 Nexus 节点的私有服务和设备出口可继续用 `tools/android_e2e.py` 验证。真机切网、后台恢复和功耗见
+[真实异网验收清单](real-network-check.md)。
+
 `tools/android_multipath.py`（M11.4）检查多路径和计费网络识别：在 redroid 的网络命名空间里加两条 veth 链路连到
 另一个命名空间里的 home，看两条直连路径、断一条时会话不断，以及系统报告的网络和 `nexus iface` 一致。需要 root。
 
