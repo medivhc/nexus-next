@@ -49,6 +49,9 @@ fn is_valid_package_name(s: &str) -> bool {
     !s.is_empty()
         && s.contains('.')
         && s.split('.').all(|seg| {
-            !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            !seg.is_empty()
+                && seg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
 }

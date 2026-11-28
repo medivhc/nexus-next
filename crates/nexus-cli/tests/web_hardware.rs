@@ -1,9 +1,7 @@
 //! 网页节点发布硬件能力（M8.3）：摄像头、麦克风、位置。功能点见 docs/feature-points/M8.3.md。
 
 use nexus_core_proto::webauthn::soft::SoftAuthenticator;
-use nexus_testkit::nexus_web_core::{
-    HardwareCapture, HardwareKind, HardwareProvider, HardwareState,
-};
+use nexus_testkit::nexus_web_core::{HardwareCapture, HardwareKind, HardwareProvider, HardwareState};
 use nexus_testkit::{scenario, World};
 use nexus_wire::WireError;
 
@@ -16,21 +14,9 @@ struct FakeHardware;
 impl HardwareProvider for FakeHardware {
     async fn capture(&self, kind: HardwareKind) -> Result<HardwareCapture, WireError> {
         Ok(match kind {
-            HardwareKind::Camera => HardwareCapture::Camera {
-                mime: "image/jpeg".into(),
-                data: vec![0xff, 0xd8, 0x01, 0x02],
-            },
-            HardwareKind::Microphone => HardwareCapture::Microphone {
-                mime: "audio/webm".into(),
-                duration_ms: 500,
-                data: vec![0x1a, 0x45, 0xdf, 0xa3],
-            },
-            HardwareKind::Location => HardwareCapture::Location {
-                lat_e7: 312_304_000,
-                lon_e7: 1_214_737_000,
-                accuracy_cm: 1250,
-                timestamp_ms: 1_700_000_000_000,
-            },
+            HardwareKind::Camera => HardwareCapture::Camera { mime: "image/jpeg".into(), data: vec![0xff, 0xd8, 0x01, 0x02] },
+            HardwareKind::Microphone => HardwareCapture::Microphone { mime: "audio/webm".into(), duration_ms: 500, data: vec![0x1a, 0x45, 0xdf, 0xa3] },
+            HardwareKind::Location => HardwareCapture::Location { lat_e7: 312_304_000, lon_e7: 1_214_737_000, accuracy_cm: 1250, timestamp_ms: 1_700_000_000_000 },
         })
     }
 }

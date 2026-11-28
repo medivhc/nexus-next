@@ -69,17 +69,12 @@ pub fn qr_text(code: &str) -> String {
 
 /// 生成二维码的点阵（纠错等级 M）。
 pub fn qr(text: &str) -> Result<Qr, String> {
-    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
-        .map_err(|e| format!("无法生成二维码：{e}"))?;
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M).map_err(|e| format!("无法生成二维码：{e}"))?;
     let size = code.width();
     let colors = code.to_colors();
     let rows = colors
         .chunks(size)
-        .map(|row| {
-            row.iter()
-                .map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' })
-                .collect()
-        })
+        .map(|row| row.iter().map(|c| if *c == qrcode::Color::Dark { '1' } else { '0' }).collect())
         .collect();
     Ok(Qr { size, rows })
 }
@@ -88,70 +83,38 @@ pub fn qr(text: &str) -> Result<Qr, String> {
 /// 不重新发起加入（重新发起会让旧的短加入码失效）。`now_ms` 是本机现在的时间。
 pub async fn refresh<C: Ctl>(ctl: &C, held: Option<JoinView>, renew: bool, now_ms: u64) -> Screen {
     let entries = match call(ctl, CtlRequest::List).await {
-        Err(e) => {
-            return Screen::Starting {
-                message: format!("正在启动 Nexus…（{e}）"),
-            }
-        }
+        Err(e) => return Screen::Starting { message: format!("正在启动 Nexus…（{e}）") },
         Ok(CtlResponse::List(entries)) => entries,
         Ok(CtlResponse::Error(e)) => return Screen::Failed { message: e.message },
-        Ok(other) => {
-            return Screen::Failed {
-                message: format!("核心的回应无法理解：{other:?}"),
-            }
-        }
+        Ok(other) => return Screen::Failed { message: format!("核心的回应无法理解：{other:?}") },
     };
     if let Some(screen) = joined(&entries) {
         return screen;
     }
-    if let Some(view) =
-        held.filter(|h| !renew && h.expires_at_ms >= now_ms.saturating_add(RENEW_BEFORE_MS))
-    {
+    if let Some(view) = held.filter(|h| !renew && h.expires_at_ms >= now_ms.saturating_add(RENEW_BEFORE_MS)) {
         return Screen::Joining(view);
     }
     match call(ctl, CtlRequest::JoinStart).await {
-        Err(e) => Screen::Starting {
-            message: format!("正在启动 Nexus…（{e}）"),
-        },
-        Ok(CtlResponse::JoinCode {
-            code,
-            short_code,
-            short_code_error,
-            expires_at,
-        }) => {
+        Err(e) => Screen::Starting { message: format!("正在启动 Nexus…（{e}）") },
+        Ok(CtlResponse::JoinCode { code, short_code, short_code_error, expires_at }) => {
             let text = qr_text(&code);
             match qr(&text) {
-                Ok(qr) => Screen::Joining(JoinView {
-                    short_code,
-                    short_code_error,
-                    code,
-                    qr_text: text,
-                    qr,
-                    expires_at_ms: expires_at.0,
-                }),
+                Ok(qr) => Screen::Joining(JoinView { short_code, short_code_error, code, qr_text: text, qr, expires_at_ms: expires_at.0 }),
                 Err(message) => Screen::Failed { message },
             }
         }
         // 刚好在两次请求之间被批准了。
-        Ok(CtlResponse::Error(e)) if e.code == ErrorCode::InvalidState => {
-            match call(ctl, CtlRequest::List).await {
-                Ok(CtlResponse::List(entries)) => {
-                    joined(&entries).unwrap_or(Screen::Failed { message: e.message })
-                }
-                _ => Screen::Failed { message: e.message },
-            }
-        }
-        Ok(CtlResponse::Error(e)) => Screen::Failed { message: e.message },
-        Ok(other) => Screen::Failed {
-            message: format!("核心的回应无法理解：{other:?}"),
+        Ok(CtlResponse::Error(e)) if e.code == ErrorCode::InvalidState => match call(ctl, CtlRequest::List).await {
+            Ok(CtlResponse::List(entries)) => joined(&entries).unwrap_or(Screen::Failed { message: e.message }),
+            _ => Screen::Failed { message: e.message },
         },
+        Ok(CtlResponse::Error(e)) => Screen::Failed { message: e.message },
+        Ok(other) => Screen::Failed { message: format!("核心的回应无法理解：{other:?}") },
     }
 }
 
 fn joined(entries: &[nexus_wire::ListEntry]) -> Option<Screen> {
-    let me = entries
-        .iter()
-        .find(|e| e.is_self && e.report.role.is_some())?;
+    let me = entries.iter().find(|e| e.is_self && e.report.role.is_some())?;
     let devices = entries
         .iter()
         .map(|e| Device {
@@ -161,10 +124,7 @@ fn joined(entries: &[nexus_wire::ListEntry]) -> Option<Screen> {
             admin: e.report.role == Some(nexus_core_proto::roster::DeviceRole::Admin),
         })
         .collect();
-    Some(Screen::Joined {
-        name: me.report.name.clone(),
-        devices,
-    })
+    Some(Screen::Joined { name: me.report.name.clone(), devices })
 }
 
 #[cfg(test)]
@@ -183,11 +143,7 @@ mod tests {
         let img = rqrr::PreparedImage::prepare_from_greyscale(px, px, |x, y| {
             let (mx, my) = (x / scale, y / scale);
             let dark = mx >= margin && my >= margin && qr.dark(mx - margin, my - margin);
-            if dark {
-                0
-            } else {
-                255
-            }
+            if dark { 0 } else { 255 }
         });
         let mut img = img;
         let grids = img.detect_grids();
@@ -202,10 +158,7 @@ mod tests {
         assert_eq!(text, CODE.to_ascii_uppercase());
         let q = qr(&text).unwrap();
         assert_eq!(q.rows.len(), q.size);
-        assert!(q
-            .rows
-            .iter()
-            .all(|r| r.len() == q.size && r.bytes().all(|b| b == b'0' || b == b'1')));
+        assert!(q.rows.iter().all(|r| r.len() == q.size && r.bytes().all(|b| b == b'0' || b == b'1')));
         assert_eq!(scan(&q), text);
     }
 
@@ -221,12 +174,7 @@ mod tests {
     // FP-11.2-07：扫出来的文字带空白也能当长码用
     #[test]
     fn scanned_text_is_a_valid_long_code() {
-        let code = nexus_wire::JoinCode {
-            node_id: nexus_core_proto::NodeId([7; 32]),
-            nonce: [9; 16],
-            name: "phone".into(),
-            addr: "0a0b".into(),
-        };
+        let code = nexus_wire::JoinCode { node_id: nexus_core_proto::NodeId([7; 32]), nonce: [9; 16], name: "phone".into(), addr: "0a0b".into() };
         let text = qr_text(&code.encode());
         let scanned = format!("  {text}\n");
         assert!(nexus_wire::JoinCode::looks_like(&scanned));
@@ -258,10 +206,7 @@ mod tests {
             short_code_error: None,
             code: CODE.into(),
             qr_text: qr_text(CODE),
-            qr: Qr {
-                size: 1,
-                rows: vec!["1".into()],
-            },
+            qr: Qr { size: 1, rows: vec!["1".into()] },
             expires_at_ms: 5,
         };
         let v = serde_json::to_value(Screen::Joining(view.clone())).unwrap();
@@ -270,18 +215,8 @@ mod tests {
         assert_eq!(v["qr"]["rows"][0], "1");
         let back: Screen = serde_json::from_value(v).unwrap();
         assert_eq!(back, Screen::Joining(view));
-        let v = serde_json::to_value(Screen::Joined {
-            name: "phone".into(),
-            devices: vec![],
-        })
-        .unwrap();
+        let v = serde_json::to_value(Screen::Joined { name: "phone".into(), devices: vec![] }).unwrap();
         assert_eq!(v["state"], "joined");
-        assert_eq!(
-            serde_json::to_value(Screen::Starting {
-                message: "x".into()
-            })
-            .unwrap()["state"],
-            "starting"
-        );
+        assert_eq!(serde_json::to_value(Screen::Starting { message: "x".into() }).unwrap()["state"], "starting");
     }
 }

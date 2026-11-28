@@ -35,17 +35,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Up {
     /// 连上后的第一条。紧接着是一条 `Output`：把终端重绘成当前屏幕的数据。
-    Hello {
-        version: u16,
-        size: Size,
-        created_at_ms: u64,
-    },
+    Hello { version: u16, size: Size, created_at_ms: u64 },
     Output(Vec<u8>),
     /// shell 退出了，输出都已发完。之后持有进程退出。
-    Exited {
-        code: Option<i32>,
-        signal: Option<i32>,
-    },
+    Exited { code: Option<i32>, signal: Option<i32> },
 }
 
 /// 常驻程序发给持有进程的。
@@ -127,10 +120,7 @@ fn shell_cwd(pid: Option<u32>) -> Option<PathBuf> {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// 关机时系统发来的结束信号（Unix 的 SIGTERM）。Windows 上没有对应的，永远等不到。
@@ -168,9 +158,7 @@ fn bad(what: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_string())
 }
 
-async fn read_frame<T: for<'de> Deserialize<'de>, R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R,
-) -> io::Result<T> {
+async fn read_frame<T: for<'de> Deserialize<'de>, R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> io::Result<T> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -198,43 +186,22 @@ fn read_frame_blocking<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::R
 
 /// 持有进程的主体：`nexus session-hold` 调用，直到 shell 退出才返回。
 /// `restore` 时按记下的状态恢复（见模块说明）。
-pub fn run(
-    data_dir: &Path,
-    name: &str,
-    size: Size,
-    created_at: Timestamp,
-    restore: bool,
-) -> io::Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+pub fn run(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(hold(data_dir, name, size, created_at, restore))
 }
 
 /// 发给常驻程序的消息排队等待的上限。
 const UP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-async fn hold(
-    data_dir: &Path,
-    name: &str,
-    size: Size,
-    created_at: Timestamp,
-    restore: bool,
-) -> io::Result<()> {
+async fn hold(data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<()> {
     let dir = sessions_dir(data_dir);
     transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     let pid = pid_path(&dir, name);
     let _ = std::fs::remove_file(&sock);
-    let saved = if restore {
-        load_state(&dir, name)
-    } else {
-        None
-    };
-    let cwd = saved
-        .as_ref()
-        .and_then(|s| s.cwd.clone())
-        .filter(|c| c.is_dir());
+    let saved = if restore { load_state(&dir, name) } else { None };
+    let cwd = saved.as_ref().and_then(|s| s.cwd.clone()).filter(|c| c.is_dir());
     let mut pty = RealPty::spawn_in(size, cwd.as_deref())?;
     let mut accepted = transport::listen(&sock).await?;
     std::fs::write(&pid, std::process::id().to_string())?;
@@ -261,10 +228,7 @@ async fn hold(
             intro.extend_from_slice(b"\x1b[?1049l");
         }
         intro.extend_from_slice(b"\x1b[m\r\n");
-        let place = cwd
-            .as_ref()
-            .map(|c| format!("，工作目录 {}", c.display()))
-            .unwrap_or_default();
+        let place = cwd.as_ref().map(|c| format!("，工作目录 {}", c.display())).unwrap_or_default();
         intro.extend_from_slice(format!("[nexus] 会话已恢复：设备重启或会话的进程意外结束过，里面的程序没有保留，shell 重新启动{place}。\r\n").as_bytes());
         let _ = screen.handle(nexus_term_proto::Event::PtyOutput(intro));
     }
@@ -426,11 +390,7 @@ impl HeldPty {
         let hello: Up = read_frame_blocking(&mut s)?;
         match hello {
             Up::Hello { version, .. } if version == HOLDER_VERSION => {}
-            Up::Hello { version, .. } => {
-                return Err(bad(format!(
-                    "持有进程的协议版本 {version}，本机 {HOLDER_VERSION}"
-                )))
-            }
+            Up::Hello { version, .. } => return Err(bad(format!("持有进程的协议版本 {version}，本机 {HOLDER_VERSION}"))),
             _ => return Err(bad("持有进程没有先发 Hello")),
         }
         s.set_read_timeout(None)?;
@@ -453,10 +413,7 @@ impl HeldPty {
                     Ok(Up::Hello { .. }) => {}
                     // 持有进程不在了（被结束了）：当作程序退出。
                     Err(_) => {
-                        let _ = ev_tx.send(PtyEvent::Exited(ExitStatus {
-                            code: None,
-                            signal: None,
-                        }));
+                        let _ = ev_tx.send(PtyEvent::Exited(ExitStatus { code: None, signal: None }));
                         return;
                     }
                 }
@@ -469,14 +426,7 @@ impl HeldPty {
                 }
             }
         });
-        Ok((
-            Self {
-                events,
-                down,
-                exited: None,
-            },
-            hello,
-        ))
+        Ok((Self { events, down, exited: None }, hello))
     }
 }
 
@@ -492,10 +442,7 @@ impl Pty for HeldPty {
             }
             Some(ev) => ev,
             None => {
-                let status = ExitStatus {
-                    code: None,
-                    signal: None,
-                };
+                let status = ExitStatus { code: None, signal: None };
                 self.exited = Some(status);
                 PtyEvent::Exited(status)
             }
@@ -517,44 +464,24 @@ impl Pty for HeldPty {
 
 /// 启动一个持有进程并连上它。`exe` 是 `nexus` 二进制。
 /// `restore` 时持有进程按记下的状态恢复会话。
-pub fn spawn(
-    exe: &Path,
-    data_dir: &Path,
-    name: &str,
-    size: Size,
-    created_at: Timestamp,
-    restore: bool,
-) -> io::Result<HeldPty> {
+pub fn spawn(exe: &Path, data_dir: &Path, name: &str, size: Size, created_at: Timestamp, restore: bool) -> io::Result<HeldPty> {
     let dir = sessions_dir(data_dir);
     transport::private_dir(&dir)?;
     let sock = socket_path(&dir, name);
     if sock.exists() {
         // 只看持有进程是否还活着，不真正连上去：连上会让持有进程换成这个连接，踢掉正在用它的常驻程序。
         if transport::holder_alive(&sock, &pid_path(&dir, name)) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("会话 {name} 的持有进程已经在运行"),
-            ));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("会话 {name} 的持有进程已经在运行")));
         }
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(pid_path(&dir, name));
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(format!("{name}.log")))?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}.log")))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--data-dir")
         .arg(data_dir)
         .arg("session-hold")
-        .args([
-            "--name",
-            name,
-            "--cols",
-            &size.cols.to_string(),
-            "--rows",
-            &size.rows.to_string(),
-        ])
+        .args(["--name", name, "--cols", &size.cols.to_string(), "--rows", &size.rows.to_string()])
         .args(["--created-at-ms", &created_at.0.to_string()])
         .args(if restore { &["--restore"][..] } else { &[] })
         .stdin(std::process::Stdio::null())
@@ -574,10 +501,7 @@ pub fn spawn(
             }
         }
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(io::Error::other(format!(
-                "持有进程启动失败（{status}），日志在 {}",
-                dir.join(format!("{name}.log")).display()
-            )));
+            return Err(io::Error::other(format!("持有进程启动失败（{status}），日志在 {}", dir.join(format!("{name}.log")).display())));
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -593,17 +517,10 @@ pub fn spawn(
 pub fn adopt(exe: &Path, data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
     let mut out = adopt_live(data_dir);
     let dir = sessions_dir(data_dir);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".state"))
-            .map(str::to_string)
-        else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".state")).map(str::to_string) else {
             continue;
         };
         if out.iter().any(|a| a.name == name) || socket_path(&dir, &name).exists() {
@@ -615,12 +532,7 @@ pub fn adopt(exe: &Path, data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
         };
         let created_at = Timestamp(saved.created_at_ms);
         match spawn(exe, data_dir, &name, saved.size, created_at, true) {
-            Ok(pty) => out.push(AdoptedPty {
-                name,
-                size: saved.size,
-                created_at,
-                pty,
-            }),
+            Ok(pty) => out.push(AdoptedPty { name, size: saved.size, created_at, pty }),
             Err(e) => eprintln!("nexus daemon: 恢复会话 {name} 失败：{e}"),
         }
     }
@@ -630,41 +542,19 @@ pub fn adopt(exe: &Path, data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
 
 fn adopt_live(data_dir: &Path) -> Vec<AdoptedPty<HeldPty>> {
     let dir = sessions_dir(data_dir);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".sock"))
-            .map(str::to_string)
-        else {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".sock")).map(str::to_string) else {
             continue;
         };
         match HeldPty::connect(&path) {
-            Ok((
-                pty,
-                Up::Hello {
-                    size,
-                    created_at_ms,
-                    ..
-                },
-            )) => {
-                out.push(AdoptedPty {
-                    name,
-                    size,
-                    created_at: Timestamp(created_at_ms),
-                    pty,
-                });
+            Ok((pty, Up::Hello { size, created_at_ms, .. })) => {
+                out.push(AdoptedPty { name, size, created_at: Timestamp(created_at_ms), pty });
             }
             Ok(_) => {}
-            Err(e)
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    || e.kind() == io::ErrorKind::NotFound =>
-            {
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused || e.kind() == io::ErrorKind::NotFound => {
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(pid_path(&dir, &name));
             }
@@ -716,9 +606,7 @@ mod transport {
         std::fs::read_to_string(pid)
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
-            .is_some_and(|p| {
-                p > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()
-            })
+            .is_some_and(|p| p > 0 && nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok())
     }
 
     pub fn into_async(s: std::os::unix::net::UnixStream) -> io::Result<Stream> {
@@ -761,10 +649,7 @@ mod transport {
         let mut token = [0u8; TOKEN_LEN];
         getrandom::fill(&mut token).map_err(|e| io::Error::other(e.to_string()))?;
         let tmp = sock.with_extension("sock.tmp");
-        std::fs::write(
-            &tmp,
-            format!("{} {}\n", listener.local_addr()?, hex(&token)),
-        )?;
+        std::fs::write(&tmp, format!("{} {}\n", listener.local_addr()?, hex(&token)))?;
         std::fs::rename(&tmp, sock)?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -774,10 +659,7 @@ mod transport {
                 // 口令在单独的任务里核对：慢的或不对的连接不耽误别的。
                 tokio::spawn(async move {
                     let mut got = [0u8; TOKEN_LEN];
-                    let ok = matches!(
-                        tokio::time::timeout(TOKEN_TIMEOUT, s.read_exact(&mut got)).await,
-                        Ok(Ok(_))
-                    );
+                    let ok = matches!(tokio::time::timeout(TOKEN_TIMEOUT, s.read_exact(&mut got)).await, Ok(Ok(_)));
                     if ok && got == token {
                         let _ = tx.send(s);
                     }
@@ -793,17 +675,14 @@ mod transport {
         if token.len() != TOKEN_LEN * 2 {
             return None;
         }
-        let token = (0..TOKEN_LEN)
-            .map(|i| u8::from_str_radix(&token[2 * i..2 * i + 2], 16).ok())
-            .collect::<Option<Vec<u8>>>()?;
+        let token = (0..TOKEN_LEN).map(|i| u8::from_str_radix(&token[2 * i..2 * i + 2], 16).ok()).collect::<Option<Vec<u8>>>()?;
         Some((addr, token))
     }
 
     pub fn connect(sock: &Path) -> io::Result<std::net::TcpStream> {
         let text = std::fs::read_to_string(sock)?;
         // 还没写完或者坏了：当作没有这个会话。
-        let (addr, token) = parse(&text)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "会话的端点文件不完整"))?;
+        let (addr, token) = parse(&text).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "会话的端点文件不完整"))?;
         let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
         let _ = s.set_nodelay(true);
         // 持有进程核对口令后立即发 Hello，由调用方读。
@@ -819,11 +698,7 @@ mod transport {
     /// 持有进程还活着：端点上的端口还能连上。不发口令，持有进程核对口令超时后直接丢掉这个连接，
     /// 不会换掉正在用它的常驻程序。
     pub fn holder_alive(sock: &Path, _pid: &Path) -> bool {
-        let Some((addr, _)) = std::fs::read_to_string(sock)
-            .ok()
-            .as_deref()
-            .and_then(parse)
-        else {
+        let Some((addr, _)) = std::fs::read_to_string(sock).ok().as_deref().and_then(parse) else {
             return false;
         };
         std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok()
@@ -843,10 +718,7 @@ mod transport {
         fn endpoint_file_round_trips() {
             let token: Vec<u8> = (0..32).collect();
             let text = format!("127.0.0.1:4000 {}\n", super::hex(&token));
-            assert_eq!(
-                super::parse(&text),
-                Some(("127.0.0.1:4000".parse().unwrap(), token))
-            );
+            assert_eq!(super::parse(&text), Some(("127.0.0.1:4000".parse().unwrap(), token)));
             assert_eq!(super::parse("127.0.0.1:4000 abc"), None);
         }
     }

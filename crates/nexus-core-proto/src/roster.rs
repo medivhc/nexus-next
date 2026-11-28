@@ -2,8 +2,8 @@
 
 use crate::authz::Grant;
 use crate::crypto::{canonical, PublicKey, Purpose, SecretKey, Signature};
-use crate::path::valid_segment;
 use crate::webauthn::P256Key;
+use crate::path::valid_segment;
 use crate::{NodeId, Timestamp};
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -123,10 +123,7 @@ pub enum RosterError {
     InvalidName(String),
     InvalidAnchor(String),
     /// 版本号没有前进。
-    NotNewer {
-        current: u64,
-        candidate: u64,
-    },
+    NotNewer { current: u64, candidate: u64 },
 }
 
 impl fmt::Display for RosterError {
@@ -150,10 +147,7 @@ impl fmt::Display for RosterError {
 impl Roster {
     pub fn sign(self, root: &SecretKey) -> SignedRoster {
         let signature = root.sign(Purpose::Roster, &self.signed_bytes());
-        SignedRoster {
-            roster: self,
-            signature,
-        }
+        SignedRoster { roster: self, signature }
     }
 
     /// 签名覆盖的内容。没有锚点时与加入锚点之前的格式逐字节相同。
@@ -204,9 +198,7 @@ impl Roster {
             if !valid_segment(&k.label) {
                 return Err(RosterError::InvalidName(k.label.clone()));
             }
-            if self.web_keys[..i].iter().any(|e| e.label == k.label)
-                || self.device_by_name(&k.label).is_some()
-            {
+            if self.web_keys[..i].iter().any(|e| e.label == k.label) || self.device_by_name(&k.label).is_some() {
                 return Err(RosterError::DuplicateName(k.label.clone()));
             }
         }
@@ -235,10 +227,7 @@ impl SignedRoster {
             web_keys: r.web_keys,
             anchor: None,
         };
-        Some(SignedRoster {
-            roster,
-            signature: old.signature,
-        })
+        Some(SignedRoster { roster, signature: old.signature })
     }
 
     /// 校验根、签名和内容，成功后返回名册本身。
@@ -246,11 +235,7 @@ impl SignedRoster {
         if self.roster.root != *trusted_root {
             return Err(RosterError::WrongRoot);
         }
-        if !trusted_root.verify(
-            Purpose::Roster,
-            &self.roster.signed_bytes(),
-            &self.signature,
-        ) {
+        if !trusted_root.verify(Purpose::Roster, &self.roster.signed_bytes(), &self.signature) {
             return Err(RosterError::BadSignature);
         }
         self.roster.validate()?;
@@ -276,10 +261,7 @@ pub struct SignedRootRotation {
 impl RootRotation {
     pub fn sign(self, old_root: &SecretKey) -> SignedRootRotation {
         let old_sig = old_root.sign(Purpose::RootRotation, &canonical(&self));
-        SignedRootRotation {
-            rotation: self,
-            old_sig,
-        }
+        SignedRootRotation { rotation: self, old_sig }
     }
 }
 
@@ -308,10 +290,7 @@ pub fn verify_root_rotation<'a>(
     }
     if let Some(cur) = current {
         if r.version <= cur.roster.version {
-            return Err(RosterError::NotNewer {
-                current: cur.roster.version,
-                candidate: r.version,
-            });
+            return Err(RosterError::NotNewer { current: cur.roster.version, candidate: r.version });
         }
     }
     new_roster.verify(&r.new_root)
@@ -325,10 +304,9 @@ pub fn accept_update(
 ) -> Result<(), RosterError> {
     let new = candidate.verify(trusted_root)?;
     match current {
-        Some(cur) if new.version <= cur.roster.version => Err(RosterError::NotNewer {
-            current: cur.roster.version,
-            candidate: new.version,
-        }),
+        Some(cur) if new.version <= cur.roster.version => {
+            Err(RosterError::NotNewer { current: cur.roster.version, candidate: new.version })
+        }
         _ => Ok(()),
     }
 }
@@ -342,23 +320,11 @@ mod tests {
     }
 
     fn dev(n: u8, name: &str) -> Device {
-        Device {
-            node_id: NodeId([n; 32]),
-            name: name.into(),
-            role: DeviceRole::Member,
-            added_at: Timestamp(0),
-        }
+        Device { node_id: NodeId([n; 32]), name: name.into(), role: DeviceRole::Member, added_at: Timestamp(0) }
     }
 
     fn roster(version: u64, devices: Vec<Device>) -> Roster {
-        Roster {
-            root: root().public(),
-            version,
-            devices,
-            revoked_agents: vec![],
-            web_keys: vec![],
-            anchor: None,
-        }
+        Roster { root: root().public(), version, devices, revoked_agents: vec![], web_keys: vec![], anchor: None }
     }
 
     #[test]
@@ -375,16 +341,10 @@ mod tests {
         // 声明了别的根
         let mut r = roster(1, vec![]);
         r.root = other.public();
-        assert_eq!(
-            r.sign(&other).verify(&root().public()),
-            Err(RosterError::WrongRoot)
-        );
+        assert_eq!(r.sign(&other).verify(&root().public()), Err(RosterError::WrongRoot));
         // 声明了本机的根，但由别的密钥签名
         let forged = roster(1, vec![]).sign(&other);
-        assert_eq!(
-            forged.verify(&root().public()),
-            Err(RosterError::BadSignature)
-        );
+        assert_eq!(forged.verify(&root().public()), Err(RosterError::BadSignature));
     }
 
     #[test]
@@ -403,20 +363,11 @@ mod tests {
     fn inconsistent_content_is_rejected_even_when_signed() {
         let r = root().public();
         let dup_id = roster(1, vec![dev(1, "a"), dev(1, "b")]).sign(&root());
-        assert_eq!(
-            dup_id.verify(&r),
-            Err(RosterError::DuplicateDevice(NodeId([1; 32])))
-        );
+        assert_eq!(dup_id.verify(&r), Err(RosterError::DuplicateDevice(NodeId([1; 32]))));
         let dup_name = roster(1, vec![dev(1, "a"), dev(2, "a")]).sign(&root());
-        assert_eq!(
-            dup_name.verify(&r),
-            Err(RosterError::DuplicateName("a".into()))
-        );
+        assert_eq!(dup_name.verify(&r), Err(RosterError::DuplicateName("a".into())));
         let bad_name = roster(1, vec![dev(1, "my laptop")]).sign(&root());
-        assert_eq!(
-            bad_name.verify(&r),
-            Err(RosterError::InvalidName("my laptop".into()))
-        );
+        assert_eq!(bad_name.verify(&r), Err(RosterError::InvalidName("my laptop".into())));
     }
 
     #[test]
@@ -427,38 +378,17 @@ mod tests {
         let v2 = roster(2, vec![dev(1, "laptop"), dev(2, "home")]).sign(&root());
         assert_eq!(accept_update(None, &v1, &r), Ok(()));
         assert_eq!(accept_update(Some(&v1), &v2, &r), Ok(()));
-        assert_eq!(
-            accept_update(Some(&v2), &v1, &r),
-            Err(RosterError::NotNewer {
-                current: 2,
-                candidate: 1
-            })
-        );
-        assert_eq!(
-            accept_update(Some(&v2), &v2, &r),
-            Err(RosterError::NotNewer {
-                current: 2,
-                candidate: 2
-            })
-        );
+        assert_eq!(accept_update(Some(&v2), &v1, &r), Err(RosterError::NotNewer { current: 2, candidate: 1 }));
+        assert_eq!(accept_update(Some(&v2), &v2, &r), Err(RosterError::NotNewer { current: 2, candidate: 2 }));
         let forged = roster(3, vec![]).sign(&SecretKey::from_seed([2; 32]));
-        assert_eq!(
-            accept_update(Some(&v2), &forged, &r),
-            Err(RosterError::BadSignature)
-        );
+        assert_eq!(accept_update(Some(&v2), &forged, &r), Err(RosterError::BadSignature));
     }
 
     #[test]
     fn errors_explain_themselves() {
-        let msg = RosterError::NotNewer {
-            current: 4,
-            candidate: 3,
-        }
-        .to_string();
+        let msg = RosterError::NotNewer { current: 4, candidate: 3 }.to_string();
         assert!(msg.contains('3') && msg.contains('4'), "{msg}");
-        assert!(RosterError::DuplicateName("home".into())
-            .to_string()
-            .contains("home"));
+        assert!(RosterError::DuplicateName("home".into()).to_string().contains("home"));
         assert!(!RosterError::BadSignature.to_string().is_empty());
     }
 
@@ -466,19 +396,10 @@ mod tests {
     fn lookups() {
         let mut r = roster(1, vec![dev(1, "laptop"), dev(2, "home")]);
         let agent = SecretKey::from_seed([7; 32]).public();
-        r.revoked_agents.push(RevokedAgent {
-            agent,
-            revoked_at: Timestamp(5),
-        });
-        assert_eq!(
-            r.device(NodeId([2; 32])).map(|d| d.name.as_str()),
-            Some("home")
-        );
+        r.revoked_agents.push(RevokedAgent { agent, revoked_at: Timestamp(5) });
+        assert_eq!(r.device(NodeId([2; 32])).map(|d| d.name.as_str()), Some("home"));
         assert_eq!(r.device(NodeId([3; 32])), None);
-        assert_eq!(
-            r.device_by_name("laptop").map(|d| d.node_id),
-            Some(NodeId([1; 32]))
-        );
+        assert_eq!(r.device_by_name("laptop").map(|d| d.node_id), Some(NodeId([1; 32])));
         assert!(r.device_by_name("office").is_none());
         assert!(r.is_agent_revoked(&agent));
         assert!(!r.is_agent_revoked(&SecretKey::from_seed([8; 32]).public()));
@@ -496,34 +417,15 @@ mod tests {
         r2.root = new_root.public();
         let v2 = r2.clone().sign(&new_root);
 
-        let rot = RootRotation {
-            old_root: old_root.public(),
-            new_root: new_root.public(),
-            version: 2,
-        }
-        .sign(&old_root);
-        assert_eq!(
-            verify_root_rotation(&old_root.public(), Some(&v1), &rot, &v2).map(|r| r.version),
-            Ok(2)
-        );
+        let rot = RootRotation { old_root: old_root.public(), new_root: new_root.public(), version: 2 }.sign(&old_root);
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &rot, &v2).map(|r| r.version), Ok(2));
 
         // 攻击者不知道旧根私钥，伪造轮换证书被拒
-        let forged_rot = RootRotation {
-            old_root: old_root.public(),
-            new_root: new_root.public(),
-            version: 2,
-        }
-        .sign(&attacker);
-        assert_eq!(
-            verify_root_rotation(&old_root.public(), Some(&v1), &forged_rot, &v2),
-            Err(RosterError::BadSignature)
-        );
+        let forged_rot = RootRotation { old_root: old_root.public(), new_root: new_root.public(), version: 2 }.sign(&attacker);
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &forged_rot, &v2), Err(RosterError::BadSignature));
 
         // 攻击者篡改新名册签名被拒
         let forged_roster = r2.sign(&attacker);
-        assert_eq!(
-            verify_root_rotation(&old_root.public(), Some(&v1), &rot, &forged_roster),
-            Err(RosterError::BadSignature)
-        );
+        assert_eq!(verify_root_rotation(&old_root.public(), Some(&v1), &rot, &forged_roster), Err(RosterError::BadSignature));
     }
 }

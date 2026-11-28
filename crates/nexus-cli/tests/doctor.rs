@@ -8,10 +8,7 @@ fn json(text: &str) -> Value {
 }
 
 fn find_check<'a>(checks: &'a [Value], name: &str) -> &'a Value {
-    checks
-        .iter()
-        .find(|c| c["name"] == name)
-        .unwrap_or_else(|| panic!("缺少检查项 {name}：{checks:?}"))
+    checks.iter().find(|c| c["name"] == name).unwrap_or_else(|| panic!("缺少检查项 {name}：{checks:?}"))
 }
 
 scenario! {

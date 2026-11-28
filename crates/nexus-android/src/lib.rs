@@ -93,11 +93,7 @@ fn start(
                 Ok(()) => "nexus: 已停止\n".to_string(),
                 Err(e) => format!("nexus: {e}\n"),
             };
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
             if let Ok(mut s) = STOP.lock() {
                 *s = None;
             }
@@ -122,11 +118,7 @@ pub fn rendezvous_override(text: &str) -> Option<Option<String>> {
 /// 数据目录里有 trace 文件时，各个库的调试日志也写进去（排查用）。
 fn redirect_stderr(path: &std::path::Path) {
     use std::os::fd::AsRawFd;
-    if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         // SAFETY: 把一个打开的文件复制到描述符 2；f 随后关闭不影响复制出的描述符。
         unsafe {
             libc::dup2(f.as_raw_fd(), 2);
@@ -167,24 +159,14 @@ pub fn screen_json(data_dir: &std::path::Path, held: &str, renew: bool, now_ms: 
         _ => None,
     };
     let ctl = nexus_cli::UnixCtl::new(data_dir, None);
-    let screen = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let screen = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt.block_on(async {
             // 核心卡住时界面不能跟着卡住。
-            tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                refresh(&ctl, held, renew, now_ms),
-            )
-            .await
-            .unwrap_or(Screen::Failed {
-                message: "核心没有回应".into(),
-            })
+            tokio::time::timeout(std::time::Duration::from_secs(15), refresh(&ctl, held, renew, now_ms))
+                .await
+                .unwrap_or(Screen::Failed { message: "核心没有回应".into() })
         }),
-        Err(e) => Screen::Failed {
-            message: e.to_string(),
-        },
+        Err(e) => Screen::Failed { message: e.to_string() },
     };
     serde_json::to_string(&screen).unwrap_or_default()
 }
@@ -275,12 +257,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
         static INIT_CTX: std::sync::Once = std::sync::Once::new();
         INIT_CTX.call_once(|| {
             let ctx = env
-                .call_method(
-                    &_this,
-                    "getApplicationContext",
-                    "()Landroid/content/Context;",
-                    &[],
-                )
+                .call_method(&_this, "getApplicationContext", "()Landroid/content/Context;", &[])
                 .ok()
                 .and_then(|v| v.l().ok())
                 .unwrap_or_else(|| env.new_local_ref(&_this).unwrap());
@@ -293,11 +270,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
             }
         });
     }
-    let (data_dir, name, relay) = (
-        string(&mut env, &data_dir),
-        string(&mut env, &name),
-        string(&mut env, &relay),
-    );
+    let (data_dir, name, relay) = (string(&mut env, &data_dir), string(&mut env, &name), string(&mut env, &relay));
     let rendezvous = string(&mut env, &rendezvous);
     // SAFETY: Java passes ownership of its open VPN descriptor via detachFd().
     let tun_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
@@ -335,10 +308,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(
-    _env: JNIEnv,
-    _class: JClass,
-) {
+pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStop(_env: JNIEnv, _class: JClass) {
     stop();
 }
 
@@ -361,17 +331,12 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeSetNetworks(
 ) {
     let n = env.get_array_length(&names).unwrap_or(0).max(0) as usize;
     let mut flags = vec![0 as jboolean; n];
-    if env
-        .get_boolean_array_region(&metered, 0, &mut flags)
-        .is_err()
-    {
+    if env.get_boolean_array_region(&metered, 0, &mut flags).is_err() {
         return;
     }
     let mut list = Vec::with_capacity(n);
     for (i, m) in flags.iter().enumerate() {
-        let Ok(obj) = env.get_object_array_element(&names, i as i32) else {
-            return;
-        };
+        let Ok(obj) = env.get_object_array_element(&names, i as i32) else { return };
         let name = string(&mut env, &JString::from(obj));
         if !name.is_empty() {
             list.push((name, *m != 0));
@@ -390,16 +355,10 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
     now_ms: jlong,
 ) -> jstring {
     let (data_dir, held) = (string(&mut env, &data_dir), string(&mut env, &held));
-    let json = screen_json(
-        std::path::Path::new(&data_dir),
-        &held,
-        renew != 0,
-        now_ms.max(0) as u64,
-    );
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    let json = screen_json(std::path::Path::new(&data_dir), &held, renew != 0, now_ms.max(0) as u64);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
 
 /// N2 电源模式查询：判断当前模式在有 Wi-Fi 时是否需要主动请求蜂窝网络。
 #[unsafe(no_mangle)]
@@ -424,32 +383,23 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeEffectiveBypass(
     let self_pkg = string(&mut env, &self_pkg);
     let raw = string(&mut env, &raw_lines);
     let policy = nexus_net_core::app_policy::AppPolicy::parse_lines(&raw);
-    let joined = policy.effective_disallowed_packages(&self_pkg).join(
-        "
-",
-    );
-    env.new_string(joined)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    let joined = policy.effective_disallowed_packages(&self_pkg).join("
+");
+    env.new_string(joined).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
-fn ctl_request_sync(
-    data_dir: &std::path::Path,
-    req: nexus_wire::CtlRequest,
-) -> Result<nexus_wire::CtlResponse, String> {
+
+fn ctl_request_sync(data_dir: &std::path::Path, req: nexus_wire::CtlRequest) -> Result<nexus_wire::CtlResponse, String> {
     let ctl = nexus_cli::UnixCtl::new(data_dir, None);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     rt.block_on(async {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            nexus_cli::call(&ctl, req),
-        )
-        .await
-        .map_err(|_| "核心没有回应（请确认 VPN 已启动）".to_string())?
-        .map_err(|e| format!("无法连接核心：{e}"))
+        tokio::time::timeout(std::time::Duration::from_secs(10), nexus_cli::call(&ctl, req))
+            .await
+            .map_err(|_| "核心没有回应（请确认 VPN 已启动）".to_string())?
+            .map_err(|e| format!("无法连接核心：{e}"))
     })
 }
 
@@ -469,13 +419,8 @@ fn route_list_json(data_dir: &std::path::Path) -> String {
                 .collect();
             serde_json::json!({ "ok": true, "rules": items }).to_string()
         }
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
@@ -507,10 +452,7 @@ fn route_import_json(
     }
     match ctl_request_sync(
         data_dir,
-        nexus_wire::CtlRequest::RouteImport {
-            rules: report.imported,
-            replace,
-        },
+        nexus_wire::CtlRequest::RouteImport { rules: report.imported, replace },
     ) {
         Ok(nexus_wire::CtlResponse::RouteImported { total, audit }) => serde_json::json!({
             "ok": true,
@@ -521,13 +463,8 @@ fn route_import_json(
             "audit": audit,
         })
         .to_string(),
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
@@ -535,13 +472,8 @@ fn route_import_json(
 fn route_rollback_json(data_dir: &std::path::Path) -> String {
     match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRollback) {
         Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
@@ -549,33 +481,19 @@ fn route_rollback_json(data_dir: &std::path::Path) -> String {
 fn route_rm_json(data_dir: &std::path::Path, index: u32) -> String {
     match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRm { index }) {
         Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
 
 fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
     let trimmed = target.trim();
-    let normalized = if trimmed.contains(':') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}:443")
-    };
+    let normalized = if trimmed.contains(':') { trimmed.to_string() } else { format!("{trimmed}:443") };
     if nexus_net_core::Target::parse(&normalized).is_none() {
         return serde_json::json!({ "ok": false, "error": format!("目标格式不合法：{trimmed}（示例：claude.ai:443）") }).to_string();
     }
-    match ctl_request_sync(
-        data_dir,
-        nexus_wire::CtlRequest::RouteExplain {
-            target: normalized.clone(),
-        },
-    ) {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteExplain { target: normalized.clone() }) {
         Ok(nexus_wire::CtlResponse::Explained(exp)) => {
             let summary = match exp {
                 nexus_wire::RouteExplanation::Service { device, service } => {
@@ -585,10 +503,7 @@ fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
                     format!("目标 {normalized} → 非法的 .internal 服务名（应为 <服务>.<设备>.internal）")
                 }
                 nexus_wire::RouteExplanation::Rule { index, rule } => {
-                    format!(
-                        "目标 {normalized} → 命中第 {index} 条规则（{}）→ {}",
-                        rule.matcher, rule.outbound
-                    )
+                    format!("目标 {normalized} → 命中第 {index} 条规则（{}）→ {}", rule.matcher, rule.outbound)
                 }
                 nexus_wire::RouteExplanation::Default { outbound } => {
                     format!("目标 {normalized} → 未命中规则，走默认动作：{outbound}")
@@ -596,13 +511,8 @@ fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
             };
             serde_json::json!({ "ok": true, "summary": summary }).to_string()
         }
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
@@ -610,16 +520,10 @@ fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
 fn route_audit_json(data_dir: &std::path::Path) -> String {
     match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteAudit) {
         Ok(nexus_wire::CtlResponse::RouteAudit(audit)) => {
-            serde_json::json!({ "ok": true, "clean": audit.is_clean(), "issues": audit.issues })
-                .to_string()
+            serde_json::json!({ "ok": true, "clean": audit.is_clean(), "issues": audit.issues }).to_string()
         }
-        Ok(nexus_wire::CtlResponse::Error(e)) => {
-            serde_json::json!({ "ok": false, "error": e.message }).to_string()
-        }
-        Ok(other) => {
-            serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") })
-                .to_string()
-        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
         Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
     }
 }
@@ -632,9 +536,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteList(
 ) -> jstring {
     let dir = string(&mut env, &data_dir);
     let json = route_list_json(std::path::Path::new(&dir));
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -652,17 +554,8 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteImport(
     let yaml = string(&mut env, &yaml);
     let via_exit = string(&mut env, &via_exit);
     let socks5 = string(&mut env, &socks5);
-    let json = route_import_json(
-        std::path::Path::new(&dir),
-        &yaml,
-        &via_exit,
-        &socks5,
-        replace != 0,
-        dry_run != 0,
-    );
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    let json = route_import_json(std::path::Path::new(&dir), &yaml, &via_exit, &socks5, replace != 0, dry_run != 0);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -673,9 +566,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRollback(
 ) -> jstring {
     let dir = string(&mut env, &data_dir);
     let json = route_rollback_json(std::path::Path::new(&dir));
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -687,9 +578,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRm(
 ) -> jstring {
     let dir = string(&mut env, &data_dir);
     let json = route_rm_json(std::path::Path::new(&dir), index.max(0) as u32);
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -702,9 +591,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteExplain(
     let dir = string(&mut env, &data_dir);
     let target = string(&mut env, &target);
     let json = route_explain_json(std::path::Path::new(&dir), &target);
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -715,9 +602,7 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteAudit(
 ) -> jstring {
     let dir = string(&mut env, &data_dir);
     let json = route_audit_json(std::path::Path::new(&dir));
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]
@@ -730,10 +615,7 @@ mod tests {
         assert_eq!(rendezvous_override(""), None);
         assert_eq!(rendezvous_override("default"), None);
         assert_eq!(rendezvous_override("disabled"), Some(None));
-        assert_eq!(
-            rendezvous_override("http://10.0.0.1:8080/pkarr"),
-            Some(Some("http://10.0.0.1:8080/pkarr".into()))
-        );
+        assert_eq!(rendezvous_override("http://10.0.0.1:8080/pkarr"), Some(Some("http://10.0.0.1:8080/pkarr".into())));
     }
 
     // FP-11.2-06：核心还没起来（没有控制套接字）时界面显示正在启动；交回的内容不对也不影响
@@ -741,8 +623,7 @@ mod tests {
     fn screen_before_the_core_is_up() {
         let dir = std::env::temp_dir().join(format!("nexus-android-test-{}", std::process::id()));
         for held in ["", "{", r#"{"state":"starting","message":"x"}"#] {
-            let v: serde_json::Value =
-                serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&screen_json(&dir, held, false, 0)).unwrap();
             assert_eq!(v["state"], "starting", "{v}");
         }
     }

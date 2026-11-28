@@ -16,38 +16,22 @@ async fn enrolled(w: &World, label: &str, grants: &[&str], auth: &SoftAuthentica
     }
     let v = w.cli_ok("laptop", &args).await;
     let link = v["url"].as_str().expect("应当输出登记链接").to_string();
-    w.browser()
-        .await
-        .enroll(&link, auth)
-        .await
-        .expect("登记应当成功");
+    w.browser().await.enroll(&link, auth).await.expect("登记应当成功");
     link
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 async fn setup(w: &World) {
     w.network("laptop", &["home"]).await;
     let web = w.serve("home", Service::HttpEcho).await.to_string();
-    w.cli_ok(
-        "home",
-        &["publish", "web", "--port", &web, "--proto", "http"],
-    )
-    .await;
+    w.cli_ok("home", &["publish", "web", "--port", &web, "--proto", "http"]).await;
     let echo = w.serve("home", Service::Echo).await.to_string();
-    w.cli_ok("home", &["publish", "echo", "--port", &echo])
-        .await;
+    w.cli_ok("home", &["publish", "echo", "--port", &echo]).await;
     let dead = w.unused_port().to_string();
-    w.cli_ok(
-        "home",
-        &["publish", "dead", "--port", &dead, "--proto", "http"],
-    )
-    .await;
+    w.cli_ok("home", &["publish", "dead", "--port", &dead, "--proto", "http"]).await;
 }
 
 scenario! {

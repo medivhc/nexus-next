@@ -10,12 +10,7 @@ async fn setup(w: &World) {
 
 async fn head(w: &World, node: &str, ws: &str) -> Option<String> {
     let v = w.cli_ok(node, &["drive", "ls"]).await;
-    v["workspaces"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|x| x["name"] == ws)
-        .and_then(|x| x["head"].as_str().map(str::to_string))
+    v["workspaces"].as_array().unwrap().iter().find(|x| x["name"] == ws).and_then(|x| x["head"].as_str().map(str::to_string))
 }
 
 scenario! {

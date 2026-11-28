@@ -49,12 +49,7 @@ pub fn parse_clash_rules(input: &str, opts: &ImportOptions) -> ImportReport {
         }
         // 顶层 YAML key 切换段落
         if !raw_line.starts_with(' ') && !raw_line.starts_with('\t') && !trimmed.starts_with('-') {
-            let key = trimmed
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
+            let key = trimmed.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
             if key == "rules" {
                 in_rules = true;
                 continue;
@@ -129,8 +124,7 @@ pub fn parse_clash_rules(input: &str, opts: &ImportOptions) -> ImportReport {
                     "第 {line_no} 行 MATCH,{policy}：Nexus 默认动作保持显式直连，未静默覆盖；如需全量出口请显式配置规则"
                 ));
             }
-            "SCRIPT" | "GEOIP" | "RULE-SET" | "PROCESS-NAME" | "DOMAIN-KEYWORD" | "DST-PORT"
-            | "SRC-IP-CIDR" => {
+            "SCRIPT" | "GEOIP" | "RULE-SET" | "PROCESS-NAME" | "DOMAIN-KEYWORD" | "DST-PORT" | "SRC-IP-CIDR" => {
                 report.skipped.push(SkippedRule {
                     line: line_no,
                     raw: item.to_string(),
@@ -148,9 +142,7 @@ pub fn parse_clash_rules(input: &str, opts: &ImportOptions) -> ImportReport {
     }
 
     if saw_mitm_or_script {
-        report
-            .notes
-            .push("检测到配置中包含 mitm 或 script 段落：已安全忽略，绝不自动启用".into());
+        report.notes.push("检测到配置中包含 mitm 或 script 段落：已安全忽略，绝不自动启用".into());
     }
     report
 }
@@ -179,17 +171,9 @@ fn map_action(action: &str, opts: &ImportOptions) -> Result<Outbound, String> {
         "REJECT" | "REJECT-DROP" => Ok(Outbound::Reject),
         "" => Err("缺少目标动作".into()),
         _ => {
-            if let Some(exit) = opts
-                .default_exit
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
+            if let Some(exit) = opts.default_exit.as_deref().filter(|s| !s.trim().is_empty()) {
                 Ok(Outbound::Exit(exit.trim().to_string()))
-            } else if let Some(up) = opts
-                .default_socks5
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
+            } else if let Some(up) = opts.default_socks5.as_deref().filter(|s| !s.trim().is_empty()) {
                 Ok(Outbound::Socks5(up.trim().to_string()))
             } else {
                 Err(format!(

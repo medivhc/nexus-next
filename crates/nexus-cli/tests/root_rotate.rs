@@ -8,17 +8,7 @@ async fn network(w: &World, members: &[&str]) -> String {
     let code = init["recovery_code"].as_str().unwrap().to_string();
     for m in members {
         let join = w.cli_ok(m, &["join"]).await;
-        w.cli_ok(
-            "laptop",
-            &[
-                "device",
-                "approve",
-                join["code"].as_str().unwrap(),
-                "--name",
-                m,
-            ],
-        )
-        .await;
+        w.cli_ok("laptop", &["device", "approve", join["code"].as_str().unwrap(), "--name", m]).await;
     }
     code
 }

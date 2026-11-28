@@ -27,11 +27,7 @@ fn chunks_respect_the_size_limits_and_cover_the_data() {
     assert!(chunks.len() > 10, "3 MiB 应当切成多块：{}", chunks.len());
     assert_eq!(chunks.concat(), d);
     for c in &chunks[..chunks.len() - 1] {
-        assert!(
-            c.len() >= chunk::MIN && c.len() <= chunk::MAX,
-            "{}",
-            c.len()
-        );
+        assert!(c.len() >= chunk::MIN && c.len() <= chunk::MAX, "{}", c.len());
     }
     // 小文件是一块；空文件没有块。
     assert_eq!(chunk::chunk_all(b"hello").len(), 1);
@@ -43,15 +39,10 @@ fn an_edit_in_the_middle_keeps_most_chunks() {
     let a = data(2 * 1024 * 1024, 7);
     let mut b = a.clone();
     b.splice(1_000_000..1_000_000, b"inserted bytes".iter().copied());
-    let ha: std::collections::HashSet<_> =
-        chunk::chunk_all(&a).iter().map(|c| Hash::of(c)).collect();
+    let ha: std::collections::HashSet<_> = chunk::chunk_all(&a).iter().map(|c| Hash::of(c)).collect();
     let hb: Vec<_> = chunk::chunk_all(&b).iter().map(|c| Hash::of(c)).collect();
     let same = hb.iter().filter(|h| ha.contains(h)).count();
-    assert!(
-        same + 3 >= hb.len(),
-        "插入几个字节只应影响附近的块：{same}/{}",
-        hb.len()
-    );
+    assert!(same + 3 >= hb.len(), "插入几个字节只应影响附近的块：{same}/{}", hb.len());
 }
 
 #[test]
@@ -71,10 +62,7 @@ fn manifests_map_ranges_to_chunks() {
     let m = FileManifest::from_chunks(&chunks);
     assert_eq!(m.size, d.len() as u64);
     let read = |off: u64, len: u64| -> Vec<u8> {
-        m.spans(off, len)
-            .iter()
-            .flat_map(|s| chunks[s.index][s.from as usize..s.to as usize].to_vec())
-            .collect()
+        m.spans(off, len).iter().flat_map(|s| chunks[s.index][s.from as usize..s.to as usize].to_vec()).collect()
     };
     assert_eq!(read(0, 10), d[..10]);
     assert_eq!(read(123_456, 300_000), d[123_456..423_456]);
@@ -90,32 +78,12 @@ fn manifests_map_ranges_to_chunks() {
 #[test]
 fn paths_are_parsed() {
     let p: DrivePath = "work:/src/main.rs".parse().unwrap();
-    assert_eq!(
-        (p.ws.as_str(), p.parts.clone()),
-        ("work", vec!["src".to_string(), "main.rs".to_string()])
-    );
-    assert_eq!(
-        "work:".parse::<DrivePath>().unwrap().parts,
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        "work:/".parse::<DrivePath>().unwrap().parts,
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        "work:/a//b/".parse::<DrivePath>().unwrap().parts,
-        vec!["a", "b"]
-    );
+    assert_eq!((p.ws.as_str(), p.parts.clone()), ("work", vec!["src".to_string(), "main.rs".to_string()]));
+    assert_eq!("work:".parse::<DrivePath>().unwrap().parts, Vec::<String>::new());
+    assert_eq!("work:/".parse::<DrivePath>().unwrap().parts, Vec::<String>::new());
+    assert_eq!("work:/a//b/".parse::<DrivePath>().unwrap().parts, vec!["a", "b"]);
     assert_eq!(p.to_string(), "work:/src/main.rs");
-    for bad in [
-        "nocolon",
-        "Work:/a",
-        ":/a",
-        "work:/a/../b",
-        "work:/./a",
-        "toolongtoolongtoolongtoolongtoolong:/",
-        "w_s:/",
-    ] {
+    for bad in ["nocolon", "Work:/a", ":/a", "work:/a/../b", "work:/./a", "toolongtoolongtoolongtoolongtoolong:/", "w_s:/"] {
         assert!(bad.parse::<DrivePath>().is_err(), "{bad}");
     }
     assert!(nexus_drive_core::path::valid_workspace("my-work-2"));
@@ -127,11 +95,7 @@ fn file(store: &mut MemStore, content: &[u8]) -> Entry {
         store.put(c.to_vec());
     }
     let m = FileManifest::from_chunks(&chunks);
-    Entry::File {
-        manifest: store.put(m.encode()),
-        size: m.size,
-        exec: false,
-    }
+    Entry::File { manifest: store.put(m.encode()), size: m.size, exec: false }
 }
 
 fn parts(p: &str) -> Vec<String> {
@@ -144,14 +108,8 @@ fn trees_are_edited_copy_on_write() {
     let empty = tree::empty(&mut s);
     let f = file(&mut s, b"fn main() {}");
     let r1 = tree::set(&mut s, empty, &parts("src/main.rs"), f.clone()).unwrap();
-    assert_eq!(
-        tree::lookup(&s, r1, &parts("src/main.rs")).unwrap(),
-        Some(f.clone())
-    );
-    assert!(matches!(
-        tree::lookup(&s, r1, &parts("src")).unwrap(),
-        Some(Entry::Dir { .. })
-    ));
+    assert_eq!(tree::lookup(&s, r1, &parts("src/main.rs")).unwrap(), Some(f.clone()));
+    assert!(matches!(tree::lookup(&s, r1, &parts("src")).unwrap(), Some(Entry::Dir { .. })));
     assert_eq!(tree::lookup(&s, r1, &parts("nope")).unwrap(), None);
     // 旧的根不受影响。
     assert_eq!(tree::lookup(&s, empty, &parts("src")).unwrap(), None);
@@ -159,29 +117,14 @@ fn trees_are_edited_copy_on_write() {
     let again = tree::set(&mut s, empty, &parts("src/main.rs"), f.clone()).unwrap();
     assert_eq!(again, r1);
     // 文件下面不能再建东西。
-    assert_eq!(
-        tree::set(&mut s, r1, &parts("src/main.rs/x"), f.clone()),
-        Err(DriveError::NotADirectory)
-    );
+    assert_eq!(tree::set(&mut s, r1, &parts("src/main.rs/x"), f.clone()), Err(DriveError::NotADirectory));
     // 删除
-    assert_eq!(
-        tree::remove(&mut s, r1, &parts("src/nope"), false),
-        Err(DriveError::NotFound)
-    );
-    assert_eq!(
-        tree::remove(&mut s, r1, &parts("src"), false),
-        Err(DriveError::IsADirectory)
-    );
+    assert_eq!(tree::remove(&mut s, r1, &parts("src/nope"), false), Err(DriveError::NotFound));
+    assert_eq!(tree::remove(&mut s, r1, &parts("src"), false), Err(DriveError::IsADirectory));
     let r2 = tree::remove(&mut s, r1, &parts("src"), true).unwrap();
     assert_eq!(r2, empty, "删光以后回到空树");
     let r3 = tree::remove(&mut s, r1, &parts("src/main.rs"), false).unwrap();
-    assert!(
-        matches!(
-            tree::lookup(&s, r3, &parts("src")).unwrap(),
-            Some(Entry::Dir { .. })
-        ),
-        "空目录保留"
-    );
+    assert!(matches!(tree::lookup(&s, r3, &parts("src")).unwrap(), Some(Entry::Dir { .. })), "空目录保留");
 }
 
 #[test]
@@ -198,26 +141,13 @@ fn diffs_list_changed_files() {
     assert_eq!(
         d,
         vec![
-            Change {
-                kind: ChangeKind::Deleted,
-                path: "keep.txt".into()
-            },
-            Change {
-                kind: ChangeKind::Modified,
-                path: "x/a.txt".into()
-            },
-            Change {
-                kind: ChangeKind::Added,
-                path: "y/new.txt".into()
-            },
+            Change { kind: ChangeKind::Deleted, path: "keep.txt".into() },
+            Change { kind: ChangeKind::Modified, path: "x/a.txt".into() },
+            Change { kind: ChangeKind::Added, path: "y/new.txt".into() },
         ]
     );
     assert_eq!(tree::diff(&s, Some(r2), r2).unwrap(), vec![]);
-    assert_eq!(
-        tree::diff(&s, None, r1).unwrap().len(),
-        2,
-        "没有旧版本时全是新增"
-    );
+    assert_eq!(tree::diff(&s, None, r1).unwrap().len(), 2, "没有旧版本时全是新增");
 }
 
 #[test]
@@ -233,13 +163,7 @@ fn identical_content_is_stored_once() {
 #[test]
 fn commits_round_trip() {
     use nexus_drive_core::Commit;
-    let c = Commit {
-        tree: Hash::of(b"t"),
-        parents: vec![Hash::of(b"p")],
-        device: "laptop".into(),
-        time_ms: 42,
-        message: "first".into(),
-    };
+    let c = Commit { tree: Hash::of(b"t"), parents: vec![Hash::of(b"p")], device: "laptop".into(), time_ms: 42, message: "first".into() };
     assert_eq!(Commit::decode(&c.encode()), Some(c));
     assert_eq!(Commit::decode(b"garbage"), None);
 }

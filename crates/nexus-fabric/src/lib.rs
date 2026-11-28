@@ -71,33 +71,20 @@ pub trait Transport {
         false
     }
     /// 重新查看本机的网络接口，按 `overrides`（接口名 → 是否计费）和自动识别决定哪些计费，并让传输按此调度。
-    fn interfaces(
-        &self,
-        overrides: &std::collections::BTreeMap<String, bool>,
-    ) -> Vec<nexus_wire::IfaceInfo> {
+    fn interfaces(&self, overrides: &std::collections::BTreeMap<String, bool>) -> Vec<nexus_wire::IfaceInfo> {
         let _ = overrides;
         Vec::new()
     }
     /// 碰头服务（短加入码，M6.1）：把 `data` 放在 `seed` 对应的位置（用它派生的签名密钥签名）。
     /// 空的 `data` 让之前放的失效。没有碰头服务时返回 `Unsupported`，原因在错误信息里。
-    fn rendezvous_put(
-        &self,
-        seed: [u8; 32],
-        data: Vec<u8>,
-    ) -> impl Future<Output = io::Result<()>> {
+    fn rendezvous_put(&self, seed: [u8; 32], data: Vec<u8>) -> impl Future<Output = io::Result<()>> {
         let _ = (seed, data);
-        std::future::ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "这个传输没有碰头服务",
-        )))
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这个传输没有碰头服务")))
     }
     /// 取回 `seed` 对应位置上的数据；没有或已失效时为 None。
     fn rendezvous_get(&self, seed: [u8; 32]) -> impl Future<Output = io::Result<Option<Vec<u8>>>> {
         let _ = seed;
-        std::future::ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "这个传输没有碰头服务",
-        )))
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这个传输没有碰头服务")))
     }
 }
 
@@ -135,10 +122,7 @@ pub async fn read_msg<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> i
 }
 
 /// 写一个回应（装进信封，M7.1）。
-pub async fn write_response<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    response: &nexus_wire::Response,
-) -> io::Result<()> {
+pub async fn write_response<W: AsyncWrite + Unpin>(w: &mut W, response: &nexus_wire::Response) -> io::Result<()> {
     write_msg(w, &nexus_wire::ResponseEnvelope::new(response)).await
 }
 
@@ -161,12 +145,7 @@ pub struct FrameReader<R> {
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            decoder: nexus_wire::FrameDecoder::default(),
-            buf: vec![0; 64 * 1024],
-            eof: false,
-        }
+        Self { inner, decoder: nexus_wire::FrameDecoder::default(), buf: vec![0; 64 * 1024], eof: false }
     }
 
     /// 下一帧。对方正常结束且没有残留数据时返回 `Ok(None)`。

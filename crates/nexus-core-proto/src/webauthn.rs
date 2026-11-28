@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 /// P-256 公钥的 SubjectPublicKeyInfo 前缀（DER），后面紧跟 65 字节的 SEC1 非压缩点。
 const P256_SPKI_PREFIX: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
-    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+    0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
 
 const FLAG_USER_PRESENT: u8 = 0x01;
@@ -21,10 +21,7 @@ fn base64url(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, &b)| acc | (b as u32) << (16 - 8 * i));
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, &b)| acc | (b as u32) << (16 - 8 * i));
         for i in 0..=chunk.len() {
             out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
         }
@@ -87,9 +84,7 @@ pub struct Verified {
 impl P256Key {
     /// 从 `AuthenticatorAttestationResponse.getPublicKey()` 给出的 SubjectPublicKeyInfo（DER）读取。
     pub fn from_spki(der: &[u8]) -> Result<Self, WebAuthnError> {
-        let point = der
-            .strip_prefix(&P256_SPKI_PREFIX[..])
-            .ok_or(WebAuthnError::BadKey)?;
+        let point = der.strip_prefix(&P256_SPKI_PREFIX[..]).ok_or(WebAuthnError::BadKey)?;
         VerifyingKey::from_sec1_bytes(point).map_err(|_| WebAuthnError::BadKey)?;
         Ok(Self(point.to_vec()))
     }
@@ -118,9 +113,7 @@ pub fn login_challenge(issued_at: crate::Timestamp, browser: crate::NodeId) -> [
 /// 页面来源是否属于依赖方 `rp_id`：https 且主机是 `rp_id` 或它的子域名；
 /// `rp_id` 为 localhost 时（开发和测试）也接受 http 和任意端口。
 pub fn origin_allowed(origin: &str, rp_id: &str) -> bool {
-    let Some((scheme, rest)) = origin.split_once("://") else {
-        return false;
-    };
+    let Some((scheme, rest)) = origin.split_once("://") else { return false };
     // 来源只有协议、主机和端口，没有路径。
     if rest.contains('/') || rp_id.is_empty() {
         return false;
@@ -132,23 +125,13 @@ pub fn origin_allowed(origin: &str, rp_id: &str) -> bool {
     if rp_id == "localhost" {
         return host == "localhost" && (scheme == "http" || scheme == "https");
     }
-    scheme == "https"
-        && (host == rp_id
-            || host
-                .strip_suffix(rp_id)
-                .is_some_and(|sub| sub.ends_with('.') && sub.len() > 1))
+    scheme == "https" && (host == rp_id || host.strip_suffix(rp_id).is_some_and(|sub| sub.ends_with('.') && sub.len() > 1))
 }
 
 /// 校验一次登录断言。`challenge` 是设备发出的挑战原文。
-pub fn verify_assertion(
-    key: &P256Key,
-    rp_id: &str,
-    challenge: &[u8],
-    a: &WebAuthnAssertion,
-) -> Result<Verified, WebAuthnError> {
+pub fn verify_assertion(key: &P256Key, rp_id: &str, challenge: &[u8], a: &WebAuthnAssertion) -> Result<Verified, WebAuthnError> {
     // 1. 客户端数据：浏览器写的，说明这是一次登录、签的是哪个挑战、在哪个页面上。
-    let cd: ClientData =
-        serde_json::from_slice(&a.client_data_json).map_err(|_| WebAuthnError::BadClientData)?;
+    let cd: ClientData = serde_json::from_slice(&a.client_data_json).map_err(|_| WebAuthnError::BadClientData)?;
     if cd.kind != "webauthn.get" {
         return Err(WebAuthnError::WrongType);
     }
@@ -182,8 +165,7 @@ pub fn verify_assertion(
     let sig = EcdsaSignature::from_der(&a.signature).map_err(|_| WebAuthnError::BadSignature)?;
     let mut msg = ad.clone();
     msg.extend_from_slice(&Sha256::digest(&a.client_data_json));
-    vk.verify(&msg, &sig)
-        .map_err(|_| WebAuthnError::BadSignature)?;
+    vk.verify(&msg, &sig).map_err(|_| WebAuthnError::BadSignature)?;
     Ok(Verified { sign_count })
 }
 
@@ -204,21 +186,12 @@ pub mod soft {
 
     impl SoftAuthenticator {
         pub fn new(seed: [u8; 32], rp_id: &str, origin: &str) -> Self {
-            Self {
-                rp_id: rp_id.into(),
-                origin: origin.into(),
-                credential_id: seed[..16].to_vec(),
-                user_verified: true,
-                user_present: true,
-                seed,
-                counter: 0,
-            }
+            Self { rp_id: rp_id.into(), origin: origin.into(), credential_id: seed[..16].to_vec(), user_verified: true, user_present: true, seed, counter: 0 }
         }
 
         /// 注册时交给依赖方的公钥（SubjectPublicKeyInfo，DER）。
         fn key(&self) -> p256::ecdsa::SigningKey {
-            p256::ecdsa::SigningKey::from_bytes(&self.seed.into())
-                .expect("种子不是合法的 P-256 私钥")
+            p256::ecdsa::SigningKey::from_bytes(&self.seed.into()).expect("种子不是合法的 P-256 私钥")
         }
 
         pub fn spki(&self) -> Vec<u8> {
@@ -236,19 +209,8 @@ pub mod soft {
                 self.origin
             );
             let mut ad = Sha256::digest(self.rp_id.as_bytes()).to_vec();
-            let present = if self.user_present {
-                FLAG_USER_PRESENT
-            } else {
-                0
-            };
-            ad.push(
-                present
-                    | if self.user_verified {
-                        FLAG_USER_VERIFIED
-                    } else {
-                        0
-                    },
-            );
+            let present = if self.user_present { FLAG_USER_PRESENT } else { 0 };
+            ad.push(present | if self.user_verified { FLAG_USER_VERIFIED } else { 0 });
             ad.extend_from_slice(&self.counter.to_be_bytes());
             let mut msg = ad.clone();
             msg.extend_from_slice(&Sha256::digest(client_data.as_bytes()));

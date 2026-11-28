@@ -25,15 +25,11 @@ fn joined(screen: &Screen) -> (String, Vec<String>) {
 }
 
 fn short(v: &JoinView) -> String {
-    v.short_code
-        .clone()
-        .unwrap_or_else(|| panic!("应当有短码：{v:?}"))
+    v.short_code.clone().unwrap_or_else(|| panic!("应当有短码：{v:?}"))
 }
 
 async fn approve_fails(w: &World, code: &str) -> i32 {
-    let out = w
-        .cli("laptop", &["device", "approve", code, "--json"])
-        .await;
+    let out = w.cli("laptop", &["device", "approve", code, "--json"]).await;
     assert_ne!(out.code, 0, "旧短码不该还能用：{}", out.stdout);
     out.code
 }

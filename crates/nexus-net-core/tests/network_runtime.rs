@@ -22,31 +22,19 @@ fn domain_exact_does_not_match_subdomains() {
     ];
     assert_eq!(
         decide(&Target::parse("api.example.com:443").unwrap(), &rules),
-        Decision::Rule {
-            index: 0,
-            outbound: Outbound::Exit("jp".into())
-        }
+        Decision::Rule { index: 0, outbound: Outbound::Exit("jp".into()) }
     );
     assert_eq!(
         decide(&Target::parse("API.EXAMPLE.COM.:443").unwrap(), &rules),
-        Decision::Rule {
-            index: 0,
-            outbound: Outbound::Exit("jp".into())
-        }
+        Decision::Rule { index: 0, outbound: Outbound::Exit("jp".into()) }
     );
     assert_eq!(
         decide(&Target::parse("sub.api.example.com:443").unwrap(), &rules),
-        Decision::Rule {
-            index: 1,
-            outbound: Outbound::Direct
-        }
+        Decision::Rule { index: 1, outbound: Outbound::Direct }
     );
     assert_eq!(
         decide(&Target::parse("www.example.com:80").unwrap(), &rules),
-        Decision::Rule {
-            index: 1,
-            outbound: Outbound::Direct
-        }
+        Decision::Rule { index: 1, outbound: Outbound::Direct }
     );
 }
 
@@ -147,10 +135,7 @@ rules:
     assert_eq!(report.skipped.len(), 3);
     assert!(report.skipped.iter().any(|s| s.raw.starts_with("GEOIP")));
     assert!(report.skipped.iter().any(|s| s.raw.starts_with("SCRIPT")));
-    assert!(report
-        .skipped
-        .iter()
-        .any(|s| s.raw.starts_with("PROCESS-NAME")));
+    assert!(report.skipped.iter().any(|s| s.raw.starts_with("PROCESS-NAME")));
     assert!(report.notes.iter().any(|n| n.contains("MATCH")));
     assert!(report.notes.iter().any(|n| n.contains("mitm")));
 }
@@ -158,8 +143,7 @@ rules:
 /// TC-N1-04：未配置出口映射的代理组绝不静默降级为直连
 #[test]
 fn clash_import_never_silently_downgrades_unmapped_proxy_to_direct() {
-    let yaml =
-        "rules:\n  - DOMAIN,secret.example.com,JP-Group\n  - DOMAIN,local.example.com,DIRECT\n";
+    let yaml = "rules:\n  - DOMAIN,secret.example.com,JP-Group\n  - DOMAIN,local.example.com,DIRECT\n";
     let report = parse_clash_rules(yaml, &ImportOptions::default());
     assert_eq!(report.imported.len(), 1);
     assert_eq!(report.imported[0].outbound, Outbound::Direct);

@@ -36,18 +36,13 @@ pub(crate) struct Iface {
 
 /// 现在启用的、不是回环的接口（按名字排序）。
 pub(crate) fn scan() -> Vec<Iface> {
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_os = "macos")),
-        allow(unused_mut)
-    )]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "macos")), allow(unused_mut))]
     let mut by_name: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     if let Ok(list) = nix::ifaddrs::getifaddrs() {
         use nix::net::if_::InterfaceFlags;
         for ifa in list {
-            if !ifa.flags.contains(InterfaceFlags::IFF_UP)
-                || ifa.flags.contains(InterfaceFlags::IFF_LOOPBACK)
-            {
+            if !ifa.flags.contains(InterfaceFlags::IFF_UP) || ifa.flags.contains(InterfaceFlags::IFF_LOOPBACK) {
                 continue;
             }
             let Some(addr) = ifa.address else { continue };
@@ -66,11 +61,7 @@ pub(crate) fn scan() -> Vec<Iface> {
         .into_iter()
         .map(|(name, addrs)| {
             let auto_metered = auto_metered(&name, system.as_ref());
-            Iface {
-                name,
-                addrs,
-                auto_metered,
-            }
+            Iface { name, addrs, auto_metered }
         })
         .collect()
 }
@@ -82,9 +73,7 @@ pub(crate) fn looks_metered(name: &str) -> bool {
         return true;
     }
     let sys = format!("/sys/class/net/{name}");
-    if std::fs::read_to_string(format!("{sys}/uevent"))
-        .is_ok_and(|u| u.lines().any(|l| l.trim() == "DEVTYPE=wwan"))
-    {
+    if std::fs::read_to_string(format!("{sys}/uevent")).is_ok_and(|u| u.lines().any(|l| l.trim() == "DEVTYPE=wwan")) {
         return true;
     }
     // ARPHRD_RAWIP（519）：蜂窝调制解调器的原始 IP 接口。
@@ -100,11 +89,7 @@ mod tests {
     #[test]
     fn the_system_report_wins_over_names() {
         // Android：计费的 Wi-Fi 热点（名字看不出来）按系统的结果计费；系统说不计费的蜂窝网络（不限流量的套餐）不计费。
-        let system: BTreeMap<String, bool> = [
-            ("wlan0".to_string(), true),
-            ("rmnet_data0".to_string(), false),
-        ]
-        .into();
+        let system: BTreeMap<String, bool> = [("wlan0".to_string(), true), ("rmnet_data0".to_string(), false)].into();
         assert!(auto_metered("wlan0", Some(&system)));
         assert!(!auto_metered("rmnet_data0", Some(&system)));
         // 系统没有报告的接口（例如 USB 网络共享）仍按名字识别。
@@ -117,14 +102,7 @@ mod tests {
 
     #[test]
     fn cellular_and_tethering_names_are_metered() {
-        for n in [
-            "wwan0",
-            "wwp0s20f0u2i12",
-            "rmnet_data0",
-            "ccmni1",
-            "usb0",
-            "rndis0",
-        ] {
+        for n in ["wwan0", "wwp0s20f0u2i12", "rmnet_data0", "ccmni1", "usb0", "rndis0"] {
             assert!(looks_metered(n), "{n}");
         }
         for n in ["eth0", "wlan0", "enp3s0", "wlp2s0", "docker0"] {

@@ -72,8 +72,7 @@ pub async fn bind(path: &Path, kind: CtlKind) -> io::Result<CtlListener> {
             }
             // agent 入口：连接不是授权，凭据才是，所以回环 TCP 就够。
             CtlKind::Agent => {
-                let listener =
-                    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
                 let addr = listener.local_addr()?;
                 write_endpoint(path, &addr.to_string())?;
                 Ok(CtlListener::Tcp(listener))

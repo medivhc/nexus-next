@@ -9,10 +9,7 @@ async fn issue(w: &World, label: &str, grants: &[&str]) -> String {
     for g in grants {
         args.extend(["--grant", g]);
     }
-    w.cli_ok("laptop", &args).await["credential"]
-        .as_str()
-        .expect("应当输出凭据")
-        .to_string()
+    w.cli_ok("laptop", &args).await["credential"].as_str().expect("应当输出凭据").to_string()
 }
 
 scenario! {
@@ -137,28 +134,13 @@ async fn network_with_code(w: &World, members: &[&str]) -> String {
     let code = init["recovery_code"].as_str().unwrap().to_string();
     for m in members {
         let join = w.cli_ok(m, &["join"]).await;
-        w.cli_ok(
-            "laptop",
-            &[
-                "device",
-                "approve",
-                join["code"].as_str().unwrap(),
-                "--name",
-                m,
-            ],
-        )
-        .await;
+        w.cli_ok("laptop", &["device", "approve", join["code"].as_str().unwrap(), "--name", m]).await;
     }
     code
 }
 
 fn entry_names(ls: &serde_json::Value) -> Vec<String> {
-    ls["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["name"].as_str().unwrap().to_string())
-        .collect()
+    ls["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_string()).collect()
 }
 
 scenario! {

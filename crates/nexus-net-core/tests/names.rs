@@ -19,10 +19,7 @@ fn query(name: &str, qtype: u16) -> Vec<u8> {
 #[test]
 fn queries_are_read() {
     let q = dns::parse_query(&query("Web.Home.internal", dns::A)).unwrap();
-    assert_eq!(
-        (q.id, q.name.as_str(), q.qtype),
-        (0x1234, "web.home.internal", dns::A)
-    );
+    assert_eq!((q.id, q.name.as_str(), q.qtype), (0x1234, "web.home.internal", dns::A));
     // 回应、多个问题、截断的报文都不是我们要回答的查询。
     let mut resp = query("a.b", dns::A);
     resp[2] |= 0x80;
@@ -38,10 +35,7 @@ fn queries_are_read() {
 fn answers_carry_only_records_of_the_asked_type() {
     let raw = query("web.home.internal", dns::A);
     let q: Query = dns::parse_query(&raw).unwrap();
-    let ips = [
-        IpAddr::V4(Ipv4Addr::new(198, 18, 0, 3)),
-        IpAddr::V6(Ipv6Addr::LOCALHOST),
-    ];
+    let ips = [IpAddr::V4(Ipv4Addr::new(198, 18, 0, 3)), IpAddr::V6(Ipv6Addr::LOCALHOST)];
     let out = dns::answer(&q, &ips, 60);
     assert_eq!(&out[..2], &[0x12, 0x34], "同一个 id");
     assert_eq!(out[2] & 0x80, 0x80, "是回应");
@@ -50,10 +44,7 @@ fn answers_carry_only_records_of_the_asked_type() {
     assert_eq!(&out[4..12], &[0, 1, 0, 1, 0, 0, 0, 0], "一个问题、一条回答");
     assert_eq!(&out[12..raw.len()], &raw[12..], "问题原样带回");
     let rr = &out[raw.len()..];
-    assert_eq!(
-        rr,
-        &[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 18, 0, 3]
-    );
+    assert_eq!(rr, &[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 18, 0, 3]);
 
     let raw6 = query("web.home.internal", dns::AAAA);
     let out = dns::answer(&dns::parse_query(&raw6).unwrap(), &ips, 60);
@@ -82,29 +73,20 @@ fn local_addresses_are_stable_and_reversible() {
     let b = pool.assign("echo.home.internal");
     assert_eq!(a, Ipv4Addr::new(198, 18, 0, 3));
     assert_ne!(a, b);
-    assert_eq!(
-        pool.assign("web.home.internal"),
-        a,
-        "同一个名字总是同一个地址"
-    );
+    assert_eq!(pool.assign("web.home.internal"), a, "同一个名字总是同一个地址");
     assert_eq!(pool.lookup(a), Some("web.home.internal"));
     assert_eq!(pool.lookup(Ipv4Addr::new(198, 18, 0, 200)), None);
     assert!(pool.contains(a) && !pool.contains(Ipv4Addr::new(10, 0, 0, 1)));
     // 不合法的网段
     assert!(FakePool::new(Ipv4Addr::new(198, 18, 0, 0), 31).is_none());
-    assert!(
-        FakePool::new(Ipv4Addr::new(198, 18, 0, 1), 24).is_none(),
-        "不是网段的起点"
-    );
+    assert!(FakePool::new(Ipv4Addr::new(198, 18, 0, 1), 24).is_none(), "不是网段的起点");
 }
 
 #[test]
 fn a_full_pool_reuses_the_oldest_address() {
     // /29：8 个地址，去掉网段、网关、名字服务、广播，剩 4 个。
     let mut pool = FakePool::new(Ipv4Addr::new(10, 9, 0, 0), 29).unwrap();
-    let first: Vec<_> = (0..4)
-        .map(|i| pool.assign(&format!("n{i}.internal")))
-        .collect();
+    let first: Vec<_> = (0..4).map(|i| pool.assign(&format!("n{i}.internal"))).collect();
     let next = pool.assign("n4.internal");
     assert_eq!(next, first[0]);
     assert_eq!(pool.lookup(next), Some("n4.internal"));

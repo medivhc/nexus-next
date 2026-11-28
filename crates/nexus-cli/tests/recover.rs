@@ -8,12 +8,7 @@ fn json(text: &str) -> Value {
 }
 
 fn role(ls: &Value, name: &str) -> String {
-    ls["devices"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["name"] == name)
-        .unwrap_or_else(|| panic!("没有 {name}：{ls}"))["role"]
+    ls["devices"].as_array().unwrap().iter().find(|d| d["name"] == name).unwrap_or_else(|| panic!("没有 {name}：{ls}"))["role"]
         .as_str()
         .unwrap()
         .to_string()
@@ -25,17 +20,7 @@ async fn network(w: &World, members: &[&str]) -> String {
     let code = init["recovery_code"].as_str().unwrap().to_string();
     for m in members {
         let join = w.cli_ok(m, &["join"]).await;
-        w.cli_ok(
-            "laptop",
-            &[
-                "device",
-                "approve",
-                join["code"].as_str().unwrap(),
-                "--name",
-                m,
-            ],
-        )
-        .await;
+        w.cli_ok("laptop", &["device", "approve", join["code"].as_str().unwrap(), "--name", m]).await;
     }
     code
 }

@@ -7,17 +7,10 @@
 
 #[tokio::main]
 async fn main() {
-    let addr: std::net::SocketAddr = std::env::args()
-        .nth(1)
-        .as_deref()
-        .unwrap_or("0.0.0.0:3340")
-        .parse()
-        .expect("地址:端口");
+    let addr: std::net::SocketAddr = std::env::args().nth(1).as_deref().unwrap_or("0.0.0.0:3340").parse().expect("地址:端口");
     let mut config = iroh_relay::server::ServerConfig::default();
     config.relay = Some(iroh_relay::server::RelayConfig::new(addr));
-    let server = iroh_relay::server::Server::spawn(config)
-        .await
-        .expect("中继启动失败");
+    let server = iroh_relay::server::Server::spawn(config).await.expect("中继启动失败");
     println!("http://{}", server.http_addr().expect("应当有 HTTP 地址"));
     let _ = tokio::signal::ctrl_c().await;
 }

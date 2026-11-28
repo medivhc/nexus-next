@@ -25,10 +25,7 @@ impl Size {
 
     /// 两个维度都至少为 1。
     pub fn clamped(self) -> Size {
-        Size {
-            cols: self.cols.max(1),
-            rows: self.rows.max(1),
-        }
+        Size { cols: self.cols.max(1), rows: self.rows.max(1) }
     }
 }
 
@@ -40,32 +37,16 @@ pub enum Event {
     /// 终端程序产生的输出。
     PtyOutput(Vec<u8>),
     /// 一个客户端连上来，报告它的终端尺寸。
-    Attach {
-        client: ClientId,
-        size: Size,
-    },
+    Attach { client: ClientId, size: Size },
     /// 客户端的键盘输入。
-    Input {
-        client: ClientId,
-        bytes: Vec<u8>,
-    },
+    Input { client: ClientId, bytes: Vec<u8> },
     /// 客户端的终端尺寸变了。
-    Resize {
-        client: ClientId,
-        size: Size,
-    },
+    Resize { client: ClientId, size: Size },
     /// 客户端确认已经处理完这么多字节。
-    Ack {
-        client: ClientId,
-        bytes: u64,
-    },
-    Detach {
-        client: ClientId,
-    },
+    Ack { client: ClientId, bytes: u64 },
+    Detach { client: ClientId },
     /// 终端程序退出了。
-    PtyExited {
-        code: Option<i32>,
-    },
+    PtyExited { code: Option<i32> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,14 +158,7 @@ impl Session {
         match event {
             Event::PtyOutput(bytes) => self.output(bytes, &mut actions),
             Event::Attach { client, size } => {
-                self.clients.insert(
-                    client,
-                    Client {
-                        size: size.clamped(),
-                        credit: self.window,
-                        lagging: false,
-                    },
-                );
+                self.clients.insert(client, Client { size: size.clamped(), credit: self.window, lagging: false });
                 if self.exited.is_none() {
                     self.activate(client, &mut actions);
                 }
@@ -204,9 +178,7 @@ impl Session {
                 }
             }
             Event::Resize { client, size } => {
-                let Some(c) = self.clients.get_mut(&client) else {
-                    return actions;
-                };
+                let Some(c) = self.clients.get_mut(&client) else { return actions };
                 c.size = size.clamped();
                 let size = c.size;
                 if self.active == Some(client) && self.exited.is_none() {
@@ -215,9 +187,7 @@ impl Session {
             }
             Event::Ack { client, bytes } => {
                 let window = self.window;
-                let Some(c) = self.clients.get_mut(&client) else {
-                    return actions;
-                };
+                let Some(c) = self.clients.get_mut(&client) else { return actions };
                 c.credit = c.credit.saturating_add(bytes).min(window);
                 if c.lagging && c.credit == window {
                     // 积压的都处理完了：从当前屏幕重新开始。
@@ -260,11 +230,7 @@ impl Session {
     fn output(&mut self, bytes: Vec<u8>, actions: &mut Vec<Action>) {
         self.pending.extend(bytes);
         let cut = safe_prefix(&self.pending);
-        let cut = if cut == 0 && self.pending.len() > MAX_PENDING {
-            self.pending.len()
-        } else {
-            cut
-        };
+        let cut = if cut == 0 && self.pending.len() > MAX_PENDING { self.pending.len() } else { cut };
         if cut == 0 {
             return;
         }
@@ -285,9 +251,7 @@ impl Session {
     /// 没有任何未确认数据时总可以发一条，否则大于窗口的消息永远发不出去。
     fn send(&mut self, client: ClientId, msg: ClientMsg, actions: &mut Vec<Action>) {
         let window = self.window;
-        let Some(c) = self.clients.get_mut(&client) else {
-            return;
-        };
+        let Some(c) = self.clients.get_mut(&client) else { return };
         if c.lagging {
             return;
         }
@@ -314,9 +278,7 @@ impl Session {
             return;
         }
         self.size = size;
-        self.parser
-            .screen_mut()
-            .set_size(nz(size.rows), nz(size.cols));
+        self.parser.screen_mut().set_size(nz(size.rows), nz(size.cols));
         actions.push(Action::ResizePty(size));
     }
 }

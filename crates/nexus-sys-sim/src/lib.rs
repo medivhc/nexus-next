@@ -4,13 +4,13 @@
 
 use nexus_core_proto::Timestamp;
 use nexus_sys::{Cmd, Datagram, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, Size, System, UdpConn};
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::io;
-use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::Notify;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::io;
+use std::rc::Rc;
 
 /// 仿真世界的起始时间：2026-01-01T00:00:00Z。
 pub const SIM_EPOCH_MS: u64 = 1_767_225_600_000;
@@ -79,11 +79,7 @@ impl SimServices {
 
     /// 注册仿真主机名解析记录（N1 测试用）。
     pub fn add_host(&self, host: &str, ip: std::net::IpAddr) {
-        self.hosts
-            .borrow_mut()
-            .entry(host.to_ascii_lowercase())
-            .or_default()
-            .push(ip);
+        self.hosts.borrow_mut().entry(host.to_ascii_lowercase()).or_default().push(ip);
     }
 
     /// 注册仿真 UDP 回声目标（收到 payload 返回 `echo:<payload>`，并计数）。
@@ -103,12 +99,7 @@ impl SimSystem {
     }
 
     pub fn with_services(disk: SimDisk, seed: u64, clock: SimClock, services: SimServices) -> Self {
-        Self {
-            disk,
-            rng: Cell::new(seed ^ 0x9e37_79b9_7f4a_7c15),
-            clock,
-            services,
-        }
+        Self { disk, rng: Cell::new(seed ^ 0x9e37_79b9_7f4a_7c15), clock, services }
     }
 
     fn next_u64(&self) -> u64 {
@@ -133,19 +124,8 @@ impl System for SimSystem {
             self.services.public.borrow().get(&addr).cloned()
         };
         match service {
-            Some(service) => Ok(SimTcp {
-                service,
-                inbox: Vec::new(),
-                outbox: VecDeque::new(),
-                closed: false,
-                stage: 0,
-                reader: None,
-                writer: None,
-            }),
-            None => Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("{addr} 上没有服务"),
-            )),
+            Some(service) => Ok(SimTcp { service, inbox: Vec::new(), outbox: VecDeque::new(), closed: false, stage: 0, reader: None, writer: None }),
+            None => Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("{addr} 上没有服务"))),
         }
     }
 
@@ -158,10 +138,7 @@ impl System for SimSystem {
                 waker: RefCell::new(None),
             })))
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("{addr} 上没有 UDP 服务"),
-            ))
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("{addr} 上没有 UDP 服务")))
         }
     }
 
@@ -172,10 +149,7 @@ impl System for SimSystem {
         }
         match host {
             "localhost" => Ok(vec![std::net::IpAddr::from([127, 0, 0, 1])]),
-            _ => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("仿真里没有主机 {host}"),
-            )),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, format!("仿真里没有主机 {host}"))),
         }
     }
 
@@ -193,21 +167,13 @@ impl System for SimSystem {
     }
 
     fn spawn(&self, cmd: Cmd) -> io::Result<SimProc> {
-        let ctx = ShellCtx {
-            cwd: cmd.cwd.clone().unwrap_or_else(|| "/home/sim".into()),
-            env: cmd.env.clone(),
-        };
+        let ctx = ShellCtx { cwd: cmd.cwd.clone().unwrap_or_else(|| "/home/sim".into()), env: cmd.env.clone() };
         let mut argv = vec![cmd.program.clone()];
         argv.extend(cmd.args.iter().cloned());
         let steps = if cmd.program == "sh" {
             match cmd.args.as_slice() {
                 [flag, script] if flag == "-c" => run_script(script, &ctx),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "仿真的 sh 只支持 sh -c",
-                    ))
-                }
+                _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "仿真的 sh 只支持 sh -c")),
             }
         } else {
             match run_command(&argv, &ctx) {
@@ -215,12 +181,7 @@ impl System for SimSystem {
                     steps.push(Step::Exit(status));
                     steps
                 }
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("没有这个程序：{}", cmd.program),
-                    ))
-                }
+                None => return Err(io::Error::new(io::ErrorKind::NotFound, format!("没有这个程序：{}", cmd.program))),
             }
         };
         Ok(SimProc {
@@ -262,22 +223,13 @@ impl System for SimSystem {
 
     fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
         let disk = self.disk.0.borrow();
-        let mut out = disk
-            .get(&format!("log:{name}.1"))
-            .cloned()
-            .unwrap_or_default();
-        out.extend_from_slice(
-            disk.get(&format!("log:{name}"))
-                .map_or(&[][..], Vec::as_slice),
-        );
+        let mut out = disk.get(&format!("log:{name}.1")).cloned().unwrap_or_default();
+        out.extend_from_slice(disk.get(&format!("log:{name}")).map_or(&[][..], Vec::as_slice));
         Ok(out)
     }
 
     fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        self.disk
-            .0
-            .borrow_mut()
-            .insert(key.to_string(), value.to_vec());
+        self.disk.0.borrow_mut().insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
@@ -291,11 +243,7 @@ impl System for SimSystem {
     }
 
     fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> {
-        self.disk
-            .0
-            .borrow_mut()
-            .entry(cas_key(hash))
-            .or_insert_with(|| bytes.to_vec());
+        self.disk.0.borrow_mut().entry(cas_key(hash)).or_insert_with(|| bytes.to_vec());
         Ok(())
     }
 
@@ -339,24 +287,11 @@ impl Proc for SimProc {
     async fn next_event(&mut self) -> ProcEvent {
         loop {
             if self.killed {
-                return ProcEvent::Exited(ExitStatus {
-                    code: None,
-                    signal: Some(9),
-                });
+                return ProcEvent::Exited(ExitStatus { code: None, signal: Some(9) });
             }
             match self.steps.front_mut() {
-                None => {
-                    return ProcEvent::Exited(ExitStatus {
-                        code: Some(0),
-                        signal: None,
-                    })
-                }
-                Some(Step::Exit(code)) => {
-                    return ProcEvent::Exited(ExitStatus {
-                        code: Some(*code),
-                        signal: None,
-                    })
-                }
+                None => return ProcEvent::Exited(ExitStatus { code: Some(0), signal: None }),
+                Some(Step::Exit(code)) => return ProcEvent::Exited(ExitStatus { code: Some(*code), signal: None }),
                 Some(Step::Out(bytes)) | Some(Step::Err(bytes)) if bytes.is_empty() => {
                     self.steps.pop_front();
                 }
@@ -372,9 +307,7 @@ impl Proc for SimProc {
                 }
                 Some(Step::Sleep(d)) => {
                     let d = *d;
-                    let until = *self
-                        .sleep_until
-                        .get_or_insert_with(|| tokio::time::Instant::now() + d);
+                    let until = *self.sleep_until.get_or_insert_with(|| tokio::time::Instant::now() + d);
                     tokio::select! {
                         biased;
                         _ = tokio::time::sleep_until(until) => {
@@ -440,9 +373,7 @@ fn run_script(script: &str, ctx: &ShellCtx) -> Vec<Step> {
                 status = st;
             }
             None => {
-                steps.push(Step::Err(
-                    format!("sh: 1: {}: not found\n", words[0]).into_bytes(),
-                ));
+                steps.push(Step::Err(format!("sh: 1: {}: not found\n", words[0]).into_bytes()));
                 status = 127;
             }
         }
@@ -457,25 +388,13 @@ fn run_command(argv: &[String], ctx: &ShellCtx) -> Option<(Vec<Step>, i32)> {
         Some((last, rest)) if last == ">&2" => (rest, true),
         _ => (argv, false),
     };
-    let emit = |bytes: Vec<u8>| {
-        if to_stderr {
-            Step::Err(bytes)
-        } else {
-            Step::Out(bytes)
-        }
-    };
+    let emit = |bytes: Vec<u8>| if to_stderr { Step::Err(bytes) } else { Step::Out(bytes) };
     let args = &argv[1..];
     let result = match argv[0].as_str() {
         "true" => (vec![], 0),
         "false" => (vec![], 1),
         "echo" => (vec![emit(format!("{}\n", args.join(" ")).into_bytes())], 0),
-        "printf" => (
-            vec![emit(printf(
-                args.first().map(String::as_str).unwrap_or(""),
-                &args[1.min(args.len())..],
-            ))],
-            0,
-        ),
+        "printf" => (vec![emit(printf(args.first().map(String::as_str).unwrap_or(""), &args[1.min(args.len())..]))], 0),
         "seq" => {
             let (first, last): (u64, u64) = match args {
                 [last] => (1, last.parse().ok()?),
@@ -490,10 +409,7 @@ fn run_command(argv: &[String], ctx: &ShellCtx) -> Option<(Vec<Step>, i32)> {
             (vec![emit(out.into_bytes())], 0)
         }
         "pwd" => (vec![emit(format!("{}\n", ctx.cwd).into_bytes())], 0),
-        "printenv" => match args
-            .first()
-            .and_then(|name| ctx.env.iter().find(|(k, _)| k == name))
-        {
+        "printenv" => match args.first().and_then(|name| ctx.env.iter().find(|(k, _)| k == name)) {
             Some((_, v)) => (vec![emit(format!("{v}\n").into_bytes())], 0),
             None => (vec![], 1),
         },
@@ -503,9 +419,7 @@ fn run_command(argv: &[String], ctx: &ShellCtx) -> Option<(Vec<Step>, i32)> {
             (vec![Step::Sleep(Duration::from_secs_f64(secs))], 0)
         }
         "head" => match args {
-            [c, n, file] if c == "-c" && file == "/dev/zero" => {
-                (vec![emit(vec![0; n.parse().ok()?])], 0)
-            }
+            [c, n, file] if c == "-c" && file == "/dev/zero" => (vec![emit(vec![0; n.parse().ok()?])], 0),
             _ => return None,
         },
         _ => return None,
@@ -590,18 +504,9 @@ fn unescape(fmt: &str) -> Vec<u8> {
         }
         i += 1;
         match b[i] {
-            b'n' => {
-                out.push(b'\n');
-                i += 1;
-            }
-            b't' => {
-                out.push(b'\t');
-                i += 1;
-            }
-            b'\\' => {
-                out.push(b'\\');
-                i += 1;
-            }
+            b'n' => { out.push(b'\n'); i += 1; }
+            b't' => { out.push(b'\t'); i += 1; }
+            b'\\' => { out.push(b'\\'); i += 1; }
             b'0'..=b'7' => {
                 let mut v: u32 = 0;
                 let mut n = 0;
@@ -612,11 +517,7 @@ fn unescape(fmt: &str) -> Vec<u8> {
                 }
                 out.push(v as u8);
             }
-            other => {
-                out.push(b'\\');
-                out.push(other);
-                i += 1;
-            }
+            other => { out.push(b'\\'); out.push(other); i += 1; }
         }
     }
     out
@@ -661,10 +562,7 @@ fn onlcr(bytes: &[u8]) -> Vec<u8> {
 impl SimPty {
     /// 把一行编译成步骤，最后输出提示符。`exit` 让 shell 退出。
     fn compile(&self, line: &str) -> VecDeque<Step> {
-        let ctx = ShellCtx {
-            cwd: "/home/sim".into(),
-            env: vec![],
-        };
+        let ctx = ShellCtx { cwd: "/home/sim".into(), env: vec![] };
         let mut steps = VecDeque::new();
         let mut status = 0;
         for stmt in line.split(';') {
@@ -677,9 +575,7 @@ impl SimPty {
                     return steps;
                 }
                 Some("stty") if words.get(1).map(String::as_str) == Some("size") => {
-                    steps.push_back(Step::Out(
-                        format!("{} {}\n", self.size.rows, self.size.cols).into_bytes(),
-                    ));
+                    steps.push_back(Step::Out(format!("{} {}\n", self.size.rows, self.size.cols).into_bytes()));
                     status = 0;
                 }
                 Some(_) => match run_command(&words, &ctx) {
@@ -688,9 +584,7 @@ impl SimPty {
                         status = st;
                     }
                     None => {
-                        steps.push_back(Step::Err(
-                            format!("sh: {}: not found\n", words[0]).into_bytes(),
-                        ));
+                        steps.push_back(Step::Err(format!("sh: {}: not found\n", words[0]).into_bytes()));
                         status = 127;
                     }
                 },
@@ -705,21 +599,13 @@ impl Pty for SimPty {
     async fn next_event(&mut self) -> PtyEvent {
         loop {
             if self.killed {
-                return PtyEvent::Exited(ExitStatus {
-                    code: None,
-                    signal: Some(9),
-                });
+                return PtyEvent::Exited(ExitStatus { code: None, signal: Some(9) });
             }
             if !self.out.is_empty() {
                 return PtyEvent::Output(std::mem::take(&mut self.out));
             }
             match self.running.front_mut() {
-                Some(Step::Exit(code)) => {
-                    return PtyEvent::Exited(ExitStatus {
-                        code: Some(*code),
-                        signal: None,
-                    })
-                }
+                Some(Step::Exit(code)) => return PtyEvent::Exited(ExitStatus { code: Some(*code), signal: None }),
                 Some(Step::Out(bytes)) | Some(Step::Err(bytes)) => {
                     let rest = bytes.split_off(bytes.len().min(CHUNK));
                     let chunk = std::mem::replace(bytes, rest);
@@ -733,9 +619,7 @@ impl Pty for SimPty {
                 }
                 Some(Step::Sleep(d)) => {
                     let d = *d;
-                    let until = *self
-                        .sleep_until
-                        .get_or_insert_with(|| tokio::time::Instant::now() + d);
+                    let until = *self.sleep_until.get_or_insert_with(|| tokio::time::Instant::now() + d);
                     tokio::select! {
                         biased;
                         _ = tokio::time::sleep_until(until) => {
@@ -771,8 +655,7 @@ impl Pty for SimPty {
                 }
                 b'\r' | b'\n' => {
                     self.out.extend_from_slice(b"\r\n");
-                    let line =
-                        String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned();
+                    let line = String::from_utf8_lossy(&std::mem::take(&mut self.line)).into_owned();
                     self.lines.push_back(line);
                 }
                 0x7f | 0x08 => {
@@ -823,11 +706,7 @@ impl SimTcp {
 }
 
 impl tokio::io::AsyncRead for SimTcp {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
         if self.outbox.is_empty() {
             if self.closed {
                 return std::task::Poll::Ready(Ok(()));
@@ -868,10 +747,7 @@ pub fn http_echo_reply(req: &[u8]) -> Option<Vec<u8>> {
     if path == "/go" {
         return Some(b"HTTP/1.1 302 Found\r\nLocation: /landed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
     }
-    let text = format!(
-        "{method} {path}\ncookie: {cookie}\nbody: {}\n",
-        String::from_utf8_lossy(&req[end..end + len])
-    );
+    let text = format!("{method} {path}\ncookie: {cookie}\nbody: {}\n", String::from_utf8_lossy(&req[end..end + len]));
     let (a, b) = text.as_bytes().split_at(text.len() / 2);
     let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: visited=yes; Path=/\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
     for part in [a, b] {
@@ -891,11 +767,7 @@ fn http_reply(body: &str) -> String {
 const SIM_TCP_BUFFER: usize = 256 * 1024;
 
 impl tokio::io::AsyncWrite for SimTcp {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        data: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<io::Result<usize>> {
         if self.closed {
             return std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
@@ -930,15 +802,12 @@ impl tokio::io::AsyncWrite for SimTcp {
                         match socks5::parse_request(&self.inbox) {
                             Ok(Some((n, target))) => {
                                 self.inbox.drain(..n);
-                                if matches!(&target.host, nexus_net_core::Host::Name(h) if h.starts_with("refuse."))
-                                {
-                                    self.outbox
-                                        .extend(socks5::reply(socks5::Reply::ConnectionRefused));
+                                if matches!(&target.host, nexus_net_core::Host::Name(h) if h.starts_with("refuse.")) {
+                                    self.outbox.extend(socks5::reply(socks5::Reply::ConnectionRefused));
                                     self.closed = true;
                                 } else {
                                     self.outbox.extend(socks5::reply(socks5::Reply::Succeeded));
-                                    self.service =
-                                        SimService::Http(format!("via upstream to {target}"));
+                                    self.service = SimService::Http(format!("via upstream to {target}"));
                                     self.stage = 2;
                                 }
                             }
@@ -984,17 +853,11 @@ impl tokio::io::AsyncWrite for SimTcp {
         }
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
         // 回声：对方结束发送，服务送完剩下的也结束。
         self.closed = true;
         self.wake_reader();
@@ -1010,11 +873,7 @@ struct SimUdp {
 }
 
 impl Datagram for SimUdp {
-    fn poll_send(
-        &self,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
+    fn poll_send(&self, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
         if let Some(count) = self.hits.borrow_mut().get_mut(&self.addr) {
             *count += 1;
         }
@@ -1027,11 +886,7 @@ impl Datagram for SimUdp {
         std::task::Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
         if let Some(pkt) = self.inbox.borrow_mut().pop_front() {
             let n = pkt.len().min(buf.remaining());
             buf.put_slice(&pkt[..n]);
@@ -1042,6 +897,7 @@ impl Datagram for SimUdp {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

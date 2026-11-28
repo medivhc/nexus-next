@@ -47,10 +47,7 @@ impl Target {
             let (host, port) = s.rsplit_once(':')?;
             (host_of(host)?, port)
         };
-        Some(Target {
-            host,
-            port: port.parse().ok()?,
-        })
+        Some(Target { host, port: port.parse().ok()? })
     }
 }
 
@@ -108,15 +105,11 @@ pub mod socks5 {
 
     /// 问候：版本、方法数、方法。返回（消耗的字节，是否提供了不认证）；不完整时 `None`。
     pub fn parse_greeting(buf: &[u8]) -> Result<Option<(usize, bool)>, Reply> {
-        let Some(&ver) = buf.first() else {
-            return Ok(None);
-        };
+        let Some(&ver) = buf.first() else { return Ok(None) };
         if ver != 5 {
             return Err(Reply::GeneralFailure);
         }
-        let Some(&n) = buf.get(1) else {
-            return Ok(None);
-        };
+        let Some(&n) = buf.get(1) else { return Ok(None) };
         let end = 2 + n as usize;
         if buf.len() < end {
             return Ok(None);
@@ -175,16 +168,8 @@ pub mod socks5 {
             }
             _ => return Err(Reply::AddressTypeNotSupported),
         };
-        let Some(p) = buf.get(at..at + 2) else {
-            return Ok(None);
-        };
-        Ok(Some((
-            at + 2,
-            Target {
-                host,
-                port: u16::from_be_bytes([p[0], p[1]]),
-            },
-        )))
+        let Some(p) = buf.get(at..at + 2) else { return Ok(None) };
+        Ok(Some((at + 2, Target { host, port: u16::from_be_bytes([p[0], p[1]]) })))
     }
 
     /// 回应：绑定地址固定为 0.0.0.0:0（客户端用不上它）。
@@ -289,28 +274,20 @@ pub mod http {
 
     /// 解析完整的请求头（到空行为止）。
     pub fn parse(head: &[u8]) -> Result<ProxyRequest, BadRequest> {
-        let end = head
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or(BadRequest("请求头不完整"))?;
+        let end = head.windows(4).position(|w| w == b"\r\n\r\n").ok_or(BadRequest("请求头不完整"))?;
         let text = core::str::from_utf8(&head[..end]).map_err(|_| BadRequest("请求头不是文本"))?;
         let mut lines = text.split("\r\n");
         let line = lines.next().unwrap_or_default();
         let mut parts = line.split(' ');
-        let (method, uri, version) = match (parts.next(), parts.next(), parts.next(), parts.next())
-        {
-            (Some(m), Some(u), Some(v), None) if !m.is_empty() && v.starts_with("HTTP/") => {
-                (m, u, v)
-            }
+        let (method, uri, version) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(m), Some(u), Some(v), None) if !m.is_empty() && v.starts_with("HTTP/") => (m, u, v),
             _ => return Err(BadRequest("请求行不合法")),
         };
         if method == "CONNECT" {
             let target = Target::parse(uri).ok_or(BadRequest("CONNECT 的目标应当是 主机:端口"))?;
             return Ok(ProxyRequest::Connect(target));
         }
-        let rest = uri
-            .strip_prefix("http://")
-            .ok_or(BadRequest("代理请求要用绝对形式的 http:// 地址"))?;
+        let rest = uri.strip_prefix("http://").ok_or(BadRequest("代理请求要用绝对形式的 http:// 地址"))?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => match rest.find('?') {
@@ -318,31 +295,15 @@ pub mod http {
                 None => (rest, "/"),
             },
         };
-        let path = if path.starts_with('?') {
-            format!("/{path}")
-        } else {
-            path.to_string()
-        };
-        let target = if authority.starts_with('[')
-            || authority
-                .rsplit_once(':')
-                .is_some_and(|(_, p)| p.bytes().all(|b| b.is_ascii_digit()))
-        {
+        let path = if path.starts_with('?') { format!("/{path}") } else { path.to_string() };
+        let target = if authority.starts_with('[') || authority.rsplit_once(':').is_some_and(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())) {
             Target::parse(authority).ok_or(BadRequest("地址不合法"))?
         } else {
-            Target {
-                host: host_of(authority).ok_or(BadRequest("地址不合法"))?,
-                port: 80,
-            }
+            Target { host: host_of(authority).ok_or(BadRequest("地址不合法"))?, port: 80 }
         };
         let mut out = format!("{method} {path} {version}\r\n");
         for l in lines {
-            let name = l
-                .split(':')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
+            let name = l.split(':').next().unwrap_or_default().trim().to_ascii_lowercase();
             if name.starts_with("proxy-") {
                 continue;
             }
@@ -352,10 +313,7 @@ pub mod http {
         out.push_str("\r\n");
         let mut bytes = out.into_bytes();
         bytes.extend_from_slice(&head[end + 4..]);
-        Ok(ProxyRequest::Forward {
-            target,
-            head: bytes,
-        })
+        Ok(ProxyRequest::Forward { target, head: bytes })
     }
 
     /// 一个简短的错误回应（之后关闭连接）。
@@ -390,9 +348,7 @@ pub mod route {
         pub fn parse_domain(s: &str) -> Result<Self, String> {
             let d = s.trim_end_matches('.').to_ascii_lowercase();
             let ok = !d.is_empty()
-                && d.split('.').all(|l| {
-                    !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                });
+                && d.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
             if ok {
                 Ok(Matcher::Domain(d))
             } else {
@@ -408,20 +364,11 @@ pub mod route {
         }
 
         pub fn parse_cidr(s: &str) -> Result<Self, String> {
-            let (ip, len) = s
-                .split_once('/')
-                .ok_or_else(|| format!("地址段应当写成 地址/前缀长度：{s}"))?;
+            let (ip, len) = s.split_once('/').ok_or_else(|| format!("地址段应当写成 地址/前缀长度：{s}"))?;
             let ip: IpAddr = ip.parse().map_err(|_| format!("地址不合法：{s}"))?;
             let max = if ip.is_ipv4() { 32 } else { 128 };
-            let prefix: u8 = len
-                .parse()
-                .ok()
-                .filter(|&p| p <= max)
-                .ok_or_else(|| format!("前缀长度不合法：{s}"))?;
-            Ok(Matcher::Cidr {
-                net: mask(ip, prefix),
-                prefix,
-            })
+            let prefix: u8 = len.parse().ok().filter(|&p| p <= max).ok_or_else(|| format!("前缀长度不合法：{s}"))?;
+            Ok(Matcher::Cidr { net: mask(ip, prefix), prefix })
         }
 
         pub fn matches(&self, t: &Target) -> bool {
@@ -452,19 +399,11 @@ pub mod route {
     fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
         match ip {
             IpAddr::V4(v) => {
-                let m = if prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - prefix)
-                };
+                let m = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
                 IpAddr::V4((u32::from(v) & m).into())
             }
             IpAddr::V6(v) => {
-                let m = if prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - prefix)
-                };
+                let m = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
                 IpAddr::V6((u128::from(v) & m).into())
             }
         }
@@ -519,25 +458,17 @@ pub mod route {
             let n = normalize(n);
             if n == SERVICE_SUFFIX || n.ends_with(&format!(".{SERVICE_SUFFIX}")) {
                 let labels: Vec<&str> = n.split('.').collect();
-                let ok = |l: &str| {
-                    !l.is_empty()
-                        && l.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                };
+                let ok = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
                 return match labels.as_slice() {
-                    [service, device, _] if ok(service) && ok(device) => Decision::Service {
-                        device: device.to_string(),
-                        service: service.to_string(),
-                    },
+                    [service, device, _] if ok(service) && ok(device) => {
+                        Decision::Service { device: device.to_string(), service: service.to_string() }
+                    }
                     _ => Decision::BadInternalName,
                 };
             }
         }
         match rules.iter().position(|r| r.matcher.matches(target)) {
-            Some(index) => Decision::Rule {
-                index,
-                outbound: rules[index].outbound.clone(),
-            },
+            Some(index) => Decision::Rule { index, outbound: rules[index].outbound.clone() },
             None => Decision::Default(Outbound::Direct),
         }
     }
@@ -606,10 +537,7 @@ pub mod route {
                         rule_index: idx,
                         kind: AuditKind::Duplicate,
                         shadowed_by: Some(prev_idx),
-                        message: format!(
-                            "第 {idx} 条规则（{}）与第 {prev_idx} 条完全重复，永不生效",
-                            rule.matcher
-                        ),
+                        message: format!("第 {idx} 条规则（{}）与第 {prev_idx} 条完全重复，永不生效", rule.matcher),
                     });
                     break;
                 }
@@ -618,10 +546,7 @@ pub mod route {
                         rule_index: idx,
                         kind: AuditKind::Shadowed,
                         shadowed_by: Some(prev_idx),
-                        message: format!(
-                            "第 {idx} 条规则（{}）被第 {prev_idx} 条（{}）完全遮蔽，永不可达",
-                            rule.matcher, prev.matcher
-                        ),
+                        message: format!("第 {idx} 条规则（{}）被第 {prev_idx} 条（{}）完全遮蔽，永不可达", rule.matcher, prev.matcher),
                     });
                     break;
                 }
@@ -632,24 +557,13 @@ pub mod route {
 
     fn matcher_covers(broad: &Matcher, narrow: &Matcher) -> bool {
         match (broad, narrow) {
-            (Matcher::Domain(b), Matcher::Domain(n))
-            | (Matcher::Domain(b), Matcher::DomainExact(n)) => {
+            (Matcher::Domain(b), Matcher::Domain(n)) | (Matcher::Domain(b), Matcher::DomainExact(n)) => {
                 n == b || n.ends_with(&format!(".{b}"))
             }
             (
-                Matcher::Cidr {
-                    net: b_net,
-                    prefix: b_pref,
-                },
-                Matcher::Cidr {
-                    net: n_net,
-                    prefix: n_pref,
-                },
-            ) => {
-                b_net.is_ipv4() == n_net.is_ipv4()
-                    && b_pref <= n_pref
-                    && mask(*n_net, *b_pref) == *b_net
-            }
+                Matcher::Cidr { net: b_net, prefix: b_pref },
+                Matcher::Cidr { net: n_net, prefix: n_pref },
+            ) => b_net.is_ipv4() == n_net.is_ipv4() && b_pref <= n_pref && mask(*n_net, *b_pref) == *b_net,
             _ => false,
         }
     }
@@ -770,8 +684,8 @@ pub mod dns {
 /// 完整节点给名字分配的本机临时地址：同一个名字总是同一个地址，地址可以反查名字；
 /// 用完时重新用最早分配的地址。网段的第一个地址留给网段本身，第二个给本机一侧，第三个给名字服务，最后一个是广播。
 pub mod fakeip {
-    use core::net::Ipv4Addr;
     use std::collections::BTreeMap;
+    use core::net::Ipv4Addr;
 
     #[derive(Clone, Debug)]
     pub struct FakePool {
@@ -796,14 +710,7 @@ pub mod fakeip {
                 return None;
             }
             let size = (1u32 << (32 - prefix)) - 4;
-            Some(Self {
-                base,
-                prefix,
-                size,
-                next: 0,
-                by_name: BTreeMap::new(),
-                by_ip: BTreeMap::new(),
-            })
+            Some(Self { base, prefix, size, next: 0, by_name: BTreeMap::new(), by_ip: BTreeMap::new() })
         }
 
         pub fn network(&self) -> (Ipv4Addr, u8) {

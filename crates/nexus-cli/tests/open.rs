@@ -10,11 +10,7 @@ fn fake_browser(dir: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let log = dir.join("opened");
     let script = dir.join("browser");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n", log.display()),
-    )
-    .unwrap();
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$1\" > {}\n", log.display())).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     (script, log)
 }
@@ -32,39 +28,20 @@ async fn eventually<T>(w: &World, what: &str, mut f: impl FnMut() -> Option<T>) 
 
 /// 网址 `http://127.0.0.1:<端口><路径>` 拆成端口和路径。
 fn split(url: &str) -> (u16, String) {
-    let rest = url
-        .strip_prefix("http://127.0.0.1:")
-        .unwrap_or_else(|| panic!("网址应当是本机的：{url}"));
+    let rest = url.strip_prefix("http://127.0.0.1:").unwrap_or_else(|| panic!("网址应当是本机的：{url}"));
     let (port, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    (
-        port.parse()
-            .unwrap_or_else(|_| panic!("网址里的端口不对：{url}")),
-        if path.is_empty() {
-            "/".into()
-        } else {
-            path.into()
-        },
-    )
+    (port.parse().unwrap_or_else(|_| panic!("网址里的端口不对：{url}")), if path.is_empty() { "/".into() } else { path.into() })
 }
 
 /// 用 `BROWSER` 打开，返回浏览器收到的网址。
 async fn open_with_browser(w: &World, args: &[&str]) -> (String, nexus_testkit::Background) {
-    let dir = w.home_dir("laptop").join(format!(
-        "browser-{}",
-        args.join("_").replace(['/', '?', '='], "_")
-    ));
+    let dir = w.home_dir("laptop").join(format!("browser-{}", args.join("_").replace(['/', '?', '='], "_")));
     std::fs::create_dir_all(&dir).unwrap();
     let (browser, log) = fake_browser(&dir);
     let mut full = vec!["open"];
     full.extend_from_slice(args);
     let bg = w.spawn_cli_env("laptop", &full, &[("BROWSER", browser.to_str().unwrap())]);
-    let url = eventually(w, "浏览器收到网址", || {
-        std::fs::read_to_string(&log)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-    .await;
+    let url = eventually(w, "浏览器收到网址", || std::fs::read_to_string(&log).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())).await;
     (url, bg)
 }
 

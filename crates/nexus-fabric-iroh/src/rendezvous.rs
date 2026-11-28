@@ -30,29 +30,16 @@ pub(crate) struct Client {
 
 impl Client {
     pub(crate) fn new(url: &str, ep: &iroh::Endpoint) -> io::Result<Self> {
-        let url = url
-            .parse()
-            .map_err(|e| io_err(format!("碰头服务的地址无效：{e}")))?;
+        let url = url.parse().map_err(|e| io_err(format!("碰头服务的地址无效：{e}")))?;
         let dns = ep.dns_resolver().map_err(io_err)?.clone();
-        Ok(Self {
-            http: PkarrRelayClient::new(url, ep.tls_config().clone(), dns),
-        })
+        Ok(Self { http: PkarrRelayClient::new(url, ep.tls_config().clone(), dns) })
     }
 
     pub(crate) async fn put(&self, seed: [u8; 32], data: Vec<u8>) -> io::Result<()> {
         let text = nexus_core_proto::joincode::base32_encode(&data);
-        let chunks: Vec<String> = text
-            .as_bytes()
-            .chunks(CHUNK)
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect();
-        let packet =
-            SignedPacket::from_txt_strings(&SecretKey::from_bytes(&seed), TXT_NAME, chunks, 60)
-                .map_err(io_err)?;
-        self.http
-            .publish(&packet)
-            .await
-            .map_err(|e| io_err(format!("{e:#}")))
+        let chunks: Vec<String> = text.as_bytes().chunks(CHUNK).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+        let packet = SignedPacket::from_txt_strings(&SecretKey::from_bytes(&seed), TXT_NAME, chunks, 60).map_err(io_err)?;
+        self.http.publish(&packet).await.map_err(|e| io_err(format!("{e:#}")))
     }
 
     pub(crate) async fn get(&self, seed: [u8; 32]) -> io::Result<Option<Vec<u8>>> {
@@ -114,35 +101,19 @@ impl Store {
     }
 
     /// 带来源 IP 限流的请求处理（锚点公网入口调用）。
-    pub fn handle_with_ip(
-        &self,
-        peer_ip: Option<std::net::IpAddr>,
-        method: &str,
-        key: &str,
-        body: &[u8],
-    ) -> (u16, Vec<u8>) {
-        let Ok(public) = PublicKey::from_z32(key) else {
-            return (400, b"bad key".to_vec());
-        };
+    pub fn handle_with_ip(&self, peer_ip: Option<std::net::IpAddr>, method: &str, key: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let Ok(public) = PublicKey::from_z32(key) else { return (400, b"bad key".to_vec()) };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let should_sweep = inner
-            .last_sweep
-            .is_none_or(|t| now.duration_since(t) >= SWEEP_INTERVAL);
+        let should_sweep = inner.last_sweep.is_none_or(|t| now.duration_since(t) >= SWEEP_INTERVAL);
         if should_sweep {
-            inner
-                .records
-                .retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
-            inner
-                .put_rates
-                .retain(|_, (start, _)| now.duration_since(*start) < PUT_WINDOW);
+            inner.records.retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
+            inner.put_rates.retain(|_, (start, _)| now.duration_since(*start) < PUT_WINDOW);
             inner.last_sweep = Some(now);
         }
         match method {
             "GET" => match inner.records.get(public.as_bytes()) {
-                Some((packet, at)) if now.duration_since(*at) < RECORD_TTL => {
-                    (200, packet.to_relay_payload())
-                }
+                Some((packet, at)) if now.duration_since(*at) < RECORD_TTL => (200, packet.to_relay_payload()),
                 _ => (404, Vec::new()),
             },
             "PUT" => {
@@ -156,17 +127,13 @@ impl Store {
                     }
                     entry.1 += 1;
                 }
-                let Ok(packet) = SignedPacket::from_relay_payload(&public, body) else {
-                    return (400, b"bad signature".to_vec());
-                };
+                let Ok(packet) = SignedPacket::from_relay_payload(&public, body) else { return (400, b"bad signature".to_vec()) };
                 if let Some((old, at)) = inner.records.get(public.as_bytes()) {
                     if now.duration_since(*at) < RECORD_TTL && !packet.more_recent_than(old) {
                         return (409, b"not newer".to_vec());
                     }
                 } else if inner.records.len() >= MAX_RECORDS {
-                    inner
-                        .records
-                        .retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
+                    inner.records.retain(|_, (_, at)| now.duration_since(*at) < RECORD_TTL);
                     if inner.records.len() >= MAX_RECORDS {
                         return (429, b"full".to_vec());
                     }
@@ -180,11 +147,7 @@ impl Store {
 }
 
 /// 请求头和已经读到的部分之后，读完请求体、回应、关闭。`head` 是 [`read_head`] 的结果。
-pub async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    head: &[u8],
-    store: &Store,
-) -> io::Result<()> {
+pub async fn respond<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, head: &[u8], store: &Store) -> io::Result<()> {
     respond_with_ip(stream, head, store, None).await
 }
 
@@ -195,17 +158,11 @@ pub async fn respond_with_ip<S: AsyncRead + AsyncWrite + Unpin>(
     store: &Store,
     peer_ip: Option<std::net::IpAddr>,
 ) -> io::Result<()> {
-    let end = head
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io_err("请求头不完整"))?;
+    let end = head.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| io_err("请求头不完整"))?;
     let text = String::from_utf8_lossy(&head[..end]);
     let mut lines = text.split("\r\n");
     let mut first = lines.next().unwrap_or("").split_whitespace();
-    let (method, target) = (
-        first.next().unwrap_or("").to_string(),
-        first.next().unwrap_or("").to_string(),
-    );
+    let (method, target) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
     let len: usize = lines
         .filter_map(|l| l.split_once(':'))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
@@ -218,18 +175,10 @@ pub async fn respond_with_ip<S: AsyncRead + AsyncWrite + Unpin>(
         body.truncate(len);
         if body.len() < len {
             let mut rest = vec![0u8; len - body.len()];
-            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut rest))
-                .await
-                .map_err(io_err)??;
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut rest)).await.map_err(io_err)??;
             body.extend_from_slice(&rest);
         }
-        let key = target
-            .split('?')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('/')
-            .strip_prefix("pkarr/")
-            .unwrap_or("");
+        let key = target.split('?').next().unwrap_or("").trim_start_matches('/').strip_prefix("pkarr/").unwrap_or("");
         store.handle_with_ip(peer_ip, &method, key, &body)
     };
     let reason = match status {
@@ -267,9 +216,7 @@ pub async fn serve(listener: tokio::net::TcpListener, store: Store) -> io::Resul
         let (mut stream, _) = listener.accept().await?;
         let store = store.clone();
         tokio::spawn(async move {
-            if let Ok(Ok(head)) =
-                tokio::time::timeout(Duration::from_secs(10), read_head(&mut stream)).await
-            {
+            if let Ok(Ok(head)) = tokio::time::timeout(Duration::from_secs(10), read_head(&mut stream)).await {
                 let _ = respond(&mut stream, &head, &store).await;
             }
         });
@@ -281,8 +228,7 @@ mod tests {
     use super::*;
 
     fn packet(seed: u8, values: &[&str]) -> SignedPacket {
-        SignedPacket::from_txt_strings(&SecretKey::from_bytes(&[seed; 32]), TXT_NAME, values, 60)
-            .unwrap()
+        SignedPacket::from_txt_strings(&SecretKey::from_bytes(&[seed; 32]), TXT_NAME, values, 60).unwrap()
     }
 
     /// FP-6.1-07：有效的记录存进去再取回；签名不对的拒绝；旧的不覆盖新的。
@@ -297,12 +243,7 @@ mod tests {
         assert_eq!(store.handle("PUT", &key, &newer.to_relay_payload()).0, 200);
         let (status, body) = store.handle("GET", &key, b"");
         assert_eq!(status, 200);
-        assert_eq!(
-            SignedPacket::from_relay_payload(&SecretKey::from_bytes(&[1; 32]).public(), &body)
-                .unwrap()
-                .txt_records(TXT_NAME),
-            ["b"]
-        );
+        assert_eq!(SignedPacket::from_relay_payload(&SecretKey::from_bytes(&[1; 32]).public(), &body).unwrap().txt_records(TXT_NAME), ["b"]);
         assert_eq!(store.handle("PUT", &key, &older.to_relay_payload()).0, 409);
         // 别人的签名放在这个位置上：拒绝。
         let other = packet(2, &["c"]);
@@ -319,23 +260,11 @@ mod tests {
     fn data_round_trips_through_txt_records() {
         let data: Vec<u8> = (0..=255).collect();
         let text = nexus_core_proto::joincode::base32_encode(&data);
-        let chunks: Vec<String> = text
-            .as_bytes()
-            .chunks(CHUNK)
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect();
+        let chunks: Vec<String> = text.as_bytes().chunks(CHUNK).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
         assert!(chunks.len() > 1);
-        let p =
-            SignedPacket::from_txt_strings(&SecretKey::from_bytes(&[3; 32]), TXT_NAME, &chunks, 60)
-                .unwrap();
+        let p = SignedPacket::from_txt_strings(&SecretKey::from_bytes(&[3; 32]), TXT_NAME, &chunks, 60).unwrap();
         assert_eq!(decode(&p), Some(data));
-        let empty = SignedPacket::from_txt_strings(
-            &SecretKey::from_bytes(&[3; 32]),
-            TXT_NAME,
-            Vec::<String>::new(),
-            60,
-        )
-        .unwrap();
+        let empty = SignedPacket::from_txt_strings(&SecretKey::from_bytes(&[3; 32]), TXT_NAME, Vec::<String>::new(), 60).unwrap();
         assert_eq!(decode(&empty), None);
     }
 }

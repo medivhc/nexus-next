@@ -16,24 +16,14 @@ use tokio::sync::{mpsc, oneshot};
 
 /// 建网卡、启动协议栈。网卡在常驻程序退出时随之消失。
 #[cfg(target_os = "android")]
-pub fn start(
-    _: &str,
-    _: &FakePool,
-    _: mpsc::UnboundedSender<TunInbound>,
-) -> io::Result<(String, ResolverGuard)> {
-    Err(io::Error::other(
-        "Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun",
-    ))
+pub fn start(_: &str, _: &FakePool, _: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
+    Err(io::Error::other("Android 上由 Nexus 应用的 VPN 建网卡，不用 --tun"))
 }
 
 /// 建网卡、启动协议栈，让系统把 `.internal` 交给名字服务。返回网卡实际的名字（macOS 上可能由系统分配），
 /// 和名字解析配置的守卫：常驻程序正常退出时撤掉配置。网卡在常驻程序退出时随之消失。
 #[cfg(not(target_os = "android"))]
-pub fn start(
-    name: &str,
-    pool: &FakePool,
-    entry: mpsc::UnboundedSender<TunInbound>,
-) -> io::Result<(String, ResolverGuard)> {
+pub fn start(name: &str, pool: &FakePool, entry: mpsc::UnboundedSender<TunInbound>) -> io::Result<(String, ResolverGuard)> {
     let (_, prefix) = pool.network();
     let mut builder = tun_rs::DeviceBuilder::new();
     if let Some(n) = device_name(name) {
@@ -68,10 +58,7 @@ fn wintun_path() -> io::Result<String> {
     if !dll.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "找不到 {}：它要和 nexus.exe 放在同一目录（Windows 的发布包里有）",
-                dll.display()
-            ),
+            format!("找不到 {}：它要和 nexus.exe 放在同一目录（Windows 的发布包里有）", dll.display()),
         ));
     }
     Ok(dll.display().to_string())
@@ -256,15 +243,7 @@ fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
     let ok = std::process::Command::new("resolvectl")
         .args(["dns", name, &dns])
         .status()
-        .and_then(|s| {
-            if s.success() {
-                std::process::Command::new("resolvectl")
-                    .args(["domain", name, "~internal"])
-                    .status()
-            } else {
-                Ok(s)
-            }
-        })
+        .and_then(|s| if s.success() { std::process::Command::new("resolvectl").args(["domain", name, "~internal"]).status() } else { Ok(s) })
         .map(|s| s.success())
         .unwrap_or(false);
     if ok {
@@ -284,8 +263,7 @@ fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
     let dns = pool.dns().to_string();
     let path = std::path::Path::new("/etc/resolver/internal");
     let content = format!("# nexus：完整节点 {name}，常驻程序退出时删掉\nnameserver {dns}\n");
-    let written =
-        std::fs::create_dir_all("/etc/resolver").and_then(|_| std::fs::write(path, &content));
+    let written = std::fs::create_dir_all("/etc/resolver").and_then(|_| std::fs::write(path, &content));
     match written {
         Ok(()) => {
             eprintln!("nexus daemon: 完整节点 {name}：.internal 的名字交给 {dns}（/etc/resolver/internal）");
@@ -342,18 +320,13 @@ fn powershell(script: &str) -> io::Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ))
+        Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn configure_resolver(name: &str, pool: &FakePool) -> ResolverGuard {
-    eprintln!(
-        "nexus daemon: 完整节点 {name}：名字服务在 {}，请把 .internal 的查询交给它",
-        pool.dns()
-    );
+    eprintln!("nexus daemon: 完整节点 {name}：名字服务在 {}，请把 .internal 的查询交给它", pool.dns());
     ResolverGuard { undo: None }
 }
 
@@ -370,30 +343,18 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);
 
 impl TunTcp {
     fn new(inner: ipstack::IpStackTcpStream) -> Self {
-        Self {
-            inner,
-            tick: Box::pin(tokio::time::sleep(SHUTDOWN_RETRY)),
-            deadline: None,
-        }
+        Self { inner, tick: Box::pin(tokio::time::sleep(SHUTDOWN_RETRY)), deadline: None }
     }
 }
 
 impl AsyncRead for TunTcp {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for TunTcp {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -460,11 +421,7 @@ impl PacketPipe {
 }
 
 impl AsyncRead for PacketPipe {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(p)) => {
                 buf.put_slice(&p);
@@ -477,11 +434,7 @@ impl AsyncRead for PacketPipe {
 }
 
 impl AsyncWrite for PacketPipe {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let _ = self.tx.send(buf.to_vec());
         Poll::Ready(Ok(buf.len()))
     }

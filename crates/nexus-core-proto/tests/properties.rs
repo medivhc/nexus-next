@@ -9,9 +9,7 @@ fn ref_resource_match(pat: &[String], path: &[String]) -> bool {
     match (pat.split_first(), path.split_first()) {
         (None, None) => true,
         (Some((p, _)), _) if p == "**" => true,
-        (Some((p, prest)), Some((q, qrest))) if p == "*" || p == q => {
-            ref_resource_match(prest, qrest)
-        }
+        (Some((p, prest)), Some((q, qrest))) if p == "*" || p == q => ref_resource_match(prest, qrest),
         _ => false,
     }
 }
@@ -26,18 +24,12 @@ fn ref_cap_match(pat: &[String], cap: &[String]) -> bool {
 }
 
 fn segs() -> impl Strategy<Value = Vec<String>> {
-    prop::collection::vec(
-        prop::sample::select(vec!["a", "b", "c"]).prop_map(String::from),
-        1..5,
-    )
+    prop::collection::vec(prop::sample::select(vec!["a", "b", "c"]).prop_map(String::from), 1..5)
 }
 
 fn resource_pattern() -> impl Strategy<Value = Vec<String>> {
     (
-        prop::collection::vec(
-            prop::sample::select(vec!["a", "b", "*"]).prop_map(String::from),
-            0..4,
-        ),
+        prop::collection::vec(prop::sample::select(vec!["a", "b", "*"]).prop_map(String::from), 0..4),
         any::<bool>(),
     )
         .prop_filter_map("模式不能为空", |(mut v, tail)| {
@@ -50,10 +42,7 @@ fn resource_pattern() -> impl Strategy<Value = Vec<String>> {
 
 fn capability_pattern() -> impl Strategy<Value = Vec<String>> {
     (
-        prop::collection::vec(
-            prop::sample::select(vec!["a", "b"]).prop_map(String::from),
-            0..4,
-        ),
+        prop::collection::vec(prop::sample::select(vec!["a", "b"]).prop_map(String::from), 0..4),
         any::<bool>(),
     )
         .prop_filter_map("模式不能为空", |(mut v, tail)| {

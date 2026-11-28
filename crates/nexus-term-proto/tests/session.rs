@@ -10,11 +10,7 @@ use std::num::NonZeroU16;
 const SIZE: Size = Size { cols: 40, rows: 12 };
 
 fn parser(size: Size) -> vt100::Parser {
-    vt100::Parser::new(
-        NonZeroU16::new(size.rows).unwrap(),
-        NonZeroU16::new(size.cols).unwrap(),
-        0,
-    )
+    vt100::Parser::new(NonZeroU16::new(size.rows).unwrap(), NonZeroU16::new(size.cols).unwrap(), 0)
 }
 
 /// 屏幕上用户能看到的一切：每格的字符和样式、光标、模式。
@@ -65,35 +61,13 @@ fn diff(a: &Snapshot, b: &Snapshot) -> String {
             out.push_str(&format!("row {i}:\n  {x}\n  {y}\n"));
         }
     }
-    if (
-        a.cursor,
-        a.alternate,
-        a.hide_cursor,
-        a.application_cursor,
-        a.bracketed_paste,
-    ) != (
-        b.cursor,
-        b.alternate,
-        b.hide_cursor,
-        b.application_cursor,
-        b.bracketed_paste,
-    ) {
+    if (a.cursor, a.alternate, a.hide_cursor, a.application_cursor, a.bracketed_paste)
+        != (b.cursor, b.alternate, b.hide_cursor, b.application_cursor, b.bracketed_paste)
+    {
         out.push_str(&format!(
             "state: {:?} vs {:?}\n",
-            (
-                a.cursor,
-                a.alternate,
-                a.hide_cursor,
-                a.application_cursor,
-                a.bracketed_paste
-            ),
-            (
-                b.cursor,
-                b.alternate,
-                b.hide_cursor,
-                b.application_cursor,
-                b.bracketed_paste
-            )
+            (a.cursor, a.alternate, a.hide_cursor, a.application_cursor, a.bracketed_paste),
+            (b.cursor, b.alternate, b.hide_cursor, b.application_cursor, b.bracketed_paste)
         ));
     }
     out
@@ -102,13 +76,7 @@ fn diff(a: &Snapshot, b: &Snapshot) -> String {
 macro_rules! assert_same {
     ($a:expr, $b:expr) => {{
         let (a, b) = (snapshot($a), snapshot($b));
-        prop_assert!(
-            a == b,
-            "{} 和 {} 的屏幕不同：\n{}",
-            stringify!($a),
-            stringify!($b),
-            diff(&a, &b)
-        );
+        prop_assert!(a == b, "{} 和 {} 的屏幕不同：\n{}", stringify!($a), stringify!($b), diff(&a, &b));
     }};
 }
 
@@ -123,13 +91,7 @@ struct Peer {
 
 impl Peer {
     fn new(size: Size) -> Self {
-        Self {
-            term: parser(size),
-            queue: VecDeque::new(),
-            in_flight: 0,
-            exit: None,
-            restores: 0,
-        }
+        Self { term: parser(size), queue: VecDeque::new(), in_flight: 0, exit: None, restores: 0 }
     }
 
     /// 处理队首一条消息，返回要确认的字节数。
@@ -162,13 +124,7 @@ struct Harness {
 
 impl Harness {
     fn new(window: u64) -> Self {
-        Self {
-            session: Session::new(SIZE, window),
-            peers: BTreeMap::new(),
-            pty_input: Vec::new(),
-            resizes: Vec::new(),
-            window,
-        }
+        Self { session: Session::new(SIZE, window), peers: BTreeMap::new(), pty_input: Vec::new(), resizes: Vec::new(), window }
     }
 
     fn apply(&mut self, event: Event) {
@@ -183,8 +139,7 @@ impl Harness {
                     peer.queue.push_back(msg);
                     // 一条大于窗口的消息只能在没有其他未确认数据时发出。
                     assert!(
-                        peer.in_flight <= self.window
-                            || peer.queue.iter().filter(|m| m.cost() > 0).count() == 1,
+                        peer.in_flight <= self.window || peer.queue.iter().filter(|m| m.cost() > 0).count() == 1,
                         "客户端 {client} 未确认的数据 {} 超过窗口 {}",
                         peer.in_flight,
                         self.window
@@ -206,10 +161,7 @@ impl Harness {
             if acked == 0 {
                 break;
             }
-            self.apply(Event::Ack {
-                client,
-                bytes: acked,
-            });
+            self.apply(Event::Ack { client, bytes: acked });
         }
     }
 
@@ -274,23 +226,19 @@ fn well_nested(tokens: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 /// 一段输出流，再按任意位置切成若干块（切口可能落在转义序列或多字节字符中间）。
 fn stream() -> impl Strategy<Value = Vec<Vec<u8>>> {
-    (
-        prop::collection::vec(token(), 0..80),
-        prop::collection::vec(1usize..40, 1..60),
-    )
-        .prop_map(|(tokens, cuts)| {
-            let bytes: Vec<u8> = well_nested(tokens).concat();
-            let mut chunks = Vec::new();
-            let mut at = 0;
-            let mut i = 0;
-            while at < bytes.len() {
-                let n = cuts[i % cuts.len()].min(bytes.len() - at);
-                chunks.push(bytes[at..at + n].to_vec());
-                at += n;
-                i += 1;
-            }
-            chunks
-        })
+    (prop::collection::vec(token(), 0..80), prop::collection::vec(1usize..40, 1..60)).prop_map(|(tokens, cuts)| {
+        let bytes: Vec<u8> = well_nested(tokens).concat();
+        let mut chunks = Vec::new();
+        let mut at = 0;
+        let mut i = 0;
+        while at < bytes.len() {
+            let n = cuts[i % cuts.len()].min(bytes.len() - at);
+            chunks.push(bytes[at..at + n].to_vec());
+            at += n;
+            i += 1;
+        }
+        chunks
+    })
 }
 
 proptest! {
@@ -370,34 +318,18 @@ proptest! {
 fn attach_gets_a_restore_of_the_current_screen() {
     let mut h = Harness::new(1 << 20);
     h.apply(Event::PtyOutput(b"hello\r\nworld".to_vec()));
-    h.apply(Event::Attach {
-        client: 7,
-        size: SIZE,
-    });
-    assert!(matches!(
-        h.peer(7).queue.front(),
-        Some(ClientMsg::Restore(_))
-    ));
+    h.apply(Event::Attach { client: 7, size: SIZE });
+    assert!(matches!(h.peer(7).queue.front(), Some(ClientMsg::Restore(_))));
     h.settle(7);
-    assert!(h
-        .peer(7)
-        .term
-        .screen()
-        .contents()
-        .starts_with("hello\nworld"));
+    assert!(h.peer(7).term.screen().contents().starts_with("hello\nworld"));
 }
 
 #[test]
 fn restore_of_a_fullscreen_program_keeps_the_shell_underneath() {
     let mut h = Harness::new(1 << 20);
     h.apply(Event::PtyOutput(b"$ vim\r\n".to_vec()));
-    h.apply(Event::PtyOutput(
-        b"\x1b[?1049h\x1b[H\x1b[2JFULLSCREEN".to_vec(),
-    ));
-    h.apply(Event::Attach {
-        client: 1,
-        size: SIZE,
-    });
+    h.apply(Event::PtyOutput(b"\x1b[?1049h\x1b[H\x1b[2JFULLSCREEN".to_vec()));
+    h.apply(Event::Attach { client: 1, size: SIZE });
     h.settle(1);
     assert!(h.peer(1).term.screen().alternate_screen());
     assert!(h.peer(1).term.screen().contents().contains("FULLSCREEN"));
@@ -405,56 +337,29 @@ fn restore_of_a_fullscreen_program_keeps_the_shell_underneath() {
     h.apply(Event::PtyOutput(b"\x1b[?1049l".to_vec()));
     h.settle(1);
     assert!(h.peer(1).term.screen().contents().starts_with("$ vim"));
-    assert_eq!(
-        snapshot(h.peer(1).term.screen()),
-        snapshot(h.session.screen())
-    );
+    assert_eq!(snapshot(h.peer(1).term.screen()), snapshot(h.session.screen()));
 }
 
 #[test]
 fn size_follows_the_client_that_typed_last() {
     let mut h = Harness::new(1 << 20);
     let small = Size { cols: 30, rows: 10 };
-    let big = Size {
-        cols: 100,
-        rows: 30,
-    };
-    h.apply(Event::Attach {
-        client: 1,
-        size: small,
-    });
+    let big = Size { cols: 100, rows: 30 };
+    h.apply(Event::Attach { client: 1, size: small });
     assert_eq!(h.resizes, vec![small]);
-    h.apply(Event::Attach {
-        client: 2,
-        size: big,
-    });
+    h.apply(Event::Attach { client: 2, size: big });
     assert_eq!(h.resizes, vec![small, big]);
-    h.apply(Event::Input {
-        client: 1,
-        bytes: b"x".to_vec(),
-    });
+    h.apply(Event::Input { client: 1, bytes: b"x".to_vec() });
     assert_eq!(h.resizes, vec![small, big, small]);
     // 同一个客户端继续打字，尺寸不再变化。
-    h.apply(Event::Input {
-        client: 1,
-        bytes: b"y".to_vec(),
-    });
+    h.apply(Event::Input { client: 1, bytes: b"y".to_vec() });
     assert_eq!(h.resizes.len(), 3);
     // 不活跃的客户端改变窗口大小，不影响会话。
-    h.apply(Event::Resize {
-        client: 2,
-        size: Size {
-            cols: 120,
-            rows: 40,
-        },
-    });
+    h.apply(Event::Resize { client: 2, size: Size { cols: 120, rows: 40 } });
     assert_eq!(h.resizes.len(), 3);
     // 活跃的客户端改变窗口大小，会话跟着变。
     let mid = Size { cols: 60, rows: 20 };
-    h.apply(Event::Resize {
-        client: 1,
-        size: mid,
-    });
+    h.apply(Event::Resize { client: 1, size: mid });
     assert_eq!(h.resizes.last(), Some(&mid));
     assert_eq!(h.session.size(), mid);
 }
@@ -462,10 +367,7 @@ fn size_follows_the_client_that_typed_last() {
 #[test]
 fn lagging_client_is_resynced_with_a_restore() {
     let mut h = Harness::new(64);
-    h.apply(Event::Attach {
-        client: 1,
-        size: SIZE,
-    });
+    h.apply(Event::Attach { client: 1, size: SIZE });
     h.settle(1);
     for i in 0..20 {
         h.apply(Event::PtyOutput(format!("line {i}\r\n").into_bytes()));
@@ -480,14 +382,8 @@ fn lagging_client_is_resynced_with_a_restore() {
 #[test]
 fn program_exit_reaches_every_client_even_a_lagging_one() {
     let mut h = Harness::new(64);
-    h.apply(Event::Attach {
-        client: 1,
-        size: SIZE,
-    });
-    h.apply(Event::Attach {
-        client: 2,
-        size: SIZE,
-    });
+    h.apply(Event::Attach { client: 1, size: SIZE });
+    h.apply(Event::Attach { client: 2, size: SIZE });
     h.settle(2);
     for i in 0..20 {
         h.apply(Event::PtyOutput(format!("line {i}\r\n").into_bytes()));
@@ -502,45 +398,24 @@ fn program_exit_reaches_every_client_even_a_lagging_one() {
     assert!(h.peer(1).term.screen().contents().contains("line 19"));
     assert!(h.session.has_exited());
     // 结束之后再连上来，立刻得到最终屏幕和退出码；输入被忽略。
-    h.apply(Event::Attach {
-        client: 3,
-        size: SIZE,
-    });
+    h.apply(Event::Attach { client: 3, size: SIZE });
     h.settle(3);
     assert_eq!(h.peer(3).exit, Some(Some(3)));
-    h.apply(Event::Input {
-        client: 3,
-        bytes: b"ignored".to_vec(),
-    });
+    h.apply(Event::Input { client: 3, bytes: b"ignored".to_vec() });
     assert!(h.pty_input.is_empty());
 }
 
 #[test]
 fn detached_client_gets_nothing_more() {
     let mut h = Harness::new(1 << 20);
-    h.apply(Event::Attach {
-        client: 1,
-        size: SIZE,
-    });
+    h.apply(Event::Attach { client: 1, size: SIZE });
     h.apply(Event::Detach { client: 1 });
     assert_eq!(h.session.client_count(), 0);
     let actions = h.session.handle(Event::PtyOutput(b"x".to_vec()));
     assert!(actions.iter().all(|a| !matches!(a, Action::Send { .. })));
     // 未知客户端的确认和尺寸变化被忽略。
-    assert!(h
-        .session
-        .handle(Event::Ack {
-            client: 9,
-            bytes: 10
-        })
-        .is_empty());
-    assert!(h
-        .session
-        .handle(Event::Resize {
-            client: 9,
-            size: SIZE
-        })
-        .is_empty());
+    assert!(h.session.handle(Event::Ack { client: 9, bytes: 10 }).is_empty());
+    assert!(h.session.handle(Event::Resize { client: 9, size: SIZE }).is_empty());
 }
 
 /// 终端模拟库在一次读入以“上次的半个字符的后半截”开头、又以新的半个字符结尾时，
@@ -555,24 +430,14 @@ fn split_characters_lose_nothing() {
     naive.process(&whole[4..]);
     let mut reference = parser(SIZE);
     reference.process(whole);
-    assert_ne!(
-        naive.screen().cursor_position(),
-        reference.screen().cursor_position(),
-        "缺陷已修复时可以删掉这一行"
-    );
+    assert_ne!(naive.screen().cursor_position(), reference.screen().cursor_position(), "缺陷已修复时可以删掉这一行");
 
     let mut h = Harness::new(1 << 20);
-    h.apply(Event::Attach {
-        client: 1,
-        size: SIZE,
-    });
+    h.apply(Event::Attach { client: 1, size: SIZE });
     for part in [&whole[..1], &whole[1..4], &whole[4..]] {
         h.apply(Event::PtyOutput(part.to_vec()));
         h.settle(1);
     }
     assert_eq!(snapshot(h.session.screen()), snapshot(reference.screen()));
-    assert_eq!(
-        snapshot(h.peer(1).term.screen()),
-        snapshot(reference.screen())
-    );
+    assert_eq!(snapshot(h.peer(1).term.screen()), snapshot(reference.screen()));
 }

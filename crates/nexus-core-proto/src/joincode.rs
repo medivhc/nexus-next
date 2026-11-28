@@ -83,21 +83,12 @@ impl ShortCode {
     /// 派生碰头服务上的位置和加密密钥。很慢（几十毫秒），每次加入只做一两次。
     pub fn keys(&self) -> RendezvousKeys {
         use argon2::{Algorithm, Argon2, Params, Version};
-        let params = Params::new(
-            ARGON2_MEMORY_KIB,
-            ARGON2_ITERATIONS,
-            ARGON2_PARALLELISM,
-            Some(64),
-        )
-        .expect("参数固定且有效");
+        let params = Params::new(ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM, Some(64)).expect("参数固定且有效");
         let mut out = [0u8; 64];
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
             .hash_password_into(self.0.as_bytes(), ARGON2_SALT, &mut out)
             .expect("输出长度固定且有效");
-        let mut keys = RendezvousKeys {
-            seed: [0; 32],
-            enc: [0; 32],
-        };
+        let mut keys = RendezvousKeys { seed: [0; 32], enc: [0; 32] };
         keys.seed.copy_from_slice(&out[..32]);
         keys.enc.copy_from_slice(&out[32..]);
         keys
@@ -130,12 +121,7 @@ fn tag(keys: &RendezvousKeys, salt: &[u8], ct: &[u8]) -> [u8; TAG_LEN] {
 pub fn seal(keys: &RendezvousKeys, salt: [u8; SALT_LEN], plain: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(SALT_LEN + plain.len() + TAG_LEN);
     out.extend_from_slice(&salt);
-    out.extend(
-        plain
-            .iter()
-            .zip(keystream(keys, &salt, plain.len()))
-            .map(|(a, b)| a ^ b),
-    );
+    out.extend(plain.iter().zip(keystream(keys, &salt, plain.len())).map(|(a, b)| a ^ b));
     let t = tag(keys, &salt, &out[SALT_LEN..]);
     out.extend_from_slice(&t);
     out
@@ -153,20 +139,12 @@ pub fn open(keys: &RendezvousKeys, sealed: &[u8]) -> Option<Vec<u8>> {
     if expect.iter().zip(t).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0 {
         return None;
     }
-    Some(
-        ct.iter()
-            .zip(keystream(keys, salt, ct.len()))
-            .map(|(a, b)| a ^ b)
-            .collect(),
-    )
+    Some(ct.iter().zip(keystream(keys, salt, ct.len())).map(|(a, b)| a ^ b).collect())
 }
 
 /// 一段数据的校验值（长加入码末尾用）。
 pub fn checksum(bytes: &[u8]) -> [u8; 32] {
-    *blake3::Hasher::new_derive_key("nexus/join/long-code/check/v1")
-        .update(bytes)
-        .finalize()
-        .as_bytes()
+    *blake3::Hasher::new_derive_key("nexus/join/long-code/check/v1").update(bytes).finalize().as_bytes()
 }
 
 /// 小写的 RFC 4648 base32（不补等号），长加入码用（R63）。
@@ -224,8 +202,7 @@ mod tests {
     #[test]
     fn generated_codes_are_ten_crockford_chars() {
         for seed in 0u8..50 {
-            let c =
-                ShortCode::from_random([seed, seed.wrapping_mul(7), 3, 200, seed ^ 0x5a, 9, 255]);
+            let c = ShortCode::from_random([seed, seed.wrapping_mul(7), 3, 200, seed ^ 0x5a, 9, 255]);
             assert_eq!(c.as_str().len(), SHORT_CODE_LEN);
             assert!(c.as_str().bytes().all(|b| CROCKFORD.contains(&b)), "{c:?}");
             let d = c.display();
@@ -234,39 +211,19 @@ mod tests {
             assert_eq!(ShortCode::parse(&d), Some(c));
         }
         // 50 位都用上：只差最后一个有效位的输入得到不同的短码。
-        assert_ne!(
-            ShortCode::from_random([0, 0, 0, 0, 0, 0, 0x40]),
-            ShortCode::from_random([0; 7])
-        );
-        assert_eq!(
-            ShortCode::from_random([0, 0, 0, 0, 0, 0, 0x3f]),
-            ShortCode::from_random([0; 7])
-        );
+        assert_ne!(ShortCode::from_random([0, 0, 0, 0, 0, 0, 0x40]), ShortCode::from_random([0; 7]));
+        assert_eq!(ShortCode::from_random([0, 0, 0, 0, 0, 0, 0x3f]), ShortCode::from_random([0; 7]));
     }
 
     /// FP-6.1-02：输入宽松。
     #[test]
     fn parsing_is_forgiving() {
         let c = code("7KQ4M-9XZ21");
-        for s in [
-            "7kq4m9xz21",
-            " 7KQ4M 9XZ21 ",
-            "7kq4m-9xz2l",
-            "7kq4m-9xz2I",
-            "7-K-Q-4-M-9-X-Z-2-1",
-        ] {
+        for s in ["7kq4m9xz21", " 7KQ4M 9XZ21 ", "7kq4m-9xz2l", "7kq4m-9xz2I", "7-K-Q-4-M-9-X-Z-2-1"] {
             assert_eq!(ShortCode::parse(s).as_ref(), Some(&c), "{s}");
         }
         assert_eq!(code("0O0O0-00000"), code("00000-00000"));
-        for bad in [
-            "",
-            "7KQ4M-9XZ2",
-            "7KQ4M-9XZ211",
-            "7KQ4M-9XZ2U",
-            "7KQ4M_9XZ21",
-            "７KQ4M-9XZ21",
-            "nxj2-abc",
-        ] {
+        for bad in ["", "7KQ4M-9XZ2", "7KQ4M-9XZ211", "7KQ4M-9XZ2U", "7KQ4M_9XZ21", "７KQ4M-9XZ21", "nxj2-abc"] {
             assert_eq!(ShortCode::parse(bad), None, "{bad}");
         }
     }
@@ -274,10 +231,7 @@ mod tests {
     /// FP-6.1-04：派生的参数固定；不同短码得到不同的位置和密钥；同一个短码总得到同样的结果。
     #[test]
     fn derivation_is_fixed_and_distinct() {
-        assert_eq!(
-            (ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM),
-            (19456, 2, 1)
-        );
+        assert_eq!((ARGON2_MEMORY_KIB, ARGON2_ITERATIONS, ARGON2_PARALLELISM), (19456, 2, 1));
         let a = code("7KQ4M-9XZ21").keys();
         assert_eq!(a, code("7kq4m9xz2l").keys());
         let b = code("7KQ4M-9XZ22").keys();
@@ -294,10 +248,7 @@ mod tests {
         let sealed = seal(&keys, [9; 16], &plain);
         assert_eq!(open(&keys, &sealed).as_deref(), Some(&plain[..]));
         for w in plain.windows(4) {
-            assert!(
-                !sealed[16..sealed.len() - 16].windows(4).any(|x| x == w),
-                "密文里出现了明文片段 {w:?}"
-            );
+            assert!(!sealed[16..sealed.len() - 16].windows(4).any(|x| x == w), "密文里出现了明文片段 {w:?}");
         }
         assert_eq!(open(&code("7KQ4M-9XZ22").keys(), &sealed), None);
         for i in 0..sealed.len() {
@@ -315,9 +266,7 @@ mod tests {
         for n in 0..40usize {
             let bytes: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
             let s = base32_encode(&bytes);
-            assert!(s
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
+            assert!(s.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
             assert_eq!(base32_decode(&s), Some(bytes.clone()));
             assert_eq!(base32_decode(&s.to_uppercase()), Some(bytes));
         }

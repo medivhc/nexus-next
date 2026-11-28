@@ -10,8 +10,8 @@ use nexus_core_proto::Timestamp;
 use nexus_fabric::Transport;
 use nexus_fabric_iroh::{Config, IrohTransport, Relay};
 use nexus_web_core::{
-    EnrollLink, EntryHandle, GuestShare, HardwareCapture, HardwareKind, HardwareProvider,
-    HardwareState, Notice, ShareLink, TerminalEnd, TerminalUi, UiEvent, WebHttpRequest, WebNode,
+    EnrollLink, EntryHandle, GuestShare, HardwareCapture, HardwareKind, HardwareProvider, HardwareState, Notice, ShareLink, TerminalEnd,
+    TerminalUi, UiEvent, WebHttpRequest, WebNode,
 };
 use nexus_wire::{ErrorCode, NewCredential, Size, WireError};
 use std::cell::RefCell;
@@ -70,24 +70,12 @@ pub struct Browser {
 }
 
 async fn connect(seed: [u8; 32], relay: String) -> Result<IrohTransport, JsError> {
-    let config = Config {
-        relay: Relay::Custom(relay),
-        discovery: false,
-        bind: None,
-        direct: false,
-        scheduling: true,
-        rendezvous: None,
-    };
-    IrohTransport::bind(seed, config)
-        .await
-        .map_err(|e| JsError::new(&format!("连不上中继：{e}")))
+    let config = Config { relay: Relay::Custom(relay), discovery: false, bind: None, direct: false, scheduling: true, rendezvous: None };
+    IrohTransport::bind(seed, config).await.map_err(|e| JsError::new(&format!("连不上中继：{e}")))
 }
 
 fn entry_of(link: &EnrollLink) -> EntryHandle {
-    EntryHandle {
-        node: link.node,
-        relay: nexus_fabric_iroh::hint_relay(&link.hint),
-    }
+    EntryHandle { node: link.node, relay: nexus_fabric_iroh::hint_relay(&link.hint) }
 }
 
 #[wasm_bindgen]
@@ -97,11 +85,7 @@ impl Browser {
     pub fn new(default_relay: String) -> Result<Browser, JsError> {
         let mut seed = [0u8; 32];
         getrandom_fill(&mut seed)?;
-        Ok(Browser {
-            seed,
-            used: Rc::new(RefCell::new(false)),
-            default_relay,
-        })
+        Ok(Browser { seed, used: Rc::new(RefCell::new(false)), default_relay })
     }
 
     /// 签名时间为 `issued_at_ms` 的登录挑战：交给 `navigator.credentials.get` 签名。
@@ -117,37 +101,20 @@ impl Browser {
     }
 
     /// 把新建的通行密钥交给管理设备登记。Promise 的结果是它在网络里的名字。
-    pub fn enroll(
-        &self,
-        link: String,
-        credential_id: Vec<u8>,
-        spki: Vec<u8>,
-        rp_id: String,
-    ) -> js_sys::Promise {
+    pub fn enroll(&self, link: String, credential_id: Vec<u8>, spki: Vec<u8>, rp_id: String) -> js_sys::Promise {
         let (seed, default_relay) = (self.seed, self.default_relay.clone());
         future_to_promise(async move {
             let link = EnrollLink::parse(&link).map_err(|m| JsError::new(&m))?;
             let relay = entry_of(&link).relay.unwrap_or(default_relay);
             let t = connect(seed, relay).await?;
-            let label = nexus_web_core::enroll(
-                &t,
-                &link,
-                NewCredential {
-                    credential_id,
-                    spki,
-                    rp_id,
-                },
-            )
-            .await
-            .map_err(js_err)?;
+            let label = nexus_web_core::enroll(&t, &link, NewCredential { credential_id, spki, rp_id }).await.map_err(js_err)?;
             Ok(JsValue::from(label))
         })
     }
 
     /// 打开一条临时分享链接（M9.1）：不需要通行密钥，校验令牌后返回 GuestSession。
     pub fn open_share(&self, link: String) -> js_sys::Promise {
-        let (seed, default_relay, used) =
-            (self.seed, self.default_relay.clone(), self.used.clone());
+        let (seed, default_relay, used) = (self.seed, self.default_relay.clone(), self.used.clone());
         future_to_promise(async move {
             if used.replace(true) {
                 return Err(JsError::new("这个浏览器实例已经使用过").into());
@@ -156,9 +123,7 @@ impl Browser {
             let relay = share_relay(&parsed.hint, default_relay);
             let t = connect(seed, relay).await?;
             let guest = GuestShare::open(t, &parsed).await.map_err(js_err)?;
-            Ok(JsValue::from(GuestSession {
-                guest: Rc::new(guest),
-            }))
+            Ok(JsValue::from(GuestSession { guest: Rc::new(guest) }))
         })
     }
 
@@ -174,33 +139,19 @@ impl Browser {
         authenticator_data: Vec<u8>,
         signature: Vec<u8>,
     ) -> js_sys::Promise {
-        let (seed, default_relay, used) =
-            (self.seed, self.default_relay.clone(), self.used.clone());
+        let (seed, default_relay, used) = (self.seed, self.default_relay.clone(), self.used.clone());
         future_to_promise(async move {
             if used.replace(true) {
                 return Err(JsError::new("这个浏览器已经登录过").into());
             }
-            let entry = EntryHandle::decode(&user_handle)
-                .ok_or_else(|| JsError::new("这个通行密钥不是 Nexus 的"))?;
+            let entry = EntryHandle::decode(&user_handle).ok_or_else(|| JsError::new("这个通行密钥不是 Nexus 的"))?;
             let relay = entry.relay.unwrap_or(default_relay);
-            let hint = nexus_fabric_iroh::relay_hint(entry.node, &relay)
-                .map_err(|e: String| JsError::new(&e))?;
+            let hint = nexus_fabric_iroh::relay_hint(entry.node, &relay).map_err(|e: String| JsError::new(&e))?;
             let t = connect(seed, relay).await?;
             t.add_hint(entry.node, &hint);
-            let assertion = WebAuthnAssertion {
-                credential_id,
-                client_data_json,
-                authenticator_data,
-                signature,
-            };
-            let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion)
-                .await
-                .map_err(js_err)?;
-            Ok(JsValue::from(Session {
-                node: Rc::new(node),
-                hardware: HardwareState::new(),
-                hardware_stop: RefCell::new(None),
-            }))
+            let assertion = WebAuthnAssertion { credential_id, client_data_json, authenticator_data, signature };
+            let node = WebNode::login(t, entry.node, Timestamp(issued_at_ms as u64), assertion).await.map_err(js_err)?;
+            Ok(JsValue::from(Session { node: Rc::new(node), hardware: HardwareState::new(), hardware_stop: RefCell::new(None) }))
         })
     }
 }
@@ -237,11 +188,7 @@ fn js_field(v: &JsValue, key: &str) -> JsValue {
 
 /// 把页面的采集结果换成协议里的 [`HardwareCapture`]。
 fn parse_capture(kind: HardwareKind, v: &JsValue) -> Result<HardwareCapture, String> {
-    let num = |key: &str| {
-        js_field(v, key)
-            .as_f64()
-            .ok_or_else(|| format!("采集结果缺少 {key}"))
-    };
+    let num = |key: &str| js_field(v, key).as_f64().ok_or_else(|| format!("采集结果缺少 {key}"));
     let bytes = |key: &str| {
         let d = js_field(v, key);
         if d.is_undefined() || d.is_null() {
@@ -249,21 +196,12 @@ fn parse_capture(kind: HardwareKind, v: &JsValue) -> Result<HardwareCapture, Str
         }
         Ok(js_sys::Uint8Array::new(&d).to_vec())
     };
-    let mime = || {
-        js_field(v, "mime")
-            .as_string()
-            .ok_or_else(|| "采集结果缺少 mime".to_string())
-    };
+    let mime = || js_field(v, "mime").as_string().ok_or_else(|| "采集结果缺少 mime".to_string());
     Ok(match kind {
-        HardwareKind::Camera => HardwareCapture::Camera {
-            mime: mime()?,
-            data: bytes("data")?,
-        },
-        HardwareKind::Microphone => HardwareCapture::Microphone {
-            mime: mime()?,
-            duration_ms: num("duration_ms")? as u32,
-            data: bytes("data")?,
-        },
+        HardwareKind::Camera => HardwareCapture::Camera { mime: mime()?, data: bytes("data")? },
+        HardwareKind::Microphone => {
+            HardwareCapture::Microphone { mime: mime()?, duration_ms: num("duration_ms")? as u32, data: bytes("data")? }
+        }
         HardwareKind::Location => HardwareCapture::Location {
             lat_e7: (num("lat")? * 1e7).round() as i64,
             lon_e7: (num("lon")? * 1e7).round() as i64,
@@ -275,16 +213,8 @@ fn parse_capture(kind: HardwareKind, v: &JsValue) -> Result<HardwareCapture, Str
 
 impl HardwareProvider for JsHardware {
     async fn capture(&self, kind: HardwareKind) -> Result<HardwareCapture, WireError> {
-        let fail = |m: String| {
-            WireError::new(
-                ErrorCode::Internal,
-                format!("浏览器采集 {} 失败：{m}", kind.as_str()),
-            )
-        };
-        let promise = self
-            .capture
-            .call1(&JsValue::NULL, &JsValue::from_str(kind.as_str()))
-            .map_err(|e| fail(format!("{e:?}")))?;
+        let fail = |m: String| WireError::new(ErrorCode::Internal, format!("浏览器采集 {} 失败：{m}", kind.as_str()));
+        let promise = self.capture.call1(&JsValue::NULL, &JsValue::from_str(kind.as_str())).map_err(|e| fail(format!("{e:?}")))?;
         let value = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&promise))
             .await
             .map_err(|e| fail(e.as_string().unwrap_or_else(|| format!("{e:?}"))))?;
@@ -306,16 +236,14 @@ impl Session {
 
     /// 显式开启一项硬件能力（M8.3：camera / microphone / location）。
     pub fn hardware_enable(&self, kind: String) -> Result<(), JsError> {
-        let k = HardwareKind::parse(&kind)
-            .ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
         self.hardware.enable(k);
         Ok(())
     }
 
     /// 关闭一项硬件能力（M8.3）。
     pub fn hardware_disable(&self, kind: String) -> Result<(), JsError> {
-        let k = HardwareKind::parse(&kind)
-            .ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
+        let k = HardwareKind::parse(&kind).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{kind}")))?;
         self.hardware.disable(k);
         Ok(())
     }
@@ -356,22 +284,14 @@ impl Session {
     pub fn hardware_command(&self, kind: Option<String>) -> Result<String, JsError> {
         let kind = match kind {
             None => None,
-            Some(k) => Some(
-                HardwareKind::parse(&k)
-                    .ok_or_else(|| JsError::new(&format!("未知的硬件能力：{k}")))?,
-            ),
+            Some(k) => Some(HardwareKind::parse(&k).ok_or_else(|| JsError::new(&format!("未知的硬件能力：{k}")))?),
         };
         Ok(self.node.hardware_command(kind))
     }
 
     /// 返回当前已显式同意开放的硬件能力（JSON 数组）。
     pub fn hardware_enabled(&self) -> String {
-        let list: Vec<&str> = self
-            .hardware
-            .enabled_list()
-            .into_iter()
-            .map(HardwareKind::as_str)
-            .collect();
+        let list: Vec<&str> = self.hardware.enabled_list().into_iter().map(HardwareKind::as_str).collect();
         serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
     }
 
@@ -388,12 +308,7 @@ impl Session {
 
     /// 能看到的设备的名字（JSON 数组）。
     pub fn devices(&self) -> String {
-        let names: Vec<&str> = self
-            .node
-            .devices()
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect();
+        let names: Vec<&str> = self.node.devices().iter().map(|d| d.name.as_str()).collect();
         serde_json::to_string(&names).expect("名字总能编码")
     }
 
@@ -402,10 +317,7 @@ impl Session {
         let node = self.node.clone();
         future_to_promise(async move {
             let list = node.session_list(&device).await.map_err(js_err)?;
-            let list: Vec<_> = list
-                .iter()
-                .map(|s| serde_json::json!({ "name": s.name, "clients": s.clients }))
-                .collect();
+            let list: Vec<_> = list.iter().map(|s| serde_json::json!({ "name": s.name, "clients": s.clients })).collect();
             Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
         })
     }
@@ -415,10 +327,7 @@ impl Session {
         let node = self.node.clone();
         future_to_promise(async move {
             let list = node.drive_workspaces().await.map_err(js_err)?;
-            let list: Vec<_> = list
-                .iter()
-                .map(|w| serde_json::json!({ "name": w.name, "device": w.device }))
-                .collect();
+            let list: Vec<_> = list.iter().map(|w| serde_json::json!({ "name": w.name, "device": w.device })).collect();
             Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
         })
     }
@@ -438,15 +347,8 @@ impl Session {
     pub fn read(&self, ws: String, path: String, max: f64) -> js_sys::Promise {
         let node = self.node.clone();
         future_to_promise(async move {
-            let f = node
-                .drive_read(&ws, &path, max as u64)
-                .await
-                .map_err(js_err)?;
-            Ok(JsValue::from(FileData {
-                size: f.size,
-                truncated: f.truncated,
-                bytes: f.bytes,
-            }))
+            let f = node.drive_read(&ws, &path, max as u64).await.map_err(js_err)?;
+            Ok(JsValue::from(FileData { size: f.size, truncated: f.truncated, bytes: f.bytes }))
         })
     }
 
@@ -455,38 +357,19 @@ impl Session {
         let node = self.node.clone();
         future_to_promise(async move {
             let list = node.services(&device).await.map_err(js_err)?;
-            let list: Vec<_> = list
-                .iter()
-                .map(|s| serde_json::json!({ "name": s.name, "proto": s.proto }))
-                .collect();
+            let list: Vec<_> = list.iter().map(|s| serde_json::json!({ "name": s.name, "proto": s.proto })).collect();
             Ok(JsValue::from(serde_json::Value::Array(list).to_string()))
         })
     }
 
     /// 经 Nexus 向设备上的网页服务发一个 HTTP 请求：`headers` 是 JSON 的 [[名字, 值], ...]。
     /// Promise 的结果是 [`HttpResult`]。
-    pub fn http(
-        &self,
-        device: String,
-        service: String,
-        method: String,
-        path: String,
-        headers: String,
-        body: Vec<u8>,
-    ) -> js_sys::Promise {
+    pub fn http(&self, device: String, service: String, method: String, path: String, headers: String, body: Vec<u8>) -> js_sys::Promise {
         let node = self.node.clone();
         future_to_promise(async move {
             let headers = parse_http_headers(&headers).map_err(|e| JsValue::from_str(&e))?;
-            let r = node
-                .http(&device, &service, &method, &path, &headers, &body)
-                .await
-                .map_err(js_err)?;
-            Ok(JsValue::from(HttpResult {
-                status: r.status,
-                reason: r.reason,
-                headers: r.headers,
-                body: r.body,
-            }))
+            let r = node.http(&device, &service, &method, &path, &headers, &body).await.map_err(js_err)?;
+            Ok(JsValue::from(HttpResult { status: r.status, reason: r.reason, headers: r.headers, body: r.body }))
         })
     }
 
@@ -495,32 +378,14 @@ impl Session {
     /// `on_output(Uint8Array)` 显示输出；`on_notice(string)` 在连接中断（"reconnecting"）和恢复（"reconnected"）时调用；
     /// `on_end(code, message)` 在终端结束时调用一次：会话退出时 code 是退出码，用户离开时是 0，出错时是 -1 并带原因。
     #[allow(clippy::too_many_arguments)]
-    pub fn open(
-        &self,
-        device: String,
-        session: String,
-        cols: u16,
-        rows: u16,
-        on_output: Function,
-        on_notice: Function,
-        on_end: Function,
-    ) -> Terminal {
+    pub fn open(&self, device: String, session: String, cols: u16, rows: u16, on_output: Function, on_notice: Function, on_end: Function) -> Terminal {
         let (tx, rx) = mpsc::unbounded_channel();
         let node = self.node.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut ui = JsUi {
-                on_output,
-                on_notice,
-                rx,
-            };
+            let mut ui = JsUi { on_output, on_notice, rx };
             let size = Size { cols, rows };
-            let (code, message) =
-                terminal_end_result(node.run_terminal(&device, &session, size, &mut ui).await);
-            let _ = on_end.call2(
-                &JsValue::NULL,
-                &JsValue::from(code),
-                &JsValue::from(message),
-            );
+            let (code, message) = terminal_end_result(node.run_terminal(&device, &session, size, &mut ui).await);
+            let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
     }
@@ -620,9 +485,7 @@ impl GuestSession {
         let g = self.guest.clone();
         future_to_promise(async move {
             let list = g.drive_list(&path).await.map_err(js_err)?;
-            Ok(JsValue::from(
-                serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()),
-            ))
+            Ok(JsValue::from(serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
         })
     }
 
@@ -632,66 +495,24 @@ impl GuestSession {
         future_to_promise(async move {
             let (size, bytes, truncated) = g.drive_read(&path, max as u64).await.map_err(js_err)?;
             let obj = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("size"),
-                &JsValue::from(size as f64),
-            );
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("truncated"),
-                &JsValue::from(truncated),
-            );
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("bytes"),
-                &js_sys::Uint8Array::from(bytes.as_slice()),
-            );
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("size"), &JsValue::from(size as f64));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("truncated"), &JsValue::from(truncated));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice()));
             Ok(obj.into())
         })
     }
 
     /// 访问被分享的 HTTP 服务：返回 `{ status, reason, headers, body }`。
-    pub fn http_fetch(
-        &self,
-        method: String,
-        path: String,
-        headers_json: String,
-        body: Vec<u8>,
-    ) -> js_sys::Promise {
+    pub fn http_fetch(&self, method: String, path: String, headers_json: String, body: Vec<u8>) -> js_sys::Promise {
         let g = self.guest.clone();
         future_to_promise(async move {
             let headers = parse_http_headers(&headers_json).map_err(|e| JsError::new(&e))?;
-            let resp = g
-                .http_fetch(&WebHttpRequest {
-                    method,
-                    path,
-                    headers,
-                    body,
-                })
-                .await
-                .map_err(js_err)?;
+            let resp = g.http_fetch(&WebHttpRequest { method, path, headers, body }).await.map_err(js_err)?;
             let obj = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("status"),
-                &JsValue::from(resp.status),
-            );
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("reason"),
-                &JsValue::from_str(&resp.reason),
-            );
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("headers"),
-                &encode_http_headers(&resp.headers),
-            );
-            let _ = js_sys::Reflect::set(
-                &obj,
-                &JsValue::from_str("body"),
-                &js_sys::Uint8Array::from(resp.body.as_slice()),
-            );
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("status"), &JsValue::from(resp.status));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("reason"), &JsValue::from_str(&resp.reason));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("headers"), &encode_http_headers(&resp.headers));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("body"), &js_sys::Uint8Array::from(resp.body.as_slice()));
             Ok(obj.into())
         })
     }
@@ -709,18 +530,10 @@ impl GuestSession {
         let (tx, rx) = mpsc::unbounded_channel();
         let guest = self.guest.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut ui = JsUi {
-                on_output,
-                on_notice,
-                rx,
-            };
+            let mut ui = JsUi { on_output, on_notice, rx };
             let size = Size { cols, rows };
             let (code, message) = terminal_end_result(guest.watch_terminal(size, &mut ui).await);
-            let _ = on_end.call2(
-                &JsValue::NULL,
-                &JsValue::from(code),
-                &JsValue::from(message),
-            );
+            let _ = on_end.call2(&JsValue::NULL, &JsValue::from(code), &JsValue::from(message));
         });
         Terminal { tx }
     }
@@ -734,9 +547,7 @@ struct JsUi {
 
 impl TerminalUi for JsUi {
     fn output(&mut self, bytes: &[u8]) {
-        let _ = self
-            .on_output
-            .call1(&JsValue::NULL, &js_sys::Uint8Array::from(bytes));
+        let _ = self.on_output.call1(&JsValue::NULL, &js_sys::Uint8Array::from(bytes));
     }
 
     fn notice(&mut self, notice: Notice) {
@@ -744,9 +555,7 @@ impl TerminalUi for JsUi {
             Notice::Reconnecting => "reconnecting",
             Notice::Reconnected => "reconnected",
         };
-        let _ = self
-            .on_notice
-            .call1(&JsValue::NULL, &JsValue::from_str(text));
+        let _ = self.on_notice.call1(&JsValue::NULL, &JsValue::from_str(text));
     }
 
     async fn event(&mut self) -> UiEvent {
@@ -762,18 +571,9 @@ mod tests {
 
     #[test]
     fn terminal_end_maps_exit_leave_and_error() {
-        assert_eq!(
-            terminal_end_result(Ok(TerminalEnd::Exited(Some(42)))),
-            (42, String::new())
-        );
-        assert_eq!(
-            terminal_end_result(Ok(TerminalEnd::Exited(None))),
-            (0, String::new())
-        );
-        assert_eq!(
-            terminal_end_result(Ok(TerminalEnd::Left)),
-            (0, String::new())
-        );
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Exited(Some(42)))), (42, String::new()));
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Exited(None))), (0, String::new()));
+        assert_eq!(terminal_end_result(Ok(TerminalEnd::Left)), (0, String::new()));
         assert_eq!(
             terminal_end_result(Err(WireError::new(ErrorCode::Denied, "这项分享已被撤销"))),
             (-1, "这项分享已被撤销".to_string())
@@ -783,13 +583,7 @@ mod tests {
     #[test]
     fn parse_http_headers_validates_json_pairs() {
         let parsed = parse_http_headers(r#"[["Accept","text/html"],["X-Test","1"]]"#).unwrap();
-        assert_eq!(
-            parsed,
-            vec![
-                ("Accept".into(), "text/html".into()),
-                ("X-Test".into(), "1".into())
-            ]
-        );
+        assert_eq!(parsed, vec![("Accept".into(), "text/html".into()), ("X-Test".into(), "1".into())]);
         assert!(parse_http_headers("not-json").is_err());
     }
 
@@ -797,13 +591,7 @@ mod tests {
     fn share_relay_prefers_hint_and_falls_back_to_default() {
         let node = nexus_fabric_iroh::node_id_from_seed(&[7; 32]);
         let hint = nexus_fabric_iroh::relay_hint(node, "https://anchor.example").unwrap();
-        assert_eq!(
-            share_relay(&hint, "https://fallback.example".into()),
-            "https://anchor.example/"
-        );
-        assert_eq!(
-            share_relay("127.0.0.1:1999", "https://fallback.example".into()),
-            "https://fallback.example"
-        );
+        assert_eq!(share_relay(&hint, "https://fallback.example".into()), "https://anchor.example/");
+        assert_eq!(share_relay("127.0.0.1:1999", "https://fallback.example".into()), "https://fallback.example");
     }
 }

@@ -8,65 +8,28 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub async fn run<K: Sink>(sink: &mut K, dir: &Path, listen: &str) -> i32 {
     let fail = |sink: &mut K, code: i32, kind: &str, message: String| {
-        sink.err(
-            format!(
-                "{}\n",
-                serde_json::json!({ "error": kind, "message": message })
-            )
-            .as_bytes(),
-        );
+        sink.err(format!("{}\n", serde_json::json!({ "error": kind, "message": message })).as_bytes());
         code
     };
     let addr: SocketAddr = match listen.parse() {
         Ok(a) => a,
-        Err(_) => {
-            return fail(
-                sink,
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                format!("--listen 应当是 地址:端口，例如 127.0.0.1:8080：{listen}"),
-            )
-        }
+        Err(_) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", format!("--listen 应当是 地址:端口，例如 127.0.0.1:8080：{listen}")),
     };
     if !addr.ip().is_loopback() {
-        return fail(
-            sink,
-            EXIT_INVALID_INPUT,
-            "invalid_input",
-            format!("只能监听本机地址（127.0.0.1 或 ::1）：{listen}"),
-        );
+        return fail(sink, EXIT_INVALID_INPUT, "invalid_input", format!("只能监听本机地址（127.0.0.1 或 ::1）：{listen}"));
     }
     let root = match std::fs::canonicalize(dir) {
         Ok(r) if r.join("index.html").is_file() => r,
-        _ => {
-            return fail(
-                sink,
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                format!("{} 里没有 index.html", dir.display()),
-            )
-        }
+        _ => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", format!("{} 里没有 index.html", dir.display())),
     };
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
-        Err(e) => {
-            return fail(
-                sink,
-                EXIT_INTERNAL,
-                "internal",
-                format!("无法监听 {listen}：{e}"),
-            )
-        }
+        Err(e) => return fail(sink, EXIT_INTERNAL, "internal", format!("无法监听 {listen}：{e}")),
     };
-    let port = listener
-        .local_addr()
-        .map(|a| a.port())
-        .unwrap_or(addr.port());
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(addr.port());
     sink.out(format!("页面：http://localhost:{port}（按 Ctrl-C 停止）\n").as_bytes());
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
-        };
+        let Ok((stream, _)) = listener.accept().await else { continue };
         let root = root.clone();
         tokio::spawn(async move {
             let _ = serve(stream, &root).await;
@@ -97,33 +60,20 @@ pub async fn read_head<R: AsyncRead + Unpin>(stream: &mut R) -> std::io::Result<
 pub fn request_line(head: &[u8]) -> (String, String) {
     let line = String::from_utf8_lossy(head);
     let mut parts = line.split_whitespace();
-    (
-        parts.next().unwrap_or("").to_string(),
-        parts.next().unwrap_or("").to_string(),
-    )
+    (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string())
 }
 
 /// 按请求头回应目录里的静态文件，然后关闭。
-pub async fn respond<W: AsyncWrite + Unpin>(
-    stream: &mut W,
-    root: &Path,
-    head: &[u8],
-) -> std::io::Result<()> {
+pub async fn respond<W: AsyncWrite + Unpin>(stream: &mut W, root: &Path, head: &[u8]) -> std::io::Result<()> {
     let (method, target) = request_line(head);
     let (method, target) = (method.as_str(), target.as_str());
     let found = match method {
-        "GET" | "HEAD" => {
-            resolve(root, target).and_then(|p| std::fs::read(&p).ok().map(|b| (p, b)))
-        }
+        "GET" | "HEAD" => resolve(root, target).and_then(|p| std::fs::read(&p).ok().map(|b| (p, b))),
         _ => None,
     };
     let (status, ctype, body) = match found {
         Some((path, body)) => ("200 OK", content_type(&path), body),
-        None => (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            b"not found\n".to_vec(),
-        ),
+        None => ("404 Not Found", "text/plain; charset=utf-8", b"not found\n".to_vec()),
     };
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\
@@ -207,25 +157,11 @@ mod tests {
 
         assert_eq!(resolve(&root, "/"), Some(root.join("index.html")));
         assert_eq!(resolve(&root, "/?x=1"), Some(root.join("index.html")));
-        assert_eq!(
-            resolve(&root, "/pkg/a%20b.js"),
-            Some(root.join("pkg/a b.js"))
-        );
-        for bad in [
-            "/../secret",
-            "/pkg/%2e%2e/%2e%2e/secret",
-            "/link",
-            "/pkg",
-            "/nope",
-            "/%zz",
-            "/pkg/..%5c..%5csecret",
-        ] {
+        assert_eq!(resolve(&root, "/pkg/a%20b.js"), Some(root.join("pkg/a b.js")));
+        for bad in ["/../secret", "/pkg/%2e%2e/%2e%2e/secret", "/link", "/pkg", "/nope", "/%zz", "/pkg/..%5c..%5csecret"] {
             assert_eq!(resolve(&root, bad), None, "{bad}");
         }
         assert_eq!(content_type(Path::new("x.wasm")), "application/wasm");
-        assert_eq!(
-            content_type(Path::new("x.html")),
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(content_type(Path::new("x.html")), "text/html; charset=utf-8");
     }
 }

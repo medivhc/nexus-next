@@ -120,8 +120,7 @@ fn udp_echo() -> u16 {
 
 /// 从一个新的 UDP 套接字发 `data` 给 `ip:port`，等回应（2 秒一次，最多五次：UDP 可能丢）。
 fn udp_ask(sock: &std::net::UdpSocket, ip: IpAddr, port: u16, data: &[u8]) -> Option<Vec<u8>> {
-    sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .unwrap();
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
     let mut buf = [0u8; 65536];
     (0..5).find_map(|_| {
         sock.send_to(data, (ip, port)).ok()?;

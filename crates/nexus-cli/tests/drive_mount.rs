@@ -2,9 +2,7 @@
 //!
 //! 挂载要真实的内核（FUSE），所以这些场景只在真实后端上运行。
 
-use nexus_testkit::{
-    local_dir, local_tree, pseudo_random, scenario, Background, LocalTree, Output, World,
-};
+use nexus_testkit::{local_dir, local_tree, pseudo_random, scenario, Background, LocalTree, Output, World};
 use std::time::{Duration, Instant};
 
 /// 在节点的机器上运行一段 shell。
@@ -27,11 +25,7 @@ async fn mount(w: &World, node: &str, args: &[&str], dir: &LocalTree) -> Backgro
         if let Some(code) = bg.exited() {
             panic!("挂载失败（{code}）：{}", bg.stderr());
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "10 秒内没有挂上：{}",
-            bg.stderr()
-        );
+        assert!(start.elapsed() < Duration::from_secs(10), "10 秒内没有挂上：{}", bg.stderr());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -45,12 +39,7 @@ async fn eventually(what: &str, mut f: impl AsyncFnMut() -> bool) {
 }
 
 async fn mtime(w: &World, m: &str) -> u64 {
-    sh(w, "desktop", &format!("stat -c %Y '{m}/notes.txt'"))
-        .await
-        .stdout
-        .trim()
-        .parse()
-        .unwrap()
+    sh(w, "desktop", &format!("stat -c %Y '{m}/notes.txt'")).await.stdout.trim().parse().unwrap()
 }
 
 fn toolchain_env() -> String {

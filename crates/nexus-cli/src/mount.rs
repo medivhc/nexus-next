@@ -11,15 +11,12 @@
 
 use crate::UnixCtl;
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, TimeOrNow,
 };
 use nexus_cli::{fail, fail_wire, Ctl, Sink, EXIT_INTERNAL, EXIT_INVALID_INPUT};
 use nexus_drive_core::path::DrivePath;
-use nexus_wire::{
-    CtlRequest, CtlResponse, DriveEntryInfo, DriveRequest, DriveResponse, ErrorCode, Input,
-    WireError,
-};
+use nexus_wire::{CtlRequest, CtlResponse, DriveEntryInfo, DriveRequest, DriveResponse, ErrorCode, Input, WireError};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -35,14 +32,7 @@ const STAMP_EVERY: Duration = Duration::from_millis(500);
 const ROOT: u64 = 1;
 
 /// 挂载并在前台运行，直到被卸载或收到 SIGINT / SIGTERM。
-pub async fn run<K: Sink>(
-    path: &str,
-    dir: &str,
-    record: Option<&str>,
-    data_dir: &Path,
-    ctl: UnixCtl,
-    sink: &mut K,
-) -> i32 {
+pub async fn run<K: Sink>(path: &str, dir: &str, record: Option<&str>, data_dir: &Path, ctl: UnixCtl, sink: &mut K) -> i32 {
     let base: DrivePath = match path.parse() {
         Ok(p) => p,
         Err(m) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &m),
@@ -53,64 +43,28 @@ pub async fn run<K: Sink>(
     }
     match std::fs::read_dir(dir).map(|mut d| d.next().is_none()) {
         Ok(true) => {}
-        Ok(false) => {
-            return fail(
-                sink,
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                &format!("挂载点 {dir} 不是空目录"),
-            )
-        }
-        Err(e) => {
-            return fail(
-                sink,
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                &format!("挂载点 {dir} 不能用：{e}"),
-            )
-        }
+        Ok(false) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("挂载点 {dir} 不是空目录")),
+        Err(e) => return fail(sink, EXIT_INVALID_INPUT, "invalid_input", &format!("挂载点 {dir} 不能用：{e}")),
     }
-    let overlay = data_dir
-        .join("mount-overlay")
-        .join(std::process::id().to_string());
+    let overlay = data_dir.join("mount-overlay").join(std::process::id().to_string());
     if let Err(e) = std::fs::create_dir_all(&overlay) {
-        return fail(
-            sink,
-            EXIT_INTERNAL,
-            "internal",
-            &format!("不能创建覆盖层目录 {}：{e}", overlay.display()),
-        );
+        return fail(sink, EXIT_INTERNAL, "internal", &format!("不能创建覆盖层目录 {}：{e}", overlay.display()));
     }
 
     // 记录预读清单：挂载前开始，卸载后结束（结束时清单交给存储设备）。
     if let Some(name) = record {
-        if let Err(e) = ask(
-            &ctl,
-            DriveRequest::Record {
-                ws: base.ws.clone(),
-                name: Some(name.to_string()),
-            },
-        )
-        .await
-        {
+        if let Err(e) = ask(&ctl, DriveRequest::Record { ws: base.ws.clone(), name: Some(name.to_string()) }).await {
             return fail_wire(sink, &e);
         }
     }
     let client = Client::start(ctl.clone());
-    let stamp = match client.ask(DriveRequest::Stamp {
-        ws: base.ws.clone(),
-    }) {
+    let stamp = match client.ask(DriveRequest::Stamp { ws: base.ws.clone() }) {
         Ok(DriveResponse::Stamp { tree }) => tree,
         Ok(_) => return fail(sink, EXIT_INTERNAL, "internal", "常驻程序的回应无法理解"),
         Err(e) => return fail_wire(sink, &e),
     };
     let fs = Fs::new(client, base.clone(), overlay.clone(), stamp);
-    let opts = [
-        MountOption::FSName("nexus".into()),
-        MountOption::Subtype(base.ws.clone()),
-        MountOption::DefaultPermissions,
-        MountOption::NoAtime,
-    ];
+    let opts = [MountOption::FSName("nexus".into()), MountOption::Subtype(base.ws.clone()), MountOption::DefaultPermissions, MountOption::NoAtime];
     let session = match fuser::spawn_mount2(fs, dir, &opts) {
         Ok(s) => s,
         Err(e) => return fail(sink, EXIT_INTERNAL, "internal", &format!("挂载失败：{e}")),
@@ -118,10 +72,7 @@ pub async fn run<K: Sink>(
     sink.err(format!("已把 {base} 挂到 {dir}；写入只落本机（nexus drive commit 提交），fusermount -u {dir} 卸载\n").as_bytes());
 
     use tokio::signal::unix::{signal, SignalKind};
-    let (Ok(mut term), Ok(mut int)) = (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) else {
+    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
         return fail(sink, EXIT_INTERNAL, "internal", "不能监听信号");
     };
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -135,25 +86,9 @@ pub async fn run<K: Sink>(
     // 卸载（已经被 fusermount -u 卸载时什么也不做），等 FUSE 线程结束：文件系统收尾时写回没写完的文件。
     drop(session);
     if record.is_some() {
-        match ask(
-            &ctl,
-            DriveRequest::Record {
-                ws: base.ws.clone(),
-                name: None,
-            },
-        )
-        .await
-        {
-            Ok(DriveResponse::Profile {
-                name,
-                files,
-                saved_to,
-            }) => {
-                let place = if saved_to.is_empty() {
-                    "只在本机".to_string()
-                } else {
-                    format!("已交给 {}", saved_to.join("、"))
-                };
+        match ask(&ctl, DriveRequest::Record { ws: base.ws.clone(), name: None }).await {
+            Ok(DriveResponse::Profile { name, files, saved_to }) => {
+                let place = if saved_to.is_empty() { "只在本机".to_string() } else { format!("已交给 {}", saved_to.join("、")) };
                 sink.err(format!("预读清单 {name}：{} 个文件，{place}\n", files.len()).as_bytes());
             }
             Ok(_) => {}
@@ -163,11 +98,7 @@ pub async fn run<K: Sink>(
     // 卸载偶尔没有生效时（挂载点还在），用 fusermount 强制卸掉，不留下断开的挂载点。
     if still_mounted(dir) {
         for bin in ["fusermount3", "fusermount"] {
-            if std::process::Command::new(bin)
-                .args(["-u", "-z", dir])
-                .status()
-                .is_ok_and(|s| s.success())
-            {
+            if std::process::Command::new(bin).args(["-u", "-z", dir]).status().is_ok_and(|s| s.success()) {
                 break;
             }
         }
@@ -180,67 +111,30 @@ fn still_mounted(dir: &str) -> bool {
     // 断开的挂载点 canonicalize 会失败（ENOTCONN），这时按原样比较。
     let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
     let target = dir.to_string_lossy().replace(' ', "\\040");
-    std::fs::read_to_string("/proc/self/mounts").is_ok_and(|m| {
-        m.lines()
-            .any(|l| l.split(' ').nth(1) == Some(target.as_str()))
-    })
+    std::fs::read_to_string("/proc/self/mounts").is_ok_and(|m| m.lines().any(|l| l.split(' ').nth(1) == Some(target.as_str())))
 }
 
 async fn check_dir(ctl: &UnixCtl, base: &DrivePath) -> Result<(), WireError> {
     let Some((name, parent)) = base.parts.split_last() else {
-        return ask(
-            ctl,
-            DriveRequest::Ls {
-                path: base.to_string(),
-                at: None,
-            },
-        )
-        .await
-        .map(|_| ());
+        return ask(ctl, DriveRequest::Ls { path: base.to_string(), at: None }).await.map(|_| ());
     };
-    let parent = DrivePath {
-        ws: base.ws.clone(),
-        parts: parent.to_vec(),
-    };
-    match ask(
-        ctl,
-        DriveRequest::Ls {
-            path: parent.to_string(),
-            at: None,
-        },
-    )
-    .await?
-    {
+    let parent = DrivePath { ws: base.ws.clone(), parts: parent.to_vec() };
+    match ask(ctl, DriveRequest::Ls { path: parent.to_string(), at: None }).await? {
         DriveResponse::Entries { entries, .. } => match entries.iter().find(|e| &e.name == name) {
             Some(e) if e.kind == "dir" => Ok(()),
-            Some(_) => Err(WireError::new(
-                ErrorCode::InvalidInput,
-                format!("{base} 不是目录"),
-            )),
-            None => Err(WireError::new(
-                ErrorCode::NotFound,
-                format!("{base} 不存在"),
-            )),
+            Some(_) => Err(WireError::new(ErrorCode::InvalidInput, format!("{base} 不是目录"))),
+            None => Err(WireError::new(ErrorCode::NotFound, format!("{base} 不存在"))),
         },
-        _ => Err(WireError::new(
-            ErrorCode::Internal,
-            "常驻程序的回应无法理解",
-        )),
+        _ => Err(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解")),
     }
 }
 
 async fn ask<C: Ctl>(ctl: &C, req: DriveRequest) -> Result<DriveResponse, WireError> {
-    let mut s = ctl
-        .open(CtlRequest::Drive(req))
-        .await
-        .map_err(unreachable)?;
+    let mut s = ctl.open(CtlRequest::Drive(req)).await.map_err(unreachable)?;
     match s.rx.recv().await {
         Some(CtlResponse::Drive(r)) => Ok(r),
         Some(CtlResponse::Error(e)) => Err(e),
-        _ => Err(WireError::new(
-            ErrorCode::Internal,
-            "常驻程序的回应无法理解",
-        )),
+        _ => Err(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解")),
     }
 }
 
@@ -248,21 +142,8 @@ fn unreachable(e: std::io::Error) -> WireError {
     WireError::new(ErrorCode::Internal, format!("连不上本机的常驻程序（{e}）"))
 }
 
-async fn read_range<C: Ctl>(
-    ctl: &C,
-    path: String,
-    offset: u64,
-    length: u64,
-) -> Result<Vec<u8>, WireError> {
-    let mut s = ctl
-        .open(CtlRequest::Drive(DriveRequest::Cat {
-            path,
-            at: None,
-            offset,
-            length: Some(length),
-        }))
-        .await
-        .map_err(unreachable)?;
+async fn read_range<C: Ctl>(ctl: &C, path: String, offset: u64, length: u64) -> Result<Vec<u8>, WireError> {
+    let mut s = ctl.open(CtlRequest::Drive(DriveRequest::Cat { path, at: None, offset, length: Some(length) })).await.map_err(unreachable)?;
     let mut out = Vec::new();
     loop {
         match s.rx.recv().await {
@@ -270,38 +151,18 @@ async fn read_range<C: Ctl>(
             Some(CtlResponse::PipeData(b)) => out.extend_from_slice(&b),
             Some(CtlResponse::PipeEnd) => return Ok(out),
             Some(CtlResponse::Error(e)) => return Err(e),
-            _ => {
-                return Err(WireError::new(
-                    ErrorCode::Internal,
-                    "常驻程序的回应无法理解",
-                ))
-            }
+            _ => return Err(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解")),
         }
     }
 }
 
-async fn put_file<C: Ctl>(
-    ctl: &C,
-    path: String,
-    exec: bool,
-    file: PathBuf,
-) -> Result<(), WireError> {
-    let mut f = File::open(&file)
-        .map_err(|e| WireError::new(ErrorCode::Internal, format!("读不了覆盖层文件：{e}")))?;
-    let mut s = ctl
-        .open(CtlRequest::Drive(DriveRequest::Put { path, exec }))
-        .await
-        .map_err(unreachable)?;
+async fn put_file<C: Ctl>(ctl: &C, path: String, exec: bool, file: PathBuf) -> Result<(), WireError> {
+    let mut f = File::open(&file).map_err(|e| WireError::new(ErrorCode::Internal, format!("读不了覆盖层文件：{e}")))?;
+    let mut s = ctl.open(CtlRequest::Drive(DriveRequest::Put { path, exec })).await.map_err(unreachable)?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| WireError::new(ErrorCode::Internal, format!("读不了覆盖层文件：{e}")))?;
-        let msg = if n == 0 {
-            Input::CloseStdin
-        } else {
-            Input::Stdin(buf[..n].to_vec())
-        };
+        let n = f.read(&mut buf).map_err(|e| WireError::new(ErrorCode::Internal, format!("读不了覆盖层文件：{e}")))?;
+        let msg = if n == 0 { Input::CloseStdin } else { Input::Stdin(buf[..n].to_vec()) };
         if s.tx.send(msg).await.is_err() || n == 0 {
             break;
         }
@@ -309,19 +170,13 @@ async fn put_file<C: Ctl>(
     match s.rx.recv().await {
         Some(CtlResponse::Drive(_)) => Ok(()),
         Some(CtlResponse::Error(e)) => Err(e),
-        _ => Err(WireError::new(
-            ErrorCode::Internal,
-            "常驻程序的回应无法理解",
-        )),
+        _ => Err(WireError::new(ErrorCode::Internal, "常驻程序的回应无法理解")),
     }
 }
 
 /// 发给客户端线程的一次调用。
 enum Call {
-    Ask(
-        DriveRequest,
-        smpsc::Sender<Result<DriveResponse, WireError>>,
-    ),
+    Ask(DriveRequest, smpsc::Sender<Result<DriveResponse, WireError>>),
     Read(String, u64, u64, smpsc::Sender<Result<Vec<u8>, WireError>>),
     Put(String, bool, PathBuf, smpsc::Sender<Result<(), WireError>>),
 }
@@ -335,10 +190,7 @@ impl Client {
     fn start(ctl: UnixCtl) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Call>();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("无法启动运行时");
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("无法启动运行时");
             let local = tokio::task::LocalSet::new();
             let ctl = std::rc::Rc::new(ctl);
             local.block_on(&rt, async move {
@@ -347,12 +199,8 @@ impl Client {
                     tokio::task::spawn_local(async move {
                         match call {
                             Call::Ask(req, reply) => drop(reply.send(ask(&*ctl, req).await)),
-                            Call::Read(path, off, len, reply) => {
-                                drop(reply.send(read_range(&*ctl, path, off, len).await))
-                            }
-                            Call::Put(path, exec, file, reply) => {
-                                drop(reply.send(put_file(&*ctl, path, exec, file).await))
-                            }
+                            Call::Read(path, off, len, reply) => drop(reply.send(read_range(&*ctl, path, off, len).await)),
+                            Call::Put(path, exec, file, reply) => drop(reply.send(put_file(&*ctl, path, exec, file).await)),
                         }
                     });
                 }
@@ -361,16 +209,12 @@ impl Client {
         Self { tx }
     }
 
-    fn call<T>(
-        &self,
-        make: impl FnOnce(smpsc::Sender<Result<T, WireError>>) -> Call,
-    ) -> Result<T, WireError> {
+    fn call<T>(&self, make: impl FnOnce(smpsc::Sender<Result<T, WireError>>) -> Call) -> Result<T, WireError> {
         let (tx, rx) = smpsc::channel();
         if self.tx.send(make(tx)).is_err() {
             return Err(WireError::new(ErrorCode::Internal, "客户端线程已经结束"));
         }
-        rx.recv()
-            .unwrap_or_else(|_| Err(WireError::new(ErrorCode::Internal, "客户端线程已经结束")))
+        rx.recv().unwrap_or_else(|_| Err(WireError::new(ErrorCode::Internal, "客户端线程已经结束")))
     }
 
     fn ask(&self, req: DriveRequest) -> Result<DriveResponse, WireError> {
@@ -466,8 +310,7 @@ impl Fs {
     /// 工作区里的路径。
     fn dpath(&self, rel: &str) -> String {
         let mut p = self.base.clone();
-        p.parts
-            .extend(rel.split('/').filter(|s| !s.is_empty()).map(str::to_string));
+        p.parts.extend(rel.split('/').filter(|s| !s.is_empty()).map(str::to_string));
         p.to_string()
     }
 
@@ -492,9 +335,7 @@ impl Fs {
             return;
         }
         self.checked = Instant::now();
-        if let Ok(DriveResponse::Stamp { tree }) = self.client.ask(DriveRequest::Stamp {
-            ws: self.base.ws.clone(),
-        }) {
+        if let Ok(DriveResponse::Stamp { tree }) = self.client.ask(DriveRequest::Stamp { ws: self.base.ws.clone() }) {
             if tree != self.stamp {
                 self.stamp = tree;
                 self.dirs.clear();
@@ -511,10 +352,7 @@ impl Fs {
     fn list(&mut self, rel: &str) -> Result<&Vec<DriveEntryInfo>, i32> {
         self.refresh();
         if !self.dirs.contains_key(rel) {
-            match self.client.ask(DriveRequest::Ls {
-                path: self.dpath(rel),
-                at: None,
-            }) {
+            match self.client.ask(DriveRequest::Ls { path: self.dpath(rel), at: None }) {
                 Ok(DriveResponse::Entries { entries, .. }) => {
                     self.dirs.insert(rel.to_string(), entries);
                 }
@@ -527,14 +365,7 @@ impl Fs {
 
     fn entry(&mut self, rel: &str) -> Result<Option<DriveEntryInfo>, i32> {
         if rel.is_empty() {
-            return Ok(Some(DriveEntryInfo {
-                name: String::new(),
-                kind: "dir".into(),
-                size: 0,
-                exec: false,
-                target: None,
-                content: None,
-            }));
+            return Ok(Some(DriveEntryInfo { name: String::new(), kind: "dir".into(), size: 0, exec: false, target: None, content: None }));
         }
         let (dir, name) = split(rel);
         match self.list(dir) {
@@ -551,11 +382,7 @@ impl Fs {
         if let Some(t) = self.touched.get(rel) {
             return *t;
         }
-        let fresh = if self.stamp == self.first_stamp {
-            self.start
-        } else {
-            SystemTime::now()
-        };
+        let fresh = if self.stamp == self.first_stamp { self.start } else { SystemTime::now() };
         match self.seen.get(rel) {
             Some((c, t)) if *c == content => *t,
             Some(_) => {
@@ -576,22 +403,14 @@ impl Fs {
         let (kind, perm, mut size) = match e.kind.as_str() {
             "dir" => (FileType::Directory, 0o755, 0),
             "symlink" => (FileType::Symlink, 0o777, e.size),
-            _ => (
-                FileType::RegularFile,
-                if e.exec { 0o755 } else { 0o644 },
-                e.size,
-            ),
+            _ => (FileType::RegularFile, if e.exec { 0o755 } else { 0o644 }, e.size),
         };
         let mut perm = perm;
         if let Some(o) = self.overlays.get(rel) {
             size = o.file.metadata().map(|m| m.len()).unwrap_or(size);
             perm = if o.exec { 0o755 } else { 0o644 };
         }
-        let mtime = if kind == FileType::Directory {
-            self.start
-        } else {
-            self.mtime(rel, e.content)
-        };
+        let mtime = if kind == FileType::Directory { self.start } else { self.mtime(rel, e.content) };
         Ok(FileAttr {
             ino,
             size,
@@ -625,17 +444,12 @@ impl Fs {
 
     /// 把覆盖层里的内容写进工作树。
     fn upload(&mut self, rel: &str) -> Result<(), i32> {
-        let Some(o) = self.overlays.get(rel) else {
-            return Ok(());
-        };
+        let Some(o) = self.overlays.get(rel) else { return Ok(()) };
         if !o.dirty {
             return Ok(());
         }
         let (path, exec, file) = (self.dpath(rel), o.exec, o.path.clone());
-        let r = self
-            .client
-            .call(|tx| Call::Put(path, exec, file, tx))
-            .map_err(|e| errno(&e));
+        let r = self.client.call(|tx| Call::Put(path, exec, file, tx)).map_err(|e| errno(&e));
         self.changed();
         if r.is_ok() {
             // 修改时间保持写入时的；记下新内容的标识，以后内容再变才再变。
@@ -663,32 +477,18 @@ impl Fs {
         }
         let n = self.next_fh;
         let path = self.overlay_dir.join(format!("o{n}"));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|_| libc::EIO)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).map_err(|_| libc::EIO)?;
         let existing = self.entry(rel)?;
         if let Some(e) = existing.as_ref().filter(|e| e.kind == "file") {
             // 打开时就确认能写（把可执行位设成它现在的值，工作树不变）：关闭时才失败的话，多数程序不会报告。
-            self.client
-                .ask(DriveRequest::Chmod {
-                    path: self.dpath(rel),
-                    exec: e.exec,
-                })
-                .map_err(|e| errno(&e))?;
+            self.client.ask(DriveRequest::Chmod { path: self.dpath(rel), exec: e.exec }).map_err(|e| errno(&e))?;
         }
         let size = existing.map(|e| e.size).unwrap_or(0);
         if !truncate && size > 0 {
             let mut off = 0u64;
             while off < size {
                 let len = (size - off).min(4 * 1024 * 1024);
-                let data = self
-                    .client
-                    .call(|tx| Call::Read(self.dpath(rel), off, len, tx))
-                    .map_err(|e| errno(&e))?;
+                let data = self.client.call(|tx| Call::Read(self.dpath(rel), off, len, tx)).map_err(|e| errno(&e))?;
                 if data.is_empty() {
                     break;
                 }
@@ -696,17 +496,7 @@ impl Fs {
                 off += data.len() as u64;
             }
         }
-        self.overlays.insert(
-            rel.to_string(),
-            Overlay {
-                file,
-                path,
-                dirty: truncate,
-                exec,
-                refs: 1,
-                mtime: SystemTime::now(),
-            },
-        );
+        self.overlays.insert(rel.to_string(), Overlay { file, path, dirty: truncate, exec, refs: 1, mtime: SystemTime::now() });
         if truncate {
             // 截断立刻生效（新文件也立刻出现在工作树里）。
             if let Err(e) = self.upload(rel) {
@@ -726,9 +516,7 @@ impl Fs {
     }
 
     fn close(&mut self, fh: u64) -> Result<(), i32> {
-        let Some(rel) = self.handles.remove(&fh) else {
-            return Ok(());
-        };
+        let Some(rel) = self.handles.remove(&fh) else { return Ok(()) };
         let r = self.upload(&rel);
         if let Some(o) = self.overlays.get_mut(&rel) {
             o.refs = o.refs.saturating_sub(1);
@@ -747,12 +535,7 @@ impl Fs {
         if let Some(old) = self.inos.remove(to) {
             self.paths.remove(&old);
         }
-        let moving: Vec<(String, u64)> = self
-            .inos
-            .iter()
-            .filter(|(p, _)| under(p))
-            .map(|(p, i)| (p.clone(), *i))
-            .collect();
+        let moving: Vec<(String, u64)> = self.inos.iter().filter(|(p, _)| under(p)).map(|(p, i)| (p.clone(), *i)).collect();
         for (p, i) in moving {
             self.inos.remove(&p);
             let q = renamed(&p);
@@ -782,12 +565,7 @@ impl Fs {
 impl Drop for Fs {
     fn drop(&mut self) {
         // 卸载时还没写回的内容（一般没有：文件关闭时已经写回）。
-        let dirty: Vec<String> = self
-            .overlays
-            .iter()
-            .filter(|(_, o)| o.dirty)
-            .map(|(p, _)| p.clone())
-            .collect();
+        let dirty: Vec<String> = self.overlays.iter().filter(|(_, o)| o.dirty).map(|(p, _)| p.clone()).collect();
         for p in dirty {
             let _ = self.upload(&p);
         }
@@ -833,10 +611,7 @@ impl Filesystem for Fs {
             if let Some(mode) = mode {
                 let exec = mode & 0o111 != 0;
                 if e.kind == "file" && exec != e.exec {
-                    self.ask(DriveRequest::Chmod {
-                        path: self.dpath(&rel),
-                        exec,
-                    })?;
+                    self.ask(DriveRequest::Chmod { path: self.dpath(&rel), exec })?;
                 }
                 if let Some(o) = self.overlays.get_mut(&rel) {
                     o.exec = exec;
@@ -879,32 +654,20 @@ impl Filesystem for Fs {
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         match self.path_of(ino).and_then(|rel| self.entry(&rel)) {
-            Ok(Some(DriveEntryInfo {
-                target: Some(t), ..
-            })) => reply.data(t.as_bytes()),
+            Ok(Some(DriveEntryInfo { target: Some(t), .. })) => reply.data(t.as_bytes()),
             Ok(Some(_)) => reply.error(libc::EINVAL),
             Ok(None) => reply.error(libc::ENOENT),
             Err(e) => reply.error(e),
         }
     }
 
-    fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
+    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let r = (|| {
             let rel = self.child(parent, name)?;
             if self.entry(&rel)?.is_some() {
                 return Err(libc::EEXIST);
             }
-            self.ask(DriveRequest::Mkdir {
-                path: self.dpath(&rel),
-            })?;
+            self.ask(DriveRequest::Mkdir { path: self.dpath(&rel) })?;
             self.attr(&rel)
         })();
         match r {
@@ -921,10 +684,7 @@ impl Filesystem for Fs {
                 Some(e) if e.kind == "dir" => return Err(libc::EISDIR),
                 Some(_) => {}
             }
-            self.ask(DriveRequest::Rm {
-                path: self.dpath(&rel),
-                recursive: false,
-            })?;
+            self.ask(DriveRequest::Rm { path: self.dpath(&rel), recursive: false })?;
             if let Some(i) = self.inos.remove(&rel) {
                 self.paths.remove(&i);
             }
@@ -948,10 +708,7 @@ impl Filesystem for Fs {
             if !self.list(&rel)?.is_empty() {
                 return Err(libc::ENOTEMPTY);
             }
-            self.ask(DriveRequest::Rm {
-                path: self.dpath(&rel),
-                recursive: true,
-            })?;
+            self.ask(DriveRequest::Rm { path: self.dpath(&rel), recursive: true })?;
             if let Some(i) = self.inos.remove(&rel) {
                 self.paths.remove(&i);
             }
@@ -963,24 +720,14 @@ impl Filesystem for Fs {
         }
     }
 
-    fn symlink(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        link_name: &OsStr,
-        target: &Path,
-        reply: ReplyEntry,
-    ) {
+    fn symlink(&mut self, _req: &Request<'_>, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
         let r = (|| {
             let rel = self.child(parent, link_name)?;
             if self.entry(&rel)?.is_some() {
                 return Err(libc::EEXIST);
             }
             let target = target.to_str().ok_or(libc::EINVAL)?.to_string();
-            self.ask(DriveRequest::Symlink {
-                path: self.dpath(&rel),
-                target,
-            })?;
+            self.ask(DriveRequest::Symlink { path: self.dpath(&rel), target })?;
             self.attr(&rel)
         })();
         match r {
@@ -989,16 +736,7 @@ impl Filesystem for Fs {
         }
     }
 
-    fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        newparent: u64,
-        newname: &OsStr,
-        flags: u32,
-        reply: ReplyEmpty,
-    ) {
+    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, flags: u32, reply: ReplyEmpty) {
         let r = (|| {
             if flags != 0 {
                 return Err(libc::EINVAL);
@@ -1015,19 +753,11 @@ impl Filesystem for Fs {
                 }
             }
             // 正在写的文件先写回，改名搬的是最新内容。
-            let dirty: Vec<String> = self
-                .overlays
-                .keys()
-                .filter(|p| **p == from || p.starts_with(&format!("{from}/")))
-                .cloned()
-                .collect();
+            let dirty: Vec<String> = self.overlays.keys().filter(|p| **p == from || p.starts_with(&format!("{from}/"))).cloned().collect();
             for p in dirty {
                 self.upload(&p)?;
             }
-            self.ask(DriveRequest::Rename {
-                from: self.dpath(&from),
-                to: self.dpath(&to),
-            })?;
+            self.ask(DriveRequest::Rename { from: self.dpath(&from), to: self.dpath(&to) })?;
             self.moved(&from, &to);
             Ok(())
         })();
@@ -1056,20 +786,8 @@ impl Filesystem for Fs {
         }
     }
 
-    fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
-        reply: ReplyData,
-    ) {
-        let Some(rel) = self.handles.get(&fh).cloned() else {
-            return reply.error(libc::EBADF);
-        };
+    fn read(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        let Some(rel) = self.handles.get(&fh).cloned() else { return reply.error(libc::EBADF) };
         if let Some(o) = self.overlays.get(&rel) {
             let mut buf = vec![0u8; size as usize];
             return match o.file.read_at(&mut buf, offset as u64) {
@@ -1077,10 +795,7 @@ impl Filesystem for Fs {
                 Err(_) => reply.error(libc::EIO),
             };
         }
-        match self
-            .client
-            .call(|tx| Call::Read(self.dpath(&rel), offset as u64, size as u64, tx))
-        {
+        match self.client.call(|tx| Call::Read(self.dpath(&rel), offset as u64, size as u64, tx)) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(errno(&e)),
         }
@@ -1098,12 +813,8 @@ impl Filesystem for Fs {
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let Some(rel) = self.handles.get(&fh) else {
-            return reply.error(libc::EBADF);
-        };
-        let Some(o) = self.overlays.get_mut(rel) else {
-            return reply.error(libc::EBADF);
-        };
+        let Some(rel) = self.handles.get(&fh) else { return reply.error(libc::EBADF) };
+        let Some(o) = self.overlays.get_mut(rel) else { return reply.error(libc::EBADF) };
         match o.file.write_all_at(data, offset as u64) {
             Ok(()) => {
                 o.dirty = true;
@@ -1114,17 +825,8 @@ impl Filesystem for Fs {
         }
     }
 
-    fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _lock_owner: u64,
-        reply: ReplyEmpty,
-    ) {
-        let Some(rel) = self.handles.get(&fh).cloned() else {
-            return reply.ok();
-        };
+    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let Some(rel) = self.handles.get(&fh).cloned() else { return reply.ok() };
         match self.upload(&rel) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1135,42 +837,19 @@ impl Filesystem for Fs {
         self.flush(req, ino, fh, 0, reply)
     }
 
-    fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock: Option<u64>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
         match self.close(fh) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
-    fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let r = (|| {
             let rel = self.path_of(ino)?;
             let list = self.list(&rel)?.clone();
-            let parent = if rel.is_empty() {
-                ROOT
-            } else {
-                self.ino(split(&rel).0)
-            };
-            let mut all = vec![
-                (ino, FileType::Directory, ".".to_string()),
-                (parent, FileType::Directory, "..".to_string()),
-            ];
+            let parent = if rel.is_empty() { ROOT } else { self.ino(split(&rel).0) };
+            let mut all = vec![(ino, FileType::Directory, ".".to_string()), (parent, FileType::Directory, "..".to_string())];
             for e in list {
                 let kind = match e.kind.as_str() {
                     "dir" => FileType::Directory,
@@ -1194,16 +873,7 @@ impl Filesystem for Fs {
         }
     }
 
-    fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: ReplyCreate,
-    ) {
+    fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         let r = (|| {
             let rel = self.child(parent, name)?;
             if let Some(e) = self.entry(&rel)? {

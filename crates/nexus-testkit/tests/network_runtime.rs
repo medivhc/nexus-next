@@ -61,9 +61,7 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
         async move {
             let sys = SimSystem::with_services(SimDisk::default(), 1, clock, svc);
             let key = nexus_runtime::load_or_create_device_key(&sys).unwrap();
-            let fab = SimTransport::bind(NodeId(key.public().0), "home")
-                .await
-                .unwrap();
+            let fab = SimTransport::bind(NodeId(key.public().0), "home").await.unwrap();
             let node = Rc::new(Node::new(fab, sys, "home").unwrap());
             let mut rx = rx.lock().await;
             let _ = node.run(&mut rx).await;
@@ -82,9 +80,7 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
         async move {
             let sys = SimSystem::with_services(SimDisk::default(), 2, clock, svc);
             let key = nexus_runtime::load_or_create_device_key(&sys).unwrap();
-            let fab = SimTransport::bind(NodeId(key.public().0), "phone")
-                .await
-                .unwrap();
+            let fab = SimTransport::bind(NodeId(key.public().0), "phone").await.unwrap();
             let node = Rc::new(Node::new(fab, sys, "phone").unwrap());
             let pool = FakePool::new(Ipv4Addr::new(198, 18, 0, 0), 16).unwrap();
             let tun_tx = node.enable_tun("sim-tun", pool);
@@ -103,75 +99,33 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
         let tun_tx = tun_ready_rx.await.unwrap();
 
         // 1. 组网：home 初始化，phone 加入并由 home 批准
-        let init_resp = ctl_call(
-            &home_ctl_tx,
-            CtlRequest::Init {
-                name: Some("home".into()),
-            },
-        )
-        .await;
-        assert!(
-            !matches!(init_resp, CtlResponse::Error(_)),
-            "home Init 失败：{init_resp:?}"
-        );
-        let CtlResponse::JoinCode { code, .. } =
-            ctl_call(&phone_ctl_tx, CtlRequest::JoinStart).await
-        else {
+        let init_resp = ctl_call(&home_ctl_tx, CtlRequest::Init { name: Some("home".into()) }).await;
+        assert!(!matches!(init_resp, CtlResponse::Error(_)), "home Init 失败：{init_resp:?}");
+        let CtlResponse::JoinCode { code, .. } = ctl_call(&phone_ctl_tx, CtlRequest::JoinStart).await else {
             panic!("phone JoinStart 失败");
         };
-        let approve_resp = ctl_call(
-            &home_ctl_tx,
-            CtlRequest::Approve {
-                code,
-                name: Some("phone".into()),
-            },
-        )
-        .await;
+        let approve_resp = ctl_call(&home_ctl_tx, CtlRequest::Approve { code, name: Some("phone".into()) }).await;
         assert!(
             !matches!(approve_resp, CtlResponse::Error(_)),
             "home Approve 失败：{approve_resp:?}"
         );
-        assert!(matches!(
-            ctl_call(&home_ctl_tx, CtlRequest::ExitSet { enabled: true }).await,
-            CtlResponse::Exit { enabled: true }
-        ));
+        assert!(matches!(ctl_call(&home_ctl_tx, CtlRequest::ExitSet { enabled: true }).await, CtlResponse::Exit { enabled: true }));
 
         // 2. 在 phone 上导入路由规则
         let rules = vec![
-            Rule {
-                matcher: Matcher::parse_domain("udp.far.test").unwrap(),
-                outbound: Outbound::Exit("home".into()),
-            },
-            Rule {
-                matcher: Matcher::parse_domain("local.test").unwrap(),
-                outbound: Outbound::Exit("home".into()),
-            },
-            Rule {
-                matcher: Matcher::parse_domain("blocked.test").unwrap(),
-                outbound: Outbound::Reject,
-            },
-            Rule {
-                matcher: Matcher::parse_domain("socks.test").unwrap(),
-                outbound: Outbound::Socks5("127.0.0.1:7890".into()),
-            },
+            Rule { matcher: Matcher::parse_domain("udp.far.test").unwrap(), outbound: Outbound::Exit("home".into()) },
+            Rule { matcher: Matcher::parse_domain("local.test").unwrap(), outbound: Outbound::Exit("home".into()) },
+            Rule { matcher: Matcher::parse_domain("blocked.test").unwrap(), outbound: Outbound::Reject },
+            Rule { matcher: Matcher::parse_domain("socks.test").unwrap(), outbound: Outbound::Socks5("127.0.0.1:7890".into()) },
         ];
         assert!(matches!(
-            ctl_call(
-                &phone_ctl_tx,
-                CtlRequest::RouteImport {
-                    rules,
-                    replace: true
-                }
-            )
-            .await,
+            ctl_call(&phone_ctl_tx, CtlRequest::RouteImport { rules, replace: true }).await,
             CtlResponse::RouteImported { total: 4, .. }
         ));
 
         // 辅助函数：经 TUN DNS 分配 FakeIP
         async fn fake_ip_for(tun_tx: &mpsc::UnboundedSender<TunInbound>, domain: &str) -> Ipv4Addr {
-            let mut pkt = vec![
-                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ];
+            let mut pkt = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
             for label in domain.split('.') {
                 pkt.push(label.len() as u8);
                 pkt.extend_from_slice(label.as_bytes());
@@ -210,15 +164,11 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
         assert_eq!(home_svc_check.udp_hits(public_udp), 1);
 
         // 验证 home 审计日志记录了 net.exit
-        let CtlResponse::Audit(events) =
-            ctl_call(&home_ctl_tx, CtlRequest::Audit { limit: Some(20) }).await
-        else {
+        let CtlResponse::Audit(events) = ctl_call(&home_ctl_tx, CtlRequest::Audit { limit: Some(20) }).await else {
             panic!("读取 home 审计失败");
         };
         assert!(
-            events
-                .iter()
-                .any(|e| e.event.capability == "net.exit" && e.event.resource == "home/exit"),
+            events.iter().any(|e| e.event.capability == "net.exit" && e.event.resource == "home/exit"),
             "未记录 net.exit 审计：{events:?}"
         );
 
@@ -235,15 +185,8 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
         let _ = app_local.write_all(b"should-block").await;
         let mut b2 = [0u8; 32];
         let res = tokio::time::timeout(Duration::from_millis(500), app_local.read(&mut b2)).await;
-        assert!(
-            res.is_err() || matches!(res, Ok(Ok(0))),
-            "本机回环地址绝不能收到回应：{res:?}"
-        );
-        assert_eq!(
-            home_svc_check.udp_hits(loopback_udp),
-            0,
-            "出口绝不能访问自身回环地址"
-        );
+        assert!(res.is_err() || matches!(res, Ok(Ok(0))), "本机回环地址绝不能收到回应：{res:?}");
+        assert_eq!(home_svc_check.udp_hits(loopback_udp), 0, "出口绝不能访问自身回环地址");
 
         // 5. TC-N1-09：Reject 与 Socks5 规则下的 UDP 明确丢弃，绝不偷偷直连
         for domain in ["blocked.test", "socks.test"] {
@@ -258,18 +201,10 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
                 .unwrap();
             let _ = app_drop.write_all(b"no-leak").await;
             let mut b3 = [0u8; 32];
-            let res =
-                tokio::time::timeout(Duration::from_millis(300), app_drop.read(&mut b3)).await;
-            assert!(
-                res.is_err() || matches!(res, Ok(Ok(0))),
-                "{domain} 不应有回应：{res:?}"
-            );
+            let res = tokio::time::timeout(Duration::from_millis(300), app_drop.read(&mut b3)).await;
+            assert!(res.is_err() || matches!(res, Ok(Ok(0))), "{domain} 不应有回应：{res:?}");
         }
-        assert_eq!(
-            phone_svc_check.udp_hits(blocked_udp),
-            0,
-            "Reject/Socks5 绝不能偷偷降级直连"
-        );
+        assert_eq!(phone_svc_check.udp_hits(blocked_udp), 0, "Reject/Socks5 绝不能偷偷降级直连");
         Ok(())
     });
 

@@ -102,19 +102,13 @@ pub mod chunk {
             let chunks = chunk_all(&self.buf);
             let keep = chunks.last().map_or(0, |c| c.len());
             let done = self.buf.len() - keep;
-            let out = chunks[..chunks.len() - 1]
-                .iter()
-                .map(|c| c.to_vec())
-                .collect();
+            let out = chunks[..chunks.len() - 1].iter().map(|c| c.to_vec()).collect();
             self.buf.drain(..done);
             out
         }
 
         pub fn finish(self) -> Vec<Vec<u8>> {
-            chunk_all(&self.buf)
-                .into_iter()
-                .map(<[u8]>::to_vec)
-                .collect()
+            chunk_all(&self.buf).into_iter().map(<[u8]>::to_vec).collect()
         }
     }
 }
@@ -144,17 +138,9 @@ pub struct Span {
 
 impl FileManifest {
     pub fn from_chunks<C: AsRef<[u8]>>(chunks: &[C]) -> Self {
-        let chunks: Vec<ChunkRef> = chunks
-            .iter()
-            .map(|c| ChunkRef {
-                hash: Hash::of(c.as_ref()),
-                len: c.as_ref().len() as u32,
-            })
-            .collect();
-        Self {
-            size: chunks.iter().map(|c| c.len as u64).sum(),
-            chunks,
-        }
+        let chunks: Vec<ChunkRef> =
+            chunks.iter().map(|c| ChunkRef { hash: Hash::of(c.as_ref()), len: c.as_ref().len() as u32 }).collect();
+        Self { size: chunks.iter().map(|c| c.len as u64).sum(), chunks }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -175,12 +161,7 @@ impl FileManifest {
             if stop > offset && start < end {
                 let from = offset.saturating_sub(start) as u32;
                 let to = (end.min(stop) - start) as u32;
-                out.push(Span {
-                    index,
-                    hash: c.hash,
-                    from,
-                    to,
-                });
+                out.push(Span { index, hash: c.hash, from, to });
             }
             if stop >= end {
                 break;
@@ -226,16 +207,11 @@ pub mod history {
         /// `a` 是 `b` 的祖先。
         Behind,
         /// 两边各有对方没有的提交；`base` 是最近的共同祖先（没有共同历史时为空）。
-        Diverged {
-            base: Option<Hash>,
-        },
+        Diverged { base: Option<Hash> },
     }
 
     /// `head` 和它的全部祖先。缺少某个提交时返回它的哈希。
-    pub fn ancestors(
-        get: &impl Fn(&Hash) -> Option<Commit>,
-        head: Hash,
-    ) -> Result<BTreeSet<Hash>, Hash> {
+    pub fn ancestors(get: &impl Fn(&Hash) -> Option<Commit>, head: Hash) -> Result<BTreeSet<Hash>, Hash> {
         let mut seen = BTreeSet::new();
         let mut queue = VecDeque::from([head]);
         while let Some(h) = queue.pop_front() {
@@ -248,11 +224,7 @@ pub mod history {
         Ok(seen)
     }
 
-    pub fn relation(
-        get: &impl Fn(&Hash) -> Option<Commit>,
-        a: Hash,
-        b: Hash,
-    ) -> Result<Relation, Hash> {
+    pub fn relation(get: &impl Fn(&Hash) -> Option<Commit>, a: Hash, b: Hash) -> Result<Relation, Hash> {
         if a == b {
             return Ok(Relation::Same);
         }
@@ -288,18 +260,12 @@ pub mod path {
     pub fn valid_workspace(name: &str) -> bool {
         (1..=32).contains(&name.len())
             && !name.starts_with('-')
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     }
 
     /// 路径里的一段：非空，不是 `.` 或 `..`，不含 `/` 和 NUL，至多 255 字节。
     pub fn valid_part(part: &str) -> bool {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part.len() <= 255
-            && !part.contains(['/', '\0'])
+        !part.is_empty() && part != "." && part != ".." && part.len() <= 255 && !part.contains(['/', '\0'])
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,26 +277,15 @@ pub mod path {
     impl std::str::FromStr for DrivePath {
         type Err = String;
         fn from_str(s: &str) -> Result<Self, String> {
-            let (ws, rest) = s
-                .split_once(':')
-                .ok_or_else(|| format!("路径应当写成 <工作区>:/<路径>：{s}"))?;
+            let (ws, rest) = s.split_once(':').ok_or_else(|| format!("路径应当写成 <工作区>:/<路径>：{s}"))?;
             if !valid_workspace(ws) {
-                return Err(format!(
-                    "工作区名只能是小写字母、数字和连字符，1 到 32 个字符：{ws}"
-                ));
+                return Err(format!("工作区名只能是小写字母、数字和连字符，1 到 32 个字符：{ws}"));
             }
-            let parts: Vec<String> = rest
-                .split('/')
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect();
+            let parts: Vec<String> = rest.split('/').filter(|p| !p.is_empty()).map(str::to_string).collect();
             if let Some(bad) = parts.iter().find(|p| !valid_part(p)) {
                 return Err(format!("路径里不能有 {bad}"));
             }
-            Ok(Self {
-                ws: ws.to_string(),
-                parts,
-            })
+            Ok(Self { ws: ws.to_string(), parts })
         }
     }
 
@@ -350,17 +305,9 @@ pub mod tree {
     /// 目录里的一项。
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Entry {
-        File {
-            manifest: Hash,
-            size: u64,
-            exec: bool,
-        },
-        Dir {
-            tree: Hash,
-        },
-        Symlink {
-            target: String,
-        },
+        File { manifest: Hash, size: u64, exec: bool },
+        Dir { tree: Hash },
+        Symlink { target: String },
     }
 
     /// 一个目录。
@@ -421,23 +368,14 @@ pub mod tree {
     }
 
     pub fn load(store: &(impl Store + ?Sized), hash: Hash) -> Result<Tree, DriveError> {
-        store
-            .get(&hash)
-            .and_then(|b| Tree::decode(&b))
-            .ok_or(DriveError::Missing(hash))
+        store.get(&hash).and_then(|b| Tree::decode(&b)).ok_or(DriveError::Missing(hash))
     }
 
     /// 找到路径上的那一项；根目录本身用空路径表示，返回 `Dir`。
-    pub fn lookup(
-        store: &(impl Store + ?Sized),
-        root: Hash,
-        parts: &[String],
-    ) -> Result<Option<Entry>, DriveError> {
+    pub fn lookup(store: &(impl Store + ?Sized), root: Hash, parts: &[String]) -> Result<Option<Entry>, DriveError> {
         let mut cur = Entry::Dir { tree: root };
         for p in parts {
-            let Entry::Dir { tree } = cur else {
-                return Ok(None);
-            };
+            let Entry::Dir { tree } = cur else { return Ok(None) };
             match load(store, tree)?.entries.get(p) {
                 Some(e) => cur = e.clone(),
                 None => return Ok(None),
@@ -447,12 +385,7 @@ pub mod tree {
     }
 
     /// 把路径上的项设成 `entry`，中间的目录自动建立，返回新的根。
-    pub fn set(
-        store: &mut impl Store,
-        root: Hash,
-        parts: &[String],
-        entry: Entry,
-    ) -> Result<Hash, DriveError> {
+    pub fn set(store: &mut impl Store, root: Hash, parts: &[String], entry: Entry) -> Result<Hash, DriveError> {
         let Some((first, rest)) = parts.split_first() else {
             return match entry {
                 Entry::Dir { tree } => Ok(tree),
@@ -468,24 +401,15 @@ pub mod tree {
                 Some(_) => return Err(DriveError::NotADirectory),
                 None => empty(store),
             };
-            Entry::Dir {
-                tree: set(store, sub, rest, entry)?,
-            }
+            Entry::Dir { tree: set(store, sub, rest, entry)? }
         };
         t.entries.insert(first.clone(), child);
         Ok(store.put(t.encode()))
     }
 
     /// 删除路径上的项，返回新的根。目录要 `recursive`。
-    pub fn remove(
-        store: &mut impl Store,
-        root: Hash,
-        parts: &[String],
-        recursive: bool,
-    ) -> Result<Hash, DriveError> {
-        let Some((first, rest)) = parts.split_first() else {
-            return Err(DriveError::IsADirectory);
-        };
+    pub fn remove(store: &mut impl Store, root: Hash, parts: &[String], recursive: bool) -> Result<Hash, DriveError> {
+        let Some((first, rest)) = parts.split_first() else { return Err(DriveError::IsADirectory) };
         let mut t = load(store, root)?;
         match (t.entries.get(first).cloned(), rest.is_empty()) {
             (None, _) => return Err(DriveError::NotFound),
@@ -503,27 +427,15 @@ pub mod tree {
     }
 
     /// 全部文件和符号链接（不含目录），路径用 `/` 连接。
-    pub fn files(
-        store: &(impl Store + ?Sized),
-        root: Hash,
-    ) -> Result<BTreeMap<String, Entry>, DriveError> {
+    pub fn files(store: &(impl Store + ?Sized), root: Hash) -> Result<BTreeMap<String, Entry>, DriveError> {
         let mut out = BTreeMap::new();
         collect(store, root, "", &mut out)?;
         Ok(out)
     }
 
-    fn collect(
-        store: &(impl Store + ?Sized),
-        root: Hash,
-        prefix: &str,
-        out: &mut BTreeMap<String, Entry>,
-    ) -> Result<(), DriveError> {
+    fn collect(store: &(impl Store + ?Sized), root: Hash, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Result<(), DriveError> {
         for (name, e) in load(store, root)?.entries {
-            let path = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             match e {
                 Entry::Dir { tree } => collect(store, tree, &path, out)?,
                 e => {
@@ -537,26 +449,16 @@ pub mod tree {
     /// 按文件三方合并：只有一边改的取那一边；两边改得不同时保留 `ours`，`theirs` 的版本另存为
     /// `<路径>.conflict-<label>`（一边删除、另一边修改时同样）。返回合并后的根和冲突的路径。
     /// 空目录（M11.5）和文件一样参与三方合并：一边新建或删掉的空目录照办；放进了文件的目录随文件存在。
-    pub fn merge(
-        store: &mut impl Store,
-        base: Option<Hash>,
-        ours: Hash,
-        theirs: Hash,
-        label: &str,
-    ) -> Result<(Hash, Vec<String>), DriveError> {
+    pub fn merge(store: &mut impl Store, base: Option<Hash>, ours: Hash, theirs: Hash, label: &str) -> Result<(Hash, Vec<String>), DriveError> {
         let leaves = |store: &mut _, h| -> Result<BTreeMap<String, Entry>, DriveError> {
             let mut out = BTreeMap::new();
             collect_leaves(store, h, "", &mut out)?;
             Ok(out)
         };
-        let b = base
-            .map(|h| leaves(store, h))
-            .transpose()?
-            .unwrap_or_default();
+        let b = base.map(|h| leaves(store, h)).transpose()?.unwrap_or_default();
         let o = leaves(store, ours)?;
         let t = leaves(store, theirs)?;
-        let paths: std::collections::BTreeSet<&String> =
-            b.keys().chain(o.keys()).chain(t.keys()).collect();
+        let paths: std::collections::BTreeSet<&String> = b.keys().chain(o.keys()).chain(t.keys()).collect();
         // Reserve all input leaf names (and their implied directories) before
         // generating conflict copies, regardless of their iteration order.
         let mut occupied: std::collections::BTreeSet<String> =
@@ -577,9 +479,7 @@ pub mod tree {
                     let mut suffix = 0u64;
                     loop {
                         let prefix = format!("{candidate}/");
-                        let is_directory = occupied
-                            .range(prefix.clone()..)
-                            .next()
+                        let is_directory = occupied.range(prefix.clone()..).next()
                             .is_some_and(|name| name.starts_with(&prefix));
                         if !occupied.contains(&candidate) && !is_directory {
                             break;
@@ -606,23 +506,14 @@ pub mod tree {
     }
 
     /// 文件、符号链接和空目录（空目录是一个没有项的 `Entry::Dir`）。合并用。
-    fn collect_leaves(
-        store: &impl Store,
-        root: Hash,
-        prefix: &str,
-        out: &mut BTreeMap<String, Entry>,
-    ) -> Result<(), DriveError> {
+    fn collect_leaves(store: &impl Store, root: Hash, prefix: &str, out: &mut BTreeMap<String, Entry>) -> Result<(), DriveError> {
         let t = load(store, root)?;
         if t.entries.is_empty() && !prefix.is_empty() {
             out.insert(prefix.to_string(), Entry::Dir { tree: root });
             return Ok(());
         }
         for (name, e) in t.entries {
-            let path = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
             match e {
                 Entry::Dir { tree } => collect_leaves(store, tree, &path, out)?,
                 e => {
@@ -648,37 +539,22 @@ pub mod tree {
     }
 
     /// 从 `old` 到 `new` 的改动，按路径排序。
-    pub fn diff(
-        store: &(impl Store + ?Sized),
-        old: Option<Hash>,
-        new: Hash,
-    ) -> Result<Vec<Change>, DriveError> {
+    pub fn diff(store: &(impl Store + ?Sized), old: Option<Hash>, new: Hash) -> Result<Vec<Change>, DriveError> {
         let mut out = Vec::new();
         diff_dir(store, old, Some(new), "", &mut out)?;
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
 
-    fn diff_dir(
-        store: &(impl Store + ?Sized),
-        old: Option<Hash>,
-        new: Option<Hash>,
-        prefix: &str,
-        out: &mut Vec<Change>,
-    ) -> Result<(), DriveError> {
+    fn diff_dir(store: &(impl Store + ?Sized), old: Option<Hash>, new: Option<Hash>, prefix: &str, out: &mut Vec<Change>) -> Result<(), DriveError> {
         if old == new {
             return Ok(());
         }
         let a = old.map(|h| load(store, h)).transpose()?.unwrap_or_default();
         let b = new.map(|h| load(store, h)).transpose()?.unwrap_or_default();
-        let names: std::collections::BTreeSet<&String> =
-            a.entries.keys().chain(b.entries.keys()).collect();
+        let names: std::collections::BTreeSet<&String> = a.entries.keys().chain(b.entries.keys()).collect();
         for name in names {
-            let path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
+            let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
             let (x, y) = (a.entries.get(name), b.entries.get(name));
             let dir = |e: Option<&Entry>| match e {
                 Some(Entry::Dir { tree }) => Some(*tree),
@@ -690,18 +566,9 @@ pub mod tree {
             // 目录里的变化递归比较；文件和符号链接直接比较。
             diff_dir(store, dir(x), dir(y), &path, out)?;
             match (leaf(x), leaf(y)) {
-                (None, Some(_)) => out.push(Change {
-                    kind: ChangeKind::Added,
-                    path,
-                }),
-                (Some(_), None) => out.push(Change {
-                    kind: ChangeKind::Deleted,
-                    path,
-                }),
-                (Some(p), Some(q)) if p != q => out.push(Change {
-                    kind: ChangeKind::Modified,
-                    path,
-                }),
+                (None, Some(_)) => out.push(Change { kind: ChangeKind::Added, path }),
+                (Some(_), None) => out.push(Change { kind: ChangeKind::Deleted, path }),
+                (Some(p), Some(q)) if p != q => out.push(Change { kind: ChangeKind::Modified, path }),
                 _ => {}
             }
         }

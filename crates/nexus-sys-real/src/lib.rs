@@ -12,14 +12,14 @@
 use nexus_core_proto::Timestamp;
 pub use nexus_sys::Size;
 use nexus_sys::{Cmd, ExitStatus, Proc, ProcEvent, Pty, PtyEvent, System};
-use std::io;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -44,21 +44,14 @@ impl RealSystem {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir.as_ref())?;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.as_ref())?;
             std::fs::set_permissions(dir.as_ref(), std::fs::Permissions::from_mode(0o700))?;
         }
         #[cfg(windows)]
         {
             std::fs::create_dir_all(dir.as_ref())?;
         }
-        Ok(Self {
-            dir: dir.as_ref().to_path_buf(),
-            session_holder: None,
-            exec_env: Vec::new(),
-        })
+        Ok(Self { dir: dir.as_ref().to_path_buf(), session_holder: None, exec_env: Vec::new() })
     }
 
     /// 终端会话由独立的持有进程管理（`exe session-hold`），常驻程序重启后会话还在（M7.2；Windows 见 M11.3）。
@@ -74,11 +67,7 @@ impl RealSystem {
     }
 
     fn path(&self, key: &str) -> io::Result<PathBuf> {
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "非法的存储键"));
         }
         Ok(self.dir.join(format!("{key}.bin")))
@@ -94,15 +83,11 @@ impl RealSystem {
 fn default_cwd() -> PathBuf {
     #[cfg(unix)]
     {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/".into())
+        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/".into())
     }
     #[cfg(windows)]
     {
-        std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| ".".into())
+        std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| ".".into())
     }
 }
 
@@ -118,35 +103,20 @@ impl System for RealSystem {
     }
 
     async fn resolve(&self, host: &str) -> io::Result<Vec<std::net::IpAddr>> {
-        Ok(tokio::net::lookup_host((host, 0))
-            .await?
-            .map(|a| a.ip())
-            .collect())
+        Ok(tokio::net::lookup_host((host, 0)).await?.map(|a| a.ip()).collect())
     }
 
     async fn udp_connect(&self, addr: std::net::SocketAddr) -> io::Result<nexus_sys::UdpConn> {
         struct Udp(tokio::net::UdpSocket);
         impl nexus_sys::Datagram for Udp {
-            fn poll_send(
-                &self,
-                cx: &mut std::task::Context<'_>,
-                buf: &[u8],
-            ) -> std::task::Poll<io::Result<usize>> {
+            fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
                 self.0.poll_send(cx, buf)
             }
-            fn poll_recv(
-                &self,
-                cx: &mut std::task::Context<'_>,
-                buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> std::task::Poll<io::Result<()>> {
+            fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
                 self.0.poll_recv(cx, buf)
             }
         }
-        let any: std::net::SocketAddr = if addr.is_ipv4() {
-            ([0, 0, 0, 0], 0).into()
-        } else {
-            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
-        };
+        let any: std::net::SocketAddr = if addr.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
         let s = tokio::net::UdpSocket::bind(any).await?;
         s.connect(addr).await?;
         Ok(nexus_sys::UdpConn(Box::new(Udp(s))))
@@ -154,8 +124,7 @@ impl System for RealSystem {
 
     fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<RealTerm> {
         if let Some(exe) = &self.session_holder {
-            return holder::spawn(exe, &self.dir, name, size, created_at, false)
-                .map(RealTerm::Held);
+            return holder::spawn(exe, &self.dir, name, size, created_at, false).map(RealTerm::Held);
         }
         let _ = (name, created_at);
         RealPty::spawn(size).map(RealTerm::Local)
@@ -163,18 +132,10 @@ impl System for RealSystem {
 
     async fn adopt_ptys(&self) -> Vec<nexus_sys::AdoptedPty<RealTerm>> {
         if self.session_holder.is_some() {
-            return holder::adopt(
-                self.session_holder.as_deref().expect("上面判断过"),
-                &self.dir,
-            )
-            .into_iter()
-            .map(|a| nexus_sys::AdoptedPty {
-                name: a.name,
-                size: a.size,
-                created_at: a.created_at,
-                pty: RealTerm::Held(a.pty),
-            })
-            .collect();
+            return holder::adopt(self.session_holder.as_deref().expect("上面判断过"), &self.dir)
+                .into_iter()
+                .map(|a| nexus_sys::AdoptedPty { name: a.name, size: a.size, created_at: a.created_at, pty: RealTerm::Held(a.pty) })
+                .collect();
         }
         Vec::new()
     }
@@ -226,9 +187,7 @@ impl System for RealSystem {
     }
 
     fn now(&self) -> Timestamp {
-        let d = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
+        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         Timestamp(d.as_millis() as u64)
     }
 
@@ -251,10 +210,7 @@ impl System for RealSystem {
         if current > 0 && current + record.len() as u64 > max_bytes {
             std::fs::rename(&path, path.with_extension("log.1"))?;
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
         f.write_all(record)
     }
 
@@ -300,22 +256,13 @@ impl System for RealSystem {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(value)?;
         }
         #[cfg(windows)]
         {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
             file.write_all(value)?;
         }
         std::fs::rename(tmp, path)
@@ -343,10 +290,7 @@ pub struct RealProc {
     pid: Option<u32>,
 }
 
-async fn read_some<R: AsyncRead + Unpin>(
-    pipe: &mut Option<R>,
-    buf: &mut [u8],
-) -> io::Result<usize> {
+async fn read_some<R: AsyncRead + Unpin>(pipe: &mut Option<R>, buf: &mut [u8]) -> io::Result<usize> {
     match pipe {
         Some(p) => p.read(buf).await,
         None => std::future::pending().await,
@@ -362,27 +306,15 @@ impl Proc for RealProc {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     return ProcEvent::Exited(match status {
-                        Ok(s) => ExitStatus {
-                            code: s.code(),
-                            signal: s.signal(),
-                        },
-                        Err(_) => ExitStatus {
-                            code: None,
-                            signal: None,
-                        },
+                        Ok(s) => ExitStatus { code: s.code(), signal: s.signal() },
+                        Err(_) => ExitStatus { code: None, signal: None },
                     });
                 }
                 #[cfg(windows)]
                 {
                     return ProcEvent::Exited(match status {
-                        Ok(s) => ExitStatus {
-                            code: s.code(),
-                            signal: None,
-                        },
-                        Err(_) => ExitStatus {
-                            code: None,
-                            signal: None,
-                        },
+                        Ok(s) => ExitStatus { code: s.code(), signal: None },
+                        Err(_) => ExitStatus { code: None, signal: None },
                     });
                 }
             }
@@ -413,10 +345,7 @@ impl Proc for RealProc {
         #[cfg(unix)]
         {
             if let Some(pgid) = self.pgid {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pgid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), nix::sys::signal::Signal::SIGKILL);
             }
         }
         #[cfg(windows)]
@@ -437,12 +366,7 @@ impl Proc for RealProc {
 // ---------------------------------------------------------------- 伪终端
 
 fn pty_size(size: Size) -> portable_pty::PtySize {
-    portable_pty::PtySize {
-        rows: size.rows.max(1),
-        cols: size.cols.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
-    }
+    portable_pty::PtySize { rows: size.rows.max(1), cols: size.cols.max(1), pixel_width: 0, pixel_height: 0 }
 }
 
 enum PtyMsg {
@@ -509,26 +433,16 @@ impl RealPty {
         fn other(e: impl std::fmt::Display) -> io::Error {
             io::Error::other(e.to_string())
         }
-        let pair = portable_pty::native_pty_system()
-            .openpty(pty_size(size))
-            .map_err(other)?;
+        let pair = portable_pty::native_pty_system().openpty(pty_size(size)).map_err(other)?;
 
         #[cfg(unix)]
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into());
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
         #[cfg(windows)]
         let shell = {
             // 有 Windows PowerShell 就用它，否则用 ComSpec（通常是 cmd.exe）。
-            const POWERSHELL: &str =
-                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+            const POWERSHELL: &str = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
             let comspec = std::env::var("ComSpec").ok().filter(|s| !s.is_empty());
-            let is_powershell = |p: &str| {
-                std::path::Path::new(p)
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe"))
-            };
+            let is_powershell = |p: &str| std::path::Path::new(p).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("powershell.exe"));
             match comspec {
                 Some(p) if is_powershell(&p) => p,
                 _ if std::path::Path::new(POWERSHELL).exists() => POWERSHELL.to_string(),
@@ -541,15 +455,9 @@ impl RealPty {
         #[cfg(unix)]
         cmd.env("TERM", "xterm-256color");
         #[cfg(unix)]
-        cmd.cwd(
-            cwd.map(|c| c.as_os_str().to_owned())
-                .unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| "/".into())),
-        );
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("HOME").unwrap_or_else(|| "/".into())));
         #[cfg(windows)]
-        cmd.cwd(
-            cwd.map(|c| c.as_os_str().to_owned())
-                .unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into())),
-        );
+        cmd.cwd(cwd.map(|c| c.as_os_str().to_owned()).unwrap_or_else(|| std::env::var_os("USERPROFILE").unwrap_or_else(|| ".".into())));
 
         let mut child = pair.slave.spawn_command(cmd).map_err(other)?;
         drop(pair.slave);
@@ -580,24 +488,13 @@ impl RealPty {
                 #[cfg(unix)]
                 Ok(s) => {
                     let signal = s.signal().map(|_| 0);
-                    ExitStatus {
-                        code: if signal.is_some() {
-                            None
-                        } else {
-                            Some(s.exit_code() as i32)
-                        },
-                        signal,
-                    }
+                    ExitStatus { code: if signal.is_some() { None } else { Some(s.exit_code() as i32) }, signal }
                 }
                 #[cfg(windows)]
-                Ok(s) => ExitStatus {
-                    code: Some(s.exit_code() as i32),
-                    signal: None,
-                },
-                Err(_) => ExitStatus {
-                    code: None,
-                    signal: None,
-                },
+                Ok(s) => {
+                    ExitStatus { code: Some(s.exit_code() as i32), signal: None }
+                }
+                Err(_) => ExitStatus { code: None, signal: None },
             };
             let _ = tx.send(PtyMsg::Exited(status));
         });
@@ -605,24 +502,12 @@ impl RealPty {
         std::thread::spawn(move || {
             use std::io::Write;
             while let Ok(chunk) = input_rx.recv() {
-                if writer
-                    .write_all(&chunk)
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
+                if writer.write_all(&chunk).and_then(|_| writer.flush()).is_err() {
                     return;
                 }
             }
         });
-        Ok(Self {
-            master: pair.master,
-            killer,
-            pid,
-            events,
-            input,
-            eof: false,
-            status: None,
-        })
+        Ok(Self { master: pair.master, killer, pid, events, input, eof: false, status: None })
     }
 }
 
@@ -641,24 +526,17 @@ impl Pty for RealPty {
                 return PtyEvent::Exited(status);
             }
             let msg = match self.status {
-                Some(status) => {
-                    match tokio::time::timeout(DRAIN_AFTER_EXIT, self.events.recv()).await {
-                        Ok(m) => m,
-                        Err(_) => return PtyEvent::Exited(status),
-                    }
-                }
+                Some(status) => match tokio::time::timeout(DRAIN_AFTER_EXIT, self.events.recv()).await {
+                    Ok(m) => m,
+                    Err(_) => return PtyEvent::Exited(status),
+                },
                 None => self.events.recv().await,
             };
             match msg {
                 Some(PtyMsg::Output(b)) => return PtyEvent::Output(b),
                 Some(PtyMsg::Eof) => self.eof = true,
                 Some(PtyMsg::Exited(s)) => self.status = Some(s),
-                None => {
-                    return PtyEvent::Exited(self.status.unwrap_or(ExitStatus {
-                        code: None,
-                        signal: None,
-                    }))
-                }
+                None => return PtyEvent::Exited(self.status.unwrap_or(ExitStatus { code: None, signal: None })),
             }
         }
     }
@@ -675,10 +553,7 @@ impl Pty for RealPty {
         #[cfg(unix)]
         {
             if let Some(pid) = self.pid {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
+                let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL);
             }
         }
         #[cfg(windows)]
@@ -715,19 +590,9 @@ mod tests {
             let sys = RealSystem::new(&path).unwrap();
             sys.store_put("device_key", &[42; 32]).unwrap();
             sys.store_put("root_key", &[43; 32]).unwrap();
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
             for key in ["device_key", "root_key"] {
-                assert_eq!(
-                    std::fs::metadata(sys.path(key).unwrap())
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
+                assert_eq!(std::fs::metadata(sys.path(key).unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
             }
             assert_eq!(sys.store_get("device_key").unwrap().unwrap(), [42; 32]);
         }

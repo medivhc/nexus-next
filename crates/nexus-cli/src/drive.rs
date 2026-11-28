@@ -1,9 +1,6 @@
 //! `nexus drive`：工作区（M4.1）。路径写作 `<工作区>:/<路径>`。
 
-use crate::{
-    doc, fail, fail_wire, Ctl, Sink, EXIT_DAEMON_UNREACHABLE, EXIT_INTERNAL, EXIT_INVALID_INPUT,
-    JSON_SCHEMA,
-};
+use crate::{doc, fail, fail_wire, Ctl, Sink, EXIT_DAEMON_UNREACHABLE, EXIT_INTERNAL, EXIT_INVALID_INPUT, JSON_SCHEMA};
 use clap::Subcommand;
 use nexus_wire::{CtlRequest, CtlResponse, DriveRequest, DriveResponse, Input};
 use serde_json::{json, Value};
@@ -174,18 +171,11 @@ pub enum DriveCmd {
 
 /// 一次请求、一次回应。
 async fn ask<C: Ctl>(ctl: &C, req: DriveRequest) -> Result<DriveResponse, Failure> {
-    let mut s = ctl
-        .open(CtlRequest::Drive(req))
-        .await
-        .map_err(unreachable)?;
+    let mut s = ctl.open(CtlRequest::Drive(req)).await.map_err(unreachable)?;
     match s.rx.recv().await {
         Some(CtlResponse::Drive(r)) => Ok(r),
         Some(CtlResponse::Error(e)) => Err(Failure::Wire(e)),
-        _ => Err(Failure::Other(
-            EXIT_INTERNAL,
-            "internal",
-            "常驻程序的回应无法理解".into(),
-        )),
+        _ => Err(Failure::Other(EXIT_INTERNAL, "internal", "常驻程序的回应无法理解".into())),
     }
 }
 
@@ -195,11 +185,7 @@ enum Failure {
 }
 
 fn unreachable(e: std::io::Error) -> Failure {
-    Failure::Other(
-        EXIT_DAEMON_UNREACHABLE,
-        "daemon_unreachable",
-        format!("连不上本机的常驻程序（{e}）"),
-    )
+    Failure::Other(EXIT_DAEMON_UNREACHABLE, "daemon_unreachable", format!("连不上本机的常驻程序（{e}）"))
 }
 
 impl Failure {
@@ -227,33 +213,12 @@ impl<R: AsyncRead + Unpin> Source<'_, R> {
 }
 
 /// 写一个文件：内容来自 `input`。
-async fn put<C: Ctl, R: AsyncRead + Unpin>(
-    ctl: &C,
-    path: &str,
-    exec: bool,
-    mut input: Source<'_, R>,
-) -> Result<DriveResponse, Failure> {
-    let mut s = ctl
-        .open(CtlRequest::Drive(DriveRequest::Put {
-            path: path.to_string(),
-            exec,
-        }))
-        .await
-        .map_err(unreachable)?;
+async fn put<C: Ctl, R: AsyncRead + Unpin>(ctl: &C, path: &str, exec: bool, mut input: Source<'_, R>) -> Result<DriveResponse, Failure> {
+    let mut s = ctl.open(CtlRequest::Drive(DriveRequest::Put { path: path.to_string(), exec })).await.map_err(unreachable)?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = input.read(&mut buf).await.map_err(|e| {
-            Failure::Other(
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                format!("读不了输入：{e}"),
-            )
-        })?;
-        let msg = if n == 0 {
-            Input::CloseStdin
-        } else {
-            Input::Stdin(buf[..n].to_vec())
-        };
+        let n = input.read(&mut buf).await.map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("读不了输入：{e}")))?;
+        let msg = if n == 0 { Input::CloseStdin } else { Input::Stdin(buf[..n].to_vec()) };
         if s.tx.send(msg).await.is_err() || n == 0 {
             break;
         }
@@ -261,35 +226,14 @@ async fn put<C: Ctl, R: AsyncRead + Unpin>(
     match s.rx.recv().await {
         Some(CtlResponse::Drive(r)) => Ok(r),
         Some(CtlResponse::Error(e)) => Err(Failure::Wire(e)),
-        _ => Err(Failure::Other(
-            EXIT_INTERNAL,
-            "internal",
-            "常驻程序的回应无法理解".into(),
-        )),
+        _ => Err(Failure::Other(EXIT_INTERNAL, "internal", "常驻程序的回应无法理解".into())),
     }
 }
 
-pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
-    cmd: &DriveCmd,
-    ctl: &C,
-    stdin: &mut R,
-    sink: &mut K,
-) -> i32 {
+pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(cmd: &DriveCmd, ctl: &C, stdin: &mut R, sink: &mut K) -> i32 {
     let (result, json) = match cmd {
-        DriveCmd::Cat {
-            path,
-            at,
-            offset,
-            length,
-        } => return cat(ctl, path, at.clone(), *offset, *length, sink).await,
-        DriveCmd::Mount { .. } => {
-            return fail(
-                sink,
-                crate::EXIT_USAGE,
-                "usage",
-                "挂载只能在真实设备上运行（Linux）",
-            )
-        }
+        DriveCmd::Cat { path, at, offset, length } => return cat(ctl, path, at.clone(), *offset, *length, sink).await,
+        DriveCmd::Mount { .. } => return fail(sink, crate::EXIT_USAGE, "usage", "挂载只能在真实设备上运行（Linux）"),
         DriveCmd::Import { dir, dest, json } => match import(ctl, dir, dest).await {
             Ok((files, bytes)) => {
                 let text = if *json {
@@ -302,20 +246,10 @@ pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
             }
             Err(f) => return f.report(sink),
         },
-        DriveCmd::Put { path, exec, json } => {
-            (put(ctl, path, *exec, Source::Stream(stdin)).await, *json)
+        DriveCmd::Put { path, exec, json } => (put(ctl, path, *exec, Source::Stream(stdin)).await, *json),
+        DriveCmd::Create { ws, replicas, json } => {
+            (ask(ctl, DriveRequest::Create { ws: ws.clone(), replicas: replicas.clone() }).await, *json)
         }
-        DriveCmd::Create { ws, replicas, json } => (
-            ask(
-                ctl,
-                DriveRequest::Create {
-                    ws: ws.clone(),
-                    replicas: replicas.clone(),
-                },
-            )
-            .await,
-            *json,
-        ),
         DriveCmd::Serve { state, json } => {
             let on = match state.as_str() {
                 "on" => Some(true),
@@ -324,102 +258,28 @@ pub(crate) async fn run<C: Ctl, R: AsyncRead + Unpin, K: Sink>(
             };
             (ask(ctl, DriveRequest::Serve { on }).await, *json)
         }
-        DriveCmd::Sync { ws, json } => {
-            (ask(ctl, DriveRequest::Sync { ws: ws.clone() }).await, *json)
+        DriveCmd::Sync { ws, json } => (ask(ctl, DriveRequest::Sync { ws: ws.clone() }).await, *json),
+        DriveCmd::Merge { ws, json } => (ask(ctl, DriveRequest::Merge { ws: ws.clone() }).await, *json),
+        DriveCmd::Where { path, json } => (ask(ctl, DriveRequest::Where { path: path.clone() }).await, *json),
+        DriveCmd::Ls { path: None, json, .. } => (ask(ctl, DriveRequest::List).await, *json),
+        DriveCmd::Ls { path: Some(path), at, json } => {
+            (ask(ctl, DriveRequest::Ls { path: path.clone(), at: at.clone() }).await, *json)
         }
-        DriveCmd::Merge { ws, json } => (
-            ask(ctl, DriveRequest::Merge { ws: ws.clone() }).await,
-            *json,
-        ),
-        DriveCmd::Where { path, json } => (
-            ask(ctl, DriveRequest::Where { path: path.clone() }).await,
-            *json,
-        ),
-        DriveCmd::Ls {
-            path: None, json, ..
-        } => (ask(ctl, DriveRequest::List).await, *json),
-        DriveCmd::Ls {
-            path: Some(path),
-            at,
-            json,
-        } => (
-            ask(
-                ctl,
-                DriveRequest::Ls {
-                    path: path.clone(),
-                    at: at.clone(),
-                },
-            )
-            .await,
-            *json,
-        ),
-        DriveCmd::Rm {
-            path,
-            recursive,
-            json,
-        } => (
-            ask(
-                ctl,
-                DriveRequest::Rm {
-                    path: path.clone(),
-                    recursive: *recursive,
-                },
-            )
-            .await,
-            *json,
-        ),
-        DriveCmd::Status { ws, json } => (
-            ask(ctl, DriveRequest::Status { ws: ws.clone() }).await,
-            *json,
-        ),
-        DriveCmd::Commit { ws, message, json } => (
-            ask(
-                ctl,
-                DriveRequest::Commit {
-                    ws: ws.clone(),
-                    message: message.clone(),
-                },
-            )
-            .await,
-            *json,
-        ),
+        DriveCmd::Rm { path, recursive, json } => {
+            (ask(ctl, DriveRequest::Rm { path: path.clone(), recursive: *recursive }).await, *json)
+        }
+        DriveCmd::Status { ws, json } => (ask(ctl, DriveRequest::Status { ws: ws.clone() }).await, *json),
+        DriveCmd::Commit { ws, message, json } => {
+            (ask(ctl, DriveRequest::Commit { ws: ws.clone(), message: message.clone() }).await, *json)
+        }
         DriveCmd::Log { ws, json } => (ask(ctl, DriveRequest::Log { ws: ws.clone() }).await, *json),
-        DriveCmd::Record {
-            ws,
-            name,
-            stop,
-            json,
-        } => {
+        DriveCmd::Record { ws, name, stop, json } => {
             let name = (!stop).then(|| name.clone());
-            (
-                ask(
-                    ctl,
-                    DriveRequest::Record {
-                        ws: ws.clone(),
-                        name,
-                    },
-                )
-                .await,
-                *json,
-            )
+            (ask(ctl, DriveRequest::Record { ws: ws.clone(), name }).await, *json)
         }
-        DriveCmd::Prefetch {
-            ws,
-            profile,
-            all,
-            json,
-        } => (
-            ask(
-                ctl,
-                DriveRequest::Prefetch {
-                    ws: ws.clone(),
-                    profile: profile.clone(),
-                    all: *all,
-                },
-            )
-            .await,
-            *json,
-        ),
+        DriveCmd::Prefetch { ws, profile, all, json } => {
+            (ask(ctl, DriveRequest::Prefetch { ws: ws.clone(), profile: profile.clone(), all: *all }).await, *json)
+        }
     };
     match result {
         Ok(r) => {
@@ -446,10 +306,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
                 return list
                     .iter()
                     .map(|w| {
-                        let head = w
-                            .head
-                            .as_deref()
-                            .map_or("（没有提交）".to_string(), |h| h[..12].to_string());
+                        let head = w.head.as_deref().map_or("（没有提交）".to_string(), |h| h[..12].to_string());
                         format!("{:<20} {:<14} 未提交的改动 {}\n", w.name, head, w.changes)
                     })
                     .collect();
@@ -462,25 +319,15 @@ fn render(r: &DriveResponse, json: bool) -> String {
                     .iter()
                     .map(|e| match e.kind.as_str() {
                         "dir" => format!("{}/\n", e.name),
-                        "symlink" => format!(
-                            "{} -> {}\n",
-                            e.name,
-                            e.target.as_deref().unwrap_or_default()
-                        ),
-                        _ => format!(
-                            "{:<40} {:>12}{}\n",
-                            e.name,
-                            e.size,
-                            if e.exec { "  可执行" } else { "" }
-                        ),
+                        "symlink" => format!("{} -> {}\n", e.name, e.target.as_deref().unwrap_or_default()),
+                        _ => format!("{:<40} {:>12}{}\n", e.name, e.size, if e.exec { "  可执行" } else { "" }),
                     })
                     .collect();
             }
             let entries: Vec<Value> = entries
                 .iter()
                 .map(|e| {
-                    let mut v =
-                        json!({ "name": e.name, "kind": e.kind, "size": e.size, "exec": e.exec });
+                    let mut v = json!({ "name": e.name, "kind": e.kind, "size": e.size, "exec": e.exec });
                     if let Some(t) = &e.target {
                         v["target"] = json!(t);
                     }
@@ -508,28 +355,16 @@ fn render(r: &DriveResponse, json: bool) -> String {
             }
             json!({ "path": path })
         }
-        DriveResponse::Stamp { tree } => {
-            json!({ "tree": nexus_drive_core::Hash(*tree).to_string() })
-        }
+        DriveResponse::Stamp { tree } => json!({ "tree": nexus_drive_core::Hash(*tree).to_string() }),
         DriveResponse::Recording { name } => {
             if !json {
-                return format!(
-                    "开始记录预读清单 {name}；读完后 nexus drive record <工作区> --stop\n"
-                );
+                return format!("开始记录预读清单 {name}；读完后 nexus drive record <工作区> --stop\n");
             }
             json!({ "recording": name })
         }
-        DriveResponse::Profile {
-            name,
-            files,
-            saved_to,
-        } => {
+        DriveResponse::Profile { name, files, saved_to } => {
             if !json {
-                let place = if saved_to.is_empty() {
-                    "只在本机（没有交给存储设备）".to_string()
-                } else {
-                    format!("已交给 {}", saved_to.join("、"))
-                };
+                let place = if saved_to.is_empty() { "只在本机（没有交给存储设备）".to_string() } else { format!("已交给 {}", saved_to.join("、")) };
                 return format!("预读清单 {name}：{} 个文件，{place}\n", files.len());
             }
             json!({ "profile": name, "files": files, "saved_to": saved_to })
@@ -553,10 +388,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
                     "modified" => "修改",
                     _ => "删除",
                 };
-                return list
-                    .iter()
-                    .map(|c| format!("{}  {}\n", mark(&c.kind), c.path))
-                    .collect();
+                return list.iter().map(|c| format!("{}  {}\n", mark(&c.kind), c.path)).collect();
             }
             json!({ "changes": list.iter().map(|c| json!({ "kind": c.kind, "path": c.path })).collect::<Vec<_>>() })
         }
@@ -568,11 +400,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
         }
         DriveResponse::Serving { on } => {
             if !json {
-                return if *on {
-                    "本机是存储设备：保存登记到这里的工作区的完整副本\n".into()
-                } else {
-                    "本机不是存储设备\n".into()
-                };
+                return if *on { "本机是存储设备：保存登记到这里的工作区的完整副本\n".into() } else { "本机不是存储设备\n".into() };
             }
             json!({ "serving": on })
         }
@@ -582,18 +410,11 @@ fn render(r: &DriveResponse, json: bool) -> String {
             }
             sync_json(r)
         }
-        DriveResponse::Merged {
-            commit,
-            conflicts,
-            sync,
-        } => {
+        DriveResponse::Merged { commit, conflicts, sync } => {
             if !json {
                 let mut t = format!("已合并 {}", &commit[..12]);
                 if !conflicts.is_empty() {
-                    t.push_str(&format!(
-                        "；冲突（本机的版本保留，对方的另存为 .conflict-*）：{}",
-                        conflicts.join("、")
-                    ));
+                    t.push_str(&format!("；冲突（本机的版本保留，对方的另存为 .conflict-*）：{}", conflicts.join("、")));
                 }
                 return format!("{t}；{}", sync_text(sync));
             }
@@ -608,9 +429,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
                 } else {
                     format!("还没同步到 {}：最新的提交只在本机", w.replicas.join("、"))
                 };
-                let pct = (w.local_bytes * 100)
-                    .checked_div(w.total_bytes)
-                    .unwrap_or(100);
+                let pct = (w.local_bytes * 100).checked_div(w.total_bytes).unwrap_or(100);
                 return format!(
                     "{}\n  {place}\n  未提交的改动 {}\n  内容 {} 字节，本机有 {} 字节（{pct}%）\n",
                     w.path, w.uncommitted, w.total_bytes, w.local_bytes
@@ -623,10 +442,7 @@ fn render(r: &DriveResponse, json: bool) -> String {
         }
         DriveResponse::Log(list) => {
             if !json {
-                return list
-                    .iter()
-                    .map(|c| format!("{}  {:<12} {}\n", &c.commit[..12], c.device, c.message))
-                    .collect();
+                return list.iter().map(|c| format!("{}  {:<12} {}\n", &c.commit[..12], c.device, c.message)).collect();
             }
             json!({ "commits": list.iter().map(|c| json!({ "commit": c.commit, "message": c.message, "device": c.device, "time_ms": c.time_ms })).collect::<Vec<_>>() })
         }
@@ -656,20 +472,8 @@ fn sync_text(r: &nexus_wire::DriveSyncReport) -> String {
     }
 }
 
-async fn cat<C: Ctl, K: Sink>(
-    ctl: &C,
-    path: &str,
-    at: Option<String>,
-    offset: u64,
-    length: Option<u64>,
-    sink: &mut K,
-) -> i32 {
-    let req = DriveRequest::Cat {
-        path: path.to_string(),
-        at,
-        offset,
-        length,
-    };
+async fn cat<C: Ctl, K: Sink>(ctl: &C, path: &str, at: Option<String>, offset: u64, length: Option<u64>, sink: &mut K) -> i32 {
+    let req = DriveRequest::Cat { path: path.to_string(), at, offset, length };
     let mut s = match ctl.open(CtlRequest::Drive(req)).await {
         Ok(s) => s,
         Err(e) => return unreachable(e).report(sink),
@@ -687,59 +491,25 @@ async fn cat<C: Ctl, K: Sink>(
 
 /// 把本地目录导入：先确认工作区存在，再逐个写入文件和符号链接。返回（文件数，字节数）。
 async fn import<C: Ctl>(ctl: &C, dir: &str, dest: &str) -> Result<(u64, u64), Failure> {
-    let base: nexus_drive_core::path::DrivePath = dest
-        .parse()
-        .map_err(|m: String| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", m))?;
-    ask(
-        ctl,
-        DriveRequest::Ls {
-            path: format!("{}:/", base.ws),
-            at: None,
-        },
-    )
-    .await?;
+    let base: nexus_drive_core::path::DrivePath =
+        dest.parse().map_err(|m: String| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", m))?;
+    ask(ctl, DriveRequest::Ls { path: format!("{}:/", base.ws), at: None }).await?;
     let root = Path::new(dir);
     if !root.is_dir() {
-        return Err(Failure::Other(
-            EXIT_INVALID_INPUT,
-            "invalid_input",
-            format!("不是本地目录：{dir}"),
-        ));
+        return Err(Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("不是本地目录：{dir}")));
     }
     let mut files = Vec::new();
-    walk(root, root, &mut files).map_err(|e| {
-        Failure::Other(
-            EXIT_INVALID_INPUT,
-            "invalid_input",
-            format!("读不了 {dir}：{e}"),
-        )
-    })?;
+    walk(root, root, &mut files).map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("读不了 {dir}：{e}")))?;
     let (mut count, mut bytes) = (0u64, 0u64);
     for rel in files {
         let local = root.join(&rel);
         let mut target = base.clone();
-        target
-            .parts
-            .extend(rel.iter().map(|c| c.to_string_lossy().into_owned()));
+        target.parts.extend(rel.iter().map(|c| c.to_string_lossy().into_owned()));
         let path = target.to_string();
-        let md = std::fs::symlink_metadata(&local).map_err(|e| {
-            Failure::Other(
-                EXIT_INVALID_INPUT,
-                "invalid_input",
-                format!("{}：{e}", local.display()),
-            )
-        })?;
+        let md = std::fs::symlink_metadata(&local).map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("{}：{e}", local.display())))?;
         if md.file_type().is_symlink() {
-            let to = std::fs::read_link(&local)
-                .map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", e.to_string()))?;
-            ask(
-                ctl,
-                DriveRequest::Symlink {
-                    path,
-                    target: to.to_string_lossy().into_owned(),
-                },
-            )
-            .await?;
+            let to = std::fs::read_link(&local).map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", e.to_string()))?;
+            ask(ctl, DriveRequest::Symlink { path, target: to.to_string_lossy().into_owned() }).await?;
         } else {
             let exec = {
                 #[cfg(unix)]
@@ -752,13 +522,8 @@ async fn import<C: Ctl>(ctl: &C, dir: &str, dest: &str) -> Result<(u64, u64), Fa
                     false
                 }
             };
-            let f = std::fs::File::open(&local).map_err(|e| {
-                Failure::Other(
-                    EXIT_INVALID_INPUT,
-                    "invalid_input",
-                    format!("{}: {e}", local.display()),
-                )
-            })?;
+            let f = std::fs::File::open(&local)
+                .map_err(|e| Failure::Other(EXIT_INVALID_INPUT, "invalid_input", format!("{}: {e}", local.display())))?;
             put::<C, tokio::io::Empty>(ctl, &path, exec, Source::File(f)).await?;
             bytes += md.len();
         }

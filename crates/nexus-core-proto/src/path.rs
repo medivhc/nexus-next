@@ -20,10 +20,7 @@ impl fmt::Display for PathError {
 
 /// 一段名字只允许字母、数字、`-`、`_`，长度 1 到 64。
 pub fn valid_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// 一个具体的资源路径。
@@ -129,13 +126,10 @@ impl CapabilityPattern {
     pub fn parse(s: &str) -> Result<Self, PathError> {
         let segs: Vec<&str> = s.split('.').collect();
         let last = segs.len() - 1;
-        let ok = segs.iter().enumerate().all(|(i, seg)| {
-            if *seg == "*" {
-                i == last
-            } else {
-                valid_segment(seg)
-            }
-        });
+        let ok = segs
+            .iter()
+            .enumerate()
+            .all(|(i, seg)| if *seg == "*" { i == last } else { valid_segment(seg) });
         if ok {
             Ok(Self(s.to_string()))
         } else {
@@ -185,16 +179,10 @@ mod tests {
             assert!(ResourcePath::parse(bad).is_err(), "路径 {bad:?} 应当非法");
         }
         for bad in ["", "a/**/b", "**/a", "a/***", "a b"] {
-            assert!(
-                ResourcePattern::parse(bad).is_err(),
-                "资源模式 {bad:?} 应当非法"
-            );
+            assert!(ResourcePattern::parse(bad).is_err(), "资源模式 {bad:?} 应当非法");
         }
         for bad in ["", "term.", ".exec", "*.exec", "term.*.x", "term exec"] {
-            assert!(
-                CapabilityPattern::parse(bad).is_err(),
-                "能力模式 {bad:?} 应当非法"
-            );
+            assert!(CapabilityPattern::parse(bad).is_err(), "能力模式 {bad:?} 应当非法");
         }
         assert!(Capability::parse("term.*").is_err());
         assert!(ResourcePath::parse(&"a".repeat(65)).is_err());
@@ -207,10 +195,7 @@ mod tests {
             assert!(valid_segment(good), "{good} 应当合法");
             assert!(ResourcePath::parse(good).is_ok());
         }
-        assert_eq!(
-            ResourcePath::parse("my-laptop/session_1").unwrap().as_str(),
-            "my-laptop/session_1"
-        );
+        assert_eq!(ResourcePath::parse("my-laptop/session_1").unwrap().as_str(), "my-laptop/session_1");
     }
 
     #[test]

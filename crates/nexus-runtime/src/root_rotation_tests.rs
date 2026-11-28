@@ -87,9 +87,7 @@ impl System for MemSystem {
         if self.fail_put_key == Some(key) {
             return Err(io::Error::other(format!("injected failure on {key}")));
         }
-        self.store
-            .borrow_mut()
-            .insert(key.to_string(), value.to_vec());
+        self.store.borrow_mut().insert(key.to_string(), value.to_vec());
         Ok(())
     }
     fn store_delete(&self, key: &str) -> io::Result<()> {
@@ -121,13 +119,7 @@ impl System for MemSystem {
 
 fn setup_rotation_fixture(
     fail_put_key: Option<&'static str>,
-) -> (
-    Node<DummyTransport, MemSystem>,
-    MemSystem,
-    SignedRootRotation,
-    SignedRoster,
-    PublicKey,
-) {
+) -> (Node<DummyTransport, MemSystem>, MemSystem, SignedRootRotation, SignedRoster, PublicKey) {
     let me = NodeId([1; 32]);
     let other = NodeId([2; 32]);
     let old_seed = [0x11; 32];
@@ -138,18 +130,8 @@ fn setup_rotation_fixture(
         root: old_root.public(),
         version: 1,
         devices: vec![
-            Device {
-                node_id: me,
-                name: "old-admin".into(),
-                role: DeviceRole::Admin,
-                added_at: Timestamp(1),
-            },
-            Device {
-                node_id: other,
-                name: "new-admin".into(),
-                role: DeviceRole::Member,
-                added_at: Timestamp(2),
-            },
+            Device { node_id: me, name: "old-admin".into(), role: DeviceRole::Admin, added_at: Timestamp(1) },
+            Device { node_id: other, name: "new-admin".into(), role: DeviceRole::Member, added_at: Timestamp(2) },
         ],
         web_keys: Vec::new(),
         anchor: None,
@@ -157,48 +139,27 @@ fn setup_rotation_fixture(
     }
     .sign(&old_root);
 
-    let sys = MemSystem {
-        store: Default::default(),
-        fail_put_key: None,
-    };
+    let sys = MemSystem { store: Default::default(), fail_put_key: None };
     save(&sys, KEY_ROOT_PUB, &old_root.public()).unwrap();
     save(&sys, KEY_ROOT_KEY, &old_seed).unwrap();
     save(&sys, KEY_ROSTER, &v1).unwrap();
 
-    let sys = MemSystem {
-        store: sys.store,
-        fail_put_key,
-    };
+    let sys = MemSystem { store: sys.store, fail_put_key };
     let node = Node::new(DummyTransport, sys.clone(), "old-admin").unwrap();
 
     let v2 = Roster {
         root: new_root.public(),
         version: 2,
         devices: vec![
-            Device {
-                node_id: me,
-                name: "old-admin".into(),
-                role: DeviceRole::Member,
-                added_at: Timestamp(1),
-            },
-            Device {
-                node_id: other,
-                name: "new-admin".into(),
-                role: DeviceRole::Admin,
-                added_at: Timestamp(2),
-            },
+            Device { node_id: me, name: "old-admin".into(), role: DeviceRole::Member, added_at: Timestamp(1) },
+            Device { node_id: other, name: "new-admin".into(), role: DeviceRole::Admin, added_at: Timestamp(2) },
         ],
         web_keys: Vec::new(),
         anchor: None,
         revoked_agents: Vec::new(),
     }
     .sign(&new_root);
-    let rot = RootRotation {
-        old_root: old_root.public(),
-        new_root: new_root.public(),
-        version: 2,
-    }
-    .sign(&old_root);
+    let rot = RootRotation { old_root: old_root.public(), new_root: new_root.public(), version: 2 }.sign(&old_root);
     (node, sys, rot, v2, old_root.public())
 }
 
@@ -208,8 +169,7 @@ fn adopt_root_rotation_clears_root_key_when_no_longer_admin() {
     assert!(node.trust.borrow().root_key.is_some());
     assert!(sys.store_get(KEY_ROOT_KEY).unwrap().is_some());
 
-    node.adopt_root_rotation(&rot, &v2)
-        .expect("rotation should succeed");
+    node.adopt_root_rotation(&rot, &v2).expect("rotation should succeed");
 
     assert!(node.trust.borrow().root_key.is_none());
     assert!(sys.store_get(KEY_ROOT_KEY).unwrap().is_none());
@@ -221,9 +181,7 @@ fn adopt_root_rotation_clears_root_key_when_no_longer_admin() {
 #[test]
 fn adopt_root_rotation_propagates_rotations_save_error() {
     let (node, _sys, rot, v2, old_root_pub) = setup_rotation_fixture(Some(KEY_ROTATIONS));
-    let err = node
-        .adopt_root_rotation(&rot, &v2)
-        .expect_err("KEY_ROTATIONS save failure must propagate");
+    let err = node.adopt_root_rotation(&rot, &v2).expect_err("KEY_ROTATIONS save failure must propagate");
     assert_eq!(err.code, ErrorCode::Internal);
     assert_eq!(node.trust.borrow().root, Some(old_root_pub));
     assert!(node.trust.borrow().rotations.is_empty());

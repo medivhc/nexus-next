@@ -20,10 +20,7 @@ async fn start_enroll(w: &World, admin: &str, args: &[&str]) -> String {
 }
 
 async fn passkeys(w: &World, node: &str) -> Vec<serde_json::Value> {
-    w.cli_ok(node, &["web", "ls"]).await["passkeys"]
-        .as_array()
-        .expect("应当有 passkeys 数组")
-        .clone()
+    w.cli_ok(node, &["web", "ls"]).await["passkeys"].as_array().expect("应当有 passkeys 数组").clone()
 }
 
 scenario! {
@@ -147,11 +144,7 @@ async fn enrolled(w: &World, label: &str, extra: &[&str], auth: &SoftAuthenticat
     let mut args = vec!["--label", label];
     args.extend_from_slice(extra);
     let link = start_enroll(w, "laptop", &args).await;
-    w.browser()
-        .await
-        .enroll(&link, auth)
-        .await
-        .expect("登记应当成功");
+    w.browser().await.enroll(&link, auth).await.expect("登记应当成功");
     link
 }
 
@@ -368,30 +361,15 @@ scenario! {
 fn http_get(port: u16, path: &str) -> (u16, String, Vec<u8>) {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连不上页面服务");
-    write!(
-        s,
-        "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n").unwrap();
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("回应没有头部");
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("回应没有头部");
     let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .expect("没有状态码");
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).expect("没有状态码");
     let ctype = head
         .lines()
-        .find_map(|l| {
-            l.to_ascii_lowercase()
-                .strip_prefix("content-type:")
-                .map(|v| v.trim().to_string())
-        })
+        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-type:").map(|v| v.trim().to_string()))
         .unwrap_or_default();
     (status, ctype, raw[split + 4..].to_vec())
 }

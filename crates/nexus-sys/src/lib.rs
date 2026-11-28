@@ -106,18 +106,12 @@ pub trait System {
         std::future::ready(Vec::new())
     }
     /// 连接本机（或本机能直接到达）的一个 TCP 服务：发布的服务就这样接到它真正监听的地址。
-    fn tcp_connect(
-        &self,
-        addr: std::net::SocketAddr,
-    ) -> impl Future<Output = io::Result<Self::Tcp>>;
+    fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<Self::Tcp>>;
     /// 向本机（或本机能直接到达）的一个 UDP 服务收发数据报（M11.5：发布成 `--proto udp` 的服务）。
     /// 没有 UDP 的实现（仿真）说不支持。
     fn udp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<UdpConn>> {
         let _ = addr;
-        std::future::ready(Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "这里没有 UDP",
-        )))
+        std::future::ready(Err(io::Error::new(io::ErrorKind::Unsupported, "这里没有 UDP")))
     }
     /// 按内容寻址的对象存储（Drive）：取出哈希为 `hash` 的对象。
     fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>>;
@@ -130,16 +124,8 @@ pub trait System {
 
 /// 一个「连上」了对端的数据报套接字：只和那一个地址收发，每次收发一个完整的数据报。
 pub trait Datagram {
-    fn poll_send(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>>;
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>>;
+    fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>>;
+    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>>;
 }
 
 /// [`System::udp_connect`] 的结果。
@@ -166,72 +152,32 @@ impl<S: System + ?Sized> System for std::rc::Rc<S> {
     type Proc = S::Proc;
     type Pty = S::Pty;
     type Tcp = S::Tcp;
-    fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> {
-        (**self).tcp_connect(addr)
-    }
-    fn udp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<UdpConn>> {
-        (**self).udp_connect(addr)
-    }
-    fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>> {
-        (**self).resolve(host)
-    }
-    fn now(&self) -> Timestamp {
-        (**self).now()
-    }
-    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
-        (**self).cas_get(hash)
-    }
-    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> {
-        (**self).cas_put(hash, bytes)
-    }
-    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool> {
-        (**self).cas_has(hash)
-    }
-    fn random(&self, buf: &mut [u8]) {
-        (**self).random(buf)
-    }
-    fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        (**self).store_get(key)
-    }
-    fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> {
-        (**self).store_put(key, value)
-    }
-    fn store_delete(&self, key: &str) -> io::Result<()> {
-        (**self).store_delete(key)
-    }
-    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> {
-        (**self).append_log(name, record, max_bytes)
-    }
-    fn read_log(&self, name: &str) -> io::Result<Vec<u8>> {
-        (**self).read_log(name)
-    }
-    fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> {
-        (**self).spawn(cmd)
-    }
-    fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<Self::Pty> {
-        (**self).spawn_pty(name, size, created_at)
-    }
-    fn adopt_ptys(&self) -> impl Future<Output = Vec<AdoptedPty<Self::Pty>>> {
-        (**self).adopt_ptys()
-    }
+    fn tcp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<S::Tcp>> { (**self).tcp_connect(addr) }
+    fn udp_connect(&self, addr: std::net::SocketAddr) -> impl Future<Output = io::Result<UdpConn>> { (**self).udp_connect(addr) }
+    fn resolve(&self, host: &str) -> impl Future<Output = io::Result<Vec<std::net::IpAddr>>> { (**self).resolve(host) }
+    fn now(&self) -> Timestamp { (**self).now() }
+    fn cas_get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> { (**self).cas_get(hash) }
+    fn cas_put(&self, hash: &[u8; 32], bytes: &[u8]) -> io::Result<()> { (**self).cas_put(hash, bytes) }
+    fn cas_has(&self, hash: &[u8; 32]) -> io::Result<bool> { (**self).cas_has(hash) }
+    fn random(&self, buf: &mut [u8]) { (**self).random(buf) }
+    fn store_get(&self, key: &str) -> io::Result<Option<Vec<u8>>> { (**self).store_get(key) }
+    fn store_put(&self, key: &str, value: &[u8]) -> io::Result<()> { (**self).store_put(key, value) }
+    fn store_delete(&self, key: &str) -> io::Result<()> { (**self).store_delete(key) }
+    fn append_log(&self, name: &str, record: &[u8], max_bytes: u64) -> io::Result<()> { (**self).append_log(name, record, max_bytes) }
+    fn read_log(&self, name: &str) -> io::Result<Vec<u8>> { (**self).read_log(name) }
+    fn spawn(&self, cmd: Cmd) -> io::Result<Self::Proc> { (**self).spawn(cmd) }
+    fn spawn_pty(&self, name: &str, size: Size, created_at: Timestamp) -> io::Result<Self::Pty> { (**self).spawn_pty(name, size, created_at) }
+    fn adopt_ptys(&self) -> impl Future<Output = Vec<AdoptedPty<Self::Pty>>> { (**self).adopt_ptys() }
 }
 
 /// 尚未实现进程支持时使用的占位类型。
 pub enum NoProc {}
 
 impl Proc for NoProc {
-    async fn next_event(&mut self) -> ProcEvent {
-        match *self {}
-    }
-    fn write_stdin(&mut self, _: Vec<u8>) {
-        match *self {}
-    }
-    fn close_stdin(&mut self) {
-        match *self {}
-    }
-    fn kill(&mut self) {
-        match *self {}
-    }
+    async fn next_event(&mut self) -> ProcEvent { match *self {} }
+    fn write_stdin(&mut self, _: Vec<u8>) { match *self {} }
+    fn close_stdin(&mut self) { match *self {} }
+    fn kill(&mut self) { match *self {} }
 }
 
 /// 日志轮转的约定，真实和仿真两种实现都用它测试。

@@ -80,11 +80,7 @@ fn sibling(exe: &Path, tag: &str) -> PathBuf {
 }
 
 fn sibling_for(exe: &Path, tag: &str, windows: bool) -> PathBuf {
-    let file = exe
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let file = exe.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let name = match file.strip_suffix(".exe").filter(|_| windows) {
         Some(stem) => format!("{stem}.{tag}.exe"),
         None => format!("{file}.{tag}"),
@@ -117,8 +113,7 @@ fn replace_for(src: &Path, dst: &Path, aside: &Path, windows: bool) -> io::Resul
 /// 给的文件：发布的 `.tar.gz`（解出里面的 `nexus`），或者二进制本身。返回放好的、可执行的新二进制
 /// （和 `exe` 同一目录的 `.new`）。
 fn stage(file: &Path, exe: &Path) -> Result<PathBuf, WireError> {
-    let bytes =
-        std::fs::read(file).map_err(|e| invalid(format!("读不了 {}：{e}", file.display())))?;
+    let bytes = std::fs::read(file).map_err(|e| invalid(format!("读不了 {}：{e}", file.display())))?;
     verify_checksum(file, &bytes)?;
     let binary = if bytes.starts_with(&[0x1f, 0x8b]) {
         extract(&bytes)?
@@ -148,16 +143,9 @@ fn stage(file: &Path, exe: &Path) -> Result<PathBuf, WireError> {
 
 /// 压缩包旁边有 `SHA256SUMS`（发布流程生成的）就校验。
 pub fn verify_checksum(file: &Path, bytes: &[u8]) -> Result<(), WireError> {
-    let Some(sums) = file.parent().map(|d| d.join("SHA256SUMS")) else {
-        return Ok(());
-    };
-    let Ok(text) = std::fs::read_to_string(&sums) else {
-        return Ok(());
-    };
-    let name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
+    let Some(sums) = file.parent().map(|d| d.join("SHA256SUMS")) else { return Ok(()) };
+    let Ok(text) = std::fs::read_to_string(&sums) else { return Ok(()) };
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let Some(want) = text.lines().find_map(|l| {
         let (hash, n) = l.split_once(char::is_whitespace)?;
         (n.trim().trim_start_matches('*') == name).then(|| hash.to_ascii_lowercase())
@@ -165,42 +153,25 @@ pub fn verify_checksum(file: &Path, bytes: &[u8]) -> Result<(), WireError> {
         return Ok(());
     };
     use sha2::Digest;
-    let got: String = sha2::Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let got: String = sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
     if got != want {
-        return Err(invalid(format!(
-            "{name} 的 SHA256 和 SHA256SUMS 里的不一样：文件可能下载不完整或被改过"
-        )));
+        return Err(invalid(format!("{name} 的 SHA256 和 SHA256SUMS 里的不一样：文件可能下载不完整或被改过")));
     }
     Ok(())
 }
 
 fn extract(gz: &[u8]) -> Result<Vec<u8>, WireError> {
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(gz));
-    let entries = archive
-        .entries()
-        .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+    let entries = archive.entries().map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
-        let is_nexus = entry
-            .path()
-            .ok()
-            .and_then(|p| p.file_name().map(is_nexus_name))
-            .unwrap_or(false);
+        let is_nexus = entry.path().ok().and_then(|p| p.file_name().map(is_nexus_name)).unwrap_or(false);
         if is_nexus && entry.header().entry_type().is_file() {
             let mut out = Vec::new();
-            io::Read::read_to_end(
-                &mut io::Read::take(&mut entry, MAX_BINARY_BYTES + 1),
-                &mut out,
-            )
-            .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+            io::Read::read_to_end(&mut io::Read::take(&mut entry, MAX_BINARY_BYTES + 1), &mut out)
+                .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
             if out.len() as u64 > MAX_BINARY_BYTES {
-                return Err(invalid(format!(
-                    "压缩包里的 nexus 超过上限（{} MiB）",
-                    MAX_BINARY_BYTES >> 20
-                )));
+                return Err(invalid(format!("压缩包里的 nexus 超过上限（{} MiB）", MAX_BINARY_BYTES >> 20)));
             }
             return Ok(out);
         }
@@ -215,29 +186,16 @@ fn is_nexus_name(name: &std::ffi::OsStr) -> bool {
 
 /// Windows 的发布包（`.zip`）。
 fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
-    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes))
-        .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
     for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
-        let is_nexus = file.is_file()
-            && file
-                .enclosed_name()
-                .and_then(|p| p.file_name().map(is_nexus_name))
-                .unwrap_or(false);
+        let mut file = archive.by_index(i).map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+        let is_nexus = file.is_file() && file.enclosed_name().and_then(|p| p.file_name().map(is_nexus_name)).unwrap_or(false);
         if is_nexus {
             let mut out = Vec::new();
-            io::Read::read_to_end(
-                &mut io::Read::take(&mut file, MAX_BINARY_BYTES + 1),
-                &mut out,
-            )
-            .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
+            io::Read::read_to_end(&mut io::Read::take(&mut file, MAX_BINARY_BYTES + 1), &mut out)
+                .map_err(|e| invalid(format!("压缩包读不了：{e}")))?;
             if out.len() as u64 > MAX_BINARY_BYTES {
-                return Err(invalid(format!(
-                    "压缩包里的 nexus 超过上限（{} MiB）",
-                    MAX_BINARY_BYTES >> 20
-                )));
+                return Err(invalid(format!("压缩包里的 nexus 超过上限（{} MiB）", MAX_BINARY_BYTES >> 20)));
             }
             return Ok(out);
         }
@@ -285,9 +243,7 @@ fn probe(bin: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Result<Strin
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -298,11 +254,7 @@ fn probe(bin: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Result<Strin
     let out_bytes = out_t.join().unwrap_or_default();
     let err_bytes = err_t.join().unwrap_or_default();
     if !status.success() {
-        return Err(format!(
-            "退出码 {}：{}",
-            status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&err_bytes).trim()
-        ));
+        return Err(format!("退出码 {}：{}", status.code().unwrap_or(-1), String::from_utf8_lossy(&err_bytes).trim()));
     }
     Ok(String::from_utf8_lossy(&out_bytes).into_owned())
 }
@@ -310,26 +262,16 @@ fn probe(bin: &Path, args: &[&std::ffi::OsStr], data_dir: &Path) -> Result<Strin
 /// 检查新版本：能运行、协议主版本相同（除非 `force`）、能读本机的数据目录。返回它的版本。
 fn preflight(new: &Path, data_dir: &Path, force: bool) -> Result<String, WireError> {
     use std::ffi::OsStr;
-    let v = probe(new, &[OsStr::new("--version")], data_dir)
-        .map_err(|e| invalid(format!("新版本的 nexus --version {e}")))?;
+    let v = probe(new, &[OsStr::new("--version")], data_dir).map_err(|e| invalid(format!("新版本的 nexus --version {e}")))?;
     let version = v
         .trim()
         .strip_prefix("nexus ")
         .filter(|v| !v.is_empty() && !v.contains(char::is_whitespace))
-        .ok_or_else(|| {
-            invalid(format!(
-                "新版本的 nexus --version 输出的不是 nexus 的版本：{:?}",
-                v.trim()
-            ))
-        })?
+        .ok_or_else(|| invalid(format!("新版本的 nexus --version 输出的不是 nexus 的版本：{:?}", v.trim())))?
         .to_string();
     let major = probe(new, &[OsStr::new("protocol-version")], data_dir)
         .ok()
-        .and_then(|p| {
-            p.split_whitespace()
-                .next()
-                .and_then(|m| m.parse::<u16>().ok())
-        });
+        .and_then(|p| p.split_whitespace().next().and_then(|m| m.parse::<u16>().ok()));
     if major != Some(nexus_wire::WIRE_VERSION) && !force {
         let theirs = major.map_or("不知道".to_string(), |m| m.to_string());
         return Err(invalid(format!(
@@ -339,12 +281,7 @@ fn preflight(new: &Path, data_dir: &Path, force: bool) -> Result<String, WireErr
     }
     probe(
         new,
-        &[
-            OsStr::new("--data-dir"),
-            data_dir.as_os_str(),
-            OsStr::new("daemon"),
-            OsStr::new("--preflight"),
-        ],
+        &[OsStr::new("--data-dir"), data_dir.as_os_str(), OsStr::new("daemon"), OsStr::new("--preflight")],
         data_dir,
     )
     .map_err(|e| invalid(format!("新版本读不了本机的数据目录：{e}")))?;
@@ -352,14 +289,7 @@ fn preflight(new: &Path, data_dir: &Path, force: bool) -> Result<String, WireErr
 }
 
 /// 换上新版本，记下 `upgrade.json`。之后由调用方用同样的参数执行 `exe`。
-pub fn install(
-    file: &Path,
-    exe: &Path,
-    data_dir: &Path,
-    peers: Vec<String>,
-    confirm_ms: u64,
-    force: bool,
-) -> Result<UpgradeState, WireError> {
+pub fn install(file: &Path, exe: &Path, data_dir: &Path, peers: Vec<String>, confirm_ms: u64, force: bool) -> Result<UpgradeState, WireError> {
     let new = stage(file, exe)?;
     let version = match preflight(&new, data_dir, force) {
         Ok(v) => v,
@@ -385,10 +315,7 @@ pub fn install(
     };
     swap().map_err(|e| {
         let _ = std::fs::remove_file(&new);
-        WireError::new(
-            ErrorCode::InvalidState,
-            format!("换不了 {}：{e}", exe.display()),
-        )
+        WireError::new(ErrorCode::InvalidState, format!("换不了 {}：{e}", exe.display()))
     })?;
     let state = UpgradeState {
         state: "pending".into(),
@@ -400,18 +327,12 @@ pub fn install(
         confirm_ms,
         attempts: 0,
         message: String::new(),
-        id: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(1, |d| d.as_millis() as u64),
+        id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64),
     };
     if let Err(e) = save(data_dir, &state) {
         // 状态文件写失败时立刻换回旧二进制，避免没有 upgrade.json 导致无法自动回滚。
-        let _ = std::fs::rename(&state.prev, &state.exe)
-            .or_else(|_| std::fs::copy(&state.prev, &state.exe).map(|_| ()));
-        return Err(WireError::new(
-            ErrorCode::Internal,
-            format!("写不了 upgrade.json：{e}"),
-        ));
+        let _ = std::fs::rename(&state.prev, &state.exe).or_else(|_| std::fs::copy(&state.prev, &state.exe).map(|_| ()));
+        return Err(WireError::new(ErrorCode::Internal, format!("写不了 upgrade.json：{e}")));
     }
     Ok(state)
 }
@@ -421,8 +342,7 @@ pub fn restore(state: &mut UpgradeState, data_dir: &Path, why: &str) -> io::Resu
     if cfg!(windows) {
         replace(&state.prev, &state.exe, &sibling(&state.exe, "old"))?;
     } else {
-        std::fs::rename(&state.prev, &state.exe)
-            .or_else(|_| std::fs::copy(&state.prev, &state.exe).map(|_| ()))?;
+        std::fs::rename(&state.prev, &state.exe).or_else(|_| std::fs::copy(&state.prev, &state.exe).map(|_| ()))?;
     }
     state.state = "rolled_back".into();
     state.message = why.to_string();
@@ -435,10 +355,7 @@ pub fn reexec(exe: &Path) -> io::Error {
     use std::os::unix::process::CommandExt;
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // 测试用的环境变量不带给下一个版本。
-    std::process::Command::new(exe)
-        .args(args)
-        .env_remove("NEXUS_TEST_NO_NETWORK")
-        .exec()
+    std::process::Command::new(exe).args(args).env_remove("NEXUS_TEST_NO_NETWORK").exec()
 }
 
 /// Windows 不能原地换进程：用同样的参数启动新的（继承标准输入输出），然后本进程退出。进程号会变。
@@ -446,11 +363,7 @@ pub fn reexec(exe: &Path) -> io::Error {
 #[cfg(windows)]
 pub fn reexec(exe: &Path) -> io::Error {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(args)
-        .env_remove("NEXUS_TEST_NO_NETWORK")
-        .spawn()
-    {
+    match std::process::Command::new(exe).args(args).env_remove("NEXUS_TEST_NO_NETWORK").spawn() {
         Ok(_) => std::process::exit(0),
         Err(e) => e,
     }
@@ -488,33 +401,15 @@ mod tests {
     #[test]
     fn prev_is_next_to_the_binary() {
         let unix = Path::new("/usr/local/bin/nexus");
-        assert_eq!(
-            sibling_for(unix, "prev", false),
-            Path::new("/usr/local/bin/nexus.prev")
-        );
-        assert_eq!(
-            sibling_for(unix, "new", false),
-            Path::new("/usr/local/bin/nexus.new")
-        );
+        assert_eq!(sibling_for(unix, "prev", false), Path::new("/usr/local/bin/nexus.prev"));
+        assert_eq!(sibling_for(unix, "new", false), Path::new("/usr/local/bin/nexus.new"));
         // covers: R84
         // Windows：还是 .exe，能被当作程序运行。没有 .exe 后缀的照 Unix 的规则。
         let win = Path::new("/apps/nexus/nexus.exe");
-        assert_eq!(
-            sibling_for(win, "prev", true),
-            Path::new("/apps/nexus/nexus.prev.exe")
-        );
-        assert_eq!(
-            sibling_for(win, "new", true),
-            Path::new("/apps/nexus/nexus.new.exe")
-        );
-        assert_eq!(
-            sibling_for(win, "old", true),
-            Path::new("/apps/nexus/nexus.old.exe")
-        );
-        assert_eq!(
-            sibling_for(unix, "prev", true),
-            Path::new("/usr/local/bin/nexus.prev")
-        );
+        assert_eq!(sibling_for(win, "prev", true), Path::new("/apps/nexus/nexus.prev.exe"));
+        assert_eq!(sibling_for(win, "new", true), Path::new("/apps/nexus/nexus.new.exe"));
+        assert_eq!(sibling_for(win, "old", true), Path::new("/apps/nexus/nexus.old.exe"));
+        assert_eq!(sibling_for(unix, "prev", true), Path::new("/usr/local/bin/nexus.prev"));
         assert_eq!(prev_path(Path::new("nexus")), Path::new("nexus.prev"));
     }
 
@@ -523,11 +418,7 @@ mod tests {
     fn windows_swap_order_keeps_every_version() {
         let dir = temp_dir("swap");
         let exe = dir.path().join("nexus.exe");
-        let (new, prev, old) = (
-            sibling_for(&exe, "new", true),
-            sibling_for(&exe, "prev", true),
-            sibling_for(&exe, "old", true),
-        );
+        let (new, prev, old) = (sibling_for(&exe, "new", true), sibling_for(&exe, "prev", true), sibling_for(&exe, "old", true));
         std::fs::write(&exe, b"v1").unwrap();
         std::fs::write(&prev, b"stale").unwrap();
         std::fs::write(&new, b"v2").unwrap();
@@ -553,13 +444,10 @@ mod tests {
         let mut buf = io::Cursor::new(Vec::new());
         {
             let mut z = zip::ZipWriter::new(&mut buf);
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
-            z.start_file("nexus-0.2.0-windows-x86_64/README.md", opts)
-                .unwrap();
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            z.start_file("nexus-0.2.0-windows-x86_64/README.md", opts).unwrap();
             z.write_all(b"readme").unwrap();
-            z.start_file("nexus-0.2.0-windows-x86_64/nexus.exe", opts)
-                .unwrap();
+            z.start_file("nexus-0.2.0-windows-x86_64/nexus.exe", opts).unwrap();
             z.write_all(b"MZ binary").unwrap();
             z.finish().unwrap();
         }
@@ -570,8 +458,7 @@ mod tests {
         let mut buf = io::Cursor::new(Vec::new());
         {
             let mut z = zip::ZipWriter::new(&mut buf);
-            z.start_file("other.txt", zip::write::SimpleFileOptions::default())
-                .unwrap();
+            z.start_file("other.txt", zip::write::SimpleFileOptions::default()).unwrap();
             z.write_all(b"x").unwrap();
             z.finish().unwrap();
         }
@@ -600,11 +487,7 @@ mod tests {
         std::fs::write(&file, b"abc").unwrap();
         // sha256("abc")
         let good = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-        std::fs::write(
-            dir.path().join("SHA256SUMS"),
-            format!("{good}  nexus-0.2.0-linux-x86_64.tar.gz\n"),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("SHA256SUMS"), format!("{good}  nexus-0.2.0-linux-x86_64.tar.gz\n")).unwrap();
         assert!(verify_checksum(&file, b"abc").is_ok());
         assert!(verify_checksum(&file, b"abd").is_err());
         // 不在 SHA256SUMS 里的文件：不校验
