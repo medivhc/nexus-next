@@ -13,7 +13,6 @@ final class NexusCore {
      * 返回 {"state": "starting"|"joined"|"joining"|"failed", ...}，字段见 nexus_cli::app::Screen。
      */
     static native String nativeScreen(String dataDir, String held, boolean renew, long nowMs);
-
     /** N2：判断给定电源模式（balanced / powersave / realtime）是否需要在有 Wi-Fi 时保持蜂窝在线。 */
     static native boolean nativeShouldKeepCellular(String powerMode);
 

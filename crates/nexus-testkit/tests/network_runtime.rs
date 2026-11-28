@@ -6,7 +6,7 @@ use nexus_core_proto::NodeId;
 use nexus_fabric_sim::SimTransport;
 use nexus_net_core::fakeip::FakePool;
 use nexus_net_core::route::{Matcher, Outbound, Rule};
-use nexus_runtime::{ctl_session, Node, TunInbound};
+use nexus_runtime::{ctl_session, Node, TunInbound, TunRouting};
 use nexus_sys_sim::{SimClock, SimDisk, SimServices, SimSystem};
 use nexus_wire::{CtlRequest, CtlResponse};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -132,7 +132,13 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
             }
             pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
             let (tx, rx) = tokio::sync::oneshot::channel();
-            tun_tx.send(TunInbound::Dns { query: pkt, reply: tx }).unwrap();
+            tun_tx
+                .send(TunInbound::Dns {
+                    query: pkt,
+                    full_capture: false,
+                    reply: tx,
+                })
+                .unwrap();
             let resp = rx.await.unwrap();
             let n = resp.len();
             Ipv4Addr::new(resp[n - 4], resp[n - 3], resp[n - 2], resp[n - 1])
@@ -145,6 +151,7 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
             .send(TunInbound::Udp {
                 stream: Box::new(stack),
                 dst: SocketAddr::new(IpAddr::V4(far_ip), 9000),
+                routing: TunRouting::FakeIp,
             })
             .unwrap();
         app.write_all(b"ping-udp").await.unwrap();
@@ -172,6 +179,7 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
             .send(TunInbound::Udp {
                 stream: Box::new(stack_local),
                 dst: SocketAddr::new(IpAddr::V4(local_ip), 9001),
+                routing: TunRouting::FakeIp,
             })
             .unwrap();
         let _ = app_local.write_all(b"should-block").await;
@@ -188,6 +196,7 @@ fn exit_datagram_forwards_udp_rejects_loopback_and_never_falls_back_to_direct() 
                 .send(TunInbound::Udp {
                     stream: Box::new(stack_drop),
                     dst: SocketAddr::new(IpAddr::V4(ip), 9002),
+                    routing: TunRouting::FakeIp,
                 })
                 .unwrap();
             let _ = app_drop.write_all(b"no-leak").await;

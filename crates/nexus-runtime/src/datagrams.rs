@@ -42,12 +42,12 @@ async fn idle(last: &Cell<tokio::time::Instant>) {
 }
 
 /// 流（帧）和一个数据报端点互相转发：流上来的每帧交给 `send`，`recv` 收到的每个数据报写成一帧。
-/// 流结束、出错或两边都空闲 [`DATAGRAM_IDLE`] 时结束。
+/// `recv` 的 `None` 表示端点结束，`Some(0)` 是空数据报。流结束、出错或两边都空闲时结束。
 pub(crate) async fn relay<St, S, R>(stream: St, mut send: S, mut recv: R) -> io::Result<()>
 where
     St: AsyncRead + AsyncWrite + Unpin,
     S: AsyncFnMut(&[u8]) -> io::Result<usize>,
-    R: AsyncFnMut(&mut [u8]) -> io::Result<usize>,
+    R: AsyncFnMut(&mut [u8]) -> io::Result<Option<usize>>,
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let last = Cell::new(tokio::time::Instant::now());
@@ -61,12 +61,10 @@ where
     };
     let down = async {
         let mut buf = vec![0u8; MAX_DATAGRAM];
-        loop {
-            let n = recv(&mut buf).await?;
+        while let Some(n) = recv(&mut buf).await? {
             last.set(tokio::time::Instant::now());
             write_frame(&mut wr, &buf[..n]).await?;
         }
-        #[allow(unreachable_code)]
         Ok::<_, io::Error>(())
     };
     let r = tokio::select! {
@@ -134,11 +132,11 @@ mod tests {
             async |buf: &mut [u8]| {
                 let next = replies.borrow_mut().pop_front();
                 match next {
-                Some(r) => {
-                    buf[..r.len()].copy_from_slice(&r);
-                    Ok(r.len())
-                }
-                None => std::future::pending().await,
+                    Some(r) => {
+                        buf[..r.len()].copy_from_slice(&r);
+                        Ok(Some(r.len()))
+                    }
+                    None => std::future::pending().await,
                 }
             },
         );

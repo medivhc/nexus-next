@@ -83,7 +83,7 @@ pub fn sniff(first: u8) -> Option<Entry> {
 }
 
 pub mod socks5 {
-    //! SOCKS5（RFC 1928）服务端：只支持不认证和 CONNECT。入口只对本机开放，认证由 Nexus 的身份承担。
+    //! SOCKS5（RFC 1928）。本机入口只接受 CONNECT；作为上游客户端还可以协商 UDP ASSOCIATE。
     use super::{Host, Target};
     use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -105,6 +105,8 @@ pub mod socks5 {
     pub const NO_AUTH: [u8; 2] = [5, 0];
     /// 没有可接受的认证方式。
     pub const NO_ACCEPTABLE: [u8; 2] = [5, 0xff];
+    /// UDP ASSOCIATE，套接字地址由上游从首个数据报获知。
+    pub const UDP_ASSOCIATE: [u8; 10] = [5, 3, 0, 1, 0, 0, 0, 0, 0, 0];
 
     /// 问候：版本、方法数、方法。返回（消耗的字节，是否提供了不认证）；不完整时 `None`。
     pub fn parse_greeting(buf: &[u8]) -> Result<Option<(usize, bool)>, Reply> {
@@ -131,15 +133,31 @@ pub mod socks5 {
         if buf[1] != 1 {
             return Err(Reply::CommandNotSupported);
         }
-        let (host, at) = match buf[3] {
+        Ok(parse_address(&buf[3..])?.map(|(n, target)| (n + 3, target)))
+    }
+
+    fn parse_address(buf: &[u8]) -> Result<Option<(usize, Target)>, Reply> {
+        let Some(&kind) = buf.first() else {
+            return Ok(None);
+        };
+        let (host, at) = match kind {
             1 => {
-                let Some(b) = buf.get(4..8) else { return Ok(None) };
-                (Host::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))), 8)
+                let Some(b) = buf.get(1..5) else {
+                    return Ok(None);
+                };
+                (
+                    Host::Ip(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3]))),
+                    5,
+                )
             }
             3 => {
-                let Some(&len) = buf.get(4) else { return Ok(None) };
-                let end = 5 + len as usize;
-                let Some(name) = buf.get(5..end) else { return Ok(None) };
+                let Some(&len) = buf.get(1) else {
+                    return Ok(None);
+                };
+                let end = 2 + len as usize;
+                let Some(name) = buf.get(2..end) else {
+                    return Ok(None);
+                };
                 let name = core::str::from_utf8(name).map_err(|_| Reply::GeneralFailure)?;
                 if name.is_empty() {
                     return Err(Reply::GeneralFailure);
@@ -147,9 +165,11 @@ pub mod socks5 {
                 (Host::Name(name.to_string()), end)
             }
             4 => {
-                let Some(b) = buf.get(4..20) else { return Ok(None) };
+                let Some(b) = buf.get(1..17) else {
+                    return Ok(None);
+                };
                 let octets: [u8; 16] = b.try_into().expect("长度已检查");
-                (Host::Ip(IpAddr::V6(Ipv6Addr::from(octets))), 20)
+                (Host::Ip(IpAddr::V6(Ipv6Addr::from(octets))), 17)
             }
             _ => return Err(Reply::AddressTypeNotSupported),
         };
@@ -165,6 +185,11 @@ pub mod socks5 {
     /// 作为客户端连上游代理时的请求（CONNECT）。名字原样交给上游，不在本机解析。
     pub fn request(target: &Target) -> Vec<u8> {
         let mut out = vec![5, 1, 0];
+        write_address(&mut out, target);
+        out
+    }
+
+    fn write_address(out: &mut Vec<u8>, target: &Target) {
         match &target.host {
             Host::Ip(IpAddr::V4(ip)) => {
                 out.push(1);
@@ -181,7 +206,6 @@ pub mod socks5 {
             }
         }
         out.extend_from_slice(&target.port.to_be_bytes());
-        out
     }
 
     /// 上游代理的回应。返回（消耗的字节，回应码）；不完整时 `None`；无法理解时 `Err`。
@@ -203,6 +227,35 @@ pub mod socks5 {
             _ => return Err(BadReply),
         };
         Ok((buf.len() >= len).then_some((len, buf[1])))
+    }
+
+    /// 读取 UDP ASSOCIATE 成功回应中的中继地址。
+    pub fn bound_address(reply: &[u8]) -> Result<Target, BadReply> {
+        if !reply.starts_with(&[5, 0, 0]) {
+            return Err(BadReply);
+        }
+        parse_address(&reply[3..])
+            .map_err(|_| BadReply)?
+            .map(|(_, target)| target)
+            .ok_or(BadReply)
+    }
+
+    /// SOCKS5 UDP 头。只发送不分片的数据报。
+    pub fn udp_header(target: &Target) -> Option<Vec<u8>> {
+        if matches!(&target.host, Host::Name(name) if name.is_empty() || name.len() > u8::MAX as usize)
+        {
+            return None;
+        }
+        let mut header = vec![0, 0, 0];
+        write_address(&mut header, target);
+        Some(header)
+    }
+
+    /// 解包从中继返回的数据报。保留字段非零、分片和不完整的数据报都丢弃。
+    pub fn parse_udp_packet(packet: &[u8]) -> Option<(Target, &[u8])> {
+        let address = packet.strip_prefix(&[0, 0, 0])?;
+        let (used, target) = parse_address(address).ok()??;
+        Some((target, &address[used..]))
     }
 }
 

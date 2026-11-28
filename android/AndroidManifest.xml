@@ -12,6 +12,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
     <!-- 应用分流（N1）：列出已安装应用供用户选择绕过 VPN。 -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <application android:label="Nexus" android:extractNativeLibs="true" android:allowBackup="false">

@@ -39,12 +39,25 @@ adb shell "NEXUS_DATA_DIR=/data/data/link.bewith.nexus/files /data/local/tmp/nex
 之后手机上的任何应用都能按名字访问服务（`http://web.home.internal/`），规则里送去出口的域名经出口设备出去
 （`nexus route add --domain example.com --via anchor`），其余流量照常走手机自己的网络。
 
+DNS 引流的公网域名同时支持 TCP 和 UDP。设备出口的 UDP 要求协议 19.6，并沿用 `nexus exit on` 的开放设置。
+使用 `--socks5` 时，UDP 要求上游接受无认证的 `UDP ASSOCIATE`。协商失败、出口拒绝和中继断开会在
+`daemon.log` 中显示原因，数据报只会发往规则指定的出口。已发布的私有 UDP 服务仍可按 `.internal` 名称访问。
+
 启动时的参数：`--es name <设备名>`、`--es relay default|disabled|<中继地址>`、`--ez discovery true|false`、
 `--ez multipath true|false`（默认 true：请求蜂窝网络在有 Wi-Fi 时也保持在线，见下）。
 `--es rendezvous default|disabled|<碰头服务地址>`（短加入码用；自建网络里是 `https://<锚点>/pkarr`）。
 停止：`adb shell am start -n link.bewith.nexus/.MainActivity --es action stop`。
 核心的日志在 `/data/data/link.bewith.nexus/files/daemon.log`；数据目录里放一个名为 `trace` 的文件，
 下次启动时各个库的调试日志也会写进去。
+
+手机上可用「停用 VPN」恢复系统原来的网络，再用「启用 VPN」连接。停用状态和「绕过 VPN 的应用」列表会保存。绕过设置在下次启用时生效。Android 用系统网络处理被排除应用的连接和 DNS，这些应用无法通过 Nexus VPN 访问 `.internal` 服务。
+「代理失败记录」显示核心最近记录的 TCP 和 UDP 转发失败。默认仅接管 `198.18.0.0/16` 临时地址。
+
+Android 10 及以后可通过「按应用选择出口」为指定应用设置设备出口或 SOCKS5。重启 VPN 后，未绕过的应用纳入 IPv4 和 IPv6 接管。已设置出口的应用经指定出口连接公网域名和字面 IP，私有服务及拒绝规则优先。可确认归属、没有指定出口的连接遵循现有规则。Android 无法确认应用归属或共享 UID 的策略冲突时关闭连接。
+
+按应用接管开启时，VPN 内的普通 TCP/UDP DNS 查询使用本地解析。`.internal` 由 Nexus 处理，公网 A 查询返回临时地址，实际解析由选定出口负责。AAAA 和其他查询类型返回空应答，端口 853 关闭。应用自行通过 HTTPS 发送的 DNS 内容仍是应用流量的一部分。绕过应用使用系统网络及其 DNS。
+
+「代理规则」可查看、添加和删除域名规则，并选择 Nexus 设备出口或 SOCKS5 上游。也可以粘贴 Clash/Mihomo 的 `rules` 或 `payload` 中的 `DOMAIN-SUFFIX` 条目。`DIRECT` 和 `REJECT` 保持原义，一个命名策略及未写策略的条目使用所填出口。导入按原顺序追加，已有规则先匹配。遇到其他规则类型、多个命名策略或无等价行为的内置策略，界面标出原因，整批保留原来的配置。
 
 ## 实测
 
@@ -64,5 +77,6 @@ adb shell "NEXUS_DATA_DIR=/data/data/link.bewith.nexus/files /data/local/tmp/nex
   系统没报告的接口仍按名字识别。手动设置（`nexus iface <接口> --metered on|off|auto`）照样优先。
 - 系统在有 Wi-Fi 时会关掉移动数据。应用请求蜂窝网络（`CHANGE_NETWORK_STATE`），让它一直在线；
   计费的蜂窝网络只承担交互流量和故障接管，平时只有心跳和交互冗余的流量。`--ez multipath false` 时不请求。
+- 可在手机上打开「按需保持蜂窝备用链路」，下次启用 VPN 时生效。此模式在 Wi-Fi 可用且虚拟网卡有应用出站流量时请求蜂窝网络，连续 90 秒未检测到流量便释放请求。核心自身的组网包不经过虚拟网卡，因而不延长这段时间。
 - 核心的多路径和 Linux 是同一份代码：每个接口的地址都打洞，包从源地址所在的接口发出（`IP_PKTINFO`）。
   真机上这依赖 Android 按出口接口选路由表的规则，还没有在有 Wi-Fi 和 5G 的真机上验证。

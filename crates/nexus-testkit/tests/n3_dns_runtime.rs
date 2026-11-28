@@ -102,7 +102,7 @@ fn tun_dns_applies_override_block_nodata_allowlist_and_records_flows() {
 
         async fn query_dns(tun_tx: &mpsc::UnboundedSender<TunInbound>, domain: &str) -> Vec<u8> {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            tun_tx.send(TunInbound::Dns { query: build_a_query(domain), reply: tx }).unwrap();
+            tun_tx.send(TunInbound::Dns { query: build_a_query(domain), full_capture: false, reply: tx }).unwrap();
             rx.await.unwrap()
         }
 

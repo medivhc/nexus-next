@@ -8,6 +8,8 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.os.Build;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -37,6 +39,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -737,6 +741,19 @@ public class MainActivity extends Activity {
         optRow.addView(saveAppsBtn);
         headerCard.addView(optRow);
 
+        // 按应用选出口（R112）：指定应用的全部流量走某台设备的出口或某个 SOCKS5 上游。
+        Button appRoutesBtn = new Button(this);
+        appRoutesBtn.setText("按应用选择出口");
+        appRoutesBtn.setAllCaps(false);
+        styleButton(appRoutesBtn, COLOR_BG, COLOR_TEXT);
+        appRoutesBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                chooseAppRoutes();
+            }
+        });
+        headerCard.addView(appRoutesBtn);
+
         ScrollView scroll = new ScrollView(this);
         appListContainer = new LinearLayout(this);
         appListContainer.setOrientation(LinearLayout.VERTICAL);
@@ -833,6 +850,103 @@ public class MainActivity extends Activity {
         }
         if (shown == 0) {
             makeText(appListContainer, "apps_empty", 13, false, COLOR_MUTED).setText("没有匹配的应用；可勾选「显示系统应用」。");
+        }
+    }
+
+    private void chooseAppRoutes() {
+        if (Build.VERSION.SDK_INT < 29) {
+            Toast.makeText(this, "按应用选择出口需要 Android 10 或更高版本", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Map<String, String> routes = NexusVpnService.readAppRoutes(this);
+        Map<String, String> apps = launchableApps(routes.keySet());
+        final String[] packages = apps.keySet().toArray(new String[0]);
+        String[] labels = new String[packages.length];
+        for (int i = 0; i < packages.length; i++) {
+            String name = packages[i];
+            String route = routes.get(name);
+            labels[i] = apps.get(name) + "\n" + (route == null ? "按域名规则" : route);
+        }
+        new AlertDialog.Builder(this).setTitle("按应用选择出口")
+            .setItems(labels, new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    editAppRoute(packages[which]);
+                }
+            }).setNegativeButton("关闭", null).show();
+    }
+
+    /** 能从桌面打开的应用，以及已经设了出口的应用（即使不在桌面上）。 */
+    private Map<String, String> launchableApps(Set<String> saved) {
+        Map<String, String> options = new TreeMap<>();
+        for (String pkg : saved) {
+            options.put(pkg, pkg);
+        }
+        PackageManager packages = getPackageManager();
+        Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        for (ResolveInfo app : packages.queryIntentActivities(launcher, 0)) {
+            String pkg = app.activityInfo.packageName;
+            if (!pkg.equals(getPackageName())) {
+                options.put(pkg, app.loadLabel(packages) + "\n" + pkg);
+            }
+        }
+        return options;
+    }
+
+    private void editAppRoute(final String pkg) {
+        String[] choices = {"按域名规则", "强制走 Nexus 设备出口", "强制走 SOCKS5"};
+        new AlertDialog.Builder(this).setTitle(pkg)
+            .setItems(choices, new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    if (which == 0) {
+                        NexusVpnService.settings(MainActivity.this).edit()
+                            .remove(NexusVpnService.APP_ROUTE_PREFIX + pkg).apply();
+                        rebuildVpnIfRunning();
+                        return;
+                    }
+                    if (selectedBypass.contains(pkg)) {
+                        Toast.makeText(MainActivity.this, "请先取消绕过此应用", Toast.LENGTH_LONG).show();
+                        return;
+                    }
+                    promptAppExit(pkg, which == 1);
+                }
+            }).show();
+    }
+
+    private void promptAppExit(final String pkg, final boolean nexus) {
+        final String prefix = nexus ? "exit:" : "socks5:";
+        final EditText address = new EditText(this);
+        address.setSingleLine(true);
+        address.setHint(nexus ? "出口设备名" : "SOCKS5 主机:端口");
+        String previous = NexusVpnService.readAppRoutes(this).get(pkg);
+        if (previous != null && previous.startsWith(prefix)) {
+            address.setText(previous.substring(prefix.length()));
+        }
+        new AlertDialog.Builder(this).setTitle(pkg).setView(address)
+            .setMessage("有应用指定了出口时，VPN 接管所有未绕过应用的 IPv4 和 IPv6，按连接所属的应用分流；无法确认归属的连接会关闭。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    String value = address.getText().toString().trim();
+                    if (value.isEmpty()) {
+                        Toast.makeText(MainActivity.this, "请填写出口", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    NexusVpnService.settings(MainActivity.this).edit()
+                        .putString(NexusVpnService.APP_ROUTE_PREFIX + pkg, prefix + value).apply();
+                    rebuildVpnIfRunning();
+                }
+            }).show();
+    }
+
+    private void rebuildVpnIfRunning() {
+        if (NexusVpnService.isVpnRunning()) {
+            startService(new Intent(this, NexusVpnService.class).setAction(NexusVpnService.ACTION_REBUILD));
+            Toast.makeText(this, "已保存，VPN 正在按新设置重建", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "已保存，下次启动 VPN 时生效", Toast.LENGTH_SHORT).show();
         }
     }
 
