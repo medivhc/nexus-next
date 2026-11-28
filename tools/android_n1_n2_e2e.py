@@ -10,7 +10,7 @@
 
 用法：python3 tools/android_n1_n2_e2e.py [--serial emulator-5554]
 """
-# covers: R41, R42, R43, R46, R87, R91
+# covers: R41, R42, R43, R46, R87, R91, R101, R102, R103, R104
 import argparse
 import json
 import os

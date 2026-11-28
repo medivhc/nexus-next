@@ -289,10 +289,11 @@ pub mod route {
     pub enum Matcher {
         /// 这个域名和它的所有子域名（小写，不带结尾的点）。
         Domain(String),
-        /// 仅精确匹配该域名本身，不匹配子域名（小写，不带结尾的点）。
-        DomainExact(String),
         /// 一个地址段。
         Cidr { net: IpAddr, prefix: u8 },
+        /// 仅精确匹配该域名本身，不匹配子域名（小写，不带结尾的点）。
+        /// 必须放在最后：路由表用 postcard 存盘，按变体序号编码，插在中间会让已存的地址段规则读错。
+        DomainExact(String),
     }
 
     impl Matcher {

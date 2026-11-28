@@ -147,7 +147,7 @@ fn string(env: &mut JNIEnv, s: &JString) -> String {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
     mut env: JNIEnv,
-    this: JObject,
+    _this: JObject,
     data_dir: JString,
     name: JString,
     tun_fd: jint,
@@ -160,10 +160,10 @@ pub extern "system" fn Java_link_bewith_nexus_NexusVpnService_nativeStart(
         static INIT_CTX: std::sync::Once = std::sync::Once::new();
         INIT_CTX.call_once(|| {
             let ctx = env
-                .call_method(&this, "getApplicationContext", "()Landroid/content/Context;", &[])
+                .call_method(&_this, "getApplicationContext", "()Landroid/content/Context;", &[])
                 .ok()
                 .and_then(|v| v.l().ok())
-                .unwrap_or_else(|| env.new_local_ref(&this).unwrap());
+                .unwrap_or_else(|| env.new_local_ref(&_this).unwrap());
             if let (Ok(vm), Ok(global)) = (env.get_java_vm(), env.new_global_ref(ctx)) {
                 let vm_ptr = vm.get_java_vm_pointer().cast();
                 let ctx_ptr = global.as_raw().cast();

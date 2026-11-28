@@ -1,4 +1,4 @@
-// covers: R41, R42, R46, R87
+// covers: R41, R46, R87, R100, R101, R103, R104
 //! N1/N2 纯逻辑测试用例（对应 docs/test-cases/network-runtime-n0-n2-test-cases.md）。
 
 use nexus_net_core::app_policy::AppPolicy;

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 5;
+pub const WIRE_MINOR: u16 = 6;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
