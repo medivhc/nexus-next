@@ -3061,6 +3061,7 @@ dependencies = [
  "nexus-cli",
  "nexus-fabric-iroh",
  "nexus-net-core",
+ "nexus-wire",
  "serde_json",
  "tokio",
  "tun-rs",

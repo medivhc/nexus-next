@@ -76,6 +76,7 @@ enum Dispatch {
     Pipe { addr: std::net::SocketAddr, name: String },
     Datagram { addr: std::net::SocketAddr, name: String },
     Exit { target: Target },
+    ExitDatagram { target: Target },
     DriveGet { hashes: Vec<[u8; 32]> },
     DrivePush { ws: String, head: [u8; 32], count: u32 },
     WebEnroll { token: [u8; 16], credential: NewCredential },
@@ -285,6 +286,7 @@ const KEY_ADDRS: &str = "addrs";
 const KEY_AGENTS: &str = "agents";
 const KEY_SERVICES: &str = "services";
 const KEY_ROUTES: &str = "routes";
+const KEY_ROUTES_LKG: &str = "routes_lkg";
 const KEY_EXIT: &str = "exit";
 /// 用户对网络接口是否计费的设置（M5.2）：接口名 → 是否计费。
 const KEY_METERED: &str = "metered-v1";
@@ -384,7 +386,7 @@ fn required_action(body: &Request, node: &str) -> Result<Option<Action>, WireErr
                 resource: ResourcePath::parse(&format!("{node}/svc/{name}")).map_err(|_| internal("本机不在名册里"))?,
             }));
         }
-        Request::ExitConnect { .. } => {
+        Request::ExitConnect { .. } | Request::ExitDatagram { .. } => {
             return Ok(Some(Action {
                 capability: Capability::parse("net.exit").expect("内置能力名合法"),
                 resource: ResourcePath::parse(&format!("{node}/exit")).map_err(|_| internal("本机不在名册里"))?,
@@ -911,6 +913,7 @@ impl<T: Transport, S: System> Node<T, S> {
             Dispatch::Pipe { addr, name } => return self.serve_pipe(stream, addr, &name).await,
             Dispatch::Datagram { addr, name } => return self.serve_datagram(stream, addr, &name).await,
             Dispatch::Exit { target } => return self.serve_exit(stream, target).await,
+            Dispatch::ExitDatagram { target } => return self.serve_exit_datagram(stream, target).await,
             Dispatch::DriveGet { hashes } => return self.serve_drive_get(stream, hashes).await,
             Dispatch::DrivePush { ws, head, count } => return self.serve_drive_push(stream, ws, head, count).await,
             Dispatch::WebEnroll { token, credential } => match self.web_enroll_finish(token, credential).await {
@@ -1049,6 +1052,16 @@ impl<T: Transport, S: System> Node<T, S> {
                 } else {
                     match Target::parse(&target) {
                         Some(target) => return Dispatch::Exit { target },
+                        None => Response::Error(err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}"))),
+                    }
+                }
+            }
+            Request::ExitDatagram { target } => {
+                if !self.exit_enabled.get() {
+                    Response::Error(err(ErrorCode::Denied, format!("{me} 没有开放出口（在 {me} 上执行 nexus exit on）")))
+                } else {
+                    match Target::parse(&target) {
+                        Some(target) => return Dispatch::ExitDatagram { target },
                         None => Response::Error(err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}"))),
                     }
                 }
@@ -1332,6 +1345,11 @@ impl<T: Transport, S: System> Node<T, S> {
             CtlRequest::ExitShow => Ok(CtlResponse::Exit { enabled: self.exit_enabled.get() }),
             CtlRequest::RouteList => Ok(CtlResponse::Routes(self.routes.borrow().rules.clone())),
             CtlRequest::RouteExplain { target } => self.route_explain(&target).map(CtlResponse::Explained),
+            CtlRequest::RouteImport { rules, replace } => {
+                self.route_import(rules, replace).map(|(total, audit)| CtlResponse::RouteImported { total, audit })
+            }
+            CtlRequest::RouteRollback => self.route_rollback().map(|()| CtlResponse::Ok),
+            CtlRequest::RouteAudit => Ok(CtlResponse::RouteAudit(route::audit_rules(&self.routes.borrow().rules))),
             CtlRequest::AnchorShow => Ok(CtlResponse::Anchor(AnchorReport {
                 anchor: self.roster().and_then(|r| r.anchor),
                 roster_version: self.roster_version(),
@@ -2498,6 +2516,42 @@ impl<T: Transport, S: System> Node<T, S> {
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut out).await;
     }
 
+    async fn serve_exit_datagram<St: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: St, target: Target) {
+        let result = async {
+            let ips = match &target.host {
+                Host::Ip(ip) => vec![*ip],
+                Host::Name(name) => {
+                    self.system.resolve(name).await.map_err(|e| err(ErrorCode::Unreachable, format!("出口解析不了 {name}：{e}")))?
+                }
+            };
+            let ips: Vec<_> = ips.into_iter().filter(|ip| !is_own_address(ip)).collect();
+            if ips.is_empty() {
+                return Err(err(ErrorCode::Denied, format!("出口不连本机地址：{target}")));
+            }
+            let mut last = String::new();
+            for ip in ips {
+                match self.system.udp_connect(std::net::SocketAddr::new(ip, target.port)).await {
+                    Ok(u) => return Ok(u),
+                    Err(e) => last = format!("出口 UDP 连不上 {target}：{e}"),
+                }
+            }
+            Err(err(ErrorCode::Unreachable, last))
+        };
+        let udp = match result.await {
+            Ok(u) => u,
+            Err(failure) => {
+                let _ = write_response(&mut stream, &Response::Error(failure)).await;
+                let _ = stream.shutdown().await;
+                drain(&mut stream).await;
+                return;
+            }
+        };
+        if write_response(&mut stream, &Response::Ok).await.is_err() {
+            return;
+        }
+        let _ = datagrams::relay(stream, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+    }
+
     /// `nexus connect`：调用方一侧把命令行的输入送到服务，把服务的输出送回命令行。
     async fn connect(&self, node: &str, name: &str, agent: Option<AgentCredential>, server: CtlServer) {
         let body = Request::SvcConnect { name: name.to_string() };
@@ -2617,6 +2671,28 @@ impl<T: Transport, S: System> Node<T, S> {
         save(&self.system, KEY_ROUTES, &*routes).map_err(internal)
     }
 
+    fn route_import(&self, incoming: Vec<Rule>, replace: bool) -> Result<(u32, route::RuleAudit), WireError> {
+        let mut routes = self.routes.borrow_mut();
+        // 先保存上一份已验证规则作为 LKG 快照，确保随时可回滚。
+        save(&self.system, KEY_ROUTES_LKG, &*routes).map_err(internal)?;
+        if replace {
+            routes.rules = incoming;
+        } else {
+            routes.rules.extend(incoming);
+        }
+        let audit = route::audit_rules(&routes.rules);
+        save(&self.system, KEY_ROUTES, &*routes).map_err(internal)?;
+        Ok((routes.rules.len() as u32, audit))
+    }
+
+    fn route_rollback(&self) -> Result<(), WireError> {
+        let Some(lkg) = load::<_, RouteTable>(&self.system, KEY_ROUTES_LKG).map_err(internal)? else {
+            return Err(err(ErrorCode::NotFound, "没有可回滚的上一版规则快照"));
+        };
+        *self.routes.borrow_mut() = lkg.clone();
+        save(&self.system, KEY_ROUTES, &lkg).map_err(internal)
+    }
+
     fn route_explain(&self, target: &str) -> Result<RouteExplanation, WireError> {
         let t = Target::parse(target).ok_or_else(|| err(ErrorCode::InvalidInput, format!("目标应当写成 主机:端口：{target}")))?;
         let rules = self.routes.borrow().rules.clone();
@@ -2692,8 +2768,7 @@ impl<T: Transport, S: System> Node<T, S> {
         };
         let Some(name) = name else { return };
         let target = Target { host: Host::Name(name), port: dst.port() };
-        let Decision::Service { device, service } = route::decide(&target, &self.routes.borrow().rules) else { return };
-        let Ok(device) = self.resolve(&device) else { return };
+        let decision = route::decide(&target, &self.routes.borrow().rules);
         // 协议栈的 UDP 流：每次读出一个数据报，每次写入一个数据报。
         let (mut client_rd, mut client_wr) = tokio::io::split(client);
         let to_client = async |b: &[u8]| -> io::Result<usize> {
@@ -2701,13 +2776,26 @@ impl<T: Transport, S: System> Node<T, S> {
             Ok(b.len())
         };
         let from_client = async |b: &mut [u8]| -> io::Result<usize> { client_rd.read(b).await };
-        if device.node_id == self.me() {
-            let Some(addr) = self.services.borrow().iter().find(|s| s.name == service && s.proto == "udp").map(|s| s.addr) else { return };
-            let Ok(udp) = self.system.udp_connect(addr).await else { return };
-            let _ = datagrams::bridge(from_client, to_client, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
-            return;
-        }
-        let body = Request::SvcDatagram { name: service };
+        let (device_name, body) = match decision {
+            Decision::Service { device, service } => {
+                let Ok(resolved) = self.resolve(&device) else { return };
+                if resolved.node_id == self.me() {
+                    let Some(addr) = self.services.borrow().iter().find(|s| s.name == service && s.proto == "udp").map(|s| s.addr) else { return };
+                    let Ok(udp) = self.system.udp_connect(addr).await else { return };
+                    let _ = datagrams::bridge(from_client, to_client, async |b: &[u8]| udp.send(b).await, async |b: &mut [u8]| udp.recv(b).await).await;
+                    return;
+                }
+                (device, Request::SvcDatagram { name: service })
+            }
+            Decision::Rule { outbound: Outbound::Exit(device), .. } | Decision::Default(Outbound::Exit(device)) => {
+                (device, Request::ExitDatagram { target: target.to_string() })
+            }
+            // Reject、暂不支持 UDP 的 Socks5 上游或非法 .internal 均明确丢弃，绝不偷偷降级直连。
+            Decision::BadInternalName
+            | Decision::Rule { outbound: Outbound::Reject | Outbound::Socks5(_) | Outbound::Direct, .. }
+            | Decision::Default(_) => return,
+        };
+        let Ok(device) = self.resolve(&device_name) else { return };
         for attempt in 0..2 {
             match self.open_stream(&device, body.clone(), None).await {
                 Ok(stream) => {

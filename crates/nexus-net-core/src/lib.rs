@@ -3,6 +3,10 @@
 //! 这里只处理字节和规则，不碰网络：读写由运行时负责，所以同一份代码在仿真和真实环境里一样。
 #![forbid(unsafe_code)]
 
+pub mod app_policy;
+pub mod import;
+pub mod power;
+
 use core::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
@@ -282,6 +286,9 @@ pub mod route {
         Domain(String),
         /// 一个地址段。
         Cidr { net: IpAddr, prefix: u8 },
+        /// 仅精确匹配该域名本身，不匹配子域名（小写，不带结尾的点）。
+        /// 必须放在最后：路由表用 postcard 存盘，按变体序号编码，插在中间会让已存的地址段规则读错。
+        DomainExact(String),
     }
 
     impl Matcher {
@@ -293,6 +300,13 @@ pub mod route {
                 Ok(Matcher::Domain(d))
             } else {
                 Err(format!("域名不合法：{s}"))
+            }
+        }
+
+        pub fn parse_domain_exact(s: &str) -> Result<Self, String> {
+            match Self::parse_domain(s)? {
+                Matcher::Domain(d) => Ok(Matcher::DomainExact(d)),
+                other => Ok(other),
             }
         }
 
@@ -310,6 +324,7 @@ pub mod route {
                     let n = normalize(n);
                     n == *d || n.ends_with(&format!(".{d}"))
                 }
+                (Matcher::DomainExact(d), Host::Name(n)) => normalize(n) == *d,
                 (Matcher::Cidr { net, prefix }, Host::Ip(ip)) => {
                     net.is_ipv4() == ip.is_ipv4() && mask(*ip, *prefix) == *net
                 }
@@ -322,6 +337,7 @@ pub mod route {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             match self {
                 Matcher::Domain(d) => write!(f, "{d}"),
+                Matcher::DomainExact(d) => write!(f, "exact:{d}"),
                 Matcher::Cidr { net, prefix } => write!(f, "{net}/{prefix}"),
             }
         }
@@ -401,6 +417,101 @@ pub mod route {
         match rules.iter().position(|r| r.matcher.matches(target)) {
             Some(index) => Decision::Rule { index, outbound: rules[index].outbound.clone() },
             None => Decision::Default(Outbound::Direct),
+        }
+    }
+
+    /// 静态规则审计发现的问题类型。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AuditKind {
+        /// 与前序规则匹配器完全重复，永不可达。
+        Duplicate,
+        /// 被更宽的前序规则遮蔽，永不可达。
+        Shadowed,
+        /// 出口或上游代理配置无效。
+        InvalidUpstream,
+    }
+
+    /// 单条审计问题（规则编号为 1-based，与 `nexus route ls` 一致）。
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct AuditIssue {
+        pub rule_index: usize,
+        pub kind: AuditKind,
+        pub shadowed_by: Option<usize>,
+        pub message: String,
+    }
+
+    /// 规则表的静态编译审计报告。
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RuleAudit {
+        pub issues: Vec<AuditIssue>,
+    }
+
+    impl RuleAudit {
+        pub fn is_clean(&self) -> bool {
+            self.issues.is_empty()
+        }
+    }
+
+    /// 检查规则表中的重复规则、被前序宽规则遮蔽的不可达规则以及无效上游地址。
+    pub fn audit_rules(rules: &[Rule]) -> RuleAudit {
+        let mut issues = Vec::new();
+        for (i, rule) in rules.iter().enumerate() {
+            let idx = i + 1;
+            match &rule.outbound {
+                Outbound::Exit(dev) if dev.trim().is_empty() => {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::InvalidUpstream,
+                        shadowed_by: None,
+                        message: format!("第 {idx} 条规则的出口设备名为空"),
+                    });
+                }
+                Outbound::Socks5(addr) if Target::parse(addr).is_none() => {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::InvalidUpstream,
+                        shadowed_by: None,
+                        message: format!("第 {idx} 条规则的上游 SOCKS5 地址不合法：{addr}"),
+                    });
+                }
+                _ => {}
+            }
+            for (j, prev) in rules[..i].iter().enumerate() {
+                let prev_idx = j + 1;
+                if prev.matcher == rule.matcher {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::Duplicate,
+                        shadowed_by: Some(prev_idx),
+                        message: format!("第 {idx} 条规则（{}）与第 {prev_idx} 条完全重复，永不生效", rule.matcher),
+                    });
+                    break;
+                }
+                if matcher_covers(&prev.matcher, &rule.matcher) {
+                    issues.push(AuditIssue {
+                        rule_index: idx,
+                        kind: AuditKind::Shadowed,
+                        shadowed_by: Some(prev_idx),
+                        message: format!("第 {idx} 条规则（{}）被第 {prev_idx} 条（{}）完全遮蔽，永不可达", rule.matcher, prev.matcher),
+                    });
+                    break;
+                }
+            }
+        }
+        RuleAudit { issues }
+    }
+
+    fn matcher_covers(broad: &Matcher, narrow: &Matcher) -> bool {
+        match (broad, narrow) {
+            (Matcher::Domain(b), Matcher::Domain(n)) | (Matcher::Domain(b), Matcher::DomainExact(n)) => {
+                n == b || n.ends_with(&format!(".{b}"))
+            }
+            (
+                Matcher::Cidr { net: b_net, prefix: b_pref },
+                Matcher::Cidr { net: n_net, prefix: n_pref },
+            ) => b_net.is_ipv4() == n_net.is_ipv4() && b_pref <= n_pref && mask(*n_net, *b_pref) == *b_net,
+            _ => false,
         }
     }
 }

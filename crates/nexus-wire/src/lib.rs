@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// 规则见 docs/protocol.md。
 pub const WIRE_VERSION: u16 = 19;
 /// 次版本：同一主版本内只增加请求、回应和错误码，已有的编码不变（M7.1）。
-pub const WIRE_MINOR: u16 = 5;
+pub const WIRE_MINOR: u16 = 6;
 /// 单帧上限。超过即视为协议错误。
 pub const MAX_FRAME: usize = 1 << 20;
 
@@ -157,6 +157,9 @@ pub enum Request {
     /// 连到对方发布的一个 UDP 服务（`--proto udp`，M11.5）。对方先回 `Response::Ok` 或 `Response::Error`；
     /// 之后两个方向都是一串数据报帧：2 字节大端长度 + 数据报。任一方向结束发送即结束这条转发。
     SvcDatagram { name: String },
+    /// 经对方出口转发公网 UDP 数据报（N1）：对方先检验出口开放、授权与非本机地址，
+    /// 回应 `Response::Ok` 后使用与 `SvcDatagram` 相同的 2 字节大端长度前缀数据报帧。
+    ExitDatagram { target: String },
 }
 
 /// 临时分享的目标（M9.1）：全部为只读访问。
@@ -385,7 +388,7 @@ impl Request {
             | Request::VaultPush { .. }
             | Request::VaultPull
             | Request::RootRotate { .. } => TrafficClass::Interactive,
-            | Request::SvcDatagram { .. } => TrafficClass::Interactive,
+            | Request::SvcDatagram { .. } | Request::ExitDatagram { .. } => TrafficClass::Interactive,
             Request::NodeInfo
             | Request::RosterSync
             | Request::RosterPush { .. }
@@ -827,6 +830,12 @@ pub enum CtlRequest {
     RouteList,
     /// 说明 `target`（主机:端口）会走哪里。
     RouteExplain { target: String },
+    /// 批量导入路由规则（N1）：导入前自动保存当前规则为 LKG 快照，并返回静态审计结果。
+    RouteImport { rules: Vec<nexus_net_core::route::Rule>, replace: bool },
+    /// 回滚路由规则到上一份 LKG 快照（N1）。
+    RouteRollback,
+    /// 对当前路由规则执行静态审计（N1）。
+    RouteAudit,
     /// 开放或关闭本机的出口。
     ExitSet { enabled: bool },
     ExitShow,
@@ -895,6 +904,8 @@ pub enum CtlResponse {
     RouteAdded { index: u32 },
     Routes(Vec<nexus_net_core::route::Rule>),
     Explained(RouteExplanation),
+    RouteImported { total: u32, audit: nexus_net_core::route::RuleAudit },
+    RouteAudit(nexus_net_core::route::RuleAudit),
     Exit { enabled: bool },
     Tun(Option<TunReport>),
     Drive(DriveResponse),

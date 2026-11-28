@@ -227,6 +227,252 @@ pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeScreen(
     env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+
+/// N2 电源模式查询：判断当前模式在有 Wi-Fi 时是否需要主动请求蜂窝网络。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeShouldKeepCellular(
+    mut env: JNIEnv,
+    _class: JClass,
+    power_mode: JString,
+) -> jboolean {
+    let mode_str = string(&mut env, &power_mode);
+    let mode = nexus_net_core::power::PowerMode::parse(&mode_str);
+    jboolean::from(nexus_net_core::power::PowerPolicy::for_mode(mode).keep_cellular_with_wifi)
+}
+
+/// N1 应用绕过列表归一化：返回按换行分隔的最终 `disallowed_packages`（强制包含自身包名防 VPN 环路）。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeEffectiveBypass(
+    mut env: JNIEnv,
+    _class: JClass,
+    self_pkg: JString,
+    raw_lines: JString,
+) -> jstring {
+    let self_pkg = string(&mut env, &self_pkg);
+    let raw = string(&mut env, &raw_lines);
+    let policy = nexus_net_core::app_policy::AppPolicy::parse_lines(&raw);
+    let joined = policy.effective_disallowed_packages(&self_pkg).join("
+");
+    env.new_string(joined).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+
+fn ctl_request_sync(data_dir: &std::path::Path, req: nexus_wire::CtlRequest) -> Result<nexus_wire::CtlResponse, String> {
+    let ctl = nexus_cli::UnixCtl::new(data_dir, None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), nexus_cli::call(&ctl, req))
+            .await
+            .map_err(|_| "核心没有回应（请确认 VPN 已启动）".to_string())?
+            .map_err(|e| format!("无法连接核心：{e}"))
+    })
+}
+
+fn route_list_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteList) {
+        Ok(nexus_wire::CtlResponse::Routes(rules)) => {
+            let items: Vec<serde_json::Value> = rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    serde_json::json!({
+                        "index": i + 1,
+                        "match": r.matcher.to_string(),
+                        "outbound": r.outbound.to_string(),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "ok": true, "rules": items }).to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_import_json(
+    data_dir: &std::path::Path,
+    yaml: &str,
+    via_exit: &str,
+    socks5: &str,
+    replace: bool,
+    dry_run: bool,
+) -> String {
+    let opts = nexus_net_core::import::ImportOptions {
+        default_exit: (!via_exit.trim().is_empty()).then(|| via_exit.trim().to_string()),
+        default_socks5: (!socks5.trim().is_empty()).then(|| socks5.trim().to_string()),
+    };
+    let report = nexus_net_core::import::parse_clash_rules(yaml, &opts);
+    let pre_audit = nexus_net_core::route::audit_rules(&report.imported);
+    if dry_run {
+        return serde_json::json!({
+            "ok": true,
+            "dry_run": true,
+            "imported_count": report.imported.len(),
+            "skipped": report.skipped,
+            "notes": report.notes,
+            "audit": pre_audit,
+        })
+        .to_string();
+    }
+    match ctl_request_sync(
+        data_dir,
+        nexus_wire::CtlRequest::RouteImport { rules: report.imported, replace },
+    ) {
+        Ok(nexus_wire::CtlResponse::RouteImported { total, audit }) => serde_json::json!({
+            "ok": true,
+            "dry_run": false,
+            "total": total,
+            "skipped": report.skipped,
+            "notes": report.notes,
+            "audit": audit,
+        })
+        .to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_rollback_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRollback) {
+        Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_rm_json(data_dir: &std::path::Path, index: u32) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteRm { index }) {
+        Ok(nexus_wire::CtlResponse::Ok) => serde_json::json!({ "ok": true }).to_string(),
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_explain_json(data_dir: &std::path::Path, target: &str) -> String {
+    let trimmed = target.trim();
+    let normalized = if trimmed.contains(':') { trimmed.to_string() } else { format!("{trimmed}:443") };
+    if nexus_net_core::Target::parse(&normalized).is_none() {
+        return serde_json::json!({ "ok": false, "error": format!("目标格式不合法：{trimmed}（示例：claude.ai:443）") }).to_string();
+    }
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteExplain { target: normalized.clone() }) {
+        Ok(nexus_wire::CtlResponse::Explained(exp)) => {
+            let summary = match exp {
+                nexus_wire::RouteExplanation::Service { device, service } => {
+                    format!("目标 {normalized} → Nexus 私有服务 {device}/{service}")
+                }
+                nexus_wire::RouteExplanation::BadInternalName => {
+                    format!("目标 {normalized} → 非法的 .internal 服务名（应为 <服务>.<设备>.internal）")
+                }
+                nexus_wire::RouteExplanation::Rule { index, rule } => {
+                    format!("目标 {normalized} → 命中第 {index} 条规则（{}）→ {}", rule.matcher, rule.outbound)
+                }
+                nexus_wire::RouteExplanation::Default { outbound } => {
+                    format!("目标 {normalized} → 未命中规则，走默认动作：{outbound}")
+                }
+            };
+            serde_json::json!({ "ok": true, "summary": summary }).to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+fn route_audit_json(data_dir: &std::path::Path) -> String {
+    match ctl_request_sync(data_dir, nexus_wire::CtlRequest::RouteAudit) {
+        Ok(nexus_wire::CtlResponse::RouteAudit(audit)) => {
+            serde_json::json!({ "ok": true, "clean": audit.is_clean(), "issues": audit.issues }).to_string()
+        }
+        Ok(nexus_wire::CtlResponse::Error(e)) => serde_json::json!({ "ok": false, "error": e.message }).to_string(),
+        Ok(other) => serde_json::json!({ "ok": false, "error": format!("未预期的回应：{other:?}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteList(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_list_json(std::path::Path::new(&dir));
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteImport(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    yaml: JString,
+    via_exit: JString,
+    socks5: JString,
+    replace: jboolean,
+    dry_run: jboolean,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let yaml = string(&mut env, &yaml);
+    let via_exit = string(&mut env, &via_exit);
+    let socks5 = string(&mut env, &socks5);
+    let json = route_import_json(std::path::Path::new(&dir), &yaml, &via_exit, &socks5, replace != 0, dry_run != 0);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRollback(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_rollback_json(std::path::Path::new(&dir));
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteRm(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    index: jint,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_rm_json(std::path::Path::new(&dir), index.max(0) as u32);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteExplain(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+    target: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let target = string(&mut env, &target);
+    let json = route_explain_json(std::path::Path::new(&dir), &target);
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_link_bewith_nexus_NexusCore_nativeRouteAudit(
+    mut env: JNIEnv,
+    _class: JClass,
+    data_dir: JString,
+) -> jstring {
+    let dir = string(&mut env, &data_dir);
+    let json = route_audit_json(std::path::Path::new(&dir));
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     // covers: R79
